@@ -4,20 +4,31 @@ import { Link } from "react-router-dom";
 import {
   AudioLines,
   Box,
+  Folder,
   FolderPlus,
   Image as ImageIcon,
   Layers,
   Library,
+  Pencil,
   RefreshCw,
   Settings as SettingsIcon,
   Sparkles,
-  Tag as TagIcon,
   Trash2,
   WifiOff,
 } from "lucide-react";
-import { useAnalyze, useScan, useSources, useStats, useRemoveSource } from "@/api/queries";
+import {
+  useAnalyze,
+  useCollections,
+  useCreateCollection,
+  useDeleteCollection,
+  useRemoveSource,
+  useRenameCollection,
+  useScan,
+  useSources,
+  useStats,
+} from "@/api/queries";
 import { useConnection } from "@/api/connection";
-import type { LicenseStatus, MediaType, SourceInfo } from "@/api/types";
+import type { Collection, LicenseStatus, MediaType, SourceInfo } from "@/api/types";
 import { licenseColorVar, licenseLabel, sourceStateLabel } from "@/lib/format";
 import { useViewState } from "@/lib/view-state";
 import { AddSourceDialog } from "./AddSourceDialog";
@@ -124,14 +135,18 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
 
       {/* library / media filters */}
       <SectionLabel>Library</SectionLabel>
-      <Row active={!state.media} onClick={() => go({ media: null })} right={<Count n={total} />}>
+      <Row
+        active={!state.media && !state.collection}
+        onClick={() => go({ media: null, collection: null })}
+        right={<Count n={total} />}
+      >
         <Layers size={14} /> All assets
       </Row>
       {MEDIA.map(({ key, label, Icon }) => (
         <Row
           key={key}
-          active={state.media === key}
-          onClick={() => go({ media: state.media === key ? null : key })}
+          active={state.media === key && !state.collection}
+          onClick={() => go({ media: state.media === key ? null : key, collection: null })}
           right={<Count n={byMedia[key] ?? 0} />}
         >
           <Icon size={14} /> {label}
@@ -143,8 +158,8 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
       {LICENSES.map((lic) => (
         <Row
           key={lic}
-          active={state.license === lic}
-          onClick={() => go({ license: state.license === lic ? null : lic })}
+          active={state.license === lic && !state.collection}
+          onClick={() => go({ license: state.license === lic ? null : lic, collection: null })}
         >
           <span
             className="h-2 w-2 shrink-0 rounded-full"
@@ -181,8 +196,8 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
         <SourceRow
           key={s.id}
           source={s}
-          active={state.source === s.id}
-          onSelect={() => go({ source: state.source === s.id ? null : s.id })}
+          active={state.source === s.id && !state.collection}
+          onSelect={() => go({ source: state.source === s.id ? null : s.id, collection: null })}
           onRescan={() => scan.mutate({ sources: [s.id], mode: "full" })}
           onRemove={() => {
             if (confirm(`Remove source "${s.name}"? Its catalogued rows are dropped.`))
@@ -191,11 +206,13 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
         />
       ))}
 
-      {/* not-yet surfaces — honest about the roadmap, not fake chrome */}
-      <SectionLabel>Collections</SectionLabel>
-      <div className="flex items-center gap-2 px-3 py-1 text-xs text-fg-dim">
-        <TagIcon size={13} /> <span className="italic">Tags & collections — soon</span>
-      </div>
+      {/* collections & smart folders (phase 4) */}
+      <Collections
+        activeId={state.collection}
+        onSelect={(id) =>
+          go({ collection: id, media: null, source: null, license: null, q: "" })
+        }
+      />
 
       <div className="mt-auto" />
       {/* Admin / Settings surface (tech-spec 09 §B.4). */}
@@ -213,6 +230,137 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
 
 function Count({ n }: { n: number }) {
   return <span className="text-[10px] text-fg-dim tabular-nums">{n.toLocaleString()}</span>;
+}
+
+/** Collections & smart folders (issue #3). Lists them, filters the grid on click, and offers
+ *  create / rename / delete. The web UI creates *manual* collections here; a smart folder carries a
+ *  saved query (set via the CLI in v1) and is shown read-only with a Sparkles marker. Adding assets
+ *  to a manual collection happens per-asset in the Inspector (batch add lands with multi-select). */
+function Collections({
+  activeId,
+  onSelect,
+}: {
+  activeId: string | null;
+  onSelect: (id: string | null) => void;
+}) {
+  const collections = useCollections();
+  const create = useCreateCollection();
+  const rename = useRenameCollection();
+  const del = useDeleteCollection();
+  const items = collections.data ?? [];
+
+  const onCreate = () => {
+    const name = prompt("New collection name")?.trim();
+    if (name) create.mutate({ name, kind: "manual" });
+  };
+
+  return (
+    <>
+      <div className="flex items-center justify-between px-3 pt-4 pb-1">
+        <span className="text-[10px] font-semibold tracking-wider text-fg-dim uppercase">
+          Collections
+        </span>
+        <button
+          className="flex items-center justify-center text-fg-dim hover:text-accent coarse:min-h-11 coarse:min-w-11"
+          title="New collection"
+          aria-label="New collection"
+          onClick={onCreate}
+          disabled={create.isPending}
+        >
+          <FolderPlus size={14} />
+        </button>
+      </div>
+      {collections.isSuccess && items.length === 0 && (
+        <button
+          className="mx-3 my-1 rounded border border-dashed border-border px-2 py-2 text-center text-[11px] text-fg-dim hover:border-accent hover:text-accent"
+          onClick={onCreate}
+        >
+          + Group assets into a collection
+        </button>
+      )}
+      {items.map((c) => (
+        <CollectionRow
+          key={c.id}
+          collection={c}
+          active={activeId === c.id}
+          onSelect={() => onSelect(activeId === c.id ? null : c.id)}
+          onRename={() => {
+            const name = prompt("Rename collection", c.name)?.trim();
+            if (name && name !== c.name) rename.mutate({ id: c.id, name });
+          }}
+          onDelete={() => {
+            if (confirm(`Delete collection "${c.name}"? The assets themselves are untouched.`)) {
+              if (activeId === c.id) onSelect(null);
+              del.mutate(c.id);
+            }
+          }}
+        />
+      ))}
+    </>
+  );
+}
+
+function CollectionRow({
+  collection,
+  active,
+  onSelect,
+  onRename,
+  onDelete,
+}: {
+  collection: Collection;
+  active: boolean;
+  onSelect: () => void;
+  onRename: () => void;
+  onDelete: () => void;
+}) {
+  const smart = collection.kind === "smart";
+  return (
+    <div
+      className="group flex items-center gap-2 px-3 py-1 text-xs"
+      style={{
+        background: active ? "var(--color-accent-muted)" : "transparent",
+        color: active ? "var(--color-accent)" : "var(--color-fg-muted)",
+      }}
+    >
+      <button
+        className="flex min-w-0 flex-1 items-center gap-2 text-left coarse:min-h-11"
+        onClick={onSelect}
+      >
+        {/* Smart folders resolve a saved query live — flag them so their read-only membership reads
+            as intentional, not a missing edit affordance. */}
+        {smart ? (
+          <Sparkles size={13} className="shrink-0" />
+        ) : (
+          <Folder size={13} className="shrink-0" />
+        )}
+        <span className="truncate" title={smart ? "Smart folder (saved query)" : collection.name}>
+          {collection.name}
+        </span>
+        {collection.count != null && (
+          <span className="text-[10px] text-fg-dim tabular-nums">{collection.count}</span>
+        )}
+      </button>
+      <div className="hidden items-center gap-1 group-hover:flex coarse:flex">
+        {/* Renaming a smart folder is fine; its query is edited via the CLI in v1. */}
+        <button
+          className="flex items-center justify-center text-fg-dim hover:text-accent coarse:min-h-11 coarse:min-w-11"
+          title="Rename"
+          aria-label={`Rename collection ${collection.name}`}
+          onClick={onRename}
+        >
+          <Pencil size={12} />
+        </button>
+        <button
+          className="flex items-center justify-center text-fg-dim hover:text-danger coarse:min-h-11 coarse:min-w-11"
+          title="Delete"
+          aria-label={`Delete collection ${collection.name}`}
+          onClick={onDelete}
+        >
+          <Trash2 size={12} />
+        </button>
+      </div>
+    </div>
+  );
 }
 
 function SourceRow({

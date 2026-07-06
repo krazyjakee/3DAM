@@ -188,6 +188,40 @@ export interface Page<T> {
   partial: PartialStatus;
 }
 
+// ── collections / smart folders (phase 4; PRODUCT_SPEC §3, §6.4) ─────────────
+
+/** A **manual** collection holds a hand-curated member list; a **smart** folder holds a saved
+ *  query and resolves live. Mirrors `dam-api` `CollectionKind`. */
+export type CollectionKind = "manual" | "smart";
+
+export interface Collection {
+  id: CollectionId;
+  name: string;
+  kind: CollectionKind;
+  /** The saved query backing a smart folder; absent for a manual collection. */
+  query?: QueryRequest | null;
+  /** Exact member count (manual) or current match count (smart) when computed, else null. */
+  count: number | null;
+  created_at: number;
+  updated_at: number;
+}
+/** Create a collection. A smart folder must carry a `query`; a manual collection ignores it. */
+export interface NewCollection {
+  name: string;
+  kind?: CollectionKind;
+  query?: QueryRequest | null;
+}
+/** Patch: rename and/or (smart folders) replace the saved query. Absent fields are unchanged. */
+export interface UpdateCollection {
+  name?: string | null;
+  query?: QueryRequest | null;
+}
+/** Add/remove members of a **manual** collection (smart membership is query-driven). */
+export interface CollectionMembers {
+  add?: AssetId[];
+  remove?: AssetId[];
+}
+
 // ── find similar (phase 3: cosine over embeddings) ──────────────────────────
 
 /** "More like this" by asset id (mirrors `dam-api` `SimilarRequest`). Scoped to the query asset's

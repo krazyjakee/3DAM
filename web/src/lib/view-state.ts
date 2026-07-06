@@ -19,6 +19,9 @@ export interface ViewState {
   media: MediaType | null;
   source: string | null;
   license: string | null;
+  /** When set, the Browser shows this collection's assets instead of the faceted search. Mutually
+   *  exclusive with the facet filters — selecting one clears the other (see Navigation). */
+  collection: string | null;
   sort: SortField;
   dir: SortDir;
   view: ViewMode;
@@ -34,6 +37,7 @@ export function useViewState() {
       media: (params.get("media") as MediaType | null) || null,
       source: params.get("source"),
       license: params.get("license"),
+      collection: params.get("col"),
       sort: (params.get("sort") as SortField | null) ?? "name",
       dir: (params.get("dir") as SortDir | null) ?? "asc",
       view: (params.get("view") as ViewMode | null) ?? "grid",
@@ -55,6 +59,7 @@ export function useViewState() {
           if ("media" in next) set("media", next.media);
           if ("source" in next) set("source", next.source);
           if ("license" in next) set("license", next.license);
+          if ("collection" in next) set("col", next.collection);
           if ("sort" in next) set("sort", next.sort);
           if ("dir" in next) set("dir", next.dir);
           if ("view" in next) set("view", next.view);

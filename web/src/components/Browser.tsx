@@ -20,7 +20,7 @@ const ROW_H = COARSE_POINTER ? 44 : 30;
 
 export function Browser({ onOpenNav }: { onOpenNav?: () => void }) {
   const { state, patch, request } = useViewState();
-  const assets = useAssets(request);
+  const assets = useAssets(request, state.collection);
 
   const items = useMemo(
     () => assets.data?.pages.flatMap((p) => p.items) ?? [],
@@ -91,7 +91,9 @@ function Toolbar({
           className="field pr-6 pl-7"
           placeholder="Search assets…"
           value={state.q}
-          onChange={(e) => patch({ q: e.target.value })}
+          // Searching is a faceted query — it can't compose with a collection view, so typing
+          // exits collection mode (mirrors the sidebar's mutual-exclusion).
+          onChange={(e) => patch({ q: e.target.value, collection: null })}
         />
         {state.q && (
           <button
@@ -108,7 +110,9 @@ function Toolbar({
         value={`${state.sort}:${state.dir}`}
         onChange={(e) => {
           const [sort, dir] = e.target.value.split(":") as [SortField, "asc" | "desc"];
-          patch({ sort, dir });
+          // Sort applies to the faceted grid; a collection view has its own order, so re-sorting
+          // exits collection mode.
+          patch({ sort, dir, collection: null });
         }}
       >
         {/* Relevance only ranks a text search — offer it when a query is active (or already picked,

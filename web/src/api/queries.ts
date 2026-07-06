@@ -13,7 +13,10 @@ import type {
   AddSource,
   AnalyzeRequest,
   AssetId,
+  CollectionId,
+  CollectionMembers,
   JobListRequest,
+  NewCollection,
   QueryRequest,
   ScanRequest,
   SourceId,
@@ -28,6 +31,7 @@ export const qk = {
   stats: ["stats"] as const,
   sources: ["sources"] as const,
   jobs: ["jobs"] as const,
+  collections: ["collections"] as const,
   similar: (id: AssetId) => ["similar", id] as const,
 };
 
@@ -37,13 +41,18 @@ export function useVersion() {
   return useQuery({ queryKey: qk.version, queryFn: api.version, staleTime: Infinity });
 }
 
-/** The browse grid/table — cursor-paginated infinite scroll (tech-spec 03 §4.1). */
-export function useAssets(req: QueryRequest) {
+/** The browse grid/table — cursor-paginated infinite scroll (tech-spec 03 §4.1). With a `collection`
+ *  the source switches to that collection's assets (manual: the member list; smart: the saved query
+ *  resolved live) instead of the faceted search. Keyed under `qk.assets` either way, so the same WS
+ *  asset events keep both views live. */
+export function useAssets(req: QueryRequest, collection?: CollectionId | null) {
   return useInfiniteQuery({
-    queryKey: [...qk.assets, req],
+    queryKey: collection ? [...qk.assets, "collection", collection] : [...qk.assets, req],
     initialPageParam: null as string | null,
     queryFn: ({ pageParam }) =>
-      api.query({ ...req, page: { after: pageParam, limit: PAGE_LIMIT } }),
+      collection
+        ? api.collectionAssets(collection, { after: pageParam, limit: PAGE_LIMIT })
+        : api.query({ ...req, page: { after: pageParam, limit: PAGE_LIMIT } }),
     getNextPageParam: (last) => last.cursor ?? undefined,
   });
 }
@@ -129,6 +138,54 @@ export function useReviewSuggestion() {
     onSuccess: (_data, req) => {
       qc.invalidateQueries({ queryKey: qk.asset(req.asset) });
       qc.invalidateQueries({ queryKey: qk.assets });
+    },
+  });
+}
+
+// ── collections / smart folders ─────────────────────────────────────────────
+
+export function useCollections() {
+  return useQuery({ queryKey: qk.collections, queryFn: api.listCollections });
+}
+
+export function useCreateCollection() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (req: NewCollection) => api.createCollection(req),
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.collections }),
+  });
+}
+
+/** Rename a collection (the only field the web UI edits directly; a smart folder's query is set
+ *  at creation via the CLI in v1). */
+export function useRenameCollection() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, name }: { id: CollectionId; name: string }) =>
+      api.updateCollection(id, { name }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.collections }),
+  });
+}
+
+export function useDeleteCollection() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: CollectionId) => api.deleteCollection(id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.collections }),
+  });
+}
+
+/** Add/remove members of a manual collection. Refreshes the collection list (counts), the browse
+ *  grid (collection views live under `qk.assets`), and the inspected asset (its `collections`). */
+export function useCollectionMembers() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, members }: { id: CollectionId; members: CollectionMembers }) =>
+      api.modifyCollectionMembers(id, members),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: qk.collections });
+      qc.invalidateQueries({ queryKey: qk.assets });
+      qc.invalidateQueries({ queryKey: ["asset"] });
     },
   });
 }

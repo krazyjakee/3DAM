@@ -4,6 +4,8 @@ import { Check, PanelRightClose, Sparkles, X } from "lucide-react";
 import {
   useAnalyze,
   useAsset,
+  useCollectionMembers,
+  useCollections,
   useReviewSuggestion,
   useSimilar,
   useSources,
@@ -12,6 +14,7 @@ import { api } from "@/api/client";
 import type {
   Asset,
   AssetId,
+  CollectionId,
   MediaAttributes,
   ReviewAction,
   SimilarHit,
@@ -168,10 +171,79 @@ function Body({ asset }: { asset: Asset }) {
           <TagList assetId={summary.id} tags={asset.tags} />
         </Group>
 
+        {/* collections — this asset's manual memberships, with per-asset add/remove (issue #3) */}
+        <CollectionsGroup asset={asset} />
+
         {/* find similar — cosine over embeddings, ranked in this asset's media space (phase 3) */}
         <SimilarSection asset={asset} />
       </div>
     </div>
+  );
+}
+
+/** This asset's collection memberships (issue #3). Manual memberships are editable per-asset here —
+ *  remove with the chip's ×, add via the picker — which needs no multi-select (batch add/remove to a
+ *  selection lands with the multi-select enabler). Smart folders are query-driven, so they show as a
+ *  read-only chip with no remove control. */
+function CollectionsGroup({ asset }: { asset: Asset }) {
+  const collections = useCollections();
+  const members = useCollectionMembers();
+  const all = collections.data ?? [];
+  const inIds = new Set(asset.collections);
+  const inCollections = all.filter((c) => inIds.has(c.id));
+  const addable = all.filter((c) => c.kind === "manual" && !inIds.has(c.id));
+
+  const edit = (id: CollectionId, op: "add" | "remove") =>
+    members.mutate({ id, members: { [op]: [asset.summary.id] } });
+
+  return (
+    <Group title="Collections">
+      {inCollections.length === 0 ? (
+        <p className="text-[11px] text-fg-dim italic">Not in any collection.</p>
+      ) : (
+        <div className="flex flex-wrap gap-1">
+          {inCollections.map((c) => (
+            <span
+              key={c.id}
+              className="inline-flex items-center gap-1 rounded bg-surface-2 px-1.5 py-0.5 text-[10px] text-fg-muted"
+              title={c.kind === "smart" ? "Smart folder (query-driven membership)" : c.name}
+            >
+              {c.name}
+              {c.kind === "manual" && (
+                <button
+                  className="flex items-center justify-center hover:text-danger disabled:opacity-40 coarse:min-h-11 coarse:min-w-11"
+                  title={`Remove from ${c.name}`}
+                  aria-label={`Remove from ${c.name}`}
+                  disabled={members.isPending}
+                  onClick={() => edit(c.id, "remove")}
+                >
+                  <X size={11} />
+                </button>
+              )}
+            </span>
+          ))}
+        </div>
+      )}
+      {addable.length > 0 && (
+        <select
+          className="field mt-2"
+          value=""
+          disabled={members.isPending}
+          onChange={(e) => {
+            if (e.target.value) edit(e.target.value, "add");
+          }}
+        >
+          <option value="" disabled>
+            Add to collection…
+          </option>
+          {addable.map((c) => (
+            <option key={c.id} value={c.id}>
+              {c.name}
+            </option>
+          ))}
+        </select>
+      )}
+    </Group>
   );
 }
 

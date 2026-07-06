@@ -8,11 +8,16 @@ import type {
   AnalyzeRequest,
   Asset,
   AssetId,
+  Collection,
+  CollectionId,
+  CollectionMembers,
   JobId,
   JobListRequest,
   JobStatus,
   LibraryStats,
+  NewCollection,
   Page,
+  PageParams,
   AssetSummary,
   QueryRequest,
   RemoveSource,
@@ -22,6 +27,7 @@ import type {
   SourceId,
   SourceInfo,
   SuggestionReview,
+  UpdateCollection,
   ErrorBody,
 } from "./types";
 
@@ -96,6 +102,19 @@ export const api = {
   /** URL for a server-rendered PNG thumbnail (tech-spec 04 §6.4). Only images produce one; other
    *  media return an error and the caller falls back to the honest typed tile. `edge` bounds the long side. */
   assetThumbnailUrl: (id: AssetId, edge = 256) => `${API}/assets/${id}/thumbnail?edge=${edge}`,
+
+  // collections / smart folders (tech-spec: phase 4 Reach)
+  listCollections: () => get<Collection[]>(`${API}/collections`),
+  createCollection: (req: NewCollection) =>
+    send<{ id: CollectionId }>("POST", `${API}/collections`, req),
+  updateCollection: (id: CollectionId, req: UpdateCollection) =>
+    send<void>("PUT", `${API}/collections/${id}`, req),
+  deleteCollection: (id: CollectionId) => send<void>("DELETE", `${API}/collections/${id}`),
+  modifyCollectionMembers: (id: CollectionId, req: CollectionMembers) =>
+    send<void>("POST", `${API}/collections/${id}/members`, req),
+  /** The assets in a collection (manual: the member list; smart: the saved query, resolved live). */
+  collectionAssets: (id: CollectionId, page: PageParams) =>
+    send<Page<AssetSummary>>("POST", `${API}/collections/${id}/assets`, page),
 
   // sources
   listSources: () => get<SourceInfo[]>(`${API}/sources`),
