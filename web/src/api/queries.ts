@@ -28,6 +28,7 @@ export const qk = {
   stats: ["stats"] as const,
   sources: ["sources"] as const,
   jobs: ["jobs"] as const,
+  similar: (id: AssetId) => ["similar", id] as const,
 };
 
 const PAGE_LIMIT = 60;
@@ -57,6 +58,17 @@ export function useAsset(id: AssetId | null) {
 
 export function useStats() {
   return useQuery({ queryKey: qk.stats, queryFn: api.stats });
+}
+
+/** "Find similar" for one asset — cosine over embeddings (phase 3). Opt-in (`enabled`) so the
+ *  Inspector only queries when the user asks; cached per-asset so reopening is instant. */
+export function useSimilar(id: AssetId | null, enabled: boolean) {
+  return useQuery({
+    queryKey: id ? qk.similar(id) : ["similar", "none"],
+    queryFn: () => api.findSimilar({ asset: id as AssetId }),
+    enabled: enabled && !!id,
+    staleTime: 60_000,
+  });
 }
 
 export function useSources() {

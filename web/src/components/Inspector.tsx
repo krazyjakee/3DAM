@@ -1,8 +1,22 @@
 import type React from "react";
-import { Check, PanelRightClose, X } from "lucide-react";
-import { useAsset, useReviewSuggestion, useSources } from "@/api/queries";
+import { useState } from "react";
+import { Check, PanelRightClose, Sparkles, X } from "lucide-react";
+import {
+  useAnalyze,
+  useAsset,
+  useReviewSuggestion,
+  useSimilar,
+  useSources,
+} from "@/api/queries";
 import { api } from "@/api/client";
-import type { Asset, AssetId, MediaAttributes, ReviewAction, TagRef } from "@/api/types";
+import type {
+  Asset,
+  AssetId,
+  MediaAttributes,
+  ReviewAction,
+  SimilarHit,
+  TagRef,
+} from "@/api/types";
 import { bytes, duration, mediaLabel, originLabel, relTime } from "@/lib/format";
 import { useViewState } from "@/lib/view-state";
 import { ModelViewerIsland } from "@/islands/ModelViewerIsland";
@@ -153,8 +167,94 @@ function Body({ asset }: { asset: Asset }) {
         <Group title={`Tags (${asset.tags.length})`}>
           <TagList assetId={summary.id} tags={asset.tags} />
         </Group>
+
+        {/* find similar — cosine over embeddings, ranked in this asset's media space (phase 3) */}
+        <SimilarSection asset={asset} />
       </div>
     </div>
+  );
+}
+
+/** "Find similar" (tech-spec 05 §3): an opt-in ranked strip of neighbours by embedding cosine.
+ *  Un-analyzed assets have no vector, so we offer to analyze first rather than query into the void.
+ *  Each hit is selectable — clicking swaps the Inspector to that asset (and back/forward works, since
+ *  selection lives in the URL). */
+function SimilarSection({ asset }: { asset: Asset }) {
+  const { patch } = useViewState();
+  const [open, setOpen] = useState(false);
+  const analyzed = asset.timestamps.analyzed != null;
+  const analyze = useAnalyze();
+  const similar = useSimilar(asset.summary.id, open && analyzed);
+
+  if (!analyzed) {
+    return (
+      <Group title="Similar">
+        <p className="text-[11px] text-fg-dim italic">
+          Analyze this asset to find visually similar ones.
+        </p>
+        <button
+          className="btn mt-2 coarse:min-h-11"
+          disabled={analyze.isPending}
+          onClick={() => analyze.mutate({ assets: [asset.summary.id] })}
+        >
+          <Sparkles size={12} />
+          {analyze.isPending ? "Analyzing…" : "Analyze now"}
+        </button>
+      </Group>
+    );
+  }
+
+  if (!open) {
+    return (
+      <Group title="Similar">
+        <button className="btn coarse:min-h-11" onClick={() => setOpen(true)}>
+          <Sparkles size={12} />
+          Find similar
+        </button>
+      </Group>
+    );
+  }
+
+  const hits = similar.data?.items ?? [];
+  return (
+    <Group title="Similar">
+      {similar.isLoading ? (
+        <p className="text-[11px] text-fg-dim">Searching…</p>
+      ) : similar.isError ? (
+        <p className="text-[11px] text-danger">Could not search for similar assets.</p>
+      ) : hits.length === 0 ? (
+        <p className="text-[11px] text-fg-dim italic">No similar assets found.</p>
+      ) : (
+        <div className="grid grid-cols-3 gap-1.5">
+          {hits.map((hit) => (
+            <SimilarTile
+              key={hit.asset.id}
+              hit={hit}
+              onOpen={() => patch({ selected: hit.asset.id })}
+            />
+          ))}
+        </div>
+      )}
+    </Group>
+  );
+}
+
+function SimilarTile({ hit, onOpen }: { hit: SimilarHit; onOpen: () => void }) {
+  const pct = Math.round(hit.score * 100);
+  return (
+    <button
+      className="group flex flex-col overflow-hidden rounded border border-border bg-bg text-left transition-colors hover:border-border-strong coarse:min-h-11"
+      title={`${hit.asset.name} · ${pct}% similar · ${hit.space}`}
+      onClick={onOpen}
+    >
+      <span className="aspect-square w-full">
+        <Thumbnail asset={hit.asset} size={32} />
+      </span>
+      <span className="flex items-center justify-between gap-1 px-1 py-0.5">
+        <span className="min-w-0 truncate text-[10px] text-fg-muted">{hit.asset.name}</span>
+        <span className="shrink-0 text-[10px] font-medium text-accent">{pct}%</span>
+      </span>
+    </button>
   );
 }
 

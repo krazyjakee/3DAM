@@ -17,6 +17,8 @@ import type {
   QueryRequest,
   RemoveSource,
   ScanRequest,
+  SimilarHit,
+  SimilarRequest,
   SourceId,
   SourceInfo,
   SuggestionReview,
@@ -83,6 +85,9 @@ export const api = {
   // auto-tag suggestion lifecycle — accept/reject one suggested tag (tech-spec 05 §1.4)
   reviewSuggestion: (req: SuggestionReview) =>
     send<void>("POST", `${API}/suggestions/review`, req),
+
+  /** "More like this" — cosine over embeddings, ranked in the asset's media space (tech-spec 05 §3). */
+  findSimilar: (req: SimilarRequest) => send<Page<SimilarHit>>("POST", `${API}/similar`, req),
 
   /** URL for an asset's raw bytes — fed to the WASM viewer islands (tech-spec 09 §B.3). The DOM
    *  fetches this and hands it across the wasm-bindgen boundary; the island does no networking. */

@@ -188,6 +188,22 @@ export interface Page<T> {
   partial: PartialStatus;
 }
 
+// ── find similar (phase 3: cosine over embeddings) ──────────────────────────
+
+/** "More like this" by asset id (mirrors `dam-api` `SimilarRequest`). Scoped to the query asset's
+ *  media space; composes the same faceted `filters` as text search. Route: POST /api/v1/similar. */
+export interface SimilarRequest {
+  asset: AssetId;
+  k?: number; // neighbours to return (post self-drop); server default 24
+  filters?: Filter[];
+}
+/** One neighbour: the asset plus its cosine score and the embedding space it was ranked in. */
+export interface SimilarHit {
+  asset: AssetSummary;
+  score: number; // cosine similarity in [0,1] (1 = identical direction)
+  space: string; // the EmbeddingSpace id the ranking happened in
+}
+
 // ── sources ────────────────────────────────────────────────────────────────
 
 export type SourceKind = "local_fs" | "sftp" | "smb" | "federated";
