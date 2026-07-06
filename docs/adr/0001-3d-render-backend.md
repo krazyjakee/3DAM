@@ -89,5 +89,10 @@ code (captured in [3d-handler-notes.md](../3d-handler-notes.md)):
 
 - Spike: headless wgpu render-to-PNG on a Linux box with **no display and no discrete GPU**
   (confirm lavapipe/llvmpipe fallback). This is the gate on the whole decision.
+  **✅ Passed (2026-07-06)** — `wgpu 30` renders headless (no surface) to a PNG with no per-OS
+  branch, and Mesa **lavapipe** (Vulkan software raster, `device_type == Cpu`) produces a frame
+  identical to the RTX 3090 output. See [`spikes/headless-render/`](../../spikes/headless-render/README.md).
+  Caveat: software was forced on a GPU-equipped box (VK_ICD/`force_fallback_adapter`); confirm on
+  genuinely GPU-less hardware before final sign-off.
 - Record the GUI toolkit choice (egui vs Iced) separately; both sit on wgpu, so this ADR is
   independent of that one.

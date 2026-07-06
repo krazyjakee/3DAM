@@ -1,0 +1,11 @@
+[package]
+name = "spike-headless-render"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+bytemuck = "1.25.0"
+image = "0.25.10"
+pollster = "0.4.0"
+wgpu = "30.0.0"

@@ -1,0 +1,6 @@
+# Rust build output
+/target/
+**/target/
+# Spike-generated images (regeneratable — see spike READMEs)
+spikes/**/out-*.png
+spikes/**/*.png

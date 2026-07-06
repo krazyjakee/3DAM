@@ -132,8 +132,10 @@ questions (PRODUCT_SPEC §10) and the roadmap's ([ROADMAP.md](../ROADMAP.md)).
 **Needs a spike (gate-level):**
 - **Headless 3D render on a GPU-less server** — software-raster fallback (lavapipe/llvmpipe)
   vs CPU thumbnail path vs render-on-demand by a GPU client. The gate on [ADR 0001](../adr/0001-3d-render-backend.md);
-  owned by [06](06-3d-render.md). Until it resolves, the server's on-render degradation path
-  is provisional.
+  owned by [06](06-3d-render.md). **✅ Core question resolved 2026-07-06** by
+  [`spikes/headless-render/`](../../spikes/headless-render/README.md): wgpu renders headless to
+  PNG and lavapipe serves it correctly. Remaining: confirm on genuinely GPU-less hardware, and
+  wire the explicit fallback ladder (06 §4.1) rather than relying on env.
 - **GUI toolkit final choice** (egui/eframe vs Iced) — needs the rendering/perf spike, then an
   ADR. Owned by [12](12-desktop-gui.md).
 - **Cross-peer similarity** — ranking hits across peers needs compatible embedding spaces
