@@ -72,8 +72,11 @@ export function AddSourceDialog({ onClose }: { onClose: () => void }) {
         name: name.trim() || null,
         options,
       });
-      // add_source does not auto-scan — kick a full scan of the new source (tech-spec 03).
-      await scan.mutateAsync({ sources: [id], mode: "full" });
+      // add_source does not auto-scan — kick a full scan of the new source (tech-spec 03). Fire it
+      // and forget: the scan is a background job, so the modal must NOT wait for it to finish before
+      // closing. Awaiting it here serialised the UI — a second source couldn't be queued until the
+      // first had fully scanned (issue #1). Any scan-submit failure surfaces as a toast (#23).
+      scan.mutate({ sources: [id], mode: "full" });
       onClose();
     } catch (e) {
       setErr(e instanceof ApiError ? e.message : String(e));
