@@ -11,6 +11,8 @@ import type {
   Collection,
   CollectionId,
   CollectionMembers,
+  DupGroup,
+  DupRequest,
   JobId,
   JobListRequest,
   JobStatus,
@@ -94,6 +96,9 @@ export const api = {
 
   /** "More like this" — cosine over embeddings, ranked in the asset's media space (tech-spec 05 §3). */
   findSimilar: (req: SimilarRequest) => send<Page<SimilarHit>>("POST", `${API}/similar`, req),
+
+  /** Duplicate groups for review — exact (content hash) or near (pHash/embedding), tech-spec 05 §4. */
+  listDuplicates: (req: DupRequest) => send<DupGroup[]>("POST", `${API}/duplicates`, req),
 
   /** URL for an asset's raw bytes — fed to the WASM viewer islands (tech-spec 09 §B.3). The DOM
    *  fetches this and hands it across the wasm-bindgen boundary; the island does no networking. */

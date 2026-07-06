@@ -15,6 +15,7 @@ import type {
   AssetId,
   CollectionId,
   CollectionMembers,
+  DupRequest,
   JobListRequest,
   NewCollection,
   QueryRequest,
@@ -32,6 +33,7 @@ export const qk = {
   sources: ["sources"] as const,
   jobs: ["jobs"] as const,
   collections: ["collections"] as const,
+  duplicates: ["duplicates"] as const,
   similar: (id: AssetId) => ["similar", id] as const,
 };
 
@@ -139,6 +141,15 @@ export function useReviewSuggestion() {
       qc.invalidateQueries({ queryKey: qk.asset(req.asset) });
       qc.invalidateQueries({ queryKey: qk.assets });
     },
+  });
+}
+
+/** Duplicate groups for the review surface (exact or near). Refetches when the tier/media changes;
+ *  ws.ts invalidates `qk.duplicates` on asset changes and finished jobs so new pHashes surface. */
+export function useDuplicates(req: DupRequest) {
+  return useQuery({
+    queryKey: [...qk.duplicates, req],
+    queryFn: () => api.listDuplicates(req),
   });
 }
 

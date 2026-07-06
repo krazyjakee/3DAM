@@ -4,6 +4,7 @@ import { Link } from "react-router-dom";
 import {
   AudioLines,
   Box,
+  Copy,
   Folder,
   FolderPlus,
   Image as ImageIcon,
@@ -215,6 +216,14 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
       />
 
       <div className="mt-auto" />
+      {/* Duplicate / dedupe review (issue #8). */}
+      <Link
+        to="/duplicates"
+        onClick={onNavigate}
+        className="flex items-center gap-2 border-t border-border px-3 py-2 text-xs text-fg-dim hover:text-accent coarse:min-h-11"
+      >
+        <Copy size={14} /> Duplicate review
+      </Link>
       {/* Admin / Settings surface (tech-spec 09 §B.4). */}
       <Link
         to="/settings"

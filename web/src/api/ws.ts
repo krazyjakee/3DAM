@@ -51,6 +51,7 @@ export function useLiveUpdates(): void {
         case "asset_changed":
           qc.invalidateQueries({ queryKey: qk.assets });
           qc.invalidateQueries({ queryKey: qk.stats });
+          qc.invalidateQueries({ queryKey: qk.duplicates });
           break;
         case "source_state":
           qc.invalidateQueries({ queryKey: qk.sources });
@@ -62,6 +63,7 @@ export function useLiveUpdates(): void {
             qc.invalidateQueries({ queryKey: qk.assets });
             qc.invalidateQueries({ queryKey: qk.stats });
             qc.invalidateQueries({ queryKey: qk.sources });
+            qc.invalidateQueries({ queryKey: qk.duplicates });
           }
           break;
       }
