@@ -1,0 +1,15 @@
+[package]
+name = "spike-vector-index"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[profile.release]
+opt-level = 3
+
+[dependencies]
+bytemuck = "1.25.0"
+rayon = "1.12.0"
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+sqlite-vec = "0.1.9"
+usearch = "2.25.3"

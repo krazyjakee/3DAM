@@ -147,6 +147,10 @@ questions (PRODUCT_SPEC §10) and the roadmap's ([ROADMAP.md](../ROADMAP.md)).
   [05](05-analysis-similarity-dedup.md).
 - Vector-index storage: embedded extension (`sqlite-vec`) vs sidecar HNSW; on-disk vs in-memory
   at 1M+. [02](02-data-model-and-storage.md)/[05](05-analysis-similarity-dedup.md).
+  **✅ Decided 2026-07-06** by [`spikes/vector-index/`](../../spikes/vector-index/README.md):
+  **sidecar HNSW (usearch) is the primary index** (sub-ms/query at 1M, recall tunable to ~100%);
+  `sqlite-vec` is exact-but-O(N) (726 ms/query at 1M) → kept for small libraries / exact re-rank.
+  Remaining: quantization (f16/i8) for memory, and validation on real embeddings.
 
 **Data & licence:**
 - Licence taxonomy: SPDX vs a 3DAM rights model for non-code assets; auto-detection (pack

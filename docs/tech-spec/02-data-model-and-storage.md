@@ -331,10 +331,17 @@ Two candidate storage strategies (PRODUCT_SPEC §7/§10 — validated by spike, 
 | **On-disk** | one file — vectors ride in the library DB, one backup/copy unit | separate `*.hnsw` files beside the DB |
 | **Portability** | vectors travel with the portable library automatically | must copy the sidecar too (or regenerate from cache) |
 | **Query model** | SQL `WHERE embedding MATCH ?` — joins naturally with facet filters in one query | in-process ANN call, then join ids back to SQLite for facets |
-| **Scale / memory** | brute-force-ish today; watch behaviour at 1M+ | mature HNSW graph, on-disk or memory-mapped; better recall/latency at scale |
+| **Scale / memory** | **exact linear scan** — measured **726 ms/query at 1M×512** (spike) | mature HNSW graph; **sub-ms/query at 1M**, recall tunable to ~100% (spike) |
 | **Ops** | no extra process, no extra file | mmap → out-of-core friendly (DESIGN_GUIDELINES §1.1's 1M-asset / not-in-RAM target) |
 
-**Storage decision framing (not the final pick):**
+**Storage decision — confirmed by the [vector-index spike](../../spikes/vector-index/README.md) (2026-07-06):**
+The spike benchmarked both at 1M×512-d. `sqlite-vec 0.1.x` `vec0` is an **exact linear scan** (100%
+recall but **726 ms/query** at 1M — ~1500× slower than the ANN and far past "instant"). `usearch`
+(HNSW) does **sub-millisecond** queries with recall **tunable to ~100%** via `ef_search`, at the cost
+of a ~2 GB in-memory index and a background build. **Decision: the primary similarity index is a
+sidecar HNSW under `vectors/`**; `sqlite-vec` is retained for **small libraries (<~100k)** and as an
+optional **exact re-rank** stage. Both store ~2 GB/1M×512 f32 raw; usearch quantization (f16/i8) is a
+follow-up. Details below still hold:
 - **Vectors are derived data** and can always be rebuilt from the blob-cached embeddings (§8) — so they may live *inside* the portable DB (convenience, one-file backup) *or* as a regenerable sidecar under `vectors/`. Either way, losing the index is a re-index, never data loss.
 - **Leaning:** a **sidecar HNSW under `vectors/`** for the primary similarity index — memory-mappable for the out-of-core 1M-asset target, decoupled from the DB write path so re-indexing doesn't bloat the WAL, and regenerable from the embedding cache. Facet filtering stays in SQLite; the ANN returns candidate ids that are then filtered/joined against `library.db`. `sqlite-vec` inside `library.db` stays a live option for smaller libraries and for keeping the "just copy one file" story simple, and remains attractive if the SQL-join-with-facets ergonomics prove decisive.
 - **Federated similarity** does *not* use the local index for remote hits — the query embedding is sent to each peer's endpoint and merged locally ([05](05-analysis-similarity-dedup.md) / [07](07-sources-and-federation.md)); only local assets populate the local vector store.
