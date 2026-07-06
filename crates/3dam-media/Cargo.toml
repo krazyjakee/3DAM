@@ -1,0 +1,9 @@
+[package]
+name = "dam-media"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MediaHandler trait + format detection and per-media handlers (tech-spec 04). Phase 1: extension-based detection."
+
+[dependencies]
+dam-api.workspace = true

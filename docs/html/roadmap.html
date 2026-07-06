@@ -210,7 +210,7 @@ web client leads rather than trailing the desktop GUI.</p>
 <ol>
 <li><strong>Engine + API core.</strong> <code>3dam-core</code> (schema, local scan, SQLite store, search) behind a
    <code>LibraryService</code> boundary, exposed early over the <code>3dam serve</code> HTTP/WS API. The CLI rides
-   the same API so it is usable from day one.</li>
+   the same API so it is usable from day one. <em>(First vertical slice landed — see </em><em>Progress</em><em> below.)</em></li>
 <li><strong>Web client (React + CSS).</strong> The three-region workspace as a DOM app against the serve
    API: browse grid, search, facets, tags, previews. Fast feedback loop lives here. The
    admin-only <strong>Settings / Administration</strong> surface — feature flags (MCP on/off, auth mode,
@@ -227,6 +227,23 @@ web client leads rather than trailing the desktop GUI.</p>
    Opt-in <strong>user accounts and roles</strong> arrive with the federation &amp; auth phase (spec §9 step 6),
    layered on the same auth surface the feature flags already gate.</li>
 </ol>
+<h3 id="progress">Progress</h3>
+<p><strong>2026-07-06 — stage 1, first vertical slice.</strong> The Cargo workspace now exists (all crates from
+<a href="tech-spec/01-architecture-and-crates.md">tech-spec 01</a> scaffolded; packages are named <code>dam-*</code>
+and the binary is <code>3dam</code>, since Cargo forbids a leading digit — <a href="adr/0010-cargo-package-naming.md">ADR 0010</a>).
+Working end-to-end:</p>
+<ul>
+<li><strong>Embedded engine</strong> — <code>dam-core</code>'s <code>EmbeddedLibrary</code> over a SQLite <code>dam-store</code> (schema V1),
+  with a background <strong>scan</strong> job (walk → BLAKE3 hash → extension-based media detection → upsert),
+  live progress/asset events, and cursor-paginated <strong>search</strong> + faceted filters + library stats.</li>
+<li><strong><code>3dam serve</code></strong> — an axum HTTP/WS server mirroring the <code>LibraryService</code> surface under <code>/api/v1</code>.</li>
+<li><strong>CLI parity</strong> — <code>3dam scan</code>/<code>search</code>/<code>sources</code>/<code>stats</code>/<code>get</code>, riding <em>either</em> the embedded
+  engine <em>or</em> a remote server via <code>--connect</code> — byte-identical results prove the seam holds.</li>
+</ul>
+<p>Not yet built (next up the stage-1 tail and into stage 2): the analysis pipeline
+(embeddings/similarity/auto-tag), tag/collection/license <em>writes</em>, convert, full-text search,
+auth/flags/accounts, and the React web client. The <code>dam-render</code> (wgpu) and <code>dam-gui</code> (egui) crates
+are scaffolded stubs pending their later stages.</p>
 <h2 id="mobile-tablet-posture">Mobile &amp; tablet posture</h2>
 <p>Desktop/tablet-first; phones are graceful-degrade, not a separate product. Because the web
 client is DOM-based this is cheap, and we follow moghub's pattern:</p>
@@ -270,21 +287,25 @@ OS, and publishes one checksummed GitHub Release. Adapted to 3DAM's shape.</p>
   dev-facing channels (Homebrew tap, winget, AUR, <code>cargo-binstall</code>) are TBD — GitHub Releases
   is the primary channel for v1.</li>
 </ul>
-<p>The actual <code>.github/workflows/release.yml</code> lands once the <code>3dam</code> crate exists; committing it
-before there's anything to build would only produce a workflow that fails on first tag.</p>
+<p>The actual <code>.github/workflows/release.yml</code> lands once the build is release-worthy. The <code>3dam</code>
+crate now exists (stage 1, above), but it is pre-web-client and pre-packaging; the workflow is a
+fast-follow rather than something to commit before there is a shippable binary to tag.</p>
 <h2 id="open-questions">Open questions</h2>
+<p>Most items here were decided on 2026-07-06 — <a href="adr/0008-web-client-stack.md">ADR 0008</a> (web stack)
+and <a href="adr/0009-v1-scope-decisions.md">ADR 0009</a> (the v1-scope tail).</p>
 <ul>
-<li>Exact React stack (bundler, router, state) and how the WASM viewer islands are packaged
-  and handed data from the DOM side.</li>
-<li><strong>Code signing &amp; notarization:</strong> unsigned macOS <code>.dmg</code>/Windows <code>.msi</code> trip Gatekeeper and
-  SmartScreen (mogen ships unsigned). Whether v1 pays for an Apple Developer ID + notarization
-  and a Windows signing cert, or accepts the warnings.</li>
-<li>Distribution channels beyond GitHub Releases (Homebrew, winget, AUR, <code>cargo-binstall</code>) —
-  which, and when.</li>
-<li>How much view logic, if any, is worth sharing between the web client and the egui desktop
-  GUI once both exist, versus letting each own its presentation over the shared API.</li>
-<li>Whether the desktop GUI ever embeds the web client (webview) for any surfaces, or stays
-  fully native.</li>
+<li>~~Exact React stack.~~ <strong>Decided: React + TypeScript + Tailwind</strong> on Vite/pnpm
+  (<a href="adr/0008-web-client-stack.md">ADR 0008</a>). WASM-island packaging/handoff decided in
+  <a href="adr/0009-v1-scope-decisions.md">ADR 0009 §9</a> (<code>wasm-pack</code>, WebGPU + WebGL2 fallback, DOM owns data).</li>
+<li>~~<strong>Code signing &amp; notarization.</strong>~~ <strong>Decided: unsigned for v1</strong> — accept the Gatekeeper /
+  SmartScreen warnings (as mogen does); revisit signing/notarization post-v1.</li>
+<li>~~Distribution channels beyond GitHub Releases.~~ <strong>Decided</strong> (<a href="adr/0009-v1-scope-decisions.md">ADR 0009 §10</a>):
+  <strong>GitHub Releases is the sole v1 channel;</strong> Homebrew tap + <code>cargo-binstall</code> are fast-follow
+  post-v1; winget/AUR are community-driven.</li>
+<li>~~View-logic sharing web ↔ desktop.~~ <strong>Decided</strong> (<a href="adr/0009-v1-scope-decisions.md">ADR 0009 §9</a>):
+  each frontend owns its own presentation over the shared API in v1; no shared view crate.</li>
+<li>~~Whether the desktop GUI embeds a webview.~~ <strong>Decided: no</strong> — the desktop GUI stays fully
+  native (egui) in v1 (<a href="adr/0009-v1-scope-decisions.md">ADR 0009 §9</a>).</li>
 </ul>
 <hr />
 <p>See also: <a href="product_spec.html">PRODUCT_SPEC.md</a> · <a href="mission.html">MISSION.md</a> · <a href="design_guidelines.html">DESIGN_GUIDELINES.md</a></p>

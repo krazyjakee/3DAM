@@ -1,0 +1,13 @@
+[package]
+name = "dam-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SQLite metadata store: schema, migrations, and row↔DTO queries (tech-spec 02). Private to 3dam-core."
+
+[dependencies]
+dam-api.workspace = true
+rusqlite.workspace = true
+uuid.workspace = true
+serde_json.workspace = true
+tracing.workspace = true

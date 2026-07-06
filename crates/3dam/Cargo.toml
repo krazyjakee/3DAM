@@ -1,0 +1,16 @@
+[package]
+name = "dam"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The 3dam binary: role dispatch only (tech-spec 01 §5). One binary, four roles."
+
+[[bin]]
+name = "3dam"
+path = "src/main.rs"
+
+[dependencies]
+dam-frontend.workspace = true
+dam-cli.workspace = true
+dam-gui.workspace = true
+tokio.workspace = true

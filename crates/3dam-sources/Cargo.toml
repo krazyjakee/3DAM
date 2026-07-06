@@ -1,0 +1,10 @@
+[package]
+name = "dam-sources"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Source trait + file sources (local FS now; SFTP/SMB/federated later) — tech-spec 07."
+
+[dependencies]
+dam-api.workspace = true
+walkdir.workspace = true

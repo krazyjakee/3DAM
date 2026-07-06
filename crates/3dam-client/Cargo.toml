@@ -1,0 +1,17 @@
+[package]
+name = "dam-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "API-client LibraryService: talks to a remote `3dam serve` over HTTP/WS (tech-spec 03/01). The connected backend."
+
+[dependencies]
+dam-api.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+url.workspace = true
+tracing.workspace = true

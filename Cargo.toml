@@ -1,0 +1,80 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/3dam-api",
+    "crates/3dam-store",
+    "crates/3dam-media",
+    "crates/3dam-sources",
+    "crates/3dam-render",
+    "crates/3dam-core",
+    "crates/3dam-client",
+    "crates/3dam-server",
+    "crates/3dam-frontend",
+    "crates/3dam-gui",
+    "crates/3dam-cli",
+    "crates/3dam",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/krazyjakee/3DAM"
+rust-version = "1.85"
+
+# One place for third-party versions; crates opt in with `dep.workspace = true`.
+[workspace.dependencies]
+# internal crates. Package names use the `dam-` prefix (cargo forbids a leading digit),
+# so libs import as `dam_api`, `dam_core`, … exactly as the tech-spec pseudocode writes them.
+# Directories keep the branded `3dam-` names; the shipped binary target is `3dam`.
+dam-api = { path = "crates/3dam-api" }
+dam-store = { path = "crates/3dam-store" }
+dam-media = { path = "crates/3dam-media" }
+dam-sources = { path = "crates/3dam-sources" }
+dam-render = { path = "crates/3dam-render" }
+dam-core = { path = "crates/3dam-core" }
+dam-client = { path = "crates/3dam-client" }
+dam-server = { path = "crates/3dam-server" }
+dam-frontend = { path = "crates/3dam-frontend" }
+dam-gui = { path = "crates/3dam-gui" }
+dam-cli = { path = "crates/3dam-cli" }
+
+# async / runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs", "signal", "time"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# serde / data
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+uuid = { version = "1", features = ["v7", "serde"] }
+blake3 = "1"
+bytes = "1"
+
+# storage
+rusqlite = { version = "0.40", features = ["bundled"] }
+
+# http / server / client
+axum = { version = "0.8", features = ["ws"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+url = "2"
+
+# cli
+clap = { version = "4", features = ["derive"] }
+
+# fs / platform
+walkdir = "2"
+directories = "5"
+
+# diagnostics
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+opt-level = 3

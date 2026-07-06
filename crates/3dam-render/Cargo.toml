@@ -1,0 +1,9 @@
+[package]
+name = "dam-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "wgpu renderer: headless render-to-PNG + GUI viewer surface (tech-spec 06, ADR 0002). Stub until the render phase."
+
+[dependencies]
+# wgpu/glam land with the render phase (ADR 0002: owns GPU, never windowing).

@@ -1,0 +1,12 @@
+[package]
+name = "dam-frontend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared front-end glue: Backend/open_backend (embedded vs connected) + Role/classify (role dispatch). Tech-spec 01 §4–§5."
+
+[dependencies]
+dam-api.workspace = true
+dam-core.workspace = true
+dam-client.workspace = true
+url.workspace = true

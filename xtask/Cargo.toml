@@ -1,0 +1,9 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Dev-only automation: dependency-direction checks and CI aggregation (tech-spec 01 §2, 15)."
+
+[dependencies]

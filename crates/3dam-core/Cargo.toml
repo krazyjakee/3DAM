@@ -1,0 +1,23 @@
+[package]
+name = "dam-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The pure engine: EmbeddedLibrary over the store + handlers + sources; scan/query orchestration (tech-spec 01/05). No UI, transport, or GPU."
+
+[dependencies]
+dam-api.workspace = true
+dam-store.workspace = true
+dam-media.workspace = true
+dam-sources.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+blake3.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+directories.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread"] }

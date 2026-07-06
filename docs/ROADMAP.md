@@ -41,7 +41,7 @@ Coarse sequence — each stage assumes the engine work it depends on from spec �
 
 1. **Engine + API core.** `3dam-core` (schema, local scan, SQLite store, search) behind a
    `LibraryService` boundary, exposed early over the `3dam serve` HTTP/WS API. The CLI rides
-   the same API so it is usable from day one.
+   the same API so it is usable from day one. *(First vertical slice landed — see **Progress** below.)*
 2. **Web client (React + CSS).** The three-region workspace as a DOM app against the serve
    API: browse grid, search, facets, tags, previews. Fast feedback loop lives here. The
    admin-only **Settings / Administration** surface — feature flags (MCP on/off, auth mode,
@@ -57,6 +57,25 @@ Coarse sequence — each stage assumes the engine work it depends on from spec �
 6. **Everything after** follows spec §9 from automation depth through federation and scale.
    Opt-in **user accounts and roles** arrive with the federation & auth phase (spec §9 step 6),
    layered on the same auth surface the feature flags already gate.
+
+### Progress
+
+**2026-07-06 — stage 1, first vertical slice.** The Cargo workspace now exists (all crates from
+[tech-spec 01](tech-spec/01-architecture-and-crates.md) scaffolded; packages are named `dam-*`
+and the binary is `3dam`, since Cargo forbids a leading digit — [ADR 0010](adr/0010-cargo-package-naming.md)).
+Working end-to-end:
+
+- **Embedded engine** — `dam-core`'s `EmbeddedLibrary` over a SQLite `dam-store` (schema V1),
+  with a background **scan** job (walk → BLAKE3 hash → extension-based media detection → upsert),
+  live progress/asset events, and cursor-paginated **search** + faceted filters + library stats.
+- **`3dam serve`** — an axum HTTP/WS server mirroring the `LibraryService` surface under `/api/v1`.
+- **CLI parity** — `3dam scan`/`search`/`sources`/`stats`/`get`, riding *either* the embedded
+  engine *or* a remote server via `--connect` — byte-identical results prove the seam holds.
+
+Not yet built (next up the stage-1 tail and into stage 2): the analysis pipeline
+(embeddings/similarity/auto-tag), tag/collection/license *writes*, convert, full-text search,
+auth/flags/accounts, and the React web client. The `dam-render` (wgpu) and `dam-gui` (egui) crates
+are scaffolded stubs pending their later stages.
 
 ## Mobile & tablet posture
 
@@ -103,22 +122,27 @@ OS, and publishes one checksummed GitHub Release. Adapted to 3DAM's shape.
   dev-facing channels (Homebrew tap, winget, AUR, `cargo-binstall`) are TBD — GitHub Releases
   is the primary channel for v1.
 
-The actual `.github/workflows/release.yml` lands once the `3dam` crate exists; committing it
-before there's anything to build would only produce a workflow that fails on first tag.
+The actual `.github/workflows/release.yml` lands once the build is release-worthy. The `3dam`
+crate now exists (stage 1, above), but it is pre-web-client and pre-packaging; the workflow is a
+fast-follow rather than something to commit before there is a shippable binary to tag.
 
 ## Open questions
 
-- Exact React stack (bundler, router, state) and how the WASM viewer islands are packaged
-  and handed data from the DOM side.
-- **Code signing & notarization:** unsigned macOS `.dmg`/Windows `.msi` trip Gatekeeper and
-  SmartScreen (mogen ships unsigned). Whether v1 pays for an Apple Developer ID + notarization
-  and a Windows signing cert, or accepts the warnings.
-- Distribution channels beyond GitHub Releases (Homebrew, winget, AUR, `cargo-binstall`) —
-  which, and when.
-- How much view logic, if any, is worth sharing between the web client and the egui desktop
-  GUI once both exist, versus letting each own its presentation over the shared API.
-- Whether the desktop GUI ever embeds the web client (webview) for any surfaces, or stays
-  fully native.
+Most items here were decided on 2026-07-06 — [ADR 0008](adr/0008-web-client-stack.md) (web stack)
+and [ADR 0009](adr/0009-v1-scope-decisions.md) (the v1-scope tail).
+
+- ~~Exact React stack.~~ **Decided: React + TypeScript + Tailwind** on Vite/pnpm
+  ([ADR 0008](adr/0008-web-client-stack.md)). WASM-island packaging/handoff decided in
+  [ADR 0009 §9](adr/0009-v1-scope-decisions.md) (`wasm-pack`, WebGPU + WebGL2 fallback, DOM owns data).
+- ~~**Code signing & notarization.**~~ **Decided: unsigned for v1** — accept the Gatekeeper /
+  SmartScreen warnings (as mogen does); revisit signing/notarization post-v1.
+- ~~Distribution channels beyond GitHub Releases.~~ **Decided** ([ADR 0009 §10](adr/0009-v1-scope-decisions.md)):
+  **GitHub Releases is the sole v1 channel;** Homebrew tap + `cargo-binstall` are fast-follow
+  post-v1; winget/AUR are community-driven.
+- ~~View-logic sharing web ↔ desktop.~~ **Decided** ([ADR 0009 §9](adr/0009-v1-scope-decisions.md)):
+  each frontend owns its own presentation over the shared API in v1; no shared view crate.
+- ~~Whether the desktop GUI embeds a webview.~~ **Decided: no** — the desktop GUI stays fully
+  native (egui) in v1 ([ADR 0009 §9](adr/0009-v1-scope-decisions.md)).
 
 ---
 

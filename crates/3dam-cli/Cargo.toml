@@ -1,0 +1,17 @@
+[package]
+name = "dam-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The clap command tree, human/--json output, and the serve/mcp entry points (tech-spec 13)."
+
+[dependencies]
+dam-api.workspace = true
+dam-frontend.workspace = true
+dam-server.workspace = true
+clap.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+url.workspace = true
+tracing-subscriber.workspace = true
