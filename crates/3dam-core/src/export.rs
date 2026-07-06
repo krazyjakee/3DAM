@@ -64,7 +64,11 @@ pub(crate) fn run_export(store: &Store, req: ExportRequest) -> Result<ExportRepo
     }
 
     let files_written = if req.attribution_only {
-        let rows: Vec<CreditRow> = assets.iter().filter(|a| needs_attribution(a)).map(credit_row).collect();
+        let rows: Vec<CreditRow> = assets
+            .iter()
+            .filter(|a| needs_attribution(a))
+            .map(credit_row)
+            .collect();
         let stems = sidecar_stems(rows.iter().map(|r| (&r.id, &r.name)));
         emit(&rows, &stems, &req)?
     } else {
@@ -159,7 +163,11 @@ fn sidecar_stems<'a>(rows: impl Iterator<Item = (&'a String, &'a String)>) -> Ve
         let base = sanitize(name);
         let base = if base.is_empty() { id.clone() } else { base };
         let n = seen.entry(base.clone()).or_insert(0);
-        let stem = if *n == 0 { base.clone() } else { format!("{base}-{n}") };
+        let stem = if *n == 0 {
+            base.clone()
+        } else {
+            format!("{base}-{n}")
+        };
         *n += 1;
         stems.push(stem);
     }
@@ -168,7 +176,13 @@ fn sidecar_stems<'a>(rows: impl Iterator<Item = (&'a String, &'a String)>) -> Ve
 
 fn sanitize(name: &str) -> String {
     name.chars()
-        .map(|c| if c.is_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -182,23 +196,16 @@ fn emit<T: Serialize>(rows: &[T], stems: &[String], req: &ExportRequest) -> Resu
     let out = Path::new(&req.output);
     match req.format {
         ExportFormat::Json => {
-            if let Some(dir) = out.parent() {
-                if !dir.as_os_str().is_empty() {
-                    std::fs::create_dir_all(dir).map_err(io_err)?;
-                }
-            }
+            ensure_parent_dir(out)?;
             let file = std::fs::File::create(out).map_err(io_err)?;
             serde_json::to_writer_pretty(file, &Manifest { assets: rows })
                 .map_err(|e| LibError::Internal(format!("write json: {e}")))?;
             Ok(1)
         }
         ExportFormat::Csv => {
-            if let Some(dir) = out.parent() {
-                if !dir.as_os_str().is_empty() {
-                    std::fs::create_dir_all(dir).map_err(io_err)?;
-                }
-            }
-            let mut wtr = csv::Writer::from_path(out).map_err(|e| LibError::Internal(format!("open csv: {e}")))?;
+            ensure_parent_dir(out)?;
+            let mut wtr = csv::Writer::from_path(out)
+                .map_err(|e| LibError::Internal(format!("open csv: {e}")))?;
             for row in rows {
                 wtr.serialize(row)
                     .map_err(|e| LibError::Internal(format!("write csv: {e}")))?;
@@ -219,6 +226,16 @@ fn emit<T: Serialize>(rows: &[T], stems: &[String], req: &ExportRequest) -> Resu
             Ok(written)
         }
     }
+}
+
+/// Create the file's parent directory (if it names one) before writing a single-file manifest.
+fn ensure_parent_dir(out: &Path) -> Result<(), LibError> {
+    if let Some(dir) = out.parent() {
+        if !dir.as_os_str().is_empty() {
+            std::fs::create_dir_all(dir).map_err(io_err)?;
+        }
+    }
+    Ok(())
 }
 
 fn io_err(e: std::io::Error) -> LibError {

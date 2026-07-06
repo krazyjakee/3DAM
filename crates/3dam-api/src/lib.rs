@@ -13,9 +13,18 @@ pub mod id;
 pub mod page;
 pub mod service;
 
+/// Unix epoch milliseconds — the single time unit used across the schema and job/audit timestamps
+/// (tech-spec 02 §3.1). Shared here so every crate reads the clock the same way.
+pub fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 // Flat re-exports so consumers write `dam_api::AssetId`, `dam_api::LibError`, etc.
 pub use dto::*;
-pub use error::{ErrorBody, LibError};
+pub use error::{internal, ErrorBody, LibError};
 pub use event::{ChangeKind, EventTopic, JobEvent, LibraryEvent, SubscribeRequest};
 pub use id::{AssetId, CollectionId, ContentHash, JobId, SourceId, TagId};
 pub use page::{Cursor, ItemWarning, Page, PageParams, PartialStatus};

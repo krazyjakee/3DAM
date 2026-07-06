@@ -107,6 +107,12 @@ impl LibError {
     }
 }
 
+/// Map any `Display` error into an opaque `LibError::Internal` — the workspace-wide shorthand for
+/// `.map_err(internal)` when a lower-level failure has no better-typed variant.
+pub fn internal<E: std::fmt::Display>(e: E) -> LibError {
+    LibError::Internal(e.to_string())
+}
+
 /// Wire error envelope (tech-spec 03 §5.2).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorBody {

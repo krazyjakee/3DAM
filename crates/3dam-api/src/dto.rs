@@ -290,8 +290,6 @@ pub struct QueryRequest {
     #[serde(default)]
     pub sort: Sort,
     #[serde(default)]
-    pub scope: QueryScope,
-    #[serde(default)]
     pub page: PageParams,
     #[serde(default)]
     pub include_facets: bool,
@@ -375,15 +373,6 @@ pub enum SortField {
 pub enum SortDir {
     Asc,
     Desc,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum QueryScope {
-    #[default]
-    Local,
-    Federated,
-    Sources(Vec<SourceId>),
 }
 
 // ── sources ────────────────────────────────────────────────────────────────

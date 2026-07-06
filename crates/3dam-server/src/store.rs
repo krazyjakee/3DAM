@@ -12,23 +12,11 @@
 
 use dam_api::admin::*;
 use dam_api::service::Scopes;
-use dam_api::LibError;
+use dam_api::{internal, now_ms, LibError};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Mutex, RwLock};
-
-/// Epoch milliseconds (matches the metadata store's timestamps).
-pub fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
-fn internal<E: std::fmt::Display>(e: E) -> LibError {
-    LibError::Internal(e.to_string())
-}
 
 /// The live, in-memory flag values + their optimistic-concurrency versions (tech-spec 10 §2.2).
 #[derive(Clone, Debug)]
@@ -165,12 +153,15 @@ impl ServerStore {
             key,
             value: f.value(key),
             version: f.version(key),
-            live: true, // every phase-5 flag applies live (ADR 0009 §2)
+            live: true,                // every phase-5 flag applies live (ADR 0009 §2)
             exposure_increasing: true, // all three can increase exposure — a UI hint (§5)
         }
     }
     pub fn all_flags(&self) -> Vec<FlagInfo> {
-        FlagKey::ALL.into_iter().map(|k| self.flag_info(k)).collect()
+        FlagKey::ALL
+            .into_iter()
+            .map(|k| self.flag_info(k))
+            .collect()
     }
 
     // ── flag writes (config seed + admin set), both audited (tech-spec 10 §2.3) ──
@@ -220,12 +211,7 @@ impl ServerStore {
 
     /// Set a flag through the audited path (tech-spec 10 §2.3, §5): optimistic-concurrency check,
     /// exposure confirmation, store write, in-memory update, audit append. Returns the applied info.
-    pub fn set_flag(
-        &self,
-        key: FlagKey,
-        req: SetFlag,
-        actor: &str,
-    ) -> Result<FlagInfo, LibError> {
+    pub fn set_flag(&self, key: FlagKey, req: SetFlag, actor: &str) -> Result<FlagInfo, LibError> {
         if !req.value.matches(key) {
             return Err(LibError::BadRequest(format!(
                 "flag '{key}' value has the wrong type"

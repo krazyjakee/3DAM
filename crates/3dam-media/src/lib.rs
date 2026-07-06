@@ -12,7 +12,7 @@ mod features;
 mod image;
 mod model;
 
-pub use features::{extract_image_features, ImageFeatures};
+pub use features::{extract_image_features, l2_normalise, ImageFeatures};
 
 use dam_api::dto::{MediaAttributes, MediaType};
 use std::path::Path;

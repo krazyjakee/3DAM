@@ -123,7 +123,13 @@ fn analyze_image(store: &Store, t: &AnalysisTarget, abs: &Path) -> Result<(), St
         .map_err(|e| e.to_string())?;
     // Index: the visual embedding (§3.1).
     store
-        .set_embedding(&t.id, IMAGE_SPACE, MediaType::Image, &f.embedding, "image-stats@1")
+        .set_embedding(
+            &t.id,
+            IMAGE_SPACE,
+            MediaType::Image,
+            &f.embedding,
+            "image-stats@1",
+        )
         .map_err(|e| e.to_string())?;
     // Classify → suggest (§1.4): tileability + content class drive auto-tags with a confidence.
     let mut suggestions: Vec<(&str, f32)> = vec![(f.class, 0.7)];
@@ -237,14 +243,10 @@ fn resolve(source_uri: &str, rel_path: &str) -> Result<std::path::PathBuf, Strin
     Ok(Path::new(source_uri).join(rel))
 }
 
-/// L2-normalise a small stats vector; a zero vector stays zero (cosine 0 = "no signal").
+/// Owned-vector adapter over the shared in-place L2 normaliser (`dam_media::l2_normalise`), so the
+/// stats embedders below can build a vector inline. A zero vector stays zero (cosine 0 = "no signal").
 fn normalise(mut v: Vec<f32>) -> Vec<f32> {
-    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm > f32::EPSILON {
-        for x in v.iter_mut() {
-            *x /= norm;
-        }
-    }
+    dam_media::l2_normalise(&mut v);
     v
 }
 

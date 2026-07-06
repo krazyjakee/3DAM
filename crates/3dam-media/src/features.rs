@@ -95,7 +95,11 @@ fn dhash(img: &DynamicImage) -> u64 {
 /// Model-free embedding: a 16×16 luminance grid, mean-centred and L2-normalised so cosine similarity
 /// is a dot product (tech-spec 05 §2.1). Mean-centring makes it invariant to overall brightness.
 fn embed(img: &DynamicImage) -> Vec<f32> {
-    let small = img.resize_exact(EMBED_EDGE, EMBED_EDGE, image::imageops::FilterType::Triangle);
+    let small = img.resize_exact(
+        EMBED_EDGE,
+        EMBED_EDGE,
+        image::imageops::FilterType::Triangle,
+    );
     let lum = small.to_luma8();
     let mut v: Vec<f32> = lum.pixels().map(|p| p.0[0] as f32).collect();
     let mean = v.iter().sum::<f32>() / v.len() as f32;
@@ -107,8 +111,8 @@ fn embed(img: &DynamicImage) -> Vec<f32> {
 }
 
 /// L2-normalise in place; a zero (flat image) vector is left as zeros — cosine against it is 0,
-/// which is the honest "no signal" answer.
-fn l2_normalise(v: &mut [f32]) {
+/// which is the honest "no signal" answer. Shared with the audio/3D stats embedders in `dam-core`.
+pub fn l2_normalise(v: &mut [f32]) {
     let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm > f32::EPSILON {
         for x in v.iter_mut() {
@@ -123,7 +127,8 @@ fn dominant_colors(img: &DynamicImage) -> Vec<String> {
     let small = img
         .resize(48, 48, image::imageops::FilterType::Triangle)
         .to_rgb8();
-    let mut buckets: std::collections::HashMap<u16, (u64, [u32; 3])> = std::collections::HashMap::new();
+    let mut buckets: std::collections::HashMap<u16, (u64, [u32; 3])> =
+        std::collections::HashMap::new();
     for p in small.pixels() {
         let [r, g, b] = p.0;
         let key = ((r as u16 >> 5) << 6) | ((g as u16 >> 5) << 3) | (b as u16 >> 5);
@@ -297,7 +302,11 @@ mod tests {
             .save(&p)
             .unwrap();
         let f = extract_image_features(&p).unwrap();
-        assert!(f.tileability > 0.9, "flat image is seamless: {}", f.tileability);
+        assert!(
+            f.tileability > 0.9,
+            "flat image is seamless: {}",
+            f.tileability
+        );
         assert_eq!(f.tile_class, "seamless");
         assert_eq!(f.embedding.len(), (EMBED_EDGE * EMBED_EDGE) as usize);
         assert!(!f.dominant_colors.is_empty());
@@ -315,7 +324,11 @@ mod tests {
         let p = tmp("seam.png");
         img.save(&p).unwrap();
         let f = extract_image_features(&p).unwrap();
-        assert!(f.tileability < 0.5, "visible seam scores low: {}", f.tileability);
+        assert!(
+            f.tileability < 0.5,
+            "visible seam scores low: {}",
+            f.tileability
+        );
         std::fs::remove_file(&p).ok();
     }
 
@@ -333,7 +346,12 @@ mod tests {
         let b = extract_image_features(&p2).unwrap();
         assert_eq!(a.phash, b.phash, "same pixels → same dHash");
         // Cosine of identical normalised embeddings ≈ 1.
-        let dot: f32 = a.embedding.iter().zip(&b.embedding).map(|(x, y)| x * y).sum();
+        let dot: f32 = a
+            .embedding
+            .iter()
+            .zip(&b.embedding)
+            .map(|(x, y)| x * y)
+            .sum();
         assert!(dot > 0.99, "identical embeddings cosine ~1: {dot}");
         std::fs::remove_file(&p1).ok();
         std::fs::remove_file(&p2).ok();
