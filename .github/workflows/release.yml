@@ -2,14 +2,15 @@
 # TEMPLATE — cross-platform release pipeline for 3DAM.
 #
 # Adapted from the sibling `mogen` project's release workflow. See
-# docs/ROADMAP.md §"Release & distribution" for the rationale and how 3DAM
-# differs (single `3dam` binary; the React web client is built and embedded
-# before `cargo build`; heavier native deps).
+# docs/tech-spec/15-observability-config-testing-packaging.md §15.5
+# ("Packaging & release") for the rationale and how 3DAM differs (single
+# `3dam` binary; the React web client is built and embedded before
+# `cargo build`; heavier native deps).
 #
 # This is a SCAFFOLD. It does NOT auto-run: the `push: tags` trigger is
 # commented out so it can't fail on a tag before the `3dam` crate exists.
 # Before enabling it:
-#   1. Create the `3dam` binary crate (and `web/` client) — see the roadmap.
+#   1. Create the `3dam` binary crate (and `web/` client) — see PRODUCT_SPEC §9.
 #   2. Confirm the crate/package name used in the `-p 3dam` flags below.
 #   3. Add an app icon at `assets/icon.png` for the .ico/.icns/.dmg steps.
 #   4. Add `[package.metadata.deb]` / `[package.metadata.wix]` as needed.

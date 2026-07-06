@@ -417,6 +417,11 @@ The **shape embedding** those multi-view renders feed is owned by
 
 ## Open questions
 
+> **Resolved 2026-07-06 in [ADR 0009 §8](../adr/0009-v1-scope-decisions.md).** The v1 format-decode
+> matrix is frozen there (incl. DDS/KTX2, AAC-MP4, PLY/STL; FBX decode-only; USD post-v1), geometry
+> counts are marked approximate when accessor counts are absent, and the one-bounded-trailer-seek
+> budget stands. Kept below as rationale.
+
 - **Format-coverage matrix for v1 vs later** (carried from PRODUCT_SPEC §10): which loaders and
   codecs actually ship in the first pass. §7 is a first cut; the exact v1 line (e.g. whether MP4/AAC
   audio, DDS/KTX2 image decode, and PLY/USD 3D land in v1 or stage later) is not frozen and depends

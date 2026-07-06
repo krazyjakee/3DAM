@@ -427,11 +427,9 @@ impl Store {
         // Total for this filter (best-effort; cheap enough at slice scale).
         let count_sql = format!("SELECT COUNT(*) FROM asset{where_sql}");
         let total: i64 = conn
-            .query_row(
-                &count_sql,
-                rusqlite::params_from_iter(binds.iter()),
-                |r| r.get(0),
-            )
+            .query_row(&count_sql, rusqlite::params_from_iter(binds.iter()), |r| {
+                r.get(0)
+            })
             .map_err(internal)?;
 
         let sql = format!(
@@ -692,7 +690,9 @@ fn blob_to_job_id(b: &[u8]) -> JobId {
     JobId(uuid_from_slice(b))
 }
 fn uuid_from_slice(b: &[u8]) -> Uuid {
-    <[u8; 16]>::try_from(b).map(Uuid::from_bytes).unwrap_or(Uuid::nil())
+    <[u8; 16]>::try_from(b)
+        .map(Uuid::from_bytes)
+        .unwrap_or(Uuid::nil())
 }
 
 fn decode_offset(c: Option<&Cursor>) -> Result<usize, LibError> {
@@ -705,7 +705,9 @@ fn decode_offset(c: Option<&Cursor>) -> Result<usize, LibError> {
 }
 
 fn escape_like(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+    s.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 fn apply_filter(
@@ -729,7 +731,11 @@ fn apply_filter(
                 where_sql.push_str(" AND source_id = ?");
                 binds.push(Value::Blob(id.as_bytes().to_vec()));
             }
-            _ => return Err(LibError::BadRequest("source filter wants a string id".into())),
+            _ => {
+                return Err(LibError::BadRequest(
+                    "source filter wants a string id".into(),
+                ))
+            }
         },
         SizeBytes => {
             let col = "size_bytes";

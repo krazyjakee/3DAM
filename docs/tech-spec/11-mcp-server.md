@@ -301,5 +301,10 @@ The served MCP endpoint is the tri-state **feature flag** `McpServer` (`Off` | `
 
 ## Open questions
 
+> **Resolved 2026-07-06 in [ADR 0009 §6](../adr/0009-v1-scope-decisions.md).** A small purpose-tool
+> set + resources, read-only by default, per-tool opt-in writes gated on auth beyond localhost, and
+> **no transitive peer MCP.** Verb↔tool parity: keep each surface idiomatic, back both with one verb
+> registry + an explicit name map (§3). Kept below as rationale.
+
 - **MCP surface & safety** (carried from PRODUCT_SPEC §10): tool granularity (one broad `search` vs many narrow tools), how far to lean on resources/prompts vs tools, and exactly which write tools to expose and how they are gated when the server is exposed beyond localhost (read-only default, auth scopes, per-tool opt-in). Also: whether federated peers' MCP endpoints should be reachable **transitively** through this server, or only their catalogs via this server's own fan-out tools (ADR 0003 §Follow-ups).
 - **CLI-verb vs MCP-tool-name parity.** The MCP tool names (`find_similar`, `add_source`) and the CLI verbs they mirror (`similar`, `source add`) have drifted; §3 says tool names mirror the CLI verbs, but the two surfaces are not yet 1:1. Whether to unify the spellings or keep each surface ergonomically idiomatic is unresolved (shared with [13](13-cli.md)).

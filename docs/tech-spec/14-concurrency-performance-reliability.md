@@ -303,6 +303,13 @@ Principles for the harness (owned by [15](15-observability-config-testing-packag
 
 ## Open questions
 
+> **Partly resolved 2026-07-06 in [ADR 0009 §11](../adr/0009-v1-scope-decisions.md)** — explicit
+> `spawn_blocking` cap, no intra-item resume in v1, and a fixed `ubuntu-latest` 4-core CI ratio
+> baseline (GPU benches on a self-hosted box). **Still open as calibration** against real hardware:
+> the `N_cpu`/`N_io` split and whether the embedding lane gets its own reservation (tied to the
+> embedding-model spike), and the byte-budget RAM fraction. These are tuned against the benchmark
+> harness ([15](15-observability-config-testing-packaging.md)), not decided by fiat.
+
 - **Runtime sizing defaults.** `N_cpu = cores - 1` and `N_io = min(cores, cap)` are starting points; the right split (and whether the embedding-inference lane deserves its own thread reservation, or should share `N_cpu`) needs a spike on real analysis workloads. Ties to the embedding-model choice ([PRODUCT_SPEC](../PRODUCT_SPEC.md) §10).
 - **Byte-budget calibration.** The in-flight-decoded-bytes budget (§3.3) default as "a fraction of available RAM" needs validation across a 512 MB NAS container and a 64 GB workstation — the fraction may need to be absolute-floored and RAM-capped rather than purely proportional.
 - **Backpressure vs latency on the firehose.** The coalesce-and-resume drop policy for lagging subscribers (§4.2) trades completeness for bounded memory. Whether progress coalescing is ever lossy in a way a client notices (vs `AssetAdded`, which must not be dropped) needs settling with [09](09-server-and-web-client.md)'s WS design.

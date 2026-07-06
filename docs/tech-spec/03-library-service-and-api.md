@@ -578,6 +578,11 @@ Markers only — mechanics are deferred, per the borders.
 
 ## Open questions
 
+> **Resolved 2026-07-06 in [ADR 0009 §5/§9](../adr/0009-v1-scope-decisions.md).** The items below
+> are superseded by the ADR's v1 decisions (accept cursor drift, `total = None`, NDJSON streamed
+> queries, at-least-once events with a resume cursor, summary bulk-write shape, `ByUpload` via a
+> server round-trip) — kept here as rationale.
+
 - **Cursor stability across re-rank.** A federated cursor encodes per-peer positions plus a merge state; if a peer's
   ranking shifts between pages (new data, model update), the merged page boundary can drift. Snapshot the query at
   first page vs accept eventual drift? Interacts with [07](07-sources-and-federation.md)'s merge and

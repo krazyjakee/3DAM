@@ -347,7 +347,13 @@ That wiring (which `LibraryService` implementation a client binds, how `--connec
 
 Carried from [PRODUCT_SPEC §10](../PRODUCT_SPEC.md); this file scopes them to source/federation mechanics.
 
-- **Cross-peer similarity** ([§5](#5-cross-peer-embedding-space-compatibility)). Exact-match gating on `(model_id, model_version, media, dim, metric)` is the floor. Open: whether the default for incompatible peers is *omit* (safe) or *per-peer-grouped section*; whether to attempt embedding-space negotiation or a shared reference space; and how peers advertise per-media-type spaces as models are re-versioned by [05](05-analysis-similarity-dedup.md). Needs a spike.
+> **Resolved 2026-07-06.** Cross-peer similarity → the [cross-peer spike](../../spikes/cross-peer-similarity/README.md)
+> (`space_id` gate + grouped fallback). Query semantics + protocol/versioning →
+> [ADR 0009 §5](../adr/0009-v1-scope-decisions.md) (2.5 s fixed deadline, partial results, `total =
+> None`, LRU peer-cache min(2 GB, 10% disk)/7-day TTL, versioned read-API subset + `advertise()`,
+> bearer-token auth first). Kept below as rationale.
+
+- ~~**Cross-peer similarity** ([§5](#5-cross-peer-embedding-space-compatibility)).~~ **Decided 2026-07-06** ([`spikes/cross-peer-similarity/`](../../spikes/cross-peer-similarity/README.md)): **exact-match `space_id` gating is the mechanism** (same-space rank corr 0.817 vs ~0 for mismatched, zero-error gate), and the default for incompatible peers is a **per-peer-grouped section** (grouped, never cross-ranked) — text/facet fan-out still merges. Negotiation / shared reference space is **deferred** (re-embedding a catalog is a version-bump job, not a handshake). Remaining: content-address `space_id` on the model-artefact sha256, and confirm the corr threshold on real checkpoints ([05](05-analysis-similarity-dedup.md)).
 - **Federated query semantics** ([§6.3](#63-timeouts-and-partial-results)–[§6.4](#64-pagination-and-result-caps-across-peers), [§7.5](#75-how-much-of-a-peers-catalog-to-cache)). Default interactive deadline; whether deadlines should be adaptive per peer latency; result caps and per-peer over-fetch `k`; the composite-cursor stability contract under peers going offline mid-pagination; and the local shadow-cache cap/TTL/eviction sizing. Needs measurement at N peers.
 - **Federation protocol & versioning.** The federated source calls [03](03-library-service-and-api.md)'s endpoints, but the *inter-instance contract* — which subset of 03's surface is the stable federation API, how `advertise()` carries protocol/schema version, how a newer peer degrades gracefully for an older caller (and vice-versa), and the auth-standard subset [10](10-auth-accounts-and-flags.md) supports first — needs pinning as the seed of a future mesh ([PRODUCT_SPEC §9](../PRODUCT_SPEC.md) future direction). Cross-links: [03](03-library-service-and-api.md) (surface), [10](10-auth-accounts-and-flags.md) (auth subset).
 

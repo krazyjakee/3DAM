@@ -31,7 +31,10 @@ async fn scan_indexes_files_and_emits_events() {
     let ctx = AuthContext::embedded();
 
     // Subscribe before scanning so no events are missed.
-    let mut events = lib.subscribe(&ctx, SubscribeRequest::default()).await.unwrap();
+    let mut events = lib
+        .subscribe(&ctx, SubscribeRequest::default())
+        .await
+        .unwrap();
 
     let sid = lib
         .add_source(
@@ -69,7 +72,10 @@ async fn scan_indexes_files_and_emits_events() {
         }
     }
     assert!(finished, "scan job should reach Done");
-    assert_eq!(added, 3, "exactly the 3 recognised files emit AssetAdded (txt skipped)");
+    assert_eq!(
+        added, 3,
+        "exactly the 3 recognised files emit AssetAdded (txt skipped)"
+    );
 
     let page = lib
         .query(
@@ -95,7 +101,13 @@ async fn scan_indexes_files_and_emits_events() {
 
     // A re-scan must not duplicate rows (reconcile on source_id+path).
     let job2 = lib
-        .submit_scan(&ctx, ScanRequest { sources: vec![sid], mode: ScanMode::Full })
+        .submit_scan(
+            &ctx,
+            ScanRequest {
+                sources: vec![sid],
+                mode: ScanMode::Full,
+            },
+        )
         .await
         .unwrap();
     loop {

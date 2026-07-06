@@ -309,7 +309,9 @@ Rules for features:
 
 ## Open questions
 
-- **Frontend-shared helper crate.** `open_backend`/`Backend` (§4) and `classify`/`Role` (§5) are shared by `3dam-cli` and `3dam-gui`. Options: put them in `3dam-cli` (GUI depends on CLI — mild coupling), add a tiny `3dam-frontend` crate, or hang them off `3dam-api`. Leaning `3dam-cli` since it already owns the clap grammar, but a `3dam-frontend` crate is cleaner if the GUI should not link CLI. To settle when [12](12-desktop-gui.md)/[13](13-cli.md) are written.
+- ~~**Frontend-shared helper crate.**~~ **Decided (2026-07-06): a tiny `3dam-frontend` crate**
+  holds `open_backend`/`Backend` (§4) and `classify`/`Role` (§5), shared by `3dam-cli` and
+  `3dam-gui` — so the GUI reaches the backend constructor without linking the clap grammar.
 - **Where ADR-0002's pure geometry/camera math lives.** ADR 0002 places `Mesh`/`Aabb`/camera/pick math in `3dam-core` (GPU-free) so both `3dam-render` and headless logic reuse it. If that math grows large it may warrant its own `3dam-geometry` crate below `3dam-core`; deferred to [06](06-3d-render.md).
 - **Default binary size vs thin-client builds.** The default binary links both `3dam-core` and `3dam-client` (§4) so `--connect` needs no reinstall. Whether we also ship an official *thin-client* profile (`--no-default-features --features "gui,cli"` without `embedded-engine`) for size-sensitive distribution is a packaging call — [15](15-observability-config-testing-packaging.md).
 - **`3dam-store` visibility.** Rule 4 forbids front-ends depending on `3dam-store`. Whether `3dam-store` is a fully private implementation detail of `3dam-core` (not published, not in the front-end lockfile path) or a workspace crate others *could* import but are CI-forbidden from, affects how strict the guard in §2 must be. Coordinate with [02](02-data-model-and-storage.md).

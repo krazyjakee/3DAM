@@ -4,7 +4,7 @@ Status: **Draft v0.1** · Scope: the native `3dam-gui` shell — toolkit-choice 
 
 This file is the low-level design for the **native desktop client** — the `3dam-gui` crate named in [01-architecture-and-crates.md](01-architecture-and-crates.md). It is a thin, GPU-accelerated front-end over the shared engine: it holds a `LibraryService` handle (embedded engine or API client) and does no data work of its own. It turns [PRODUCT_SPEC.md](../PRODUCT_SPEC.md) §6.3/§6.4 (browse/search/preview), §7 (candidate GUI stack), and §8 (60 fps at 100k+, virtualisation) into an implementable shell, and it realises [DESIGN_GUIDELINES.md](../DESIGN_GUIDELINES.md) §3 (three-region workspace, grid+table equal, license-prioritised inspector) and §4 (dark-first, low-chrome) natively.
 
-It stays inside its border. The `LibraryService` trait, its DTOs, pagination and the live-update stream are **owned by [03-library-service-and-api.md](03-library-service-and-api.md)** — the GUI *consumes* them and never re-specs them. The wgpu viewer's internals (render graph, camera, software raster) are **owned by [06-3d-render.md](06-3d-render.md)** — the GUI *hosts* the widget and describes only the surface handoff. The **web client is [09-server-and-web-client.md](09-server-and-web-client.md)'s**; per [ROADMAP.md](../ROADMAP.md) it ships *before* this GUI and settles the interaction patterns, so this file describes the native counterpart that reuses them, not a second design of the same workspace. Off-UI-thread concurrency lives in [14-concurrency-performance-reliability.md](14-concurrency-performance-reliability.md); the derivative cache the grid draws from lives in [02-data-model-and-storage.md](02-data-model-and-storage.md).
+It stays inside its border. The `LibraryService` trait, its DTOs, pagination and the live-update stream are **owned by [03-library-service-and-api.md](03-library-service-and-api.md)** — the GUI *consumes* them and never re-specs them. The wgpu viewer's internals (render graph, camera, software raster) are **owned by [06-3d-render.md](06-3d-render.md)** — the GUI *hosts* the widget and describes only the surface handoff. The **web client is [09-server-and-web-client.md](09-server-and-web-client.md)'s**; per the web-first phasing (PRODUCT_SPEC §9) it ships *before* this GUI and settles the interaction patterns, so this file describes the native counterpart that reuses them, not a second design of the same workspace. Off-UI-thread concurrency lives in [14-concurrency-performance-reliability.md](14-concurrency-performance-reliability.md); the derivative cache the grid draws from lives in [02-data-model-and-storage.md](02-data-model-and-storage.md).
 
 ---
 
@@ -164,7 +164,7 @@ The load-bearing invariant: **`dispatch` and every `spawn_*` return immediately.
 
 ## 3. The three-region workspace
 
-The window is the three-region workspace of DESIGN_GUIDELINES §3.1, rendered natively: **left navigation**, **centre browser**, **right inspector**. This is the same layout the web client (file 09) settles first; the GUI reuses those interaction patterns (ROADMAP).
+The window is the three-region workspace of DESIGN_GUIDELINES §3.1, rendered natively: **left navigation**, **centre browser**, **right inspector**. This is the same layout the web client (file 09) settles first; the GUI reuses those interaction patterns (PRODUCT_SPEC §9).
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────────┐
@@ -190,7 +190,7 @@ The window is the three-region workspace of DESIGN_GUIDELINES §3.1, rendered na
 └───────────────┴──────────────────────────────────────────────┴───────────────────┘
 ```
 
-Both side regions are collapsible; the centre browser is never hidden. Region splits are draggable and persisted. On narrow windows the native shell keeps three regions (it is desktop-first); the *responsive collapse to one column* is the web client's tablet/phone concern (ROADMAP, file 09), not the desktop GUI's.
+Both side regions are collapsible; the centre browser is never hidden. Region splits are draggable and persisted. On narrow windows the native shell keeps three regions (it is desktop-first); the *responsive collapse to one column* is the web client's tablet/phone concern (file 09), not the desktop GUI's.
 
 ### 3.1 Left navigation
 
@@ -376,12 +376,21 @@ An immediate-mode toolkit (egui) redraws every frame unless told otherwise; naiv
 
 ## Open questions
 
+> **Mostly resolved 2026-07-06 in [ADR 0009 §9](../adr/0009-v1-scope-decisions.md)** — view-logic
+> sharing (each frontend owns its presentation; no shared view crate), windowed-rows (periodic
+> coalesced refresh), and the native-GUI/no-webview stance; GUI toolkit + frontend crate were
+> settled earlier ([ADR 0005](../adr/0005-gui-toolkit-egui.md)). **Still open:** native audio
+> latency & device handling (`cpal`/`rodio`) — its own small spike.
+
 - ~~**GUI toolkit final choice**~~ — **Decided: egui/eframe** ([ADR 0005](../adr/0005-gui-toolkit-egui.md), 2026-07-06). The §1 rendering/perf spike (virtualised grid+table at 100k+ over the real derivative cache, embedded [06](06-3d-render.md) viewer, sustained scroll frame time *and* idle CPU §7.3) remains as a **validation** follow-up, not a gate on the choice.
-- **View-logic sharing between web and desktop** — carried from [ROADMAP.md](../ROADMAP.md) Open questions. The web client (file 09) ships first and settles the interaction patterns; how much *presentation* logic (query/facet modelling, virtual-window bookkeeping, selection/keyboard semantics) is worth sharing across the React web UI and this native GUI — versus letting each own its presentation over the shared [03](03-library-service-and-api.md) API — is open. The `LibraryService` seam is shared by construction; the view layer above it may or may not be.
-- **Where the frontend-shared helper lives** — [01](01-architecture-and-crates.md) Open questions defers `open_backend`/`Backend` and `classify`/`Role` placement (in `3dam-cli`, a new `3dam-frontend` crate, or `3dam-api`) to this file. Leaning toward a small `3dam-frontend` crate so `3dam-gui` need not link the whole clap tree just to reach the backend constructor; to settle with [13-cli.md](13-cli.md).
+- **View-logic sharing between web and desktop** — carried from PRODUCT_SPEC §10 open questions. The web client (file 09) ships first and settles the interaction patterns; how much *presentation* logic (query/facet modelling, virtual-window bookkeeping, selection/keyboard semantics) is worth sharing across the React web UI and this native GUI — versus letting each own its presentation over the shared [03](03-library-service-and-api.md) API — is open. The `LibraryService` seam is shared by construction; the view layer above it may or may not be.
+- ~~**Where the frontend-shared helper lives**~~ — **Decided: a small `3dam-frontend` crate**
+  (2026-07-06) holds `open_backend`/`Backend` and `classify`/`Role`, so `3dam-gui` reaches the
+  backend constructor without linking the whole clap tree. Owned across
+  [01](01-architecture-and-crates.md)/[13-cli.md](13-cli.md).
 - **Windowed-rows reconciliation with live updates.** When the §2.4 stream splices new assets into a sorted, windowed result set, how insertions/removals reconcile against the engine's ordering without a full re-query (stable positions vs periodic window refresh) needs pinning down against [03](03-library-service-and-api.md)'s pagination/stream contract.
 - **Native audio latency & device handling.** §6.3 owns playback via `cpal`/`rodio`; device selection, sample-rate conversion, and scrub latency on the three OSes are a native-only concern with no web-client precedent to inherit — needs its own small spike.
 
 ---
 
-See also: [00-overview.md](00-overview.md) · [01-architecture-and-crates.md](01-architecture-and-crates.md) · [03-library-service-and-api.md](03-library-service-and-api.md) · [06-3d-render.md](06-3d-render.md) · [09-server-and-web-client.md](09-server-and-web-client.md) · [14-concurrency-performance-reliability.md](14-concurrency-performance-reliability.md) · [PRODUCT_SPEC.md](../PRODUCT_SPEC.md) · [DESIGN_GUIDELINES.md](../DESIGN_GUIDELINES.md) · [ROADMAP.md](../ROADMAP.md)
+See also: [00-overview.md](00-overview.md) · [01-architecture-and-crates.md](01-architecture-and-crates.md) · [03-library-service-and-api.md](03-library-service-and-api.md) · [06-3d-render.md](06-3d-render.md) · [09-server-and-web-client.md](09-server-and-web-client.md) · [14-concurrency-performance-reliability.md](14-concurrency-performance-reliability.md) · [PRODUCT_SPEC.md](../PRODUCT_SPEC.md) · [DESIGN_GUIDELINES.md](../DESIGN_GUIDELINES.md)

@@ -2,7 +2,7 @@
 
 Status: **Draft v0.1** · Scope: the `3dam serve` axum service (config, one-port routing, WebSocket transport, embedded assets) and the React + CSS web-client architecture with its WASM/wgpu viewer islands.
 
-This file specifies *how* `3dam serve` is wired and *how* the browser web client is built. It sits under [PRODUCT_SPEC.md](../PRODUCT_SPEC.md) §6.8 (server & web client), §4.2 (embedded vs connected), §7 (stack direction), §6.11 (admin surface), and follows the web-first build order and the hybrid React+CSS + WASM-islands decision in [ROADMAP.md](../ROADMAP.md).
+This file specifies *how* `3dam serve` is wired and *how* the browser web client is built. It sits under [PRODUCT_SPEC.md](../PRODUCT_SPEC.md) §6.8 (server & web client), §4.2 (embedded vs connected), §7 (stack direction), §6.11 (admin surface), §9 (web-first phasing), and follows the hybrid React+CSS + WASM-islands decision in [ADR 0008](../adr/0008-web-client-stack.md) and [ADR 0009 §9](../adr/0009-v1-scope-decisions.md).
 
 **Borders — read before editing.** This file owns the *plumbing*, not the *semantics* of what flows through it:
 
@@ -112,17 +112,17 @@ Live updates — scan/analysis progress, newly-ingested assets, job state — pu
 
 ## A.4 Embedding the built web assets (`rust-embed`) + dev mode
 
-One binary must serve the whole UI with no separate deploy (ROADMAP §Release). The built React bundle is embedded into the `3dam` binary at compile time via **`rust-embed`**, and a **dev proxy** swaps in a live Vite server during development.
+One binary must serve the whole UI with no separate deploy (PRODUCT_SPEC §8; §15.5 release plan). The built React bundle is embedded into the `3dam` binary at compile time via **`rust-embed`**, and a **dev proxy** swaps in a live Vite server during development.
 
 **Production (embedded).**
 
-- A build step compiles the web client (`pnpm build`, §B) into `web/dist/` (JS/CSS/`.wasm`/assets, content-hashed filenames). This runs **before `cargo build`** in the release matrix (ROADMAP §Release: "build the React web client and embed its static assets … *before* `cargo build`").
+- A build step compiles the web client (`pnpm build`, §B) into `web/dist/` (JS/CSS/`.wasm`/assets, content-hashed filenames). This runs **before `cargo build`** in the release matrix ([tech-spec 15](15-observability-config-testing-packaging.md) §15.5: build the React web client and embed its static assets *before* `cargo build`).
 - A `#[derive(RustEmbed)]` struct with `#[folder = "web/dist/"]` bakes those files into the binary. The static handler resolves a request path against the embedded set, sets `Content-Type` from the extension, emits long-lived immutable cache headers for hashed assets (short/no-cache for `index.html`), and serves `.wasm` with `application/wasm` (required for `WebAssembly.instantiateStreaming`).
 - **SPA fallback:** unmatched non-asset GETs return the embedded `index.html` so the client router (§B.2) owns in-app navigation. Result: one self-contained binary is the NAS/workstation deploy — copy it, run `3dam serve`, browse.
 
 **Development (proxy).**
 
-- With `[web].dev_proxy = "http://localhost:5173"` set (or `--dev`), the static/SPA handler is replaced by a **reverse proxy** to the Vite dev server. `/api/*`, `/api/ws`, `/mcp`, `/admin/api/*` stay served by axum in-process; everything else proxies to Vite, giving hot-module-reload and browser devtools against a real engine — the fast iteration loop the web-first order is built around (ROADMAP guiding decision 1). WebSocket upgrades for Vite HMR are proxied through.
+- With `[web].dev_proxy = "http://localhost:5173"` set (or `--dev`), the static/SPA handler is replaced by a **reverse proxy** to the Vite dev server. `/api/*`, `/api/ws`, `/mcp`, `/admin/api/*` stay served by axum in-process; everything else proxies to Vite, giving hot-module-reload and browser devtools against a real engine — the fast iteration loop the web-first order is built around (PRODUCT_SPEC §9, [ADR 0008](../adr/0008-web-client-stack.md)). WebSocket upgrades for Vite HMR are proxied through.
 - Dev mode is the only mode where the embedded bundle is bypassed; the same `build_router` chooses the proxy vs the `rust-embed` handler based on config, so nothing else in the routing differs.
 
 ```
@@ -152,9 +152,9 @@ One binary must serve the whole UI with no separate deploy (ROADMAP §Release). 
 
 # Part B — The web client (React + CSS + WASM islands)
 
-The web client is a **separate front-end codebase** (the sole non-Rust codebase in the workspace — file 00), served by `3dam serve`. Per the ROADMAP's hybrid decision, it is an ordinary **React + CSS** app for all chrome/layout, with **WASM/wgpu islands only** for the interactive 3D viewer and hot render paths (waveforms/thumbnails). It talks to the engine **purely over the serve API** (file 03) — it is always in *connected* mode (PRODUCT_SPEC §4.2), never touching a DB or the engine directly.
+The web client is a **separate front-end codebase** (the sole non-Rust codebase in the workspace — file 00), served by `3dam serve`. Per the hybrid React+CSS + WASM-islands decision ([ADR 0008](../adr/0008-web-client-stack.md)), it is an ordinary **React + CSS** app for all chrome/layout, with **WASM/wgpu islands only** for the interactive 3D viewer and hot render paths (waveforms/thumbnails). It talks to the engine **purely over the serve API** (file 03) — it is always in *connected* mode (PRODUCT_SPEC §4.2), never touching a DB or the engine directly.
 
-Rationale for the split (React/CSS chrome, WASM only for heavy canvas) is settled in [ROADMAP.md](../ROADMAP.md) and PRODUCT_SPEC §7 — not re-argued here. This part specifies the *architecture and packaging*.
+Rationale for the split (React/CSS chrome, WASM only for heavy canvas) is settled in [ADR 0008](../adr/0008-web-client-stack.md) and PRODUCT_SPEC §7 — not re-argued here. This part specifies the *architecture and packaging*.
 
 ## B.1 The three-region workspace as DOM
 
@@ -174,13 +174,13 @@ The desktop workspace (DESIGN_GUIDELINES §3.1) maps to plain DOM, not a canvas:
 
 - **Left / centre / inspector are DOM** — semantic HTML + CSS. The centre grid/table is **virtualised** (windowed rendering) so a 100k+ grid scrolls at 60fps with lazily-fetched thumbnails (DESIGN_GUIDELINES §1.1, §3.1). Grid and table are equal views over the same query, toggle preserves selection+filter.
 - **Inspector** prioritises the license badge high (DESIGN_GUIDELINES §3.1), then preview, metadata, features, tags — all DOM, fed by `get_asset` (file 03).
-- **All state comes from the API.** Every list, facet, tag edit, and preview is a file-03 call; live progress arrives on the `/api/ws` socket (§A.3). The DOM gets responsive layout, touch, text input, and accessibility for free (ROADMAP guiding decision 2).
+- **All state comes from the API.** Every list, facet, tag edit, and preview is a file-03 call; live progress arrives on the `/api/ws` socket (§A.3). The DOM gets responsive layout, touch, text input, and accessibility for free (PRODUCT_SPEC §7).
 
 ## B.2 The React stack (choices framed, not frozen)
 
-Per ROADMAP §Open questions, the exact stack is open. Framing the choices as an implementable starting point (to be confirmed in the web-client build, ROADMAP step 2):
+The exact stack is framed here as an implementable starting point (frozen in [ADR 0008](../adr/0008-web-client-stack.md)):
 
-- **Bundler / dev server: Vite.** Fast HMR (the web-first iteration loop, §A.4 dev proxy), first-class WASM + Web Worker support, and a simple `pnpm build → web/dist/` that the `rust-embed` step consumes. `pnpm` as the package manager (matches ROADMAP §Release).
+- **Bundler / dev server: Vite.** Fast HMR (the web-first iteration loop, §A.4 dev proxy), first-class WASM + Web Worker support, and a simple `pnpm build → web/dist/` that the `rust-embed` step consumes. `pnpm` as the package manager (matches the release matrix, §15.5).
 - **Router: a lightweight client-side router** (e.g. React Router, or a minimal file-based router). URL owns view state (current source/collection/filter/selected asset) so views are linkable and back/forward works; the axum SPA fallback (§A.4) serves `index.html` for all such routes.
 - **Data fetching / server state:** a query/cache layer (e.g. TanStack Query) over a thin typed API client wrapping file-03 endpoints — caching, background refetch, and request dedup for the grid, with the WebSocket (§A.3) invalidating/patching cached queries on live events. **UI state** (selection, view toggle, filter chips) stays minimal and local/URL-driven; a heavy global store is likely unnecessary.
 - **Styling: CSS** (CSS Modules or a small utility layer), dark-first, low-chrome, information-dense per DESIGN_GUIDELINES §4 — one restrained accent for selection/focus/primary. No heavyweight component framework; the design language is dense tables and tight grids, not card-heavy chrome.
@@ -189,7 +189,7 @@ These are *candidates to validate*, mirroring the tech-spec convention that stac
 
 ## B.3 WASM / wgpu viewer islands — packaging & data handoff
 
-The interactive 3D viewer and hot render paths (waveforms, thumbnails) are the parts DOM/CSS can't do well; they are **focused WASM/wgpu components embedded *in* the DOM layout — not a full-page canvas** (ROADMAP decision 2, step 3). The wgpu **viewer internals** are files [06](06-3d-render.md)/[12](12-desktop-gui.md); this file owns only how that Rust code becomes a DOM-embeddable island and how the DOM hands it data.
+The interactive 3D viewer and hot render paths (waveforms, thumbnails) are the parts DOM/CSS can't do well; they are **focused WASM/wgpu components embedded *in* the DOM layout — not a full-page canvas** ([ADR 0009 §9](../adr/0009-v1-scope-decisions.md)). The wgpu **viewer internals** are files [06](06-3d-render.md)/[12](12-desktop-gui.md); this file owns only how that Rust code becomes a DOM-embeddable island and how the DOM hands it data.
 
 **Packaging.**
 
@@ -210,32 +210,32 @@ The interactive 3D viewer and hot render paths (waveforms, thumbnails) are the p
 
 - The **DOM side owns the data**: it fetches model bytes / waveform samples / preview data over the file-03 API (a bytes/preview endpoint) and *hands them to the island* through the wasm-bindgen boundary (`load_model(bytes)`, `set_waveform(samples)`), rather than the island doing its own networking. This keeps the island a pure renderer and keeps all API/auth on the DOM side (§B.1).
 - **DOM owns interaction chrome and layout**; the island owns pixels. Camera controls, playback transport, and buttons are DOM (so they get accessibility/touch/keyboard for free); they call into the island (`set_camera`, `play`, `resize`). Islands are handed their canvas node and size from CSS layout and re-`resize()`d on container changes.
-- **Exact packaging boundary and the data-handoff API are an open question** (below) shared with the ROADMAP — the shape above is the intended contract for files 06/12 to satisfy on the web target.
+- **Exact packaging boundary and the data-handoff API are an open question** (below) — the shape above is the intended contract for files 06/12 to satisfy on the web target.
 
 ## B.4 Hosting the admin / Settings surface
 
 The web client hosts the admin-only **Settings / Administration** area (PRODUCT_SPEC §6.11, DESIGN_GUIDELINES §3.6). **This surface's semantics — the flags, the toggle behaviour, warnings, live-vs-restart, accounts/roles — are file [10](10-auth-accounts-and-flags.md)'s** ([ADR 0004](../adr/0004-feature-flags-admin.md)). This file notes only how the web app *hosts* it:
 
-- It is **plain DOM** riding the `/admin/api/*` endpoints (file 10) — grouped toggle cards, progressive disclosure of sub-options, warn-and-confirm on exposure-increasing toggles, explicit live/restart labels (DESIGN_GUIDELINES §3.6). Being DOM (not canvas) is exactly why it is cheap to build well (ROADMAP step 2).
+- It is **plain DOM** riding the `/admin/api/*` endpoints (file 10) — grouped toggle cards, progressive disclosure of sub-options, warn-and-confirm on exposure-increasing toggles, explicit live/restart labels (DESIGN_GUIDELINES §3.6). Being DOM (not canvas) is exactly why it is cheap to build well.
 - **Admin-scoped routing:** the Settings routes are gated client-side by the auth context and, authoritatively, by file 10's server-side admin scope on `/admin/api/*` — once auth is on, this surface is never reachable anonymously ([ADR 0004](../adr/0004-feature-flags-admin.md) consequences).
 - It is a **coequal control plane** with the config file and CLI over one persisted state — a convenience, never the only way in (DESIGN_GUIDELINES §3.6). This file does not define that state; file 10 does.
 
 ## B.5 Responsive / touch degradation
 
-Desktop/tablet-first; phones graceful-degrade — cheap precisely because the shell is DOM (ROADMAP §Mobile & tablet posture). Concretely:
+Desktop/tablet-first; phones graceful-degrade — cheap precisely because the shell is DOM (mobile & tablet posture, PRODUCT_SPEC §6.8). Concretely:
 
 - **Collapse the three regions** to a single scrollable column at tablet width via CSS breakpoints; navigation and inspector become drawers/sheets over the centre browser rather than always-visible columns.
 - **44×44px minimum touch targets** on all controls; `touch-action: manipulation` on canvas-overlay controls (viewer camera, waveform scrub) so they don't fight browser gestures.
-- **Stacked panes** (viewer + detail) go vertical with viewport-unit heights and a `min-height` floor so a 3D island stays usable on a phone (ROADMAP).
-- Full small-screen polish and real-device testing are tracked as **UX debt, not a v1 gate** (ROADMAP) — the responsive pass is a build-order step (ROADMAP step 4) done before the web client is "done."
+- **Stacked panes** (viewer + detail) go vertical with viewport-unit heights and a `min-height` floor so a 3D island stays usable on a phone.
+- Full small-screen polish and real-device testing are tracked as **UX debt, not a v1 gate** — the responsive pass is done before the web client is considered "done."
 
 ---
 
 ## Open questions
 
-Carried from [ROADMAP.md](../ROADMAP.md) §Open questions (this file is where they bottom out for the server/web-client area):
+Carried from PRODUCT_SPEC §10 open questions (this file is where they bottom out for the server/web-client area):
 
-- **Exact React stack** — bundler/router/state are framed in §B.2 as Vite + a client router + a query/cache layer, but not locked; to be confirmed during the web-client build (ROADMAP step 2).
+- ~~**Exact React stack**~~ — **Decided: React + TypeScript + Tailwind** on the Vite/pnpm base of §B.2, a client router, and a query/cache layer ([ADR 0008](../adr/0008-web-client-stack.md)). Styling is Tailwind (the "small utility layer" §B.2 anticipated); typography is a modern self-hosted sans per [DESIGN_GUIDELINES §4](../DESIGN_GUIDELINES.md). Exact router/query packages stay directional.
 - **WASM-island packaging & data handoff** (§B.3) — the precise wasm-bindgen boundary (`load_model` / `set_waveform` / `set_camera` shapes), WebGPU-vs-WebGL2 fallback policy, whether waveform/thumbnail rendering is a WASM island at all or stays a server-rendered preview, and how island lifecycle interacts with the virtualised grid. Depends on files 06/12 landing the shared render crate on the web target.
 - **Serve config ⇄ flags-store reconciliation** — *deferred to file 10* ([ADR 0004](../adr/0004-feature-flags-admin.md) §10, "two writers, one state"): which control plane wins on conflict, whether the config file is watched and re-applied, and which flags flip live vs need a restart (this file's `build_router` must know the live set to rebuild routes safely).
 - **Dev-proxy vs embedded parity** — ensuring routes/auth behave identically whether the SPA is proxied to Vite or served from `rust-embed`, especially for WebSocket upgrades and `.wasm` MIME/caching.
@@ -243,4 +243,4 @@ Carried from [ROADMAP.md](../ROADMAP.md) §Open questions (this file is where th
 
 ---
 
-See also: [03-library-service-and-api.md](03-library-service-and-api.md) · [06-3d-render.md](06-3d-render.md) · [10-auth-accounts-and-flags.md](10-auth-accounts-and-flags.md) · [11-mcp-server.md](11-mcp-server.md) · [12-desktop-gui.md](12-desktop-gui.md) · [15-observability-config-testing-packaging.md](15-observability-config-testing-packaging.md) · [PRODUCT_SPEC.md](../PRODUCT_SPEC.md) §6.8 · [ROADMAP.md](../ROADMAP.md) · [ADR 0003](../adr/0003-mcp-server.md) · [ADR 0004](../adr/0004-feature-flags-admin.md)
+See also: [03-library-service-and-api.md](03-library-service-and-api.md) · [06-3d-render.md](06-3d-render.md) · [10-auth-accounts-and-flags.md](10-auth-accounts-and-flags.md) · [11-mcp-server.md](11-mcp-server.md) · [12-desktop-gui.md](12-desktop-gui.md) · [15-observability-config-testing-packaging.md](15-observability-config-testing-packaging.md) · [PRODUCT_SPEC.md](../PRODUCT_SPEC.md) §6.8 · [ADR 0003](../adr/0003-mcp-server.md) · [ADR 0004](../adr/0004-feature-flags-admin.md)

@@ -284,6 +284,12 @@ Setting a *consequential* flag (e.g. `remote-access`, `network-writes`) without 
 
 ## 9. Open questions
 
+> **Resolved 2026-07-06 in [ADR 0009 §6/§7/§10](../adr/0009-v1-scope-decisions.md).** `--json`
+> schemas version independently (a `--schema-version` pin is post-v1); the single `partial-failure`
+> exit code `6` stands; ship `clap_complete` completions + `clap_mangen` man pages; unify batch-verb
+> selection on ids ∪ query ∪ saved-search; embedded `admin` may seed config but not manage live
+> sessions; verb↔tool parity via one verb registry. Kept below as rationale.
+
 - **`--json` schema versioning.** Each envelope carries a `schema` id with a version suffix (`/1`). Open: whether these version independently per record type or bump together, and whether a `--schema-version` pin is offered for long-lived CI. Coordinate with the export manifest schema owned by [03](03-library-service-and-api.md).
 - **Exit-code granularity for `partial-failure`.** One code (`6`) covers both "a peer was offline in a fan-out" and "some assets in a batch failed". Open: whether CI needs to distinguish these by code, or whether the `summary` record's structured detail suffices (current bet: the record suffices).
 - **`admin` reach in embedded mode.** How much administration is meaningful against a *plain* embedded library that has never run `serve` (no serve store): reject entirely, or allow seeding an initial config? Depends on where flag state persists — an open question shared with [10](10-auth-accounts-and-flags.md) and PRODUCT_SPEC §10.

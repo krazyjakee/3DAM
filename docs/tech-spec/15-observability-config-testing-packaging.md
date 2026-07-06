@@ -30,7 +30,7 @@ Product grounding: local-first, no telemetry, no unsolicited network calls
 ([PRODUCT_SPEC.md](../PRODUCT_SPEC.md) §8, [DESIGN_GUIDELINES.md](../DESIGN_GUIDELINES.md)
 §1.5); graceful degradation and tested-at-scale (DESIGN_GUIDELINES §6); documented DB +
 plain-text export, reproducible cross-platform binaries from a tag-triggered CI matrix
-(PRODUCT_SPEC §8, [ROADMAP.md](../ROADMAP.md) §Release & distribution).
+(PRODUCT_SPEC §8; the release plan is §15.5 below).
 
 ---
 
@@ -325,8 +325,8 @@ not trusted:
 
 ## 15.5 Packaging & release
 
-This expands [ROADMAP.md](../ROADMAP.md) §Release & distribution into implementable CI detail
-and reflects the existing scaffold at
+This is the canonical **release & distribution** plan (referenced from PRODUCT_SPEC §8), in
+implementable CI detail, and reflects the existing scaffold at
 [`.github/workflows/release.yml`](../../.github/workflows/release.yml) — currently a
 **template** whose `push: tags` trigger is commented out so it cannot fail before the `3dam`
 crate exists (only `workflow_dispatch` is live). The mechanics below are what that scaffold
@@ -414,13 +414,13 @@ push (game-store specific) is deliberately **not** carried over.
 
 ## Open questions
 
-Carried from [ROADMAP.md](../ROADMAP.md) §Open questions, owned there, surfaced here because
-they gate this file's packaging/release scope:
+Carried from PRODUCT_SPEC §10 open questions, surfaced here because they gate this file's
+packaging/release scope:
 
-- **Code signing & notarization.** Unsigned macOS `.dmg` trips Gatekeeper and unsigned Windows
-  `.msi` trips SmartScreen (mogen ships unsigned). Does v1 pay for an Apple Developer ID +
-  notarization and a Windows signing certificate — adding signing/notarization/stapling steps
-  to §15.5.5 — or accept the warnings for v1? Unresolved.
+- ~~**Code signing & notarization.**~~ **Decided (2026-07-06): unsigned for v1.** Accept the
+  Gatekeeper (macOS `.dmg`) and SmartScreen (Windows `.msi`) warnings as mogen does — no Apple
+  Developer ID + notarization or Windows signing certificate, and no signing/notarization/stapling
+  steps in §15.5.5 for v1. Revisit post-v1.
 - **Distribution channels beyond GitHub Releases.** Homebrew tap, winget, AUR,
   `cargo-binstall` — which, and when. All TBD; GitHub Releases is the v1 channel (§15.5.6).
 
@@ -441,4 +441,4 @@ See also: [00-overview.md](00-overview.md) ·
 [10-auth-accounts-and-flags.md](10-auth-accounts-and-flags.md) ·
 [14-concurrency-performance-reliability.md](14-concurrency-performance-reliability.md) ·
 [PRODUCT_SPEC.md](../PRODUCT_SPEC.md) · [DESIGN_GUIDELINES.md](../DESIGN_GUIDELINES.md) ·
-[ROADMAP.md](../ROADMAP.md) · [ADR 0002](../adr/0002-3d-render-crate-boundary.md)
+[ADR 0002](../adr/0002-3d-render-crate-boundary.md)

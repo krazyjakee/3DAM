@@ -84,4 +84,4 @@ low-chrome language (§4).
 - Scope the v1 accounts model: fixed vs custom roles, where visibility scoping bottoms out
   (source/collection vs per-asset), bootstrap and recovery (§10).
 - Confirm the admin surface's warning/confirm flows for exposure-increasing toggles during the
-  web-client build (ROADMAP build order step 2).
+  web-client build (web-first phasing, PRODUCT_SPEC §9).

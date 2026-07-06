@@ -38,7 +38,7 @@ the top of each file.
 | 12 | [12-desktop-gui.md](12-desktop-gui.md) | The native GUI shell, the three-region workspace, the virtualised grid/table, the inspector, embedding the wgpu 3D viewer, and keyboard/dark-mode behaviour. |
 | 13 | [13-cli.md](13-cli.md) | The CLI command tree (clap), human vs `--json`/`--csv` output, exit codes, `--dry-run`, `--connect`, and the `serve`/`mcp` subcommands. |
 | 14 | [14-concurrency-performance-reliability.md](14-concurrency-performance-reliability.md) | The tokio (I/O) + rayon (CPU) split, bounded worker pools, the incremental non-blocking pipeline, out-of-core data at 1M+ assets, cancellation, fail-soft, and the performance targets/benchmarks. |
-| 15 | [15-observability-config-testing-packaging.md](15-observability-config-testing-packaging.md) | Logging/tracing, the error taxonomy, config precedence, the testing strategy and scale fixtures, and packaging/release mechanics (expanding the roadmap's release section). |
+| 15 | [15-observability-config-testing-packaging.md](15-observability-config-testing-packaging.md) | Logging/tracing, the error taxonomy, config precedence, the testing strategy and scale fixtures, and packaging/release mechanics (the canonical §15.5 release section). |
 
 ---
 
@@ -127,25 +127,37 @@ wins and this spec is the bug.
 
 Each area file keeps its own "Open questions" list; the load-bearing ones are collected here
 with their owning file. This complements, and does not replace, the product spec's open
-questions (PRODUCT_SPEC §10) and the roadmap's ([ROADMAP.md](../ROADMAP.md)).
+questions (PRODUCT_SPEC §10) and its build phasing (PRODUCT_SPEC §9).
+
+> **Most of the tail below is resolved.** The scope/decision questions (licence, flags, accounts,
+> auth, federation semantics, MCP/CLI, convert-export, format matrix, web islands, packaging) were
+> decided on **2026-07-06 in [ADR 0009](../adr/0009-v1-scope-decisions.md)** — see it for the v1
+> line and rationale. What genuinely remains: the **embedding-model spike** (research in
+> `spikes/embedding-models/`) and a few **calibration** knobs tuned against the benchmark harness.
 
 **Needs a spike (gate-level):**
-- **Headless 3D render on a GPU-less server** — software-raster fallback (lavapipe/llvmpipe)
-  vs CPU thumbnail path vs render-on-demand by a GPU client. The gate on [ADR 0001](../adr/0001-3d-render-backend.md);
-  owned by [06](06-3d-render.md). **✅ Core question resolved 2026-07-06** by
+- ~~**Headless 3D render on a GPU-less server**~~ — **✅ Resolved 2026-07-06** by
   [`spikes/headless-render/`](../../spikes/headless-render/README.md): wgpu renders headless to
-  PNG and lavapipe serves it correctly. Remaining: confirm on genuinely GPU-less hardware, and
-  wire the explicit fallback ladder (06 §4.1) rather than relying on env.
+  PNG on real GPU, and the **fallback ladder was exercised** — rung 2 (`force_fallback_adapter`)
+  and rung 3 (simulated GPU-less via the lavapipe ICD) both render correctly through llvmpipe.
+  The gate on [ADR 0001](../adr/0001-3d-render-backend.md); owned by [06](06-3d-render.md).
 - ~~**GUI toolkit final choice**~~ — **Decided: egui/eframe** ([ADR 0005](../adr/0005-gui-toolkit-egui.md),
   2026-07-06). The rendering/perf spike is now a validation follow-up, not a gate. Owned by [12](12-desktop-gui.md).
-- **Cross-peer similarity** — ranking hits across peers needs compatible embedding spaces
-  (`EmbeddingSpace` match); advertise + gate, negotiate, or per-peer-grouped fallback. Owned by
-  [05](05-analysis-similarity-dedup.md)/[07](07-sources-and-federation.md).
+- ~~**Cross-peer similarity**~~ — **✅ Decided 2026-07-06** by
+  [`spikes/cross-peer-similarity/`](../../spikes/cross-peer-similarity/README.md): **advertise an
+  `EmbeddingSpace` `space_id` and gate cross-peer ranking on exact match**, with per-peer-grouped
+  fallback when spaces differ; negotiation deferred (it's a re-embedding job, not a handshake).
+  Same-space rank corr **0.817**, mismatched spaces **~0** (gate: 0 false ±). Owned by
+  [05](05-analysis-similarity-dedup.md)/[07](07-sources-and-federation.md). Remaining: content-address
+  the id on the model-artefact sha256 (05 §2.3), and validate the corr threshold on real checkpoints.
 
 **Model & analysis:**
-- Concrete embedding models per media type (quality/size/speed on-device) — still open.
-  **Runtime decided: `candle`** ([ADR 0006](../adr/0006-inference-runtime-candle.md), 2026-07-06),
-  `ort` as feature-gated fallback. [05](05-analysis-similarity-dedup.md).
+- ~~**Concrete embedding models per media type**~~ — **Researched 2026-07-06**
+  ([`spikes/embedding-models/`](../../spikes/embedding-models/README.md)): **SigLIP 768-d** (image,
+  candle-native; + DINOv2 384-d dedup), **LAION-CLAP 512-d** (audio, via `ort`), **multi-view→SigLIP
+  768-d** (3D, reuses headless render). Runtime `candle` ([ADR 0006](../adr/0006-inference-runtime-candle.md));
+  **audio forces the `ort` path** (no candle CLAP). Remaining: a follow-up *code* spike for on-domain
+  quality + real latency before dims freeze. [05](05-analysis-similarity-dedup.md).
 - Vector-index storage: embedded extension (`sqlite-vec`) vs sidecar HNSW; on-disk vs in-memory
   at 1M+. [02](02-data-model-and-storage.md)/[05](05-analysis-similarity-dedup.md).
   **✅ Decided 2026-07-06** by [`spikes/vector-index/`](../../spikes/vector-index/README.md):
@@ -153,52 +165,58 @@ questions (PRODUCT_SPEC §10) and the roadmap's ([ROADMAP.md](../ROADMAP.md)).
   `sqlite-vec` is exact-but-O(N) (726 ms/query at 1M) → kept for small libraries / exact re-rank.
   Remaining: quantization (f16/i8) for memory, and validation on real embeddings.
 
-**Data & licence:**
-- Licence taxonomy: SPDX vs a 3DAM rights model for non-code assets; auto-detection (pack
-  manifests/sidecars/LICENSE) vs user-set; per-asset overrides within a blanket-licensed pack.
-  [02](02-data-model-and-storage.md).
+**Data & licence:** — all **decided in [ADR 0009 §1](../adr/0009-v1-scope-decisions.md)**.
+- ~~Licence taxonomy & detection~~ — **No defaults; unknown-is-unknown** (never inferred). Hybrid
+  representation (SPDX id | Proprietary | Custom | NULL), tri-state rights flags, per-asset
+  overrides via an `'inherited'` provenance. [02](02-data-model-and-storage.md).
 
-**Server, auth & flags:**
-- Feature-flag store & lifecycle: where state persists, how config-file and admin-UI edits
-  reconcile, which flags flip live vs need a restart. [10](10-auth-accounts-and-flags.md).
-- User-accounts scope for v1: fixed vs custom roles, where visibility scoping bottoms out
-  (source/collection vs per-asset), first-admin bootstrap, session/token lifetime.
-  [10](10-auth-accounts-and-flags.md).
-- Server auth/security hardening for exposure beyond localhost; TLS extent. [10](10-auth-accounts-and-flags.md).
+**Server, auth & flags:** — all **decided in [ADR 0009 §2–4](../adr/0009-v1-scope-decisions.md)**.
+- ~~Feature-flag store & lifecycle~~ — versioned `server.db` table, per-flag `config_authority`
+  (default `seed-only`, `reconcile` opt-in, no auto-revert), live-by-default + frozen restart-only
+  set. [10](10-auth-accounts-and-flags.md).
+- ~~User-accounts scope~~ — fixed `admin`/`editor`/`viewer`, source/collection visibility, config
+  bootstrap recovery, session 14d/90d. Custom roles + per-asset scoping post-v1. [10](10-auth-accounts-and-flags.md).
+- ~~Auth hardening & TLS~~ — rate-limit + lockout + CSRF; static `rustls` cert/key (ACME post-v1);
+  **bind beyond localhost without TLS refused** unless `--insecure`. [10](10-auth-accounts-and-flags.md).
 
-**Federation:**
-- Federated-query semantics: timeouts, partial results, pagination/result caps across N peers,
-  how much of a peer's catalog to cache. [07](07-sources-and-federation.md).
-- Federation protocol & versioning (the inter-instance API contract as the seed of a future
-  mesh). [07](07-sources-and-federation.md).
+**Federation:** — all **decided in [ADR 0009 §5](../adr/0009-v1-scope-decisions.md)**.
+- ~~Query semantics~~ — 2.5 s fixed deadline, partial results flagged, `total = None`, accept cursor
+  drift, LRU peer-cache min(2 GB, 10% disk) / 7-day TTL. [07](07-sources-and-federation.md).
+- ~~Protocol & versioning~~ — versioned subset of 03's read surface + `advertise()` carrying
+  `protocol_version` + `space_id`; newer peers degrade; bearer-token auth first. [07](07-sources-and-federation.md).
 
-**MCP & CLI:**
-- MCP surface & safety: tool granularity, how far to lean on resources/prompts vs tools, exact
-  write-tool gating beyond localhost. [11](11-mcp-server.md).
-- **CLI-verb ↔ MCP-tool-name parity** (`similar`/`find_similar`, `source add`/`add_source`) —
-  the product docs are themselves in tension; pick one spelling convention.
-  [11](11-mcp-server.md)/[13](13-cli.md).
-- **Export job DTO** — reconciliation added `submit_export` to `LibraryService`
-  ([03](03-library-service-and-api.md)) to back the `export` CLI verb + MCP tool, but its
-  `ExportRequest`/return shape must be pinned against the manifest model in
-  [08](08-convert-pipeline.md)/[03](03-library-service-and-api.md).
+**MCP & CLI:** — all **decided in [ADR 0009 §6–7](../adr/0009-v1-scope-decisions.md)**.
+- ~~MCP surface & safety~~ — small purpose-tool set + resources, read-only default, per-tool
+  opt-in writes gated on auth beyond localhost, no transitive peer MCP. [11](11-mcp-server.md).
+- ~~CLI-verb ↔ MCP-tool-name parity~~ — keep each surface idiomatic, back both with **one verb
+  registry** + an explicit name map (no forced 1:1). [11](11-mcp-server.md)/[13](13-cli.md).
+- ~~Export job DTO~~ — `ExportRequest{selection, profile, destination, manifest}` → `JobHandle`;
+  unified selection grammar; manifest persisted first-class. [03](03-library-service-and-api.md)/[08](08-convert-pipeline.md).
 
 **Web, GUI & build:**
-- Exact React stack (bundler/router/state) and how WASM viewer islands are packaged and fed
-  data from the DOM. [09](09-server-and-web-client.md) / [ROADMAP](../ROADMAP.md).
-- How much view logic (if any) is shared between the web client and the egui desktop GUI.
-  [12](12-desktop-gui.md).
-- Windowed-rows virtualisation vs the live-update stream — reconciliation against 03's
-  pagination contract. [12](12-desktop-gui.md)/[03](03-library-service-and-api.md).
-- Code signing & notarization (macOS/Windows) and distribution channels beyond GitHub
-  Releases. [15](15-observability-config-testing-packaging.md) / [ROADMAP](../ROADMAP.md).
+- ~~Exact React stack~~ — **Decided: React + TypeScript + Tailwind** on Vite/pnpm
+  ([ADR 0008](../adr/0008-web-client-stack.md), 2026-07-06). *WASM-island packaging & data
+  handoff* remains open. [09](09-server-and-web-client.md) / PRODUCT_SPEC §9.
+- ~~WASM-island packaging & data handoff; view-logic sharing; windowed-rows reconciliation~~ —
+  **Decided in [ADR 0009 §9](../adr/0009-v1-scope-decisions.md)**: `wasm-pack` islands (WebGPU +
+  WebGL2 fallback), each frontend owns its own presentation (no shared view crate), periodic
+  coalesced window refresh, NDJSON streamed queries, native GUI (no webview).
+  [09](09-server-and-web-client.md)/[12](12-desktop-gui.md)/[03](03-library-service-and-api.md).
+- ~~Where the frontend-shared backend helper lives~~ — **Decided: a small `3dam-frontend` crate**
+  (2026-07-06) holds `open_backend`/`Backend` + `classify`/`Role` so `3dam-gui` need not link the
+  clap tree. [01](01-architecture-and-crates.md)/[12](12-desktop-gui.md)/[13](13-cli.md).
+- ~~Code signing & notarization~~ — **Decided: unsigned for v1** (accept Gatekeeper/SmartScreen
+  warnings; revisit post-v1). ~~Distribution channels~~ — **GitHub Releases only for v1**; Homebrew
+  + `cargo-binstall` fast-follow ([ADR 0009 §10](../adr/0009-v1-scope-decisions.md)).
+  [15](15-observability-config-testing-packaging.md) / PRODUCT_SPEC §9.
 
-**Format coverage:**
-- v1-vs-later format/codec matrix per media; in particular **FBX is decode-only in v1** (encode
-  targets are the glTF family + OBJ), which the product spec frames as "FBX↔glTF" — to confirm.
+**Format coverage:** — **frozen in [ADR 0009 §8](../adr/0009-v1-scope-decisions.md)**.
+- ~~v1-vs-later format/codec matrix~~ — v1 decodes PNG/JPEG/WebP/TIFF/GIF/BMP/**DDS/KTX2**,
+  WAV/FLAC/OGG/MP3/**AAC-MP4**, glTF/OBJ/**FBX (decode-only)**/**PLY/STL**; encode targets =
+  glTF family + OBJ. **USD decode and FBX/USD encode are post-v1.**
   [04](04-media-handlers.md)/[08](08-convert-pipeline.md).
 
 ---
 
 See also: [PRODUCT_SPEC.md](../PRODUCT_SPEC.md) · [DESIGN_GUIDELINES.md](../DESIGN_GUIDELINES.md) ·
-[ROADMAP.md](../ROADMAP.md) · [ADRs](../adr/)
+[ADRs](../adr/)

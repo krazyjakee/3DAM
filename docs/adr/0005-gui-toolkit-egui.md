@@ -16,7 +16,7 @@ flagged a rendering/perf spike as the intended tie-breaker.
 The product shape that drives the choice: a **dense, dark, virtualised tooling UI** — grid +
 sortable attribute table at 100k+ rows at 60 fps — with an embedded wgpu 3D viewer, and full
 parity with the shared engine. The web client (React) ships first and settles interaction
-patterns ([ROADMAP.md](../ROADMAP.md)); the desktop GUI follows.
+patterns (PRODUCT_SPEC §9, web-first front-end sequence); the desktop GUI follows.
 
 ## Decision
 

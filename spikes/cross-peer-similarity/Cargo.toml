@@ -1,0 +1,10 @@
+[package]
+name = "spike-cross-peer-similarity"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[profile.release]
+opt-level = 3
+
+[dependencies]

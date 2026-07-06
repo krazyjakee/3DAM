@@ -5,8 +5,8 @@
 use dam_api::dto::*;
 use dam_api::event::LibraryEvent;
 use dam_api::id::JobId;
-use dam_store::{NewAsset, Store};
 use dam_sources::{FileSource, LocalFsSource};
+use dam_store::{NewAsset, Store};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

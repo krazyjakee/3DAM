@@ -21,6 +21,52 @@ pub enum MediaType {
     Model,
 }
 
+/// Raw asset bytes for a preview, plus just enough descriptor to serve/label them. This is the
+/// out-of-band data-handoff the WASM viewer islands consume (tech-spec 09 §B.3): the DOM fetches it
+/// and feeds `load_model` / a WebAudio decode. Not a JSON DTO — the server streams `bytes` with
+/// `content_type`, and `ApiClient` reconstructs it from the raw HTTP response.
+#[derive(Clone, Debug)]
+pub struct AssetContent {
+    pub bytes: Vec<u8>,
+    /// MIME type for the `Content-Type` header (`model/gltf-binary`, `audio/wav`, …).
+    pub content_type: String,
+    /// The asset's format token (e.g. `glb`, `wav`), for logging/labels.
+    pub format: String,
+    pub media: MediaType,
+}
+
+/// Best-effort MIME for a `(media, format)` pair — covers the v1 decode matrix (ADR 0009 §8) and
+/// falls back to `application/octet-stream`. Lives here so both the engine and any client agree.
+pub fn content_type_for(media: MediaType, format: &str) -> &'static str {
+    match format.to_ascii_lowercase().as_str() {
+        // 3D
+        "glb" => "model/gltf-binary",
+        "gltf" => "model/gltf+json",
+        "obj" => "model/obj",
+        "ply" => "model/ply",
+        "stl" => "model/stl",
+        "fbx" => "application/octet-stream",
+        // audio
+        "wav" => "audio/wav",
+        "mp3" => "audio/mpeg",
+        "flac" => "audio/flac",
+        "ogg" => "audio/ogg",
+        "aac" | "m4a" | "mp4" => "audio/mp4",
+        // image
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "bmp" => "image/bmp",
+        "tif" | "tiff" => "image/tiff",
+        _ => match media {
+            MediaType::Image => "application/octet-stream",
+            MediaType::Audio => "application/octet-stream",
+            MediaType::Model => "application/octet-stream",
+        },
+    }
+}
+
 impl MediaType {
     pub fn as_str(&self) -> &'static str {
         match self {

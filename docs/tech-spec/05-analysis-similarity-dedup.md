@@ -125,16 +125,20 @@ in similarity results until stage 5 completes for it.
 Each media type gets one *primary* embedding space used for similarity and near-dup. All are
 L2-normalised float vectors so cosine similarity is a dot product.
 
-| Media | Embedding | Input | Dim (indicative) |
-|-------|-----------|-------|------------------|
-| Image | CLIP-style image encoder | decoded RGB, centre-crop/resize to model input | 512–768 |
-| Audio | audio embedding (e.g. a log-mel/CNN or PANNs/VGGish-style encoder) | mel-spectrogram from the DSP stage | 512–2048 |
-| 3D | multi-view/shape embedding | N fixed-pose renders → per-view image features → pooled | 512–768 |
+| Media | Embedding (v1 pick) | Input | Dim |
+|-------|--------------------|-------|-----|
+| Image | **SigLIP** base/patch16-224 (candle-native); **DINOv2** ViT-S/14 paired for pure-visual dedup | decoded RGB, resize to model input | **768** (DINOv2 384) |
+| Audio | **LAION-CLAP** `clap-htsat-unfused` (via `ort`/ONNX — no candle impl) | mel-spectrogram from the DSP stage | **512** |
+| 3D | **multi-view render → SigLIP → mean-pool** (6 canonical views, L2-renorm) | N fixed-pose renders → per-view features → pooled | **768** |
 
-Concrete model selection is an **open question** (PRODUCT_SPEC §10) — the pipeline is written
-against the *contract* (an `Embedder` producing a normalised vector tagged with an
-embedding-space id), not a specific checkpoint, so a model swap is a version bump (§7), not a
-rewrite.
+Concrete model selection was the **last open spike** — researched 2026-07-06
+([`spikes/embedding-models/`](../../spikes/embedding-models/README.md)); the picks above are the v1
+target (dims **provisional** pending on-domain validation). The pipeline is written against the
+*contract* (an `Embedder` producing a normalised vector tagged with an embedding-space id), not a
+specific checkpoint, so a model swap is a `model_version` bump (§7), not a rewrite. Two findings
+carry forward: **audio forces the `ort`/ONNX path** (candle has no CLAP-class model), and **image +
+3D share the SigLIP weights but hold distinct `EmbeddingSpace`s** (pooled multi-view vectors must
+never cross-rank against single images).
 
 The `Embedder` seam:
 
@@ -336,7 +340,7 @@ them be adjusted, because "duplicate" is a judgement call the user disposes (DES
 
 ## 5. Per-media derived signals (non-embedding)
 
-Beyond embeddings, stage 3 derives the media-specific attributes in PRODUCT_SPEC §5 that feed
+Beyond embeddings, this analysis pass derives the media-specific attributes in PRODUCT_SPEC §5 that feed
 facets and auto-tags. These are computed from `extract_features` output (04), not re-decoded
 here:
 
@@ -482,18 +486,23 @@ and results are explainable and regenerable.
 
 Carried from PRODUCT_SPEC §10 and rolled up in [00-overview.md](00-overview.md):
 
-- **Concrete embedding models per media type** — which CLIP-style image, audio, and
-  multi-view/shape models balance quality, size, and on-device speed. The pipeline is written
-  to the `Embedder` contract (§2.1) so this stays a version bump (§7), not a rewrite. Needs a
-  spike (also gates dims in §2.1).
+- ~~**Concrete embedding models per media type**~~ — **Researched 2026-07-06**
+  ([`spikes/embedding-models/`](../../spikes/embedding-models/README.md)): **SigLIP 768-d** (image,
+  candle-native; + DINOv2 384-d for dedup), **LAION-CLAP 512-d** (audio, via `ort` — no candle
+  impl), **multi-view→SigLIP 768-d** (3D). Dims recorded in §2.1. **Remaining: a follow-up *code*
+  spike** to validate on-domain retrieval quality on real game assets and real candle/`ort` latency
+  before dims freeze. Still gated on the `Embedder` contract (§2.1), so any swap is a `model_version`
+  bump (§7).
 - ~~**Inference runtime pick**~~ — **Decided: `candle`** ([ADR 0006](../adr/0006-inference-runtime-candle.md), 2026-07-06), `ort` as a feature-gated fallback. Only the *concrete models* (above) remain open.
 - **Vector index choice** (§3.1) — embedded extension (`sqlite-vec`) vs standalone crate
   (`usearch`/HNSW), in-memory vs on-disk at 1M+ scale. Storage layout is 02's; the
   perf/out-of-core call is shared with [14](14-concurrency-performance-reliability.md).
-- **Cross-peer similarity** (§3.4) — ranking hits across peers needs compatible embedding
-  spaces (same model + version). Advertise space id and gate on match, negotiate a shared
-  space, or fall back to per-peer-ranked grouped results. Mechanics live in
-  [07-sources-and-federation.md](07-sources-and-federation.md); needs a spike.
+- ~~**Cross-peer similarity** (§3.4)~~ — **Decided 2026-07-06** ([`spikes/cross-peer-similarity/`](../../spikes/cross-peer-similarity/README.md)):
+  **advertise the `EmbeddingSpace` `space_id` and gate cross-peer ranking on exact match**; fall
+  back to per-peer-ranked grouped results when spaces differ; negotiation deferred. The spike
+  measured same-space rank corr **0.817** vs **~0** for mismatched spaces with a zero-error gate.
+  The `space_id` should be **content-addressed on the model-artefact sha256** (§2.3) so it can't
+  false-positive. Mechanics live in [07-sources-and-federation.md](07-sources-and-federation.md).
 - **Dedup/tileability thresholds** (§4.2, §6) — the strong/possible near-dup bands, the
   edge-score mapping constant `k`, `seamless_threshold`, and periodicity `tau` need tuning
   against real, messy scale fixtures ([15](15-observability-config-testing-packaging.md))

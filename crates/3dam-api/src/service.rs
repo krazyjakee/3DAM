@@ -54,13 +54,21 @@ pub trait LibraryService: Send + Sync {
 
     async fn get_asset(&self, ctx: &AuthContext, id: &AssetId) -> Result<Asset, LibError>;
 
+    /// Read an asset's raw bytes for a preview (the out-of-band data-handoff the WASM viewer islands
+    /// consume — tech-spec 09 §B.3). Bounded to preview-sized reads; large assets return an error
+    /// rather than streaming the whole file. Read-only, non-destructive (PRODUCT_SPEC §8).
+    async fn read_content(
+        &self,
+        ctx: &AuthContext,
+        id: &AssetId,
+    ) -> Result<AssetContent, LibError>;
+
     async fn library_stats(&self, ctx: &AuthContext) -> Result<LibraryStats, LibError>;
 
     // ── sources ──────────────────────────────────────────────────────────────
     async fn list_sources(&self, ctx: &AuthContext) -> Result<Vec<SourceInfo>, LibError>;
 
-    async fn get_source(&self, ctx: &AuthContext, id: &SourceId)
-        -> Result<SourceInfo, LibError>;
+    async fn get_source(&self, ctx: &AuthContext, id: &SourceId) -> Result<SourceInfo, LibError>;
 
     async fn add_source(&self, ctx: &AuthContext, req: AddSource) -> Result<SourceId, LibError>;
 

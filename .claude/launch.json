@@ -6,6 +6,24 @@
       "runtimeExecutable": "python3",
       "runtimeArgs": ["-m", "http.server", "4173", "--directory", "docs/html"],
       "port": 4173
+    },
+    {
+      "name": "3dam-serve",
+      "runtimeExecutable": "target/debug/3dam",
+      "runtimeArgs": [
+        "serve",
+        "--addr",
+        "127.0.0.1:7333",
+        "--data",
+        "/tmp/claude-1000/-home-krazy-Documents-GitHub-3DAM/2f3b5a8d-dd64-41c3-b04d-8305798b2da4/scratchpad/data"
+      ],
+      "port": 7333
+    },
+    {
+      "name": "web",
+      "runtimeExecutable": "pnpm",
+      "runtimeArgs": ["--dir", "web", "dev", "--port", "5273", "--strictPort"],
+      "port": 5273
     }
   ]
 }

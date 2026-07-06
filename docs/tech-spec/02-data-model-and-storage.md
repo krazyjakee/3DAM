@@ -451,6 +451,12 @@ Config-file values *seed* `feature_flag` and the admin API/CLI edit the same row
 
 ## 11. Open questions
 
+> **Resolved 2026-07-06.** Licence taxonomy → [ADR 0009 §1](../adr/0009-v1-scope-decisions.md)
+> (**no defaults; unknown-is-unknown**; hybrid SPDX/Proprietary/Custom/NULL; per-asset override via
+> `'inherited'` provenance). Feature-flag store, change-detection `strict` mode, and cache-size
+> policy → [ADR 0009 §2/§11](../adr/0009-v1-scope-decisions.md). Vector-index storage → the
+> [vector-index spike](../../spikes/vector-index/README.md) (sidecar HNSW). Kept below as rationale.
+
 Carried forward from PRODUCT_SPEC §10 where they touch storage; the analysis/auth files own the non-storage halves.
 
 - **Vector index — embedded vs sidecar, on-disk vs in-memory** (PRODUCT_SPEC §10): final pick between `sqlite-vec` inside `library.db` and a sidecar HNSW under `vectors/`; whether one index or per-media indices; memory-map vs load; and how re-index interacts with the WAL at 1M+ assets. Storage framing is §7; production/query is [05](05-analysis-similarity-dedup.md).

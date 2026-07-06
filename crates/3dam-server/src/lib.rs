@@ -1,11 +1,13 @@
 //! `dam-server` — the axum host. Exposes the embedded engine over `/api/v1` (tech-spec 03 §8),
-//! serves live updates over a WebSocket, and hosts a placeholder web root until the React client
-//! lands. `serve` starts the long-lived service; `mcp_stdio` is the local-agent MCP transport (stub).
+//! serves live updates over a WebSocket, and hosts the embedded React web client (tech-spec 09 §A.4)
+//! with SPA-fallback routing. `serve` starts the long-lived service; `mcp_stdio` is the local-agent
+//! MCP transport (stub).
 
+use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as AxPath, State};
-use axum::http::StatusCode;
-use axum::response::{Html, IntoResponse, Response};
+use axum::http::{header, StatusCode, Uri};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use dam_api::dto::*;
@@ -15,11 +17,20 @@ use dam_api::service::{AuthContext, LibraryService};
 use dam_api::LibError;
 use dam_core::EmbeddedLibrary;
 use futures::StreamExt;
+use rust_embed::RustEmbed;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
+
+/// The built React web client (tech-spec 09 §A.4). `pnpm build` emits content-hashed assets into
+/// `web/dist/`; this bakes them into the `3dam` binary so one file serves the whole UI with no
+/// separate deploy. In debug builds rust-embed reads from disk (fast iteration); release embeds.
+/// If `web/dist` is empty (web client not yet built), the handler serves a build hint instead.
+#[derive(RustEmbed)]
+#[folder = "../../web/dist/"]
+struct WebAssets;
 
 /// Server configuration (a subset of the eventual serve config file, tech-spec 09).
 pub struct ServeConfig {
@@ -60,18 +71,24 @@ fn parse_id<T: std::str::FromStr>(s: &str, what: &str) -> Result<T, ApiError> {
 pub fn router(lib: Arc<EmbeddedLibrary>) -> Router {
     let state = AppState { lib };
     Router::new()
-        .route("/", get(web_root))
         .route("/api/version", get(version))
         .route("/api/v1/query", post(query))
         .route("/api/v1/assets/{id}", get(get_asset))
+        .route("/api/v1/assets/{id}/content", get(asset_content))
         .route("/api/v1/stats", get(stats))
         .route("/api/v1/sources", get(list_sources).post(add_source))
-        .route("/api/v1/sources/{id}", get(get_source).delete(remove_source))
+        .route(
+            "/api/v1/sources/{id}",
+            get(get_source).delete(remove_source),
+        )
         .route("/api/v1/jobs/scan", post(submit_scan))
         .route("/api/v1/jobs/list", post(list_jobs))
         .route("/api/v1/jobs/{id}", get(get_job))
         .route("/api/v1/jobs/{id}/cancel", post(cancel_job))
         .route("/api/v1/ws", get(ws_handler))
+        // SPA fallback: any non-API GET serves the embedded web client (tech-spec 09 §A.4).
+        // API prefixes are matched above, so a mistyped `/api/...` still returns a JSON 404.
+        .fallback(static_handler)
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
         .with_state(state)
@@ -84,7 +101,10 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(cfg.addr).await?;
     let actual = listener.local_addr()?;
     tracing::info!(%actual, data_dir = %cfg.data_dir.display(), "3dam serve listening");
-    eprintln!("3dam serve → http://{actual}  (data: {})", cfg.data_dir.display());
+    eprintln!(
+        "3dam serve → http://{actual}  (data: {})",
+        cfg.data_dir.display()
+    );
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
@@ -104,11 +124,54 @@ pub async fn mcp_stdio(_data_dir: PathBuf) -> anyhow::Result<()> {
 
 // ── handlers ─────────────────────────────────────────────────────────────────
 
-async fn web_root() -> Html<&'static str> {
-    Html(
-        "<!doctype html><meta charset=utf-8><title>3dam</title>\
-         <h1>3dam serve</h1><p>API is live at <code>/api/v1</code>. \
-         The React web client is not built yet (roadmap stage 2).</p>",
+/// Serve the embedded web client with SPA-fallback semantics (tech-spec 09 §A.4):
+/// a hashed asset path returns that asset with a long immutable cache; any other GET returns
+/// `index.html` (no-cache) so the client router owns in-app navigation. A stray `/api/*` that
+/// fell through returns a JSON 404 (file-03 error shape), never the HTML shell.
+async fn static_handler(uri: Uri) -> Response {
+    let path = uri.path().trim_start_matches('/');
+
+    if path.starts_with("api/") || path == "api" {
+        return ApiError(LibError::NotFound(format!("no route: /{path}"))).into_response();
+    }
+
+    if let Some(resp) = serve_embedded(path) {
+        return resp;
+    }
+    // Unknown non-asset path → SPA shell (client-side route), or a build hint if unbuilt.
+    match serve_embedded("index.html") {
+        Some(resp) => resp,
+        None => (
+            StatusCode::NOT_FOUND,
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            "<!doctype html><meta charset=utf-8><title>3dam</title>\
+             <h1>3dam serve</h1><p>API is live at <code>/api/v1</code>. The web client bundle is \
+             not present — run <code>pnpm --dir web build</code> (or <code>cargo xtask web</code>) \
+             and rebuild.</p>",
+        )
+            .into_response(),
+    }
+}
+
+/// Look up one embedded file and build its response (content-type + cache policy).
+fn serve_embedded(path: &str) -> Option<Response> {
+    let file = WebAssets::get(path)?;
+    let mime = file.metadata.mimetype();
+    // Vite emits content-hashed asset filenames → safe to cache forever; the HTML shell must not.
+    let cache = if path.starts_with("assets/") {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    };
+    Some(
+        (
+            [
+                (header::CONTENT_TYPE, mime.to_string()),
+                (header::CACHE_CONTROL, cache.to_string()),
+            ],
+            Body::from(file.data.into_owned()),
+        )
+            .into_response(),
     )
 }
 
@@ -116,7 +179,7 @@ async fn version() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "api": "v1",
         "server": concat!("3dam ", env!("CARGO_PKG_VERSION")),
-        "capabilities": ["query", "sources", "scan", "stats", "ws"],
+        "capabilities": ["query", "sources", "scan", "stats", "ws", "web"],
     }))
 }
 
@@ -133,6 +196,25 @@ async fn get_asset(
 ) -> Result<Json<Asset>, ApiError> {
     let id: AssetId = parse_id(&id, "asset")?;
     Ok(Json(st.lib.get_asset(&ctx(), &id).await?))
+}
+
+/// Raw asset bytes for the WASM viewer islands (tech-spec 09 §B.3). Streams the file with its MIME
+/// `Content-Type` so the DOM can `load_model` a GLB or WebAudio-decode an audio file. Private cache:
+/// bytes can change on re-scan, so this is not the immutable-forever policy the hashed web assets use.
+async fn asset_content(
+    State(st): State<AppState>,
+    AxPath(id): AxPath<String>,
+) -> Result<Response, ApiError> {
+    let id: AssetId = parse_id(&id, "asset")?;
+    let content = st.lib.read_content(&ctx(), &id).await?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, content.content_type),
+            (header::CACHE_CONTROL, "private, max-age=60".to_string()),
+        ],
+        Body::from(content.bytes),
+    )
+        .into_response())
 }
 
 async fn stats(State(st): State<AppState>) -> Result<Json<LibraryStats>, ApiError> {

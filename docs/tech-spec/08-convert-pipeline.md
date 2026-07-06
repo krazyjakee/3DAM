@@ -501,6 +501,11 @@ Derivative/blob caching (thumbnails of converted previews) is 02's cache; conver
 
 ## Open questions
 
+> **Resolved 2026-07-06 in [ADR 0009 §7/§8](../adr/0009-v1-scope-decisions.md).** v1 encode targets
+> = glTF family + OBJ (FBX/USD encode post-v1); the convert manifest is a first-class persisted
+> record; commits are idempotent by `content_hash`; profiles are built-in-only for v1; estimation
+> stays `Approx` (real-encode calibration post-v1). Kept below as rationale.
+
 - **FBX (and other proprietary) write-back.** v1 encodes to the open glTF family + OBJ only
   (§3.3); whether FBX/USD *encode* targets ship later (licensing, loader-writer availability)
   is deferred (PRODUCT_SPEC §6.5, §10 format matrix).

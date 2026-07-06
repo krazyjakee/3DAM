@@ -335,6 +335,13 @@ Design constraints the routes encode:
 
 ## Open questions
 
+> **Resolved 2026-07-06 in [ADR 0009 §2–4](../adr/0009-v1-scope-decisions.md).** Flags: `server.db`
+> table, per-flag `config_authority` (default `seed-only`, no auto-revert), live-by-default + a
+> frozen restart-only set. Accounts: fixed roles, source/collection visibility, config-bootstrap
+> recovery, session 14d/90d (custom roles + per-asset post-v1). Auth: rate-limit + lockout + CSRF,
+> static `rustls` (ACME post-v1), **non-localhost bind without TLS refused unless `--insecure`.**
+> Kept below as rationale.
+
 Carried from PRODUCT_SPEC §10; this file is where their mechanics land as they resolve.
 
 - **Feature-flag store & lifecycle.** Confirmed here as a versioned table in the server's own store seeded by the config file, with `config_authority` (seed-only vs reconcile) + opt-in watch as the two-writers resolution, and a per-flag live/restart table (§3). Still open: whether the config file should ever be watched-and-reverted by default, and the exact set of restart-only flags once the router's live-remount mechanism ([09](09-server-and-web-client.md)) is built and measured.

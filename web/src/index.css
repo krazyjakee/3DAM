@@ -1,0 +1,121 @@
+@import "tailwindcss";
+@import "@fontsource-variable/inter";
+
+/* Touch/coarse-pointer variant (responsive + touch pass). Lets components opt
+   individual controls up to 44×44px tap targets, and reveal hover-only actions, ONLY where a
+   finger is the pointer — the dense desktop grid keeps its information density under a mouse. */
+@custom-variant coarse (@media (pointer: coarse));
+
+/* ── Design tokens (DESIGN_GUIDELINES §4) ───────────────────────────────────
+   Dark-first, low-chrome, information-dense. The UI recedes; content is the
+   bright part. ONE restrained accent for selection/focus/primary. A distinct
+   warning tone is reserved for exposure risk in the admin surface (§3.6). */
+@theme {
+  --font-sans: "Inter Variable", ui-sans-serif, system-ui, sans-serif;
+
+  /* Surfaces — near-black, layered by elevation. */
+  --color-bg: #0b0d10;
+  --color-surface: #14171c;
+  --color-surface-2: #1b1f26;
+  --color-border: #262b33;
+  --color-border-strong: #333a45;
+
+  /* Text. */
+  --color-fg: #e6e9ee;
+  --color-fg-muted: #9aa3b0;
+  --color-fg-dim: #656d7a;
+
+  /* The one accent. */
+  --color-accent: #38bdf8;
+  --color-accent-fg: #051016;
+  --color-accent-muted: #0e2b3a;
+
+  /* Warning tone — exposure risk only. */
+  --color-warn: #f5a524;
+  --color-danger: #f0616d;
+
+  /* License badge buckets (PRODUCT_SPEC §License; unknown is never "safe"). */
+  --color-lic-permissive: #4ade80;
+  --color-lic-attribution: #38bdf8;
+  --color-lic-restricted: #f0616d;
+  --color-lic-unknown: #8b93a1;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+  body {
+    margin: 0;
+    background: var(--color-bg);
+    color: var(--color-fg);
+    font-family: var(--font-sans);
+    font-size: 13px;
+    line-height: 1.4;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+  * {
+    scrollbar-color: var(--color-border-strong) transparent;
+  }
+  /* Remove the 300ms tap delay / double-tap-zoom on every interactive control and (later) the
+     viewer canvas overlay buttons, so taps feel native on touch (responsive + touch pass). */
+  button,
+  a,
+  label,
+  input,
+  select,
+  textarea,
+  summary,
+  canvas,
+  [role="button"] {
+    touch-action: manipulation;
+  }
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--color-border-strong);
+    border-radius: 5px;
+    border: 2px solid var(--color-bg);
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--color-fg-dim);
+  }
+}
+
+@layer components {
+  .btn {
+    @apply inline-flex items-center gap-1.5 rounded px-2.5 py-1 text-xs font-medium
+      text-fg-muted transition-colors select-none;
+    border: 1px solid var(--color-border);
+    background: var(--color-surface-2);
+  }
+  .btn:hover {
+    @apply text-fg;
+    border-color: var(--color-border-strong);
+  }
+  .btn-accent {
+    background: var(--color-accent);
+    color: var(--color-accent-fg);
+    border-color: transparent;
+  }
+  .btn-accent:hover {
+    color: var(--color-accent-fg);
+    filter: brightness(1.08);
+  }
+  .btn:disabled {
+    @apply cursor-not-allowed opacity-50;
+  }
+  .field {
+    @apply w-full rounded px-2 py-1 text-xs text-fg outline-none;
+    background: var(--color-bg);
+    border: 1px solid var(--color-border);
+  }
+  .field:focus {
+    border-color: var(--color-accent);
+  }
+}

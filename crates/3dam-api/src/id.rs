@@ -124,6 +124,7 @@ impl Serialize for ContentHash {
 impl<'de> Deserialize<'de> for ContentHash {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let s = String::deserialize(d)?;
-        ContentHash::from_hex(&s).ok_or_else(|| serde::de::Error::custom("invalid content hash hex"))
+        ContentHash::from_hex(&s)
+            .ok_or_else(|| serde::de::Error::custom("invalid content hash hex"))
     }
 }

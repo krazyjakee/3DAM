@@ -23,7 +23,10 @@ pub struct FileEntry {
 pub trait FileSource: Send + Sync {
     /// Walk the source, invoking `sink` per discovered file. Fail-soft: a per-entry error is
     /// reported to `sink` as `Err` and iteration continues.
-    fn walk(&self, sink: &mut dyn FnMut(Result<FileEntry, LibError>) -> bool) -> Result<(), LibError>;
+    fn walk(
+        &self,
+        sink: &mut dyn FnMut(Result<FileEntry, LibError>) -> bool,
+    ) -> Result<(), LibError>;
 }
 
 /// A local directory tree.

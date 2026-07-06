@@ -152,6 +152,33 @@ blockquote {
 .card h3 { margin: 8px 0 6px; color: var(--heading); }
 .card p { margin: 0; color: var(--fg-muted); font-size: .95em; }
 
+/* Status pills */
+.pill {
+  display: inline-block; font-family: var(--mono); font-size: .72em;
+  font-weight: 600; letter-spacing: .4px; text-transform: uppercase;
+  padding: .18em .6em; border-radius: 999px; border: 1px solid transparent;
+  vertical-align: middle; white-space: nowrap;
+}
+.pill.done   { color: #35d0ba; background: rgba(53,208,186,0.12);  border-color: rgba(53,208,186,0.35); }
+.pill.active { color: #ffcf5c; background: rgba(255,207,92,0.12);   border-color: rgba(255,207,92,0.35); }
+.pill.next   { color: #7aa2ff; background: rgba(122,162,255,0.12);  border-color: rgba(122,162,255,0.35); }
+.pill.todo   { color: #8b98a9; background: rgba(139,152,169,0.10);  border-color: rgba(139,152,169,0.28); }
+.pill.later  { color: #c98bff; background: rgba(201,139,255,0.10);  border-color: rgba(201,139,255,0.30); }
+
+/* Phase overview table */
+.phasetable td:first-child { width: 46px; text-align: center; color: var(--fg-dim); font-family: var(--mono); }
+.phasetable td:last-child  { white-space: nowrap; }
+.phasetable td .sub { display: block; color: var(--fg-dim); font-size: .86em; margin-top: 2px; }
+
+/* Legend */
+.legend { display: flex; flex-wrap: wrap; gap: 14px; margin: 1em 0 0; color: var(--fg-muted); font-size: .9em; }
+.legend span { display: inline-flex; align-items: center; gap: 7px; }
+
+/* Progress log entries */
+.log { border-left: 2px solid var(--border); padding-left: 20px; margin: 1.4em 0; }
+.log h4 { color: var(--heading); margin: 0 0 .3em; font-size: 1rem; }
+.log .when { color: var(--fg-dim); font-family: var(--mono); font-size: .8em; letter-spacing: .3px; }
+
 @media (max-width: 600px) {
   body { font-size: 15px; }
   h1 { font-size: 1.7rem; } .hero h1 { font-size: 2.2rem; }
@@ -581,7 +608,10 @@ inspector work across all three types.</p>
   GUI, delivered as a <strong>separate React + CSS web app</strong> (with WASM only for the 3D viewer and
   hot render paths; see §7), so a library can be browsed from any device on the network with
   no install. Being DOM-based, it degrades responsively to tablet/phone widths — desktop and
-  tablet first, phones graceful-degrade (see <a href="roadmap.html">ROADMAP.md</a>).</li>
+  tablet first, phones graceful-degrade: the three-region workspace collapses to a single
+  scrollable column at tablet width, with 44×44px minimum touch targets. Full small-screen
+  polish and real-device testing are tracked UX debt, not a v1 gate (responsive detail in
+  <a href="tech-spec/09-server-and-web-client.md">tech-spec 09</a>).</li>
 <li>The desktop GUI and CLI can <strong>connect</strong> to a running server as their whole backend
   (e.g. <code>3dam --connect host:port …</code>) — distinct from adding it as a federated <em>source</em>.</li>
 <li>Also exposes a <strong>built-in MCP server for AI agents on the same port</strong> (§6.10) — no separate
@@ -756,20 +786,20 @@ can read and set it too — so nothing is browser-only and a headless operator i
 <p>Choices to be validated by spikes; listed to establish direction, not to lock in.</p>
 <ul>
 <li><strong>Language:</strong> Rust across core, CLI, and GUI.</li>
-<li><strong>GUI:</strong> a native, GPU-accelerated Rust UI toolkit — leading candidates <strong>egui/eframe</strong>
-  or <strong>Iced</strong> — with <strong>wgpu</strong> for the embedded 3D viewer and custom thumbnail/waveform
-  rendering. (Decision recorded in a later ADR.)</li>
-<li><strong>Database:</strong> embedded <strong>SQLite</strong> (via <code>rusqlite</code>/<code>sqlx</code>) for metadata; a vector index
-  for similarity (e.g. <code>sqlite-vec</code>, <code>usearch</code>, or an HNSW crate). Local, single-file,
-  portable.</li>
+<li><strong>GUI:</strong> a native, GPU-accelerated Rust UI toolkit — <strong><code>egui</code>/<code>eframe</code></strong>
+  (<a href="adr/0005-gui-toolkit-egui.md">ADR 0005</a>) — with <strong>wgpu</strong> for the embedded 3D viewer and
+  custom thumbnail/waveform rendering.</li>
+<li><strong>Database:</strong> embedded <strong>SQLite</strong> (via <code>rusqlite</code>/<code>sqlx</code>) for metadata; the vector index for
+  similarity is a <strong>sidecar HNSW (<code>usearch</code>)</strong> (<a href="../spikes/vector-index/README.md">spike</a>), with
+  <code>sqlite-vec</code> retained for small libraries / exact re-rank. Local, single-file, portable.</li>
 <li><strong>Audio:</strong> <code>symphonia</code> (decode) + FFT/DSP crates (<code>rustfft</code>/<code>realfft</code>) for feature
   extraction; playback via <code>cpal</code>/<code>rodio</code>.</li>
 <li><strong>Image:</strong> <code>image</code> + <code>imageproc</code>; perceptual hashing (<code>img_hash</code>); optional GPU decode.</li>
 <li><strong>3D:</strong> <code>gltf</code> and format loaders (glTF/FBX/OBJ/etc.), <code>wgpu</code> for rendering turntable
   thumbnails and the interactive viewer; mesh optimisation via <code>meshopt</code>-style tooling.</li>
-<li><strong>ML / embeddings:</strong> on-device inference via <code>candle</code> or ONNX Runtime (<code>ort</code>) to run
-  CLIP-style image models, audio embedding models, and shape/multi-view models — all local,
-  no cloud calls.</li>
+<li><strong>ML / embeddings:</strong> on-device inference via <strong><code>candle</code></strong> (<a href="adr/0006-inference-runtime-candle.md">ADR 0006</a>;
+  ONNX Runtime <code>ort</code> a feature-gated fallback) to run CLIP-style image models, audio embedding
+  models, and shape/multi-view models — all local, no cloud calls.</li>
 <li><strong>File sources:</strong> SFTP via <code>russh</code>/<code>ssh2</code>; SMB/Samba via an SMB client crate; behind the
   common <code>Source</code> trait.</li>
 <li><strong>Federated sources:</strong> a 3DAM-server <code>Source</code> implementation that satisfies the same trait
@@ -800,8 +830,8 @@ can read and set it too — so nothing is browser-only and a headless operator i
   any hot render paths like waveforms/thumbnails) embedded in the DOM layout. Talks to the
   engine purely over the serve API. The DOM shell gets responsive layout, touch, text input,
   and accessibility for free; WASM is reserved for the heavy canvas. See
-  <a href="roadmap.html">ROADMAP.md</a> for why this leads over egui-in-WASM and why it ships before the
-  desktop GUI.</li>
+  <a href="adr/0008-web-client-stack.md">ADR 0008</a> and <a href="adr/0009-v1-scope-decisions.md">ADR 0009 §9</a>
+  for why this leads over egui-in-WASM and why it ships before the desktop GUI.</li>
 <li><strong>Concurrency:</strong> bounded worker pools (<code>rayon</code> for CPU-parallel analysis, async runtime
   for I/O-bound source access) feeding an incremental, non-blocking pipeline.</li>
 </ul>
@@ -814,15 +844,17 @@ can read and set it too — so nothing is browser-only and a headless operator i
 <li><strong>Privacy:</strong> no telemetry, no unsolicited network calls, no account.</li>
 <li><strong>Portability:</strong> one engine codebase, three OSes; documented DB and plain-text export.
   Cross-platform binaries + native installers (<code>.deb</code>/<code>.msi</code>/<code>.dmg</code>) ship from a tag-triggered
-  CI matrix — see <a href="roadmap.html">ROADMAP.md</a> §Release &amp; distribution.</li>
+  CI matrix — see <a href="tech-spec/15-observability-config-testing-packaging.md">tech-spec 15</a> §15.5
+  (Packaging &amp; release).</li>
 <li><strong>Reproducibility:</strong> versioned analysis; explainable automated results.</li>
 </ul>
 <h2 id="9-phasing-indicative">9. Phasing (indicative)</h2>
 <blockquote>
-<p>This phasing tracks <strong>capability maturity</strong> (what works), not front-end build order. The
-<strong>front-end sequence is web-first</strong> — the React + CSS web client ships before the egui
-desktop GUI, and the <code>LibraryService</code>/serve API is pulled early to support it. Where the
-steps below mention a GUI or web client, read the order from <a href="roadmap.html">ROADMAP.md</a>.</p>
+<p>This phasing tracks <strong>capability maturity</strong> (what works). The <strong>front-end sequence is
+web-first</strong> — the React + CSS web client ships before the egui desktop GUI, and the
+<code>LibraryService</code>/serve API is pulled early to support it (see §7 and
+<a href="adr/0008-web-client-stack.md">ADR 0008</a>). This section is the single source of truth for
+build phasing; where a step mentions a GUI or web client, that web-first ordering applies.</p>
 </blockquote>
 <ol>
 <li><strong>Foundation:</strong> <code>3dam-core</code> skeleton, unified schema, local source scanning, SQLite
@@ -848,45 +880,57 @@ steps below mention a GUI or web client, read the order from <a href="roadmap.ht
 </ol>
 <h2 id="10-open-questions">10. Open questions</h2>
 <ul>
-<li>GUI toolkit final choice (egui vs Iced vs other) — needs a rendering/perf spike.</li>
-<li>Which concrete embedding models per media type balance quality, size, and speed on-device.</li>
-<li>Vector index: embedded extension vs standalone crate; on-disk vs in-memory at scale.</li>
-<li>Extent of write-back to sources (rename/relocate) vs strictly-read-only default.</li>
-<li>Format coverage matrix for v1 vs later (which loaders/converters ship first).</li>
+<li>~~GUI toolkit final choice (egui vs Iced vs other).~~ <strong>Decided:</strong> <code>egui</code>/<code>eframe</code>
+  (<a href="adr/0005-gui-toolkit-egui.md">ADR 0005</a>); the perf spike is a validation follow-up.</li>
+<li>~~Which concrete embedding models per media type.~~ <strong>Researched</strong> (<a href="../spikes/embedding-models/README.md"><code>spikes/embedding-models/</code></a>):
+  <strong>SigLIP 768-d</strong> (image; + DINOv2 for dedup), <strong>LAION-CLAP 512-d</strong> (audio, via <code>ort</code>),
+  <strong>multi-view→SigLIP 768-d</strong> (3D). Runtime <code>candle</code> (<a href="adr/0006-inference-runtime-candle.md">ADR 0006</a>);
+  audio forces the <code>ort</code> fallback. A follow-up code spike validates on-domain quality + latency
+  before dims freeze.</li>
+<li>~~Vector index: embedded extension vs standalone crate; on-disk vs in-memory at scale.~~
+  <strong>Decided:</strong> sidecar HNSW (<code>usearch</code>) as the primary index, <code>sqlite-vec</code> for small libraries /
+  exact re-rank (<a href="../spikes/vector-index/README.md">spike</a>).</li>
+<li>~~Extent of write-back to sources (rename/relocate) vs strictly-read-only default.~~
+  <strong>Decided:</strong> strictly <strong>read-only default</strong> in v1; write-back (rename/relocate) is opt-in and
+  <strong>post-v1</strong>.</li>
+<li>~~Format coverage matrix for v1 vs later.~~ <strong>Decided</strong> (<a href="adr/0009-v1-scope-decisions.md">ADR 0009 §8</a>):
+  v1 decodes PNG/JPEG/WebP/TIFF/GIF/BMP/DDS/KTX2, WAV/FLAC/OGG/MP3/AAC-MP4, glTF/OBJ/FBX(decode)/PLY/STL;
+  encode = glTF family + OBJ; USD decode and FBX/USD encode post-v1.</li>
 <li>~~Web client approach: shared Rust→WASM view code vs a separate web UI.~~ <strong>Decided:</strong>
-  separate <strong>React + CSS</strong> web app with WASM only for viewer/render islands, built before the
-  desktop GUI (see <a href="roadmap.html">ROADMAP.md</a>). Remaining detail — the React stack (bundler,
-  router, state) and how WASM islands are packaged/fed data — tracked in the roadmap.</li>
-<li>Server auth/security model: token vs account, TLS, and how far the server hardens for
-  exposure beyond localhost/LAN in v1.</li>
-<li><strong>Feature-flag store &amp; lifecycle:</strong> where flag state persists (a table beside the metadata DB
-  vs a watched config file), how config-file and admin-UI edits reconcile when both change, and
-  which flags can flip <strong>live</strong> vs require a restart (§6.11).</li>
-<li><strong>User-accounts scope for v1:</strong> how far the role/scope model goes (fixed admin/editor/viewer
-  vs custom roles), where per-account visibility scoping bottoms out (source- and
-  collection-level vs per-asset), account recovery/first-admin bootstrap, and session/token
-  lifetime. Accounts are opt-in, so v1 can start minimal.</li>
-<li><strong>Headless 3D rendering on GPU-less servers:</strong> software-raster fallback (lavapipe/llvmpipe)
-  vs a CPU thumbnail path vs render-on-demand by a GPU-capable client. Needs a spike on a
-  headless Linux box with no display and no discrete GPU — the exact §6.8 serve target.</li>
-<li><strong>Cross-peer similarity:</strong> ranking similarity hits across peers needs compatible embedding
-  spaces (same model + version). Options: advertise embedding model/version in the API and
-  gate cross-peer ranking on a match, negotiate a shared space, or fall back to
-  per-peer-ranked, grouped results. Needs a spike.</li>
-<li><strong>Federated query semantics:</strong> timeouts, partial results when a peer is slow/offline,
-  pagination and result caps across N peers, and how much of a peer's catalog to cache
-  locally for responsiveness.</li>
-<li><strong>Federation protocol &amp; versioning:</strong> the API contract between instances (and how it
-  evolves) as the seed of a future mesh; auth-standard subset to support first.</li>
-<li><strong>MCP surface &amp; safety:</strong> tool granularity (one <code>search</code> vs many narrow tools), how far to
-  lean on resources/prompts vs tools, and exactly which write tools to expose and how they are
-  gated when the server is exposed beyond localhost (read-only default, auth scopes, per-tool
-  opt-in). Also: whether federated peers' MCP endpoints should be reachable transitively.</li>
-<li><strong>License taxonomy &amp; detection:</strong> how far to lean on SPDX vs a 3DAM rights model for
-  non-code assets; how much to auto-detect (from pack manifests, sidecars, <code>LICENSE</code>/readme
-  files, store metadata) vs require the user to set; and how to represent per-asset overrides
-  within a pack that has one blanket license. 3DAM records and surfaces license — it is not
-  legal advice, and unknown stays unknown.</li>
+  separate <strong>React + TypeScript + Tailwind</strong> web app on Vite/pnpm, WASM only for viewer/render
+  islands, built before the desktop GUI (<a href="adr/0008-web-client-stack.md">ADR 0008</a>). Remaining
+  detail — how WASM islands are packaged/fed data — decided in
+  <a href="adr/0009-v1-scope-decisions.md">ADR 0009 §9</a>.</li>
+<li>~~Server auth/security model &amp; TLS.~~ <strong>Decided</strong> (<a href="adr/0009-v1-scope-decisions.md">ADR 0009 §4</a>):
+  rate-limit + lockout + CSRF; static <code>rustls</code> cert/key (ACME post-v1); <strong>bind beyond localhost
+  without TLS is refused</strong> unless <code>--insecure</code>.</li>
+<li>~~<strong>Feature-flag store &amp; lifecycle.</strong>~~ <strong>Decided</strong> (<a href="adr/0009-v1-scope-decisions.md">ADR 0009 §2</a>):
+  versioned <code>server.db</code> table, per-flag <code>config_authority</code> (default <code>seed-only</code>, <code>reconcile</code>
+  opt-in, no auto-revert), live-by-default + a frozen restart-only set.</li>
+<li>~~<strong>User-accounts scope for v1.</strong>~~ <strong>Decided</strong> (<a href="adr/0009-v1-scope-decisions.md">ADR 0009 §3</a>):
+  fixed <code>admin</code>/<code>editor</code>/<code>viewer</code>, source/collection visibility, config-bootstrap recovery,
+  session 14d inactivity / 90d max. Custom roles and per-asset scoping are post-v1.</li>
+<li>~~<strong>Headless 3D rendering on GPU-less servers.</strong>~~ <strong>Decided:</strong> wgpu renders headless with a
+  <strong>software-raster fallback</strong> (Mesa lavapipe/llvmpipe); the fallback ladder is validated by
+  <a href="../spikes/headless-render/README.md"><code>spikes/headless-render/</code></a> (<a href="adr/0001-3d-render-backend.md">ADR 0001</a>).</li>
+<li>~~<strong>Cross-peer similarity.</strong>~~ <strong>Decided:</strong> advertise an embedding-space id and <strong>gate
+  cross-peer ranking on an exact match</strong>, falling back to <strong>per-peer-ranked grouped results</strong>
+  when spaces differ; a shared/negotiated space is deferred (<a href="../spikes/cross-peer-similarity/README.md">spike</a>:
+  same-space rank corr 0.817 vs ~0 for mismatched, zero-error gate).</li>
+<li>~~<strong>Federated query semantics.</strong>~~ <strong>Decided</strong> (<a href="adr/0009-v1-scope-decisions.md">ADR 0009 §5</a>):
+  2.5 s fixed deadline, partial results flagged, <code>total = None</code>, accept cursor drift, LRU
+  peer-cache min(2 GB, 10% disk) / 7-day TTL.</li>
+<li>~~<strong>Federation protocol &amp; versioning.</strong>~~ <strong>Decided</strong> (<a href="adr/0009-v1-scope-decisions.md">ADR 0009 §5</a>):
+  versioned subset of the read API + <code>advertise()</code> carrying <code>protocol_version</code> + <code>space_id</code>; newer
+  peers degrade to the caller's version; bearer-token auth first (OIDC federation post-v1).</li>
+<li>~~<strong>MCP surface &amp; safety.</strong>~~ <strong>Decided</strong> (<a href="adr/0009-v1-scope-decisions.md">ADR 0009 §6</a>): a small
+  purpose-tool set + resources, read-only by default, per-tool opt-in writes gated on auth beyond
+  localhost, no transitive peer MCP.</li>
+<li>~~<strong>License taxonomy &amp; detection.</strong>~~ <strong>Decided</strong> (<a href="adr/0009-v1-scope-decisions.md">ADR 0009 §1</a>):
+  <strong>no defaults — unknown stays unknown, never inferred.</strong> Hybrid representation (SPDX id |
+  Proprietary | Custom | NULL) + tri-state rights flags; licences recorded only from explicit
+  declarations; per-asset overrides via an <code>'inherited'</code> provenance. 3DAM records and surfaces
+  licence — it is not legal advice.</li>
 </ul>
 <hr />
 <p>See also: <a href="mission.html">MISSION.md</a> · <a href="design_guidelines.html">DESIGN_GUIDELINES.md</a></p>

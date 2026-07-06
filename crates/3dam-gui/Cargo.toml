@@ -6,4 +6,4 @@ license.workspace = true
 description = "Native desktop shell (egui/eframe, ADR 0005) over the LibraryService seam (tech-spec 12). Stub until the GUI phase."
 
 [dependencies]
-# egui/eframe + egui-wgpu land with the GUI phase (ROADMAP: desktop follows the web client).
+# egui/eframe + egui-wgpu land with the GUI phase (desktop follows the web client — PRODUCT_SPEC §9).

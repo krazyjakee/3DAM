@@ -428,7 +428,10 @@ inspector work across all three types.
   GUI, delivered as a **separate React + CSS web app** (with WASM only for the 3D viewer and
   hot render paths; see §7), so a library can be browsed from any device on the network with
   no install. Being DOM-based, it degrades responsively to tablet/phone widths — desktop and
-  tablet first, phones graceful-degrade (see [ROADMAP.md](ROADMAP.md)).
+  tablet first, phones graceful-degrade: the three-region workspace collapses to a single
+  scrollable column at tablet width, with 44×44px minimum touch targets. Full small-screen
+  polish and real-device testing are tracked UX debt, not a v1 gate (responsive detail in
+  [tech-spec 09](tech-spec/09-server-and-web-client.md)).
 - The desktop GUI and CLI can **connect** to a running server as their whole backend
   (e.g. `3dam --connect host:port …`) — distinct from adding it as a federated *source*.
 - Also exposes a **built-in MCP server for AI agents on the same port** (§6.10) — no separate
@@ -637,8 +640,8 @@ Choices to be validated by spikes; listed to establish direction, not to lock in
   any hot render paths like waveforms/thumbnails) embedded in the DOM layout. Talks to the
   engine purely over the serve API. The DOM shell gets responsive layout, touch, text input,
   and accessibility for free; WASM is reserved for the heavy canvas. See
-  [ROADMAP.md](ROADMAP.md) for why this leads over egui-in-WASM and why it ships before the
-  desktop GUI.
+  [ADR 0008](adr/0008-web-client-stack.md) and [ADR 0009 §9](adr/0009-v1-scope-decisions.md)
+  for why this leads over egui-in-WASM and why it ships before the desktop GUI.
 - **Concurrency:** bounded worker pools (`rayon` for CPU-parallel analysis, async runtime
   for I/O-bound source access) feeding an incremental, non-blocking pipeline.
 
@@ -651,15 +654,17 @@ Choices to be validated by spikes; listed to establish direction, not to lock in
 - **Privacy:** no telemetry, no unsolicited network calls, no account.
 - **Portability:** one engine codebase, three OSes; documented DB and plain-text export.
   Cross-platform binaries + native installers (`.deb`/`.msi`/`.dmg`) ship from a tag-triggered
-  CI matrix — see [ROADMAP.md](ROADMAP.md) §Release & distribution.
+  CI matrix — see [tech-spec 15](tech-spec/15-observability-config-testing-packaging.md) §15.5
+  (Packaging & release).
 - **Reproducibility:** versioned analysis; explainable automated results.
 
 ## 9. Phasing (indicative)
 
-> This phasing tracks **capability maturity** (what works), not front-end build order. The
-> **front-end sequence is web-first** — the React + CSS web client ships before the egui
-> desktop GUI, and the `LibraryService`/serve API is pulled early to support it. Where the
-> steps below mention a GUI or web client, read the order from [ROADMAP.md](ROADMAP.md).
+> This phasing tracks **capability maturity** (what works). The **front-end sequence is
+> web-first** — the React + CSS web client ships before the egui desktop GUI, and the
+> `LibraryService`/serve API is pulled early to support it (see §7 and
+> [ADR 0008](adr/0008-web-client-stack.md)). This section is the single source of truth for
+> build phasing; where a step mentions a GUI or web client, that web-first ordering applies.
 
 1. **Foundation:** `3dam-core` skeleton, unified schema, local source scanning, SQLite
    store, basic grid/table browser + text search, CLI `scan`/`search`.
@@ -686,48 +691,55 @@ Choices to be validated by spikes; listed to establish direction, not to lock in
 
 - ~~GUI toolkit final choice (egui vs Iced vs other).~~ **Decided:** `egui`/`eframe`
   ([ADR 0005](adr/0005-gui-toolkit-egui.md)); the perf spike is a validation follow-up.
-- Which concrete embedding models per media type balance quality, size, and speed on-device.
-  (The *runtime* is decided — `candle`, [ADR 0006](adr/0006-inference-runtime-candle.md); the
-  concrete models remain open.)
+- ~~Which concrete embedding models per media type.~~ **Researched** ([`spikes/embedding-models/`](../spikes/embedding-models/README.md)):
+  **SigLIP 768-d** (image; + DINOv2 for dedup), **LAION-CLAP 512-d** (audio, via `ort`),
+  **multi-view→SigLIP 768-d** (3D). Runtime `candle` ([ADR 0006](adr/0006-inference-runtime-candle.md));
+  audio forces the `ort` fallback. A follow-up code spike validates on-domain quality + latency
+  before dims freeze.
 - ~~Vector index: embedded extension vs standalone crate; on-disk vs in-memory at scale.~~
   **Decided:** sidecar HNSW (`usearch`) as the primary index, `sqlite-vec` for small libraries /
   exact re-rank ([spike](../spikes/vector-index/README.md)).
-- Extent of write-back to sources (rename/relocate) vs strictly-read-only default.
-- Format coverage matrix for v1 vs later (which loaders/converters ship first).
+- ~~Extent of write-back to sources (rename/relocate) vs strictly-read-only default.~~
+  **Decided:** strictly **read-only default** in v1; write-back (rename/relocate) is opt-in and
+  **post-v1**.
+- ~~Format coverage matrix for v1 vs later.~~ **Decided** ([ADR 0009 §8](adr/0009-v1-scope-decisions.md)):
+  v1 decodes PNG/JPEG/WebP/TIFF/GIF/BMP/DDS/KTX2, WAV/FLAC/OGG/MP3/AAC-MP4, glTF/OBJ/FBX(decode)/PLY/STL;
+  encode = glTF family + OBJ; USD decode and FBX/USD encode post-v1.
 - ~~Web client approach: shared Rust→WASM view code vs a separate web UI.~~ **Decided:**
-  separate **React + CSS** web app with WASM only for viewer/render islands, built before the
-  desktop GUI (see [ROADMAP.md](ROADMAP.md)). Remaining detail — the React stack (bundler,
-  router, state) and how WASM islands are packaged/fed data — tracked in the roadmap.
-- Server auth/security model: token vs account, TLS, and how far the server hardens for
-  exposure beyond localhost/LAN in v1.
-- **Feature-flag store & lifecycle:** where flag state persists (a table beside the metadata DB
-  vs a watched config file), how config-file and admin-UI edits reconcile when both change, and
-  which flags can flip **live** vs require a restart (§6.11).
-- **User-accounts scope for v1:** how far the role/scope model goes (fixed admin/editor/viewer
-  vs custom roles), where per-account visibility scoping bottoms out (source- and
-  collection-level vs per-asset), account recovery/first-admin bootstrap, and session/token
-  lifetime. Accounts are opt-in, so v1 can start minimal.
-- **Headless 3D rendering on GPU-less servers:** software-raster fallback (lavapipe/llvmpipe)
-  vs a CPU thumbnail path vs render-on-demand by a GPU-capable client. Needs a spike on a
-  headless Linux box with no display and no discrete GPU — the exact §6.8 serve target.
-- **Cross-peer similarity:** ranking similarity hits across peers needs compatible embedding
-  spaces (same model + version). Options: advertise embedding model/version in the API and
-  gate cross-peer ranking on a match, negotiate a shared space, or fall back to
-  per-peer-ranked, grouped results. Needs a spike.
-- **Federated query semantics:** timeouts, partial results when a peer is slow/offline,
-  pagination and result caps across N peers, and how much of a peer's catalog to cache
-  locally for responsiveness.
-- **Federation protocol & versioning:** the API contract between instances (and how it
-  evolves) as the seed of a future mesh; auth-standard subset to support first.
-- **MCP surface & safety:** tool granularity (one `search` vs many narrow tools), how far to
-  lean on resources/prompts vs tools, and exactly which write tools to expose and how they are
-  gated when the server is exposed beyond localhost (read-only default, auth scopes, per-tool
-  opt-in). Also: whether federated peers' MCP endpoints should be reachable transitively.
-- **License taxonomy & detection:** how far to lean on SPDX vs a 3DAM rights model for
-  non-code assets; how much to auto-detect (from pack manifests, sidecars, `LICENSE`/readme
-  files, store metadata) vs require the user to set; and how to represent per-asset overrides
-  within a pack that has one blanket license. 3DAM records and surfaces license — it is not
-  legal advice, and unknown stays unknown.
+  separate **React + TypeScript + Tailwind** web app on Vite/pnpm, WASM only for viewer/render
+  islands, built before the desktop GUI ([ADR 0008](adr/0008-web-client-stack.md)). Remaining
+  detail — how WASM islands are packaged/fed data — decided in
+  [ADR 0009 §9](adr/0009-v1-scope-decisions.md).
+- ~~Server auth/security model & TLS.~~ **Decided** ([ADR 0009 §4](adr/0009-v1-scope-decisions.md)):
+  rate-limit + lockout + CSRF; static `rustls` cert/key (ACME post-v1); **bind beyond localhost
+  without TLS is refused** unless `--insecure`.
+- ~~**Feature-flag store & lifecycle.**~~ **Decided** ([ADR 0009 §2](adr/0009-v1-scope-decisions.md)):
+  versioned `server.db` table, per-flag `config_authority` (default `seed-only`, `reconcile`
+  opt-in, no auto-revert), live-by-default + a frozen restart-only set.
+- ~~**User-accounts scope for v1.**~~ **Decided** ([ADR 0009 §3](adr/0009-v1-scope-decisions.md)):
+  fixed `admin`/`editor`/`viewer`, source/collection visibility, config-bootstrap recovery,
+  session 14d inactivity / 90d max. Custom roles and per-asset scoping are post-v1.
+- ~~**Headless 3D rendering on GPU-less servers.**~~ **Decided:** wgpu renders headless with a
+  **software-raster fallback** (Mesa lavapipe/llvmpipe); the fallback ladder is validated by
+  [`spikes/headless-render/`](../spikes/headless-render/README.md) ([ADR 0001](adr/0001-3d-render-backend.md)).
+- ~~**Cross-peer similarity.**~~ **Decided:** advertise an embedding-space id and **gate
+  cross-peer ranking on an exact match**, falling back to **per-peer-ranked grouped results**
+  when spaces differ; a shared/negotiated space is deferred ([spike](../spikes/cross-peer-similarity/README.md):
+  same-space rank corr 0.817 vs ~0 for mismatched, zero-error gate).
+- ~~**Federated query semantics.**~~ **Decided** ([ADR 0009 §5](adr/0009-v1-scope-decisions.md)):
+  2.5 s fixed deadline, partial results flagged, `total = None`, accept cursor drift, LRU
+  peer-cache min(2 GB, 10% disk) / 7-day TTL.
+- ~~**Federation protocol & versioning.**~~ **Decided** ([ADR 0009 §5](adr/0009-v1-scope-decisions.md)):
+  versioned subset of the read API + `advertise()` carrying `protocol_version` + `space_id`; newer
+  peers degrade to the caller's version; bearer-token auth first (OIDC federation post-v1).
+- ~~**MCP surface & safety.**~~ **Decided** ([ADR 0009 §6](adr/0009-v1-scope-decisions.md)): a small
+  purpose-tool set + resources, read-only by default, per-tool opt-in writes gated on auth beyond
+  localhost, no transitive peer MCP.
+- ~~**License taxonomy & detection.**~~ **Decided** ([ADR 0009 §1](adr/0009-v1-scope-decisions.md)):
+  **no defaults — unknown stays unknown, never inferred.** Hybrid representation (SPDX id |
+  Proprietary | Custom | NULL) + tri-state rights flags; licences recorded only from explicit
+  declarations; per-asset overrides via an `'inherited'` provenance. 3DAM records and surfaces
+  licence — it is not legal advice.
 
 ---
 

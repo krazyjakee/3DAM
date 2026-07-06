@@ -74,9 +74,7 @@ enum Cmd {
     /// List background jobs.
     Jobs,
     /// Show one job's status.
-    Job {
-        id: String,
-    },
+    Job { id: String },
 }
 
 #[derive(Subcommand)]
@@ -136,7 +134,13 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 None => Vec::new(),
             };
             let job_id = lib
-                .submit_scan(&ctx, ScanRequest { sources, mode: ScanMode::Full })
+                .submit_scan(
+                    &ctx,
+                    ScanRequest {
+                        sources,
+                        mode: ScanMode::Full,
+                    },
+                )
                 .await?;
             if json {
                 println!("{}", serde_json::json!({ "job_id": job_id }));
@@ -254,7 +258,10 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                         j.kind,
                         j.state,
                         j.progress.done,
-                        j.progress.total.map(|t| t.to_string()).unwrap_or_else(|| "?".into())
+                        j.progress
+                            .total
+                            .map(|t| t.to_string())
+                            .unwrap_or_else(|| "?".into())
                     );
                 }
             }
@@ -326,14 +333,14 @@ struct ServeArgs {
 /// Entry point for the `serve` role. Dispatches into `3dam-server`.
 pub async fn serve(args: Vec<OsString>) -> ExitCode {
     init_tracing();
-    let parsed = match ServeArgs::try_parse_from(std::iter::once(OsString::from("serve")).chain(args))
-    {
-        Ok(a) => a,
-        Err(e) => {
-            let _ = e.print();
-            return ExitCode::from(2);
-        }
-    };
+    let parsed =
+        match ServeArgs::try_parse_from(std::iter::once(OsString::from("serve")).chain(args)) {
+            Ok(a) => a,
+            Err(e) => {
+                let _ = e.print();
+                return ExitCode::from(2);
+            }
+        };
     let addr: SocketAddr = match parsed.addr.parse() {
         Ok(a) => a,
         Err(_) => {
@@ -403,7 +410,8 @@ fn parse_endpoint(s: &str) -> anyhow::Result<Url> {
 }
 
 fn parse_source_id(s: &str) -> anyhow::Result<SourceId> {
-    s.parse().map_err(|_| anyhow::anyhow!("invalid source id: {s}"))
+    s.parse()
+        .map_err(|_| anyhow::anyhow!("invalid source id: {s}"))
 }
 
 fn init_tracing() {
@@ -477,7 +485,11 @@ fn print_stats(s: &LibraryStats) {
 fn print_asset(a: &Asset) {
     println!("{}", a.summary.name);
     println!("  id:       {}", a.summary.id);
-    println!("  media:    {}/{}", a.summary.media.as_str(), a.summary.format);
+    println!(
+        "  media:    {}/{}",
+        a.summary.media.as_str(),
+        a.summary.format
+    );
     println!("  size:     {}", human_size(a.summary.size));
     println!("  path:     {}", a.path);
     if let Some(h) = &a.hash {

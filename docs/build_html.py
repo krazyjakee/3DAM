@@ -17,7 +17,7 @@ PAGES = [
     ("MISSION.md",           "mission",           "Mission",     "Why 3DAM exists"),
     ("DESIGN_GUIDELINES.md", "design_guidelines", "Design",      "How it's built & behaves"),
     ("PRODUCT_SPEC.md",      "product_spec",      "Spec",        "What it is, in detail"),
-    ("ROADMAP.md",           "roadmap",           "Roadmap",     "What we build, in what order"),
+    ("ROADMAP.md",           "roadmap",           "Roadmap",     "Build status by capability phase"),
 ]
 MD_TO_SLUG = {src: slug for src, slug, _, _ in PAGES}
 
@@ -175,6 +175,33 @@ blockquote {
 .card h3 { margin: 8px 0 6px; color: var(--heading); }
 .card p { margin: 0; color: var(--fg-muted); font-size: .95em; }
 
+/* Status pills */
+.pill {
+  display: inline-block; font-family: var(--mono); font-size: .72em;
+  font-weight: 600; letter-spacing: .4px; text-transform: uppercase;
+  padding: .18em .6em; border-radius: 999px; border: 1px solid transparent;
+  vertical-align: middle; white-space: nowrap;
+}
+.pill.done   { color: #35d0ba; background: rgba(53,208,186,0.12);  border-color: rgba(53,208,186,0.35); }
+.pill.active { color: #ffcf5c; background: rgba(255,207,92,0.12);   border-color: rgba(255,207,92,0.35); }
+.pill.next   { color: #7aa2ff; background: rgba(122,162,255,0.12);  border-color: rgba(122,162,255,0.35); }
+.pill.todo   { color: #8b98a9; background: rgba(139,152,169,0.10);  border-color: rgba(139,152,169,0.28); }
+.pill.later  { color: #c98bff; background: rgba(201,139,255,0.10);  border-color: rgba(201,139,255,0.30); }
+
+/* Phase overview table */
+.phasetable td:first-child { width: 46px; text-align: center; color: var(--fg-dim); font-family: var(--mono); }
+.phasetable td:last-child  { white-space: nowrap; }
+.phasetable td .sub { display: block; color: var(--fg-dim); font-size: .86em; margin-top: 2px; }
+
+/* Legend */
+.legend { display: flex; flex-wrap: wrap; gap: 14px; margin: 1em 0 0; color: var(--fg-muted); font-size: .9em; }
+.legend span { display: inline-flex; align-items: center; gap: 7px; }
+
+/* Progress log entries */
+.log { border-left: 2px solid var(--border); padding-left: 20px; margin: 1.4em 0; }
+.log h4 { color: var(--heading); margin: 0 0 .3em; font-size: 1rem; }
+.log .when { color: var(--fg-dim); font-family: var(--mono); font-size: .8em; letter-spacing: .3px; }
+
 @media (max-width: 600px) {
   body { font-size: 15px; }
   h1 { font-size: 1.7rem; } .hero h1 { font-size: 2.2rem; }
@@ -259,7 +286,7 @@ def convert():
         "mission": "Problem, answer, and principles.",
         "design_guidelines": "Rules for how 3DAM is built and behaves.",
         "product_spec": "Data model, features, architecture, and tech stack.",
-        "roadmap": "What we build, in what order, and why.",
+        "roadmap": "Build status against the capability phases in the spec.",
     }
     cards = "".join(
         f'<a class="card" href="{slug}.html"><div class="k">{sub}</div>'

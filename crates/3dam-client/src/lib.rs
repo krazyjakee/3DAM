@@ -28,6 +28,29 @@ pub struct ApiClient {
     http: reqwest::Client,
 }
 
+/// Recover `(media, format)` from a `Content-Type` — the inverse of `dam_api::dto::content_type_for`.
+/// Only informational on the client side (the bytes are what matter); unknown types default to model.
+fn media_from_content_type(ct: &str) -> (MediaType, String) {
+    let main = ct.split(';').next().unwrap_or(ct).trim();
+    match main {
+        "model/gltf-binary" => (MediaType::Model, "glb".to_string()),
+        "model/gltf+json" => (MediaType::Model, "gltf".to_string()),
+        "model/obj" => (MediaType::Model, "obj".to_string()),
+        "model/ply" => (MediaType::Model, "ply".to_string()),
+        "model/stl" => (MediaType::Model, "stl".to_string()),
+        "audio/wav" => (MediaType::Audio, "wav".to_string()),
+        "audio/mpeg" => (MediaType::Audio, "mp3".to_string()),
+        "audio/flac" => (MediaType::Audio, "flac".to_string()),
+        "audio/ogg" => (MediaType::Audio, "ogg".to_string()),
+        "audio/mp4" => (MediaType::Audio, "aac".to_string()),
+        m if m.starts_with("image/") => {
+            (MediaType::Image, m.trim_start_matches("image/").to_string())
+        }
+        m if m.starts_with("audio/") => (MediaType::Audio, String::new()),
+        _ => (MediaType::Model, String::new()),
+    }
+}
+
 impl ApiClient {
     /// Connect to a remote server. `endpoint` is its base URL (e.g. `http://127.0.0.1:7878`).
     pub async fn connect(endpoint: Url) -> Result<ApiClient, LibError> {
@@ -114,6 +137,47 @@ impl LibraryService for ApiClient {
         self.get(&format!("/api/v1/assets/{id}")).await
     }
 
+    async fn read_content(
+        &self,
+        _ctx: &AuthContext,
+        id: &AssetId,
+    ) -> Result<AssetContent, LibError> {
+        // Raw bytes, not JSON — reconstruct `AssetContent` from the HTTP response. Media/format are
+        // recovered from the `Content-Type` header (the server sets it via `content_type_for`).
+        let resp = self
+            .http
+            .get(self.url(&format!("/api/v1/assets/{id}/content"))?)
+            .send()
+            .await
+            .map_err(|e| LibError::SourceUnavailable(e.to_string()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let bytes = resp.bytes().await.unwrap_or_default();
+            return match serde_json::from_slice::<ErrorBody>(&bytes) {
+                Ok(body) => Err(LibError::from_body(body)),
+                Err(_) => Err(LibError::Upstream(format!("HTTP {}", status.as_u16()))),
+            };
+        }
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| LibError::Upstream(e.to_string()))?
+            .to_vec();
+        let (media, format) = media_from_content_type(&content_type);
+        Ok(AssetContent {
+            bytes,
+            content_type,
+            format,
+            media,
+        })
+    }
+
     async fn library_stats(&self, _ctx: &AuthContext) -> Result<LibraryStats, LibError> {
         self.get("/api/v1/stats").await
     }
@@ -122,11 +186,7 @@ impl LibraryService for ApiClient {
         self.get("/api/v1/sources").await
     }
 
-    async fn get_source(
-        &self,
-        _ctx: &AuthContext,
-        id: &SourceId,
-    ) -> Result<SourceInfo, LibError> {
+    async fn get_source(&self, _ctx: &AuthContext, id: &SourceId) -> Result<SourceInfo, LibError> {
         self.get(&format!("/api/v1/sources/{id}")).await
     }
 

@@ -29,7 +29,8 @@ Rationale:
 - **Preserves the "one binary" promise (PRODUCT_SPEC §2).** candle is pure Rust with no native
   C++ dependency to ship and dynamically load per OS, so the single `3dam` binary across
   Linux/Windows/macOS stays intact — consistent with the packaging story in
-  [ROADMAP.md](../ROADMAP.md) and the one-binary-three-roles architecture.
+  [tech-spec 15](../tech-spec/15-observability-config-testing-packaging.md) §15.5 and the
+  one-binary-three-roles architecture.
 - **Weights are `safetensors`,** loaded lazily and once (tech-spec 05 §2.3); models are optional
   artefacts fetched on first use (user-initiated, not bundled), which fits the no-unsolicited-
   network rule.
@@ -54,8 +55,12 @@ Rationale:
   when picking concrete models (still open, below).
 
 **Follow-ups**
-- **Concrete model selection per media type** remains open (tech-spec 05 Open questions /
-  PRODUCT_SPEC §10) — quality vs size vs on-device speed, and it fixes the embedding dimensions.
-  Prefer candle-native architectures; reach for `ort` only when forced.
-- Wire the `candle` (default) / `ort` (fallback) feature gating in [01](../tech-spec/01-architecture-and-crates.md).
-- A small load/latency spike per chosen model before locking dimensions in `EmbeddingSpace`.
+- ~~**Concrete model selection per media type**~~ — **researched 2026-07-06**
+  ([`spikes/embedding-models/`](../../spikes/embedding-models/README.md)): **SigLIP 768-d** (image,
+  candle-native; + DINOv2 384-d dedup) and **multi-view→SigLIP 768-d** (3D) stay pure-candle, but
+  **audio (LAION-CLAP 512-d) has no candle implementation and forces the `ort`/ONNX path** — so the
+  fallback below is **load-bearing in v1, not hypothetical.** Dims are provisional pending the
+  validation spike.
+- Wire the `candle` (default) / `ort` (**required for audio**) feature gating in [01](../tech-spec/01-architecture-and-crates.md).
+- A follow-up load/latency + on-domain-quality spike per chosen model (real game assets, real
+  candle/`ort` CPU latency) before locking the dimensions in `EmbeddingSpace`.
