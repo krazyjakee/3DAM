@@ -13,6 +13,8 @@ import type {
   CollectionMembers,
   DupGroup,
   DupRequest,
+  ExportReport,
+  ExportRequest,
   JobId,
   JobListRequest,
   JobStatus,
@@ -99,6 +101,9 @@ export const api = {
 
   /** Duplicate groups for review — exact (content hash) or near (pHash/embedding), tech-spec 05 §4. */
   listDuplicates: (req: DupRequest) => send<DupGroup[]>("POST", `${API}/duplicates`, req),
+
+  /** Export a manifest (json/csv/sidecar) for a selection / collection / query to a server path. */
+  exportAssets: (req: ExportRequest) => send<ExportReport>("POST", `${API}/export`, req),
 
   /** URL for an asset's raw bytes — fed to the WASM viewer islands (tech-spec 09 §B.3). The DOM
    *  fetches this and hands it across the wasm-bindgen boundary; the island does no networking. */

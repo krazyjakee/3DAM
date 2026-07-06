@@ -1,7 +1,7 @@
 import type React from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { LayoutGrid, Menu, Rows3, Search, Sparkles, X } from "lucide-react";
+import { FileDown, LayoutGrid, Menu, Rows3, Search, Sparkles, X } from "lucide-react";
 import { useAnalyze, useAssets, useCollectionMembers, useCollections } from "@/api/queries";
 import type { AssetSummary, SortField } from "@/api/types";
 import { useViewState } from "@/lib/view-state";
@@ -10,6 +10,7 @@ import { Thumbnail } from "./Thumbnail";
 import { LicenseBadge } from "./LicenseBadge";
 import { MediaIcon } from "./MediaIcon";
 import { ContextMenu, useLongPress, type MenuState } from "./ContextMenu";
+import { ExportDialog } from "./ExportDialog";
 
 /** Modifier keys that change what a click does to the multi-selection (issue #10/#22). */
 export interface ClickMods {
@@ -160,6 +161,7 @@ function SelectionBar({
   const collections = useCollections();
   const members = useCollectionMembers();
   const manual = (collections.data ?? []).filter((c) => c.kind === "manual");
+  const [showExport, setShowExport] = useState(false);
 
   return (
     <div className="flex items-center gap-2 border-b border-border bg-surface px-3 py-1.5 text-xs">
@@ -171,6 +173,12 @@ function SelectionBar({
       >
         <Sparkles size={12} /> Analyze
       </button>
+      <button className="btn coarse:min-h-11" onClick={() => setShowExport(true)}>
+        <FileDown size={12} /> Export
+      </button>
+      {showExport && (
+        <ExportDialog scope={{ assets: ids }} onClose={() => setShowExport(false)} />
+      )}
       <select
         className="field w-auto"
         value=""
@@ -212,7 +220,8 @@ function Toolbar({
   total: number | null;
   onOpenNav?: () => void;
 }) {
-  const { state, patch } = useViewState();
+  const { state, patch, request } = useViewState();
+  const [showExport, setShowExport] = useState(false);
   return (
     <div className="flex items-center gap-2 border-b border-border px-3 py-2">
       {/* Menu — opens the Navigation drawer once the layout collapses (responsive + touch pass). */}
@@ -272,6 +281,16 @@ function Toolbar({
         {total != null && total > count ? ` / ${total.toLocaleString()}` : ""}
       </span>
 
+      {/* Export the current view — a collection when one is active, else the faceted query. */}
+      <button
+        className="btn shrink-0 px-1.5 py-1 coarse:min-h-11 coarse:min-w-11 coarse:justify-center"
+        title="Export manifest for the current view"
+        aria-label="Export manifest"
+        onClick={() => setShowExport(true)}
+      >
+        <FileDown size={14} />
+      </button>
+
       <div className="flex overflow-hidden rounded border border-border">
         <ViewBtn active={state.view === "grid"} onClick={() => patch({ view: "grid" })}>
           <LayoutGrid size={14} />
@@ -280,6 +299,13 @@ function Toolbar({
           <Rows3 size={14} />
         </ViewBtn>
       </div>
+
+      {showExport && (
+        <ExportDialog
+          scope={state.collection ? { collection: state.collection } : { query: request }}
+          onClose={() => setShowExport(false)}
+        />
+      )}
     </div>
   );
 }

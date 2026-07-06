@@ -16,6 +16,7 @@ import type {
   CollectionId,
   CollectionMembers,
   DupRequest,
+  ExportRequest,
   JobListRequest,
   NewCollection,
   QueryRequest,
@@ -199,6 +200,12 @@ export function useCollectionMembers() {
       qc.invalidateQueries({ queryKey: ["asset"] });
     },
   });
+}
+
+/** Export a manifest (json/csv/sidecar). Read-only w.r.t. the catalog, so no cache invalidation;
+ *  the caller shows the returned report (path + counts). */
+export function useExport() {
+  return useMutation({ mutationFn: (req: ExportRequest) => api.exportAssets(req) });
 }
 
 export function useCancelJob() {

@@ -222,6 +222,30 @@ export interface CollectionMembers {
   remove?: AssetId[];
 }
 
+// ── export / manifests (phase 4: json/csv/sidecar) ──────────────────────────
+
+/** Manifest shape (mirrors `dam-api` `ExportFormat`): a single JSON doc, a single CSV, or one JSON
+ *  sidecar per asset under a directory. */
+export type ExportFormat = "json" | "csv" | "sidecar";
+
+/** What to export — explicit assets, a collection, or a search (the same faceted query as browse).
+ *  `output` is a file path for json/csv, a directory for sidecar (destinations are server-side; for
+ *  a local-first server that is the user's own disk). */
+export interface ExportRequest {
+  assets?: AssetId[];
+  collection?: CollectionId | null;
+  query?: QueryRequest | null;
+  format: ExportFormat;
+  output: string;
+  attribution_only?: boolean;
+}
+export interface ExportReport {
+  format: ExportFormat;
+  output: string;
+  assets: number;
+  files_written: number;
+}
+
 // ── duplicates (phase 3: exact content-hash + near pHash/embedding) ──────────
 
 /** Which duplicate tier to surface (mirrors `dam-api` `DupKind`): byte-identical `exact`, or
