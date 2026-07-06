@@ -18,6 +18,7 @@ import {
   type TokenInfo,
 } from "@/api/admin";
 import { ApiError } from "@/api/client";
+import { errorMessage, toast } from "@/lib/toast";
 
 const ALL_SCOPES: Scope[] = ["read", "write", "admin", "mcp_use", "federate"];
 
@@ -27,6 +28,9 @@ export function Settings() {
   const [tokens, setTokens] = useState<TokenInfo[]>([]);
   const [audit, setAudit] = useState<AuditEntry[]>([]);
   const [error, setError] = useState<string | null>(null);
+  // Which flag write is in flight — disables the flag controls so a slow admin round-trip can't be
+  // double-submitted into two conflicting writes (issue #23).
+  const [busyFlag, setBusyFlag] = useState<string | null>(null);
   const promptToken = useAdminTokenPrompt();
 
   const refresh = useCallback(async () => {
@@ -54,18 +58,27 @@ export function Settings() {
   /** Set a flag, retrying with `confirm` after an explicit warning on an exposure-increasing change. */
   const setFlag = useCallback(
     async (key: string, value: FlagValue, version: number) => {
+      setBusyFlag(key);
       try {
         await admin.setFlag(key, { value, expected_version: version });
         await refresh();
+        toast.success("Setting updated");
       } catch (e) {
         if (e instanceof ApiError && e.status === 400 && /exposure/i.test(e.message)) {
           if (window.confirm(`This increases exposure:\n\n${e.message}\n\nApply anyway?`)) {
-            await admin.setFlag(key, { value, expected_version: version, confirm: true });
-            await refresh();
+            try {
+              await admin.setFlag(key, { value, expected_version: version, confirm: true });
+              await refresh();
+              toast.success("Setting updated");
+            } catch (e2) {
+              toast.error(errorMessage(e2));
+            }
           }
         } else {
-          setError(e instanceof Error ? e.message : String(e));
+          toast.error(errorMessage(e));
         }
+      } finally {
+        setBusyFlag(null);
       }
     },
     [refresh],
@@ -113,6 +126,7 @@ export function Settings() {
           <Choice
             value={String(flag("authentication")?.value ?? "off")}
             options={["off", "anonymous", "token"]}
+            disabled={busyFlag !== null}
             onChange={(v) => {
               const f = flag("authentication");
               if (f) void setFlag(f.key, v as FlagValue, f.version);
@@ -128,6 +142,7 @@ export function Settings() {
           <Choice
             value={String(flag("mcp_server")?.value ?? "off")}
             options={["off", "read_only", "read_write"]}
+            disabled={busyFlag !== null}
             onChange={(v) => {
               const f = flag("mcp_server");
               if (f) void setFlag(f.key, v as FlagValue, f.version);
@@ -142,6 +157,7 @@ export function Settings() {
         >
           <Toggle
             checked={flag("network_writes")?.value === true}
+            disabled={busyFlag !== null}
             onChange={(v) => {
               const f = flag("network_writes");
               if (f) void setFlag(f.key, v, f.version);
@@ -239,15 +255,18 @@ function Choice({
   value,
   options,
   onChange,
+  disabled,
 }: {
   value: string;
   options: string[];
   onChange: (v: string) => void;
+  disabled?: boolean;
 }) {
   return (
     <select
-      className="rounded border border-neutral-700 bg-neutral-900 px-2 py-1"
+      className="rounded border border-neutral-700 bg-neutral-900 px-2 py-1 disabled:opacity-50"
       value={value}
+      disabled={disabled}
       onChange={(e) => onChange(e.target.value)}
     >
       {options.map((o) => (
@@ -259,14 +278,25 @@ function Choice({
   );
 }
 
-function Toggle({ checked, onChange }: { checked: boolean; onChange: (v: boolean) => void }) {
+function Toggle({
+  checked,
+  onChange,
+  disabled,
+}: {
+  checked: boolean;
+  onChange: (v: boolean) => void;
+  disabled?: boolean;
+}) {
   return (
     <button
       type="button"
       role="switch"
       aria-checked={checked}
+      disabled={disabled}
       onClick={() => onChange(!checked)}
-      className={`h-6 w-11 rounded-full transition ${checked ? "bg-accent" : "bg-neutral-700"}`}
+      className={`h-6 w-11 rounded-full transition disabled:opacity-50 ${
+        checked ? "bg-accent" : "bg-neutral-700"
+      }`}
     >
       <span
         className={`block h-5 w-5 rounded-full bg-white transition ${
@@ -282,16 +312,38 @@ function TokensSection({ tokens, onChange }: { tokens: TokenInfo[]; onChange: ()
   const [scopes, setScopes] = useState<Scope[]>(["read", "mcp_use"]);
   const [created, setCreated] = useState<NewTokenReply | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
+  // Which token is being revoked — keeps its row's button disabled during the round-trip so a
+  // second click can't fire a duplicate revoke (issue #23).
+  const [revoking, setRevoking] = useState<string | null>(null);
 
   const create = async () => {
     setErr(null);
+    setCreating(true);
     try {
       const reply = await admin.createToken({ label, scopes });
       setCreated(reply);
       setLabel("");
       onChange();
+      toast.success(`Token “${reply.label}” issued`);
     } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e));
+      setErr(errorMessage(e));
+      toast.error(errorMessage(e));
+    } finally {
+      setCreating(false);
+    }
+  };
+
+  const revoke = async (id: string) => {
+    setRevoking(id);
+    try {
+      await admin.revokeToken(id);
+      onChange();
+      toast.success("Token revoked");
+    } catch (e) {
+      toast.error(errorMessage(e));
+    } finally {
+      setRevoking(null);
     }
   };
 
@@ -309,11 +361,11 @@ function TokensSection({ tokens, onChange }: { tokens: TokenInfo[]; onChange: ()
           />
           <button
             type="button"
-            disabled={!label.trim()}
+            disabled={!label.trim() || creating}
             onClick={() => void create()}
             className="rounded bg-accent px-3 py-1 text-black disabled:opacity-40"
           >
-            Issue token
+            {creating ? "Issuing…" : "Issue token"}
           </button>
         </div>
         <div className="flex flex-wrap gap-3">
@@ -357,13 +409,11 @@ function TokensSection({ tokens, onChange }: { tokens: TokenInfo[]; onChange: ()
             </span>
             <button
               type="button"
-              onClick={async () => {
-                await admin.revokeToken(t.token_id);
-                onChange();
-              }}
-              className="text-red-400 hover:underline"
+              disabled={revoking === t.token_id}
+              onClick={() => void revoke(t.token_id)}
+              className="text-red-400 hover:underline disabled:opacity-40"
             >
-              revoke
+              {revoking === t.token_id ? "revoking…" : "revoke"}
             </button>
           </div>
         ))}

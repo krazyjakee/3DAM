@@ -198,6 +198,7 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
           key={s.id}
           source={s}
           active={state.source === s.id && !state.collection}
+          removing={removeSource.isPending && removeSource.variables === s.id}
           onSelect={() => go({ source: state.source === s.id ? null : s.id, collection: null })}
           onRescan={() => scan.mutate({ sources: [s.id], mode: "full" })}
           onRemove={() => {
@@ -375,12 +376,14 @@ function CollectionRow({
 function SourceRow({
   source,
   active,
+  removing,
   onSelect,
   onRescan,
   onRemove,
 }: {
   source: SourceInfo;
   active: boolean;
+  removing: boolean;
   onSelect: () => void;
   onRescan: () => void;
   onRemove: () => void;
@@ -432,11 +435,12 @@ function SourceRow({
           <RefreshCw size={12} className={scanning ? "animate-spin" : ""} />
         </button>
         <button
-          className="flex items-center justify-center text-fg-dim hover:text-danger coarse:min-h-11 coarse:min-w-11"
+          className="flex items-center justify-center text-fg-dim hover:text-danger disabled:opacity-40 coarse:min-h-11 coarse:min-w-11"
           title="Remove"
           onClick={onRemove}
+          disabled={removing}
         >
-          <Trash2 size={12} />
+          <Trash2 size={12} className={removing ? "animate-pulse" : ""} />
         </button>
       </div>
     </div>
