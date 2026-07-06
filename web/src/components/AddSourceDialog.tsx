@@ -4,8 +4,9 @@ import { useAddSource, useScan } from "@/api/queries";
 import { ApiError } from "@/api/client";
 import type { SourceKind } from "@/api/types";
 
-// Phase-1 engine only scans local filesystem sources (sftp/smb/federated land later), so the
-// dialog offers local_fs and marks the rest as not-yet-available rather than hiding the roadmap.
+// The dialog offers local_fs today and marks sftp/smb/federated as not-yet-wired here (the phase-4
+// backend supports sftp/smb; surfacing their connection fields is issue #2) rather than hiding the
+// roadmap.
 const KINDS: { value: SourceKind; label: string; enabled: boolean }[] = [
   { value: "local_fs", label: "Local folder", enabled: true },
   { value: "sftp", label: "SFTP (soon)", enabled: false },
@@ -64,7 +65,7 @@ export function AddSourceDialog({ onClose }: { onClose: () => void }) {
 
         <label className="mb-1 block text-[11px] text-fg-muted">Kind</label>
         <select
-          className="field mb-3"
+          className="field mb-3 coarse:min-h-11"
           value={kind}
           onChange={(e) => setKind(e.target.value as SourceKind)}
         >
@@ -77,7 +78,7 @@ export function AddSourceDialog({ onClose }: { onClose: () => void }) {
 
         <label className="mb-1 block text-[11px] text-fg-muted">Path</label>
         <input
-          className="field mb-3"
+          className="field mb-3 coarse:min-h-11"
           placeholder="/mnt/assets/sfx"
           value={uri}
           onChange={(e) => setUri(e.target.value)}
@@ -87,14 +88,19 @@ export function AddSourceDialog({ onClose }: { onClose: () => void }) {
 
         <label className="mb-1 block text-[11px] text-fg-muted">Name (optional)</label>
         <input
-          className="field mb-3"
+          className="field mb-3 coarse:min-h-11"
           placeholder="SFX library"
           value={name}
           onChange={(e) => setName(e.target.value)}
         />
 
-        <label className="mb-3 flex items-center gap-2 text-xs text-fg-muted select-none">
-          <input type="checkbox" checked={watch} onChange={(e) => setWatch(e.target.checked)} />
+        <label className="mb-3 flex items-center gap-2 text-xs text-fg-muted select-none coarse:min-h-11">
+          <input
+            type="checkbox"
+            className="coarse:h-5 coarse:w-5"
+            checked={watch}
+            onChange={(e) => setWatch(e.target.checked)}
+          />
           Watch for changes and re-scan deltas
         </label>
 

@@ -1,8 +1,8 @@
 import type React from "react";
-import { PanelRightClose } from "lucide-react";
-import { useAsset, useSources } from "@/api/queries";
+import { Check, PanelRightClose, X } from "lucide-react";
+import { useAsset, useReviewSuggestion, useSources } from "@/api/queries";
 import { api } from "@/api/client";
-import type { Asset, MediaAttributes } from "@/api/types";
+import type { Asset, AssetId, MediaAttributes, ReviewAction, TagRef } from "@/api/types";
 import { bytes, duration, mediaLabel, originLabel, relTime } from "@/lib/format";
 import { useViewState } from "@/lib/view-state";
 import { ModelViewerIsland } from "@/islands/ModelViewerIsland";
@@ -149,28 +149,112 @@ function Body({ asset }: { asset: Asset }) {
           />
         </Group>
 
-        {/* tags */}
+        {/* tags — auto-suggestions are actionable (accept/reject); the analysis pass shipped in phase 3 */}
         <Group title={`Tags (${asset.tags.length})`}>
-          {asset.tags.length === 0 ? (
-            <p className="text-[11px] text-fg-dim italic">
-              No tags yet — auto-tagging arrives with the analysis pipeline.
-            </p>
-          ) : (
-            <div className="flex flex-wrap gap-1">
-              {asset.tags.map((t) => (
-                <span
-                  key={t.name}
-                  className="rounded bg-surface-2 px-1.5 py-0.5 text-[10px] text-fg-muted"
-                  title={`${t.state} · ${t.source}`}
-                >
-                  {t.name}
-                </span>
-              ))}
-            </div>
-          )}
+          <TagList assetId={summary.id} tags={asset.tags} />
         </Group>
       </div>
     </div>
+  );
+}
+
+/** Auto-tag review (tech-spec 05 §1.4): a *suggested* tag shows accept/reject; a *confirmed* or
+ *  *rejected* tag shows its state and lets the user flip the decision (the one endpoint supports
+ *  both directions). User-authored tags are static — there is nothing to review. */
+function TagList({ assetId, tags }: { assetId: AssetId; tags: TagRef[] }) {
+  const review = useReviewSuggestion();
+  if (tags.length === 0) {
+    return (
+      <p className="text-[11px] text-fg-dim italic">
+        No tags yet — the analysis pass proposes auto-tags to accept or reject.
+      </p>
+    );
+  }
+  return (
+    <div className="flex flex-wrap gap-1">
+      {tags.map((t) => (
+        <TagChip
+          key={t.name}
+          tag={t}
+          busy={review.isPending && review.variables?.tag === t.name}
+          onReview={(action) => review.mutate({ asset: assetId, tag: t.name, action })}
+        />
+      ))}
+    </div>
+  );
+}
+
+function TagChip({
+  tag,
+  busy,
+  onReview,
+}: {
+  tag: TagRef;
+  busy: boolean;
+  onReview: (action: ReviewAction) => void;
+}) {
+  const auto = tag.source === "auto";
+  const confidence =
+    tag.confidence != null ? ` · ${Math.round(tag.confidence * 100)}%` : "";
+  const title = `${tag.state} · ${tag.source}${confidence}`;
+
+  // User tags (and any non-auto) are not reviewable — render a plain chip.
+  if (!auto) {
+    return (
+      <span
+        className="rounded bg-surface-2 px-1.5 py-0.5 text-[10px] text-fg-muted"
+        title={title}
+      >
+        {tag.name}
+      </span>
+    );
+  }
+
+  const rejected = tag.state === "rejected";
+  const confirmed = tag.state === "confirmed";
+  return (
+    <span
+      className="inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px]"
+      style={{
+        borderColor: confirmed
+          ? "var(--color-lic-permissive)"
+          : rejected
+            ? "var(--color-border)"
+            : "var(--color-accent)",
+        color: confirmed
+          ? "var(--color-lic-permissive)"
+          : rejected
+            ? "var(--color-fg-dim)"
+            : "var(--color-accent)",
+        background: "color-mix(in srgb, currentColor 10%, transparent)",
+      }}
+      title={title}
+    >
+      <span className={rejected ? "line-through" : ""}>{tag.name}</span>
+      {/* Accept is offered unless already confirmed; reject unless already rejected. */}
+      {!confirmed && (
+        <button
+          className="flex items-center justify-center hover:text-lic-permissive disabled:opacity-40 coarse:min-h-11 coarse:min-w-11"
+          title={rejected ? "Accept tag" : "Accept suggestion"}
+          aria-label={`Accept tag ${tag.name}`}
+          disabled={busy}
+          onClick={() => onReview("accept")}
+        >
+          <Check size={12} />
+        </button>
+      )}
+      {!rejected && (
+        <button
+          className="flex items-center justify-center hover:text-danger disabled:opacity-40 coarse:min-h-11 coarse:min-w-11"
+          title={confirmed ? "Reject tag" : "Reject suggestion"}
+          aria-label={`Reject tag ${tag.name}`}
+          disabled={busy}
+          onClick={() => onReview("reject")}
+        >
+          <X size={12} />
+        </button>
+      )}
+    </span>
   );
 }
 

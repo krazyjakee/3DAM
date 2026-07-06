@@ -89,6 +89,15 @@ export interface TagRef {
   confidence: number | null;
 }
 
+/** Accept promotes a suggested tag to confirmed; reject records a negative (mirrors
+ *  `dam-api` `ReviewAction`). Backend route: POST /api/v1/suggestions/review. */
+export type ReviewAction = "accept" | "reject";
+export interface SuggestionReview {
+  asset: AssetId;
+  tag: string;
+  action: ReviewAction;
+}
+
 export interface Asset {
   summary: AssetSummary;
   hash: ContentHash | null;
@@ -161,7 +170,6 @@ export interface QueryRequest {
   sort?: Sort;
   scope?: QueryScope;
   page?: PageParams;
-  include_facets?: boolean;
 }
 
 export interface ItemWarning {

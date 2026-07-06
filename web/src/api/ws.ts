@@ -2,7 +2,7 @@
 // `LibraryEvent` firehose; on each event we invalidate the affected TanStack Query caches so the
 // grid, stats, sources, and jobs stay live without polling. Auto-reconnects with backoff.
 
-import { useEffect } from "react";
+import { useEffect, useSyncExternalStore } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import type { LibraryEvent } from "./types";
 import { qk } from "./queries";
@@ -10,6 +10,28 @@ import { qk } from "./queries";
 function wsUrl(): string {
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
   return `${proto}//${location.host}/api/v1/ws`;
+}
+
+// Live-connection state, surfaced to the UI so a silent disconnect becomes visible (issue #25).
+// A tiny external store rather than context: ws.ts is a leaf effect and any region can subscribe.
+let wsConnected = false;
+const wsListeners = new Set<() => void>();
+function setWsConnected(next: boolean) {
+  if (wsConnected === next) return;
+  wsConnected = next;
+  wsListeners.forEach((l) => l());
+}
+
+/** `true` while the live-update WebSocket is open; `false` while down/reconnecting. */
+export function useWsConnected(): boolean {
+  return useSyncExternalStore(
+    (l) => {
+      wsListeners.add(l);
+      return () => wsListeners.delete(l);
+    },
+    () => wsConnected,
+    () => false,
+  );
 }
 
 /** Subscribe to the live firehose for the lifetime of the mounted component. */
@@ -50,6 +72,7 @@ export function useLiveUpdates(): void {
       socket = new WebSocket(wsUrl());
       socket.onopen = () => {
         retry = 0;
+        setWsConnected(true);
       };
       socket.onmessage = (msg) => {
         try {
@@ -59,6 +82,7 @@ export function useLiveUpdates(): void {
         }
       };
       socket.onclose = () => {
+        setWsConnected(false);
         if (closed) return;
         const delay = Math.min(1000 * 2 ** retry, 15000);
         retry += 1;

@@ -77,7 +77,6 @@ export function useViewState() {
       text: state.q || null,
       filters,
       sort: { field: state.sort, dir: state.dir },
-      include_facets: true,
     };
   }, [state]);
 

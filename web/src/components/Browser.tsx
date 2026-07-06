@@ -12,7 +12,11 @@ import { MediaIcon } from "./MediaIcon";
 
 const CELL_W = 150; // grid cell target width (px); actual columns computed from container
 const CELL_H = 132;
-const ROW_H = 30; // table row height
+// Table row height. Virtualization drives the height in JS, so `coarse:` CSS can't reach it — bump
+// to a 44px touch target on coarse pointers instead (issue #31). Pointer type is stable per session.
+const COARSE_POINTER =
+  typeof window !== "undefined" && window.matchMedia("(pointer: coarse)").matches;
+const ROW_H = COARSE_POINTER ? 44 : 30;
 
 export function Browser({ onOpenNav }: { onOpenNav?: () => void }) {
   const { state, patch, request } = useViewState();

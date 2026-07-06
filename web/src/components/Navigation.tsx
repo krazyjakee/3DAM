@@ -12,8 +12,10 @@ import {
   Settings as SettingsIcon,
   Tag as TagIcon,
   Trash2,
+  WifiOff,
 } from "lucide-react";
 import { useScan, useSources, useStats, useRemoveSource } from "@/api/queries";
+import { useConnection } from "@/api/connection";
 import type { LicenseStatus, MediaType, SourceInfo } from "@/api/types";
 import { licenseColorVar, licenseLabel, sourceStateLabel } from "@/lib/format";
 import { useViewState } from "@/lib/view-state";
@@ -73,6 +75,7 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
   const sources = useSources();
   const scan = useScan();
   const removeSource = useRemoveSource();
+  const conn = useConnection();
   const [showAdd, setShowAdd] = useState(false);
 
   const total = stats.data?.total ?? 0;
@@ -96,6 +99,16 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
           <RefreshCw size={13} className={scan.isPending ? "animate-spin" : ""} />
         </button>
       </div>
+
+      {/* backend-unreachable banner — otherwise a dead server reads as an empty library (issue #24) */}
+      {conn.backendDown && (
+        <div className="flex items-center gap-2 border-b border-border bg-danger/10 px-3 py-2 text-[11px] text-danger">
+          <WifiOff size={13} className="shrink-0" />
+          <span>
+            Can’t reach the server. Is <code className="font-mono">3dam serve</code> running?
+          </span>
+        </div>
+      )}
 
       {/* library / media filters */}
       <SectionLabel>Library</SectionLabel>
@@ -142,7 +155,9 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
           <FolderPlus size={14} />
         </button>
       </div>
-      {sources.data?.length === 0 && (
+      {/* Only when the fetch actually succeeded with zero sources — `data?.length === 0` was falsy
+          while `data` is undefined (loading/error), leaving a blank, unexplained section (issue #24). */}
+      {sources.isSuccess && sources.data.length === 0 && (
         <button
           className="mx-3 my-1 rounded border border-dashed border-border px-2 py-2 text-center text-[11px] text-fg-dim hover:border-accent hover:text-accent"
           onClick={() => setShowAdd(true)}

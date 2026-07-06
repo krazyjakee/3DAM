@@ -18,6 +18,7 @@ import type {
   ScanRequest,
   SourceId,
   SourceInfo,
+  SuggestionReview,
   ErrorBody,
 } from "./types";
 
@@ -78,6 +79,10 @@ export const api = {
   getAsset: (id: AssetId) => get<Asset>(`${API}/assets/${id}`),
   stats: () => get<LibraryStats>(`${API}/stats`),
 
+  // auto-tag suggestion lifecycle — accept/reject one suggested tag (tech-spec 05 §1.4)
+  reviewSuggestion: (req: SuggestionReview) =>
+    send<void>("POST", `${API}/suggestions/review`, req),
+
   /** URL for an asset's raw bytes — fed to the WASM viewer islands (tech-spec 09 §B.3). The DOM
    *  fetches this and hands it across the wasm-bindgen boundary; the island does no networking. */
   assetContentUrl: (id: AssetId) => `${API}/assets/${id}/content`,
@@ -88,7 +93,6 @@ export const api = {
 
   // sources
   listSources: () => get<SourceInfo[]>(`${API}/sources`),
-  getSource: (id: SourceId) => get<SourceInfo>(`${API}/sources/${id}`),
   addSource: (req: AddSource) => send<{ id: SourceId }>("POST", `${API}/sources`, req),
   removeSource: (id: SourceId, req: RemoveSource = {}) =>
     send<void>("DELETE", `${API}/sources/${id}`, req),
@@ -96,6 +100,5 @@ export const api = {
   // jobs
   submitScan: (req: ScanRequest) => send<{ job_id: JobId }>("POST", `${API}/jobs/scan`, req),
   listJobs: (req: JobListRequest = {}) => send<Page<JobStatus>>("POST", `${API}/jobs/list`, req),
-  getJob: (id: JobId) => get<JobStatus>(`${API}/jobs/${id}`),
   cancelJob: (id: JobId) => send<void>("POST", `${API}/jobs/${id}/cancel`),
 };

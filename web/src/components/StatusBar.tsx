@@ -1,12 +1,15 @@
 import { Loader2, X } from "lucide-react";
 import { useCancelJob, useJobs, useVersion } from "@/api/queries";
+import { useConnection, type ConnState } from "@/api/connection";
 import type { JobStatus } from "@/api/types";
 
-/** Bottom status strip: active scan/analysis jobs with live progress + the server build. */
+/** Bottom status strip: active scan/analysis jobs with live progress, the live-connection state, and
+ *  the server build. The connection dot makes a silent disconnect visible (issues #24, #25). */
 export function StatusBar() {
   const version = useVersion();
   const jobs = useJobs({});
   const cancel = useCancelJob();
+  const conn = useConnection();
 
   const active = (jobs.data?.items ?? []).filter(
     (j) => j.state === "running" || j.state === "queued",
@@ -24,8 +27,37 @@ export function StatusBar() {
       ) : (
         <span className="flex-1">Idle</span>
       )}
+      <ConnectionPill state={conn.state} />
       <span className="tabular-nums">{version.data?.server ?? ""}</span>
     </footer>
+  );
+}
+
+const CONN_META: Record<ConnState, { color: string; label: string | null; pulse: boolean }> = {
+  online: { color: "var(--color-lic-permissive)", label: null, pulse: false },
+  reconnecting: { color: "var(--color-warn)", label: "Reconnecting…", pulse: true },
+  offline: { color: "var(--color-danger)", label: "Offline", pulse: false },
+};
+
+function ConnectionPill({ state }: { state: ConnState }) {
+  const { color, label, pulse } = CONN_META[state];
+  return (
+    <span
+      className="flex items-center gap-1.5"
+      title={
+        state === "online"
+          ? "Live updates connected"
+          : state === "reconnecting"
+            ? "Live updates paused — reconnecting"
+            : "Can't reach the server"
+      }
+    >
+      <span
+        className={`h-1.5 w-1.5 shrink-0 rounded-full ${pulse ? "animate-pulse" : ""}`}
+        style={{ background: color }}
+      />
+      {label && <span style={{ color }}>{label}</span>}
+    </span>
   );
 }
 

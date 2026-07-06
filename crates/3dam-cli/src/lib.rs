@@ -112,7 +112,8 @@ struct McpArgs {
     data: Option<PathBuf>,
 }
 
-/// Entry point for the `mcp` stdio role. Dispatches into `3dam-server` (stub).
+/// Entry point for the `mcp` stdio role. Dispatches into `dam_server::mcp_stdio`, the hand-rolled
+/// stdio MCP server (`crates/3dam-server/src/mcp.rs`).
 pub async fn mcp(args: Vec<OsString>) -> ExitCode {
     let parsed = match McpArgs::try_parse_from(std::iter::once(OsString::from("mcp")).chain(args)) {
         Ok(a) => a,

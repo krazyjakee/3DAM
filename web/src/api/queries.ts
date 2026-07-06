@@ -16,6 +16,7 @@ import type {
   QueryRequest,
   ScanRequest,
   SourceId,
+  SuggestionReview,
 } from "./types";
 
 /** Stable query-key roots — ws.ts invalidates against these. */
@@ -94,6 +95,18 @@ export function useScan() {
   return useMutation({
     mutationFn: (req: ScanRequest) => api.submitScan(req),
     onSuccess: () => qc.invalidateQueries({ queryKey: qk.jobs }),
+  });
+}
+
+/** Accept/reject an auto-tag suggestion; refresh the inspected asset + grid on success. */
+export function useReviewSuggestion() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (req: SuggestionReview) => api.reviewSuggestion(req),
+    onSuccess: (_data, req) => {
+      qc.invalidateQueries({ queryKey: qk.asset(req.asset) });
+      qc.invalidateQueries({ queryKey: qk.assets });
+    },
   });
 }
 
