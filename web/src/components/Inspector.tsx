@@ -23,7 +23,7 @@ import type {
 import { bytes, duration, mediaLabel, originLabel, relTime } from "@/lib/format";
 import { useViewState } from "@/lib/view-state";
 import { ModelViewerIsland } from "@/islands/ModelViewerIsland";
-import { WaveformIsland } from "@/islands/WaveformIsland";
+import { AudioPlayer } from "./AudioPlayer";
 import { LicenseBadge } from "./LicenseBadge";
 import { ImageViewer } from "./ImageViewer";
 import { Thumbnail } from "./Thumbnail";
@@ -108,9 +108,11 @@ function Preview({ asset }: { asset: Asset }) {
     );
   }
   if (summary.media === "audio") {
+    // Playable inline: waveform + transport, with the playhead driven by real progress (issues
+    // #16, #14). Keyed by id so switching assets resets playback + the decoded waveform.
     return (
-      <div className="h-24 border-b border-border">
-        <WaveformIsland src={src} />
+      <div className="border-b border-border">
+        <AudioPlayer key={summary.id} src={src} />
       </div>
     );
   }
