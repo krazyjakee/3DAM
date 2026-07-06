@@ -11,6 +11,8 @@ import type {
   Collection,
   CollectionId,
   CollectionMembers,
+  ConvertReport,
+  ConvertRequest,
   DupGroup,
   DupRequest,
   ExportReport,
@@ -104,6 +106,9 @@ export const api = {
 
   /** Export a manifest (json/csv/sidecar) for a selection / collection / query to a server path. */
   exportAssets: (req: ExportRequest) => send<ExportReport>("POST", `${API}/export`, req),
+
+  /** Convert assets to a target format into a server output dir (source-safe, atomic; tech-spec 08). */
+  convert: (req: ConvertRequest) => send<ConvertReport>("POST", `${API}/convert`, req),
 
   /** URL for an asset's raw bytes — fed to the WASM viewer islands (tech-spec 09 §B.3). The DOM
    *  fetches this and hands it across the wasm-bindgen boundary; the island does no networking. */

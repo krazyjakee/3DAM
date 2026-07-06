@@ -5,7 +5,7 @@
 // asset; batch-over-selection lands with multi-select (#22).
 
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { FolderPlus, Search, Sparkles, ClipboardCopy } from "lucide-react";
+import { FileCog, FolderPlus, Search, Sparkles, ClipboardCopy } from "lucide-react";
 import { api } from "@/api/client";
 import { useAnalyze, useCollections, useCollectionMembers } from "@/api/queries";
 import type { AssetSummary } from "@/api/types";
@@ -44,7 +44,16 @@ export function useLongPress(onLongPress: (x: number, y: number) => void) {
   };
 }
 
-export function ContextMenu({ menu, onClose }: { menu: MenuState | null; onClose: () => void }) {
+export function ContextMenu({
+  menu,
+  onClose,
+  onConvert,
+}: {
+  menu: MenuState | null;
+  onClose: () => void;
+  /** Hand the target asset(s) up to the Browser, which hosts the convert dialog (issue #5). */
+  onConvert: (assets: AssetSummary[]) => void;
+}) {
   const ref = useRef<HTMLDivElement>(null);
   const [pos, setPos] = useState({ x: 0, y: 0 });
   const { patch } = useViewState();
@@ -126,6 +135,11 @@ export function ContextMenu({ menu, onClose }: { menu: MenuState | null; onClose
         icon={<Sparkles size={13} />}
         label={single ? "Analyze" : `Analyze ${assets.length}`}
         onClick={() => run(() => analyze.mutate({ assets: ids }))}
+      />
+      <Item
+        icon={<FileCog size={13} />}
+        label={single ? "Convert…" : `Convert ${assets.length}…`}
+        onClick={() => run(() => onConvert(assets))}
       />
 
       {/* Add to collection — submenu of manual collections (smart folders are query-driven). */}

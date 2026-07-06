@@ -222,6 +222,61 @@ export interface CollectionMembers {
   remove?: AssetId[];
 }
 
+// ── convert (phase 2: image + audio, source-safe, atomic) ───────────────────
+
+/** On a planned-output collision (mirrors `dam-api` `CollisionRule`): fail the item (default),
+ *  disambiguate with a `-N` suffix, skip (leave existing), or overwrite a non-source file. */
+export type CollisionRule = "fail" | "suffix" | "skip" | "overwrite";
+
+/** The media-typed encode target. One target per request; items of the other media type fail as
+ *  `unsupported` (fail-soft). Matches `dam-api` `ConvertTarget` (`#[serde(tag = "media")]`). */
+export type ConvertTarget =
+  | { media: "image"; format: string; max_edge?: number | null; quality?: number | null }
+  | { media: "audio"; format: string };
+
+export interface ConvertRequest {
+  inputs: AssetId[];
+  target: ConvertTarget;
+  /** Destination directory — never a registered source tree (the backend enforces this, §5.1). */
+  output_dir: string;
+  /** Plan only: resolve outputs + estimate, write nothing. */
+  dry_run?: boolean;
+  on_collision?: CollisionRule;
+}
+
+/** How one input resolved (mirrors `dam-api` `Disposition`). */
+export type Disposition =
+  | "write"
+  | "collision"
+  | "skipped"
+  | "unsupported"
+  | "done"
+  | "failed";
+
+export interface ConvertItemReport {
+  input: AssetId;
+  input_path: string;
+  planned_output: string;
+  disposition: Disposition;
+  input_bytes: number;
+  output_bytes?: number | null;
+  ratio?: number | null;
+  error?: string | null;
+}
+
+/** Whole-batch result. Fail-soft: the request succeeds as long as it ran; counts summarise. */
+export interface ConvertReport {
+  dry_run: boolean;
+  output_dir: string;
+  items: ConvertItemReport[];
+  total_input_bytes: number;
+  total_output_bytes: number;
+  done: number;
+  failed: number;
+  collisions: number;
+  unsupported: number;
+}
+
 // ── export / manifests (phase 4: json/csv/sidecar) ──────────────────────────
 
 /** Manifest shape (mirrors `dam-api` `ExportFormat`): a single JSON doc, a single CSV, or one JSON

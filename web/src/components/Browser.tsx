@@ -1,7 +1,7 @@
 import type React from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { FileDown, LayoutGrid, Menu, Rows3, Search, Sparkles, X } from "lucide-react";
+import { FileCog, FileDown, LayoutGrid, Menu, Rows3, Search, Sparkles, X } from "lucide-react";
 import { useAnalyze, useAssets, useCollectionMembers, useCollections } from "@/api/queries";
 import type { AssetSummary, SortField } from "@/api/types";
 import { useViewState } from "@/lib/view-state";
@@ -11,6 +11,7 @@ import { LicenseBadge } from "./LicenseBadge";
 import { MediaIcon } from "./MediaIcon";
 import { ContextMenu, useLongPress, type MenuState } from "./ContextMenu";
 import { ExportDialog } from "./ExportDialog";
+import { ConvertDialog } from "./ConvertDialog";
 
 /** Modifier keys that change what a click does to the multi-selection (issue #10/#22). */
 export interface ClickMods {
@@ -44,6 +45,12 @@ export function Browser({ onOpenNav }: { onOpenNav?: () => void }) {
 
   const clearSelection = useCallback(() => setSelection(new Set()), []);
   const selectAll = useCallback(() => setSelection(new Set(items.map((a) => a.id))), [items]);
+  const selectedAssets = useMemo(
+    () => [...selection].map((id) => byId.get(id)).filter((a): a is AssetSummary => !!a),
+    [selection, byId],
+  );
+  // Convert targets set from the context menu (single/multi); rendered as a dialog at Browser root.
+  const [convertTargets, setConvertTargets] = useState<AssetSummary[] | null>(null);
 
   // Click semantics: plain = single-select + inspect; ctrl/cmd = toggle; shift = extend range from
   // the anchor. Every click also sets the Inspector focus so the detail panel tracks the last click.
@@ -118,8 +125,7 @@ export function Browser({ onOpenNav }: { onOpenNav?: () => void }) {
       <Toolbar count={items.length} total={total} onOpenNav={onOpenNav} />
       {selection.size > 1 && (
         <SelectionBar
-          count={selection.size}
-          ids={[...selection]}
+          assets={selectedAssets}
           onSelectAll={selectAll}
           onClear={clearSelection}
         />
@@ -139,7 +145,14 @@ export function Browser({ onOpenNav }: { onOpenNav?: () => void }) {
           <Table items={items} {...listProps} />
         )}
       </div>
-      <ContextMenu menu={menu} onClose={() => setMenu(null)} />
+      <ContextMenu
+        menu={menu}
+        onClose={() => setMenu(null)}
+        onConvert={(assets) => setConvertTargets(assets)}
+      />
+      {convertTargets && (
+        <ConvertDialog assets={convertTargets} onClose={() => setConvertTargets(null)} />
+      )}
     </section>
   );
 }
@@ -147,13 +160,11 @@ export function Browser({ onOpenNav }: { onOpenNav?: () => void }) {
 /** Batch-action affordance for a multi-selection (issue #10 enabler). Feature actions hang off here;
  *  today: analyze all, add all to a collection, select-all, clear. */
 function SelectionBar({
-  count,
-  ids,
+  assets,
   onSelectAll,
   onClear,
 }: {
-  count: number;
-  ids: string[];
+  assets: AssetSummary[];
   onSelectAll: () => void;
   onClear: () => void;
 }) {
@@ -162,10 +173,12 @@ function SelectionBar({
   const members = useCollectionMembers();
   const manual = (collections.data ?? []).filter((c) => c.kind === "manual");
   const [showExport, setShowExport] = useState(false);
+  const [showConvert, setShowConvert] = useState(false);
+  const ids = assets.map((a) => a.id);
 
   return (
     <div className="flex items-center gap-2 border-b border-border bg-surface px-3 py-1.5 text-xs">
-      <span className="font-medium text-fg tabular-nums">{count} selected</span>
+      <span className="font-medium text-fg tabular-nums">{assets.length} selected</span>
       <button
         className="btn coarse:min-h-11"
         onClick={() => analyze.mutate({ assets: ids })}
@@ -173,9 +186,15 @@ function SelectionBar({
       >
         <Sparkles size={12} /> Analyze
       </button>
+      <button className="btn coarse:min-h-11" onClick={() => setShowConvert(true)}>
+        <FileCog size={12} /> Convert
+      </button>
       <button className="btn coarse:min-h-11" onClick={() => setShowExport(true)}>
         <FileDown size={12} /> Export
       </button>
+      {showConvert && (
+        <ConvertDialog assets={assets} onClose={() => setShowConvert(false)} />
+      )}
       {showExport && (
         <ExportDialog scope={{ assets: ids }} onClose={() => setShowExport(false)} />
       )}

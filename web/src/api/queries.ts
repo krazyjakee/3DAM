@@ -15,6 +15,7 @@ import type {
   AssetId,
   CollectionId,
   CollectionMembers,
+  ConvertRequest,
   DupRequest,
   ExportRequest,
   JobListRequest,
@@ -206,6 +207,12 @@ export function useCollectionMembers() {
  *  the caller shows the returned report (path + counts). */
 export function useExport() {
   return useMutation({ mutationFn: (req: ExportRequest) => api.exportAssets(req) });
+}
+
+/** Convert assets to a target format. Writes to an output dir outside any source, so the catalog is
+ *  unchanged — no invalidation; the caller shows the per-item report. */
+export function useConvert() {
+  return useMutation({ mutationFn: (req: ConvertRequest) => api.convert(req) });
 }
 
 export function useCancelJob() {
