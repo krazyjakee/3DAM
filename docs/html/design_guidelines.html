@@ -1,0 +1,875 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Design · 3DAM</title>
+<style>:root {
+  --bg: #0d1117;
+  --bg-soft: #161b22;
+  --bg-code: #0a0e14;
+  --border: #232a35;
+  --border-soft: #1c222c;
+  --fg: #d6dee8;
+  --fg-muted: #8b98a9;
+  --fg-dim: #6b7787;
+  --heading: #f0f4f9;
+  --accent: #35d0ba;
+  --accent-soft: rgba(53, 208, 186, 0.12);
+  --accent-line: rgba(53, 208, 186, 0.35);
+  --radius: 10px;
+  --maxw: 860px;
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --mono: "SFMono-Regular", "JetBrains Mono", "Fira Code", ui-monospace, Menlo, Consolas, monospace;
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0;
+  font-family: var(--font);
+  color: var(--fg);
+  background:
+    radial-gradient(1200px 600px at 80% -10%, rgba(53,208,186,0.06), transparent 60%),
+    radial-gradient(900px 500px at -10% 10%, rgba(80,120,255,0.05), transparent 55%),
+    var(--bg);
+  line-height: 1.65;
+  font-size: 16px;
+  -webkit-font-smoothing: antialiased;
+}
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+/* Top bar */
+.topbar {
+  position: sticky; top: 0; z-index: 20;
+  backdrop-filter: blur(10px);
+  background: rgba(13,17,23,0.72);
+  border-bottom: 1px solid var(--border);
+}
+.topbar-inner {
+  max-width: var(--maxw); margin: 0 auto; padding: 14px 24px;
+  display: flex; align-items: center; gap: 22px;
+}
+.brand { display: flex; align-items: baseline; gap: 10px; font-weight: 700; letter-spacing: .3px; }
+.brand .logo { color: var(--heading); font-size: 19px; }
+.brand .logo b { color: var(--accent); }
+.brand .tag { color: var(--fg-dim); font-size: 12px; font-weight: 500; }
+.nav { display: flex; gap: 6px; margin-left: auto; flex-wrap: wrap; }
+.nav a {
+  color: var(--fg-muted); padding: 6px 12px; border-radius: 8px;
+  font-size: 14px; font-weight: 500; border: 1px solid transparent;
+}
+.nav a:hover { color: var(--fg); background: var(--bg-soft); text-decoration: none; }
+.nav a.active { color: var(--accent); background: var(--accent-soft); border-color: var(--accent-line); }
+
+/* Page */
+main { max-width: var(--maxw); margin: 0 auto; padding: 48px 24px 96px; }
+.subtitle { color: var(--fg-dim); font-size: 14px; text-transform: uppercase; letter-spacing: 2px; margin: 0 0 6px; }
+
+h1, h2, h3, h4 { color: var(--heading); line-height: 1.25; font-weight: 700; }
+h1 { font-size: 2.1rem; margin: .2em 0 .6em; letter-spacing: -.5px; }
+h2 {
+  font-size: 1.4rem; margin: 2.4em 0 .8em; padding-bottom: .35em;
+  border-bottom: 1px solid var(--border);
+}
+h2::before {
+  content: ""; display: inline-block; width: 8px; height: 8px; margin-right: 12px;
+  border-radius: 2px; background: var(--accent); vertical-align: middle;
+  transform: translateY(-2px);
+}
+h3 { font-size: 1.12rem; margin: 1.8em 0 .5em; color: #cdd7e3; }
+h4 { font-size: 1rem; margin: 1.4em 0 .4em; color: var(--fg-muted); }
+
+p { margin: .8em 0; }
+strong { color: var(--heading); font-weight: 650; }
+hr { border: none; border-top: 1px solid var(--border); margin: 2.6em 0; }
+
+ul, ol { padding-left: 1.4em; }
+li { margin: .35em 0; }
+li::marker { color: var(--accent); }
+
+/* Inline + block code */
+code {
+  font-family: var(--mono); font-size: .88em;
+  background: var(--bg-soft); border: 1px solid var(--border-soft);
+  padding: .12em .4em; border-radius: 5px; color: #a7f3e4;
+}
+pre {
+  background: var(--bg-code); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 18px 20px; overflow-x: auto;
+  box-shadow: inset 0 0 0 1px rgba(255,255,255,0.01);
+}
+pre code {
+  background: none; border: none; padding: 0; color: #9fb0c3;
+  font-size: .84em; line-height: 1.55;
+}
+
+/* Tables */
+table {
+  border-collapse: collapse; width: 100%; margin: 1.2em 0; font-size: .95em;
+  border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden;
+}
+th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--border-soft); }
+th { background: var(--bg-soft); color: var(--heading); font-weight: 600; }
+tr:last-child td { border-bottom: none; }
+tbody tr:hover { background: rgba(255,255,255,0.015); }
+
+/* Blockquote */
+blockquote {
+  margin: 1.2em 0; padding: .6em 1.1em; color: var(--fg-muted);
+  border-left: 3px solid var(--accent-line); background: var(--accent-soft);
+  border-radius: 0 8px 8px 0;
+}
+
+/* Footer nav between docs */
+.docnav {
+  display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap;
+  margin-top: 3.5em; padding-top: 1.8em; border-top: 1px solid var(--border);
+}
+.docnav a {
+  flex: 1 1 220px; padding: 14px 18px; border: 1px solid var(--border);
+  border-radius: var(--radius); background: var(--bg-soft); color: var(--fg);
+}
+.docnav a:hover { border-color: var(--accent-line); text-decoration: none; }
+.docnav a small { display: block; color: var(--fg-dim); font-size: 12px; text-transform: uppercase; letter-spacing: 1px; }
+.docnav a span { color: var(--accent); font-weight: 600; }
+.docnav a.next { text-align: right; }
+
+.footer { max-width: var(--maxw); margin: 0 auto; padding: 0 24px 60px; color: var(--fg-dim); font-size: 13px; }
+
+/* Landing cards */
+.hero { text-align: center; padding: 40px 0 20px; }
+.hero h1 { font-size: 3rem; }
+.hero .lede { color: var(--fg-muted); font-size: 1.15rem; max-width: 640px; margin: 0 auto; }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 18px; margin: 40px 0; }
+.card {
+  display: block; padding: 22px; border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--bg-soft); color: var(--fg);
+}
+.card:hover { border-color: var(--accent-line); transform: translateY(-2px); text-decoration: none; }
+.card { transition: border-color .15s ease, transform .15s ease; }
+.card .k { color: var(--accent); font-size: 12px; text-transform: uppercase; letter-spacing: 2px; }
+.card h3 { margin: 8px 0 6px; color: var(--heading); }
+.card p { margin: 0; color: var(--fg-muted); font-size: .95em; }
+
+@media (max-width: 600px) {
+  body { font-size: 15px; }
+  h1 { font-size: 1.7rem; } .hero h1 { font-size: 2.2rem; }
+  main { padding: 32px 18px 72px; }
+  .topbar-inner { padding: 12px 18px; }
+}</style>
+</head>
+<body>
+<header class="topbar"><div class="topbar-inner">
+  <a class="brand" href="index.html" style="color:inherit">
+    <span class="logo">3D<b>AM</b></span>
+    <span class="tag">asset manager</span>
+  </a>
+  <nav class="nav">
+    <a href="index.html" class="">Home</a>
+    <a href="mission.html" class="">Mission</a><a href="design_guidelines.html" class="active">Design</a><a href="product_spec.html" class="">Spec</a><a href="roadmap.html" class="">Roadmap</a>
+  </nav>
+</div></header>
+<main>
+<p class="subtitle">How it's built & behaves</p>
+<h1 id="3dam-design-guidelines">3DAM — Design Guidelines</h1>
+<p>These guidelines govern how 3DAM is built and how it behaves. They apply to the desktop
+app, the CLI, and the server/web client. When a decision is ambiguous, favour the principle
+earlier in this document over the one later.</p>
+<!-- ============================================================= -->
+<!--  3DAM design showcase — injected into design_guidelines.html  -->
+<!--  Self-contained: scoped styles (.dsx*), markup, small script.  -->
+<!-- ============================================================= -->
+<style>
+.dsx {
+  --dsx-bg:#0d1117; --dsx-panel:#12171f; --dsx-panel-2:#161b22; --dsx-elev:#1b222c;
+  --dsx-border:#232a35; --dsx-border-soft:#1c2029;
+  --dsx-fg:#d6dee8; --dsx-muted:#8b98a9; --dsx-dim:#6b7787; --dsx-head:#f0f4f9;
+  --dsx-accent:#35d0ba; --dsx-accent-soft:rgba(53,208,186,.14); --dsx-accent-ink:#04211d;
+  --dsx-ok:#3fb950; --dsx-warn:#d29922; --dsx-off:#586170; --dsx-sug:#a371f7;
+  --dsx-audio:#35d0ba; --dsx-image:#f0883e; --dsx-model:#7c8cff;
+  --dsx-r:10px;
+  color:var(--dsx-fg);
+}
+.dsx[data-accent="violet"]  { --dsx-accent:#a371f7; --dsx-accent-soft:rgba(163,113,247,.16); --dsx-accent-ink:#150a2b; }
+.dsx[data-accent="amber"]   { --dsx-accent:#e3a008; --dsx-accent-soft:rgba(227,160,8,.16);  --dsx-accent-ink:#241a02; }
+.dsx[data-accent="sky"]     { --dsx-accent:#4c9ffe; --dsx-accent-soft:rgba(76,159,254,.16);  --dsx-accent-ink:#04182e; }
+.dsx[data-accent="rose"]    { --dsx-accent:#f778ba; --dsx-accent-soft:rgba(247,120,186,.16); --dsx-accent-ink:#2b0a1c; }
+.dsx.light {
+  --dsx-bg:#f4f6f9; --dsx-panel:#ffffff; --dsx-panel-2:#eef1f6; --dsx-elev:#e8ecf2;
+  --dsx-border:#d7dee7; --dsx-border-soft:#e5e9f0;
+  --dsx-fg:#2a333f; --dsx-muted:#5c6835; --dsx-muted:#5a6674; --dsx-dim:#8592a1; --dsx-head:#121821;
+  --dsx-off:#a2adba; --dsx-accent-ink:#ffffff;
+}
+.dsx * { box-sizing:border-box; }
+.dsx-wrap {
+  margin:1.5em 0 0; padding:20px; border:1px solid var(--dsx-border); border-radius:14px;
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--dsx-panel) 70%, transparent), transparent 40%),
+    var(--dsx-bg);
+  transition:background .25s ease, border-color .25s ease;
+}
+.dsx-eyebrow { font-size:11px; letter-spacing:2px; text-transform:uppercase; color:var(--dsx-accent); font-weight:700; }
+.dsx-h { color:var(--dsx-head); font-weight:700; margin:4px 0 2px; }
+.dsx-sub { color:var(--dsx-muted); font-size:14px; margin:0 0 14px; }
+.dsx-block { margin:26px 0; }
+.dsx-block > h4 { color:var(--dsx-head); font-size:13px; letter-spacing:1.5px; text-transform:uppercase; margin:0 0 12px; display:flex; align-items:center; gap:8px; }
+.dsx-block > h4::before { content:""; width:6px; height:6px; border-radius:2px; background:var(--dsx-accent); display:inline-block; }
+
+/* ---- theme controls ---- */
+.dsx-controls { display:flex; flex-wrap:wrap; gap:10px; align-items:center; padding:12px 14px; border:1px solid var(--dsx-border); border-radius:var(--dsx-r); background:var(--dsx-panel); }
+.dsx-controls .lbl { font-size:12px; color:var(--dsx-dim); text-transform:uppercase; letter-spacing:1px; margin-right:2px; }
+.dsx-acc { width:26px; height:26px; border-radius:50%; border:2px solid var(--dsx-border); cursor:pointer; padding:0; position:relative; transition:transform .12s ease; }
+.dsx-acc:hover { transform:scale(1.12); }
+.dsx-acc.active { border-color:var(--dsx-fg); box-shadow:0 0 0 3px var(--dsx-accent-soft); }
+.dsx-acc[data-set-accent="teal"]{background:#35d0ba} .dsx-acc[data-set-accent="violet"]{background:#a371f7}
+.dsx-acc[data-set-accent="amber"]{background:#e3a008} .dsx-acc[data-set-accent="sky"]{background:#4c9ffe}
+.dsx-acc[data-set-accent="rose"]{background:#f778ba}
+.dsx-toggle { margin-left:auto; font:inherit; font-size:13px; font-weight:600; color:var(--dsx-fg); background:var(--dsx-elev); border:1px solid var(--dsx-border); border-radius:8px; padding:6px 14px; cursor:pointer; }
+.dsx-toggle:hover { border-color:var(--dsx-accent); }
+
+/* ---- palette ---- */
+.dsx-swatches { display:grid; grid-template-columns:repeat(auto-fill,minmax(120px,1fr)); gap:10px; }
+.dsx-sw { border:1px solid var(--dsx-border); border-radius:var(--dsx-r); overflow:hidden; background:var(--dsx-panel); }
+.dsx-sw .chip { height:56px; }
+.dsx-sw .lab { padding:8px 10px; font-size:12px; }
+.dsx-sw .lab b { display:block; color:var(--dsx-head); font-weight:600; }
+.dsx-sw .lab span { color:var(--dsx-dim); font-family:var(--mono,monospace); font-size:11px; }
+.dsx-ramp { display:flex; border:1px solid var(--dsx-border); border-radius:var(--dsx-r); overflow:hidden; }
+.dsx-ramp div { flex:1; height:40px; display:flex; align-items:flex-end; justify-content:center; padding-bottom:4px; font-size:10px; color:#0009; font-weight:700; }
+
+/* ---- type scale ---- */
+.dsx-type { border:1px solid var(--dsx-border); border-radius:var(--dsx-r); background:var(--dsx-panel); padding:6px 16px; }
+.dsx-type .row { display:flex; align-items:baseline; gap:16px; padding:9px 0; border-bottom:1px solid var(--dsx-border-soft); }
+.dsx-type .row:last-child { border-bottom:none; }
+.dsx-type .tag { width:120px; flex:none; color:var(--dsx-dim); font-size:12px; font-family:var(--mono,monospace); }
+.dsx-type .samp { color:var(--dsx-head); }
+
+/* ---- components ---- */
+.dsx-cgrid { display:grid; grid-template-columns:repeat(auto-fill,minmax(200px,1fr)); gap:12px; }
+.dsx-comp { border:1px solid var(--dsx-border); border-radius:var(--dsx-r); background:var(--dsx-panel); padding:14px; }
+.dsx-comp .t { font-size:11px; letter-spacing:1px; text-transform:uppercase; color:var(--dsx-dim); margin-bottom:10px; }
+.dsx-comp .r { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+.dsx-btn { font:inherit; font-size:13px; font-weight:600; border-radius:8px; padding:7px 14px; cursor:pointer; border:1px solid transparent; }
+.dsx-btn.primary { background:var(--dsx-accent); color:var(--dsx-accent-ink); }
+.dsx-btn.ghost { background:transparent; color:var(--dsx-fg); border-color:var(--dsx-border); }
+.dsx-btn.icon { background:var(--dsx-elev); color:var(--dsx-fg); border-color:var(--dsx-border); padding:7px 10px; }
+.dsx-field { display:flex; align-items:center; gap:8px; background:var(--dsx-elev); border:1px solid var(--dsx-border); border-radius:8px; padding:7px 10px; color:var(--dsx-muted); font-size:13px; min-width:150px; }
+.dsx-field .kbd { margin-left:auto; font-size:11px; color:var(--dsx-dim); border:1px solid var(--dsx-border); border-radius:5px; padding:1px 5px; }
+.dsx-fchip { display:inline-flex; align-items:center; gap:6px; font-size:12.5px; color:var(--dsx-fg); background:var(--dsx-elev); border:1px solid var(--dsx-border); border-radius:20px; padding:5px 11px; cursor:pointer; }
+.dsx-fchip.on { color:var(--dsx-accent); background:var(--dsx-accent-soft); border-color:color-mix(in srgb,var(--dsx-accent) 40%,transparent); }
+.dsx-badge { font-size:10px; font-weight:800; letter-spacing:.6px; padding:2px 6px; border-radius:5px; }
+.dsx-badge.audio { color:var(--dsx-audio); background:color-mix(in srgb,var(--dsx-audio) 16%,transparent); }
+.dsx-badge.image { color:var(--dsx-image); background:color-mix(in srgb,var(--dsx-image) 16%,transparent); }
+.dsx-badge.model { color:var(--dsx-model); background:color-mix(in srgb,var(--dsx-model) 16%,transparent); }
+.dsx-tag { font-size:12px; padding:3px 9px; border-radius:6px; background:var(--dsx-elev); color:var(--dsx-muted); border:1px solid var(--dsx-border); }
+.dsx-tag.sug { border-style:dashed; color:var(--dsx-sug); border-color:color-mix(in srgb,var(--dsx-sug) 45%,transparent); background:color-mix(in srgb,var(--dsx-sug) 10%,transparent); display:inline-flex; align-items:center; gap:6px; }
+.dsx-tag.sug .yn { display:inline-flex; gap:3px; }
+.dsx-tag.sug .yn b { cursor:pointer; width:15px; height:15px; line-height:14px; text-align:center; border-radius:4px; font-size:10px; }
+.dsx-tag.sug .yn .y { background:color-mix(in srgb,var(--dsx-ok) 25%,transparent); color:var(--dsx-ok); }
+.dsx-tag.sug .yn .n { background:color-mix(in srgb,#f85149 25%,transparent); color:#f85149; }
+.dsx-bar { height:6px; border-radius:4px; background:var(--dsx-elev); overflow:hidden; flex:1; min-width:90px; }
+.dsx-bar i { display:block; height:100%; background:var(--dsx-accent); border-radius:4px; }
+.dot { width:8px; height:8px; border-radius:50%; display:inline-block; }
+.dot.ok{background:var(--dsx-ok)} .dot.busy{background:var(--dsx-accent)} .dot.off{background:var(--dsx-off)}
+
+/* ---- license badges ---- */
+.dsx-lic { display:flex; flex-direction:column; gap:1px; border-radius:8px; padding:6px 10px; border:1px solid; font-size:12px; }
+.dsx-lic .k { font-weight:800; letter-spacing:.3px; display:flex; align-items:center; gap:6px; }
+.dsx-lic .r { font-size:10.5px; opacity:.9; }
+.dsx-lic.ok { color:#3fb950; background:color-mix(in srgb,#3fb950 12%,transparent); border-color:color-mix(in srgb,#3fb950 40%,transparent); }
+.dsx-lic.attr { color:#e3a008; background:color-mix(in srgb,#e3a008 13%,transparent); border-color:color-mix(in srgb,#e3a008 45%,transparent); }
+.dsx-lic.warn { color:#f85149; background:color-mix(in srgb,#f85149 12%,transparent); border-color:color-mix(in srgb,#f85149 42%,transparent); }
+.dsx-lic.unknown { color:var(--dsx-muted); background:transparent; border-style:dashed; border-color:var(--dsx-border); }
+.dsx-lm { font-weight:700; font-size:11px; display:inline-flex; align-items:center; gap:5px; }
+.dsx-lm::before { content:""; width:7px; height:7px; border-radius:2px; background:currentColor; }
+.dsx-lm.ok{color:#3fb950} .dsx-lm.attr{color:#e3a008} .dsx-lm.warn{color:#f85149} .dsx-lm.unknown{color:var(--dsx-dim)}
+
+/* ---- app window mockup ---- */
+.dsx-scroll { overflow-x:auto; margin-top:6px; padding-bottom:4px; }
+.dsx-win { min-width:760px; border:1px solid var(--dsx-border); border-radius:12px; overflow:hidden; background:var(--dsx-bg); box-shadow:0 20px 50px -20px #0009; }
+.dsx-titlebar { display:flex; align-items:center; gap:10px; padding:9px 14px; background:var(--dsx-panel-2); border-bottom:1px solid var(--dsx-border); }
+.dsx-dots { display:flex; gap:6px; } .dsx-dots i{ width:11px;height:11px;border-radius:50%;background:var(--dsx-elev);border:1px solid var(--dsx-border); }
+.dsx-title { color:var(--dsx-muted); font-size:12.5px; }
+.dsx-conn { margin-left:auto; display:flex; align-items:center; gap:6px; font-size:12px; color:var(--dsx-muted); }
+.dsx-toolbar { display:flex; align-items:center; gap:9px; padding:10px 12px; border-bottom:1px solid var(--dsx-border); background:var(--dsx-panel); flex-wrap:wrap; }
+.dsx-seg { display:flex; border:1px solid var(--dsx-border); border-radius:8px; overflow:hidden; }
+.dsx-seg button { font:inherit; font-size:12.5px; color:var(--dsx-muted); background:transparent; border:none; padding:6px 11px; cursor:pointer; }
+.dsx-seg button.on { background:var(--dsx-accent-soft); color:var(--dsx-accent); }
+.dsx-count { font-size:12px; color:var(--dsx-dim); }
+.dsx-body { display:grid; grid-template-columns:194px 1fr 250px; min-height:430px; }
+.dsx-side { border-right:1px solid var(--dsx-border); background:var(--dsx-panel); padding:12px 8px; overflow:hidden; }
+.dsx-side .grp { font-size:10.5px; letter-spacing:1.4px; text-transform:uppercase; color:var(--dsx-dim); margin:14px 8px 6px; }
+.dsx-side .grp:first-child { margin-top:2px; }
+.dsx-nav { display:flex; align-items:center; gap:8px; padding:6px 9px; border-radius:7px; font-size:13px; color:var(--dsx-fg); cursor:pointer; }
+.dsx-nav:hover { background:var(--dsx-elev); }
+.dsx-nav.on { background:var(--dsx-accent-soft); color:var(--dsx-accent); font-weight:600; }
+.dsx-nav.dim { color:var(--dsx-dim); }
+.dsx-nav .ct { margin-left:auto; font-size:11px; color:var(--dsx-dim); }
+.dsx-fed { color:var(--dsx-accent); font-size:11px; }
+.dsx-fedtag { font-size:9px; font-weight:800; letter-spacing:.5px; color:var(--dsx-accent); background:var(--dsx-accent-soft); border:1px solid color-mix(in srgb,var(--dsx-accent) 35%,transparent); border-radius:4px; padding:0 4px; margin-left:4px; }
+.dsx-origin { position:absolute; bottom:6px; right:6px; display:flex; align-items:center; gap:3px; font-size:9px; font-weight:700; color:var(--dsx-accent); background:color-mix(in srgb,var(--dsx-bg) 78%,transparent); border:1px solid color-mix(in srgb,var(--dsx-accent) 30%,transparent); border-radius:20px; padding:1px 6px; }
+.dsx-tagrow { display:flex; flex-wrap:wrap; gap:5px; padding:4px 8px; }
+.dsx-gridwrap { padding:12px 14px; overflow:hidden; }
+.dsx-crumb { font-size:12px; color:var(--dsx-muted); margin-bottom:12px; }
+.dsx-crumb b { color:var(--dsx-fg); }
+.dsx-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; }
+.dsx-card { border:1px solid var(--dsx-border); border-radius:9px; overflow:hidden; background:var(--dsx-panel-2); cursor:pointer; position:relative; transition:border-color .12s ease, transform .12s ease; }
+.dsx-card:hover { transform:translateY(-2px); border-color:color-mix(in srgb,var(--dsx-accent) 40%,transparent); }
+.dsx-card.sel { border-color:var(--dsx-accent); box-shadow:0 0 0 2px var(--dsx-accent-soft); }
+.dsx-thumb { height:84px; display:flex; align-items:center; justify-content:center; position:relative; background:var(--dsx-elev); }
+.dsx-card .m { padding:7px 9px; }
+.dsx-card .m .n { font-size:12px; color:var(--dsx-head); font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.dsx-card .m .s { font-size:10.5px; color:var(--dsx-dim); }
+.dsx-card .bdg { position:absolute; top:6px; left:6px; }
+.dsx-wave { display:flex; align-items:center; gap:2px; height:56px; width:82%; }
+.dsx-wave i { flex:1; background:var(--dsx-audio); border-radius:1px; min-height:2px; opacity:.9; }
+.tx-moss{background:radial-gradient(circle at 30% 30%,#4a6b3a,#243a1e 70%),repeating-linear-gradient(45deg,#0002 0 3px,#0000 3px 7px)}
+.tx-bark{background:linear-gradient(90deg,#5a3a24,#3d2716),repeating-linear-gradient(90deg,#0003 0 2px,#0000 2px 6px)}
+.tx-stone{background:radial-gradient(circle at 60% 40%,#7a8390,#3b444f 75%)}
+.tx-metal{background:linear-gradient(120deg,#9aa4b2,#4b5563 60%,#8b95a3)}
+
+/* inspector */
+.dsx-insp { border-left:1px solid var(--dsx-border); background:var(--dsx-panel); padding:14px; overflow:hidden; }
+.dsx-insp .prev { height:104px; border-radius:8px; background:var(--dsx-elev); border:1px solid var(--dsx-border); display:flex; align-items:center; justify-content:center; position:relative; margin-bottom:10px; }
+.dsx-insp .play { position:absolute; width:34px; height:34px; border-radius:50%; background:var(--dsx-accent); color:var(--dsx-accent-ink); display:flex; align-items:center; justify-content:center; font-size:13px; }
+.dsx-insp h5 { margin:2px 0 3px; color:var(--dsx-head); font-size:15px; }
+.dsx-insp .badges { display:flex; gap:6px; margin-bottom:10px; }
+.dsx-kv { display:flex; justify-content:space-between; font-size:12px; padding:3px 0; border-bottom:1px solid var(--dsx-border-soft); }
+.dsx-kv span { color:var(--dsx-dim); } .dsx-kv b { color:var(--dsx-fg); font-weight:500; }
+.dsx-sech { font-size:10.5px; letter-spacing:1.2px; text-transform:uppercase; color:var(--dsx-dim); margin:13px 0 7px; }
+.dsx-feat { display:flex; align-items:center; gap:8px; font-size:11.5px; color:var(--dsx-muted); margin:5px 0; }
+.dsx-feat .fl { width:74px; flex:none; }
+.dsx-insp .acts { display:flex; gap:8px; margin-top:13px; }
+.dsx-insp .acts .dsx-btn { flex:1; text-align:center; }
+
+/* statusbar */
+.dsx-status { display:flex; align-items:center; gap:10px; padding:7px 14px; background:var(--dsx-panel-2); border-top:1px solid var(--dsx-border); font-size:11.5px; color:var(--dsx-muted); }
+.dsx-prog { width:130px; height:5px; border-radius:3px; background:var(--dsx-elev); overflow:hidden; }
+.dsx-prog i { display:block; height:100%; width:62%; background:var(--dsx-accent); }
+.dsx-spacer { flex:1; }
+
+/* ---- table view ---- */
+.dsx-table { width:100%; border-collapse:collapse; border:1px solid var(--dsx-border); border-radius:var(--dsx-r); overflow:hidden; font-size:13px; }
+.dsx-table th { text-align:left; padding:9px 12px; background:var(--dsx-panel-2); color:var(--dsx-muted); font-weight:600; font-size:11.5px; letter-spacing:.4px; border-bottom:1px solid var(--dsx-border); }
+.dsx-table td { padding:8px 12px; border-bottom:1px solid var(--dsx-border-soft); color:var(--dsx-fg); }
+.dsx-table tr:last-child td { border-bottom:none; }
+.dsx-table tbody tr { background:var(--dsx-panel); cursor:pointer; }
+.dsx-table tbody tr:hover { background:var(--dsx-elev); }
+.dsx-table tbody tr.sel { background:var(--dsx-accent-soft); }
+.dsx-table .nm { color:var(--dsx-head); font-weight:600; }
+.dsx-table .miniwave { display:inline-flex; align-items:center; gap:1.5px; height:16px; width:74px; vertical-align:middle; }
+.dsx-table .miniwave i { flex:1; background:var(--dsx-audio); opacity:.85; border-radius:1px; min-height:2px; }
+.dsx-mut { color:var(--dsx-dim); }
+
+/* ---- similarity ---- */
+.dsx-sim { display:grid; grid-template-columns:auto 34px 1fr; gap:12px; align-items:center; border:1px solid var(--dsx-border); border-radius:var(--dsx-r); background:var(--dsx-panel); padding:14px; }
+.dsx-sim .q { width:150px; }
+.dsx-arrow { text-align:center; color:var(--dsx-accent); font-size:20px; }
+.dsx-simres { display:grid; grid-template-columns:repeat(4,1fr); gap:10px; }
+.dsx-match { position:absolute; top:6px; right:6px; font-size:10px; font-weight:800; background:var(--dsx-accent); color:var(--dsx-accent-ink); padding:1px 6px; border-radius:20px; }
+
+.dsx-legend { font-size:12px; color:var(--dsx-dim); margin-top:10px; }
+@media (max-width:560px){ .dsx-body{ grid-template-columns:150px 1fr; } .dsx-insp{ display:none; } }
+</style>
+
+<div class="dsx" data-accent="teal">
+<div class="dsx-wrap">
+  <div class="dsx-eyebrow">Visual language</div>
+  <div class="dsx-h" style="font-size:1.5rem">What 3DAM looks like</div>
+  <p class="dsx-sub">An interactive preview of the interface, its color system, and core components.
+  Pick an accent or flip light/dark — every mockup below re-themes live.</p>
+
+  <div class="dsx-controls">
+    <span class="lbl">Accent</span>
+    <button class="dsx-acc active" data-set-accent="teal"   title="Teal (default)"></button>
+    <button class="dsx-acc"        data-set-accent="violet" title="Violet"></button>
+    <button class="dsx-acc"        data-set-accent="sky"    title="Sky"></button>
+    <button class="dsx-acc"        data-set-accent="amber"  title="Amber"></button>
+    <button class="dsx-acc"        data-set-accent="rose"   title="Rose"></button>
+    <button class="dsx-toggle" data-toggle-light>☀ Light</button>
+  </div>
+
+  <!-- ===================== COLOR ===================== -->
+  <div class="dsx-block">
+    <h4>Color system — dark-first</h4>
+    <div class="dsx-swatches">
+      <div class="dsx-sw"><div class="chip" style="background:#0d1117"></div><div class="lab"><b>Canvas</b><span>#0D1117</span></div></div>
+      <div class="dsx-sw"><div class="chip" style="background:#12171f"></div><div class="lab"><b>Panel</b><span>#12171F</span></div></div>
+      <div class="dsx-sw"><div class="chip" style="background:#1b222c"></div><div class="lab"><b>Elevated</b><span>#1B222C</span></div></div>
+      <div class="dsx-sw"><div class="chip" style="background:#232a35"></div><div class="lab"><b>Border</b><span>#232A35</span></div></div>
+      <div class="dsx-sw"><div class="chip" style="background:#d6dee8"></div><div class="lab"><b>Text</b><span>#D6DEE8</span></div></div>
+      <div class="dsx-sw"><div class="chip" style="background:#8b98a9"></div><div class="lab"><b>Muted</b><span>#8B98A9</span></div></div>
+      <div class="dsx-sw"><div class="chip" style="background:var(--dsx-accent)"></div><div class="lab"><b>Accent</b><span>live</span></div></div>
+    </div>
+
+    <h4 style="margin-top:20px">Semantic &amp; media colors</h4>
+    <div class="dsx-swatches">
+      <div class="dsx-sw"><div class="chip" style="background:var(--dsx-audio)"></div><div class="lab"><b>Audio</b><span>media type</span></div></div>
+      <div class="dsx-sw"><div class="chip" style="background:var(--dsx-image)"></div><div class="lab"><b>Image</b><span>media type</span></div></div>
+      <div class="dsx-sw"><div class="chip" style="background:var(--dsx-model)"></div><div class="lab"><b>3D model</b><span>media type</span></div></div>
+      <div class="dsx-sw"><div class="chip" style="background:#3fb950"></div><div class="lab"><b>Online</b><span>source up</span></div></div>
+      <div class="dsx-sw"><div class="chip" style="background:#586170"></div><div class="lab"><b>Offline</b><span>source down</span></div></div>
+      <div class="dsx-sw"><div class="chip" style="background:#a371f7"></div><div class="lab"><b>Suggested</b><span>auto tag</span></div></div>
+      <div class="dsx-sw"><div class="chip" style="background:#f85149"></div><div class="lab"><b>Danger</b><span>destructive</span></div></div>
+    </div>
+  </div>
+
+  <!-- ===================== TYPE ===================== -->
+  <div class="dsx-block">
+    <h4>Type scale</h4>
+    <div class="dsx-type">
+      <div class="row"><span class="tag">Display / 34</span><span class="samp" style="font-size:2.1rem;font-weight:700">3DAM</span></div>
+      <div class="row"><span class="tag">Heading / 22</span><span class="samp" style="font-size:1.4rem;font-weight:700">Unified asset library</span></div>
+      <div class="row"><span class="tag">Subhead / 18</span><span class="samp" style="font-size:1.12rem;font-weight:600">Content-aware search</span></div>
+      <div class="row"><span class="tag">Body / 16</span><span class="samp" style="font-size:1rem">Find more assets like this one — across audio, image, and 3D.</span></div>
+      <div class="row"><span class="tag">Small / 13</span><span class="samp" style="font-size:.82rem;color:var(--dsx-muted)">2048 × 2048 · PNG · Studio NAS</span></div>
+      <div class="row"><span class="tag">Mono / 13</span><span class="samp" style="font-size:.82rem;font-family:var(--mono,monospace);color:var(--dsx-muted)">3dam similar footstep_gravel_03.wav</span></div>
+    </div>
+  </div>
+
+  <!-- ===================== COMPONENTS ===================== -->
+  <div class="dsx-block">
+    <h4>Core components</h4>
+    <div class="dsx-cgrid">
+      <div class="dsx-comp"><div class="t">Buttons</div><div class="r">
+        <button class="dsx-btn primary">Find similar</button>
+        <button class="dsx-btn ghost">Convert</button>
+        <button class="dsx-btn icon">☰</button>
+      </div></div>
+      <div class="dsx-comp"><div class="t">Search</div><div class="r">
+        <div class="dsx-field">⌕ footstep gravel <span class="kbd">⌘K</span></div>
+      </div></div>
+      <div class="dsx-comp"><div class="t">Filter chips</div><div class="r">
+        <span class="dsx-fchip on">Type: Audio ✕</span><span class="dsx-fchip">Tags ▾</span><span class="dsx-fchip">Source ▾</span>
+      </div></div>
+      <div class="dsx-comp"><div class="t">Media badges</div><div class="r">
+        <span class="dsx-badge audio">SFX</span><span class="dsx-badge image">IMG</span><span class="dsx-badge model">3D</span>
+      </div></div>
+      <div class="dsx-comp"><div class="t">License — colour-coded by rights</div><div class="r">
+        <span class="dsx-lm ok">CC0 · public domain</span><span class="dsx-lm attr">CC-BY · attribution</span>
+        <span class="dsx-lm warn">Proprietary · restricted</span><span class="dsx-lm unknown">Unknown</span>
+      </div></div>
+      <div class="dsx-comp"><div class="t">Tags — confirmed</div><div class="r">
+        <span class="dsx-tag">foley</span><span class="dsx-tag">stone</span><span class="dsx-tag">dry</span>
+      </div></div>
+      <div class="dsx-comp"><div class="t">Tags — auto-suggested</div><div class="r">
+        <span class="dsx-tag sug">gravel <span class="yn"><b class="y">✓</b><b class="n">✕</b></span></span>
+        <span class="dsx-tag sug">footstep <span class="yn"><b class="y">✓</b><b class="n">✕</b></span></span>
+      </div></div>
+      <div class="dsx-comp"><div class="t">Feature readout</div><div class="r" style="flex-direction:column;align-items:stretch;gap:7px">
+        <div class="dsx-feat"><span class="fl">Brightness</span><div class="dsx-bar"><i style="width:58%"></i></div></div>
+        <div class="dsx-feat"><span class="fl">Harmonicity</span><div class="dsx-bar"><i style="width:24%"></i></div></div>
+      </div></div>
+      <div class="dsx-comp"><div class="t">Source status</div><div class="r" style="flex-direction:column;align-items:stretch;gap:6px">
+        <span style="display:flex;gap:8px;align-items:center;font-size:12.5px"><i class="dot ok"></i> Studio NAS · SMB</span>
+        <span style="display:flex;gap:8px;align-items:center;font-size:12.5px" class="dsx-mut"><i class="dot off"></i> vendor · SFTP — offline</span>
+        <span style="display:flex;gap:8px;align-items:center;font-size:12.5px"><i class="dot busy"></i> Analysing 84 assets…</span>
+      </div></div>
+    </div>
+  </div>
+
+  <!-- ===================== WORKSPACE ===================== -->
+  <div class="dsx-block">
+    <h4>The workspace — three-region layout</h4>
+    <div class="dsx-scroll"><div class="dsx-win">
+      <div class="dsx-titlebar">
+        <span class="dsx-dots"><i></i><i></i><i></i></span>
+        <span class="dsx-title">3DAM — Forest Pack</span>
+        <span class="dsx-conn"><i class="dot ok"></i> Local engine · 3 sources</span>
+      </div>
+      <div class="dsx-toolbar">
+        <button class="dsx-btn icon">☰</button>
+        <div class="dsx-field" style="flex:1;min-width:160px">⌕ footstep gravel <span class="kbd">⌘K</span></div>
+        <div class="dsx-seg"><button class="on">▦ Grid</button><button>▤ Table</button></div>
+        <span class="dsx-fchip on">Type: All</span>
+        <span class="dsx-fchip">Tags ▾</span>
+        <span class="dsx-fchip">⚖ License ▾</span>
+        <span class="dsx-count">1,248 assets</span>
+      </div>
+      <div class="dsx-body">
+        <!-- sidebar -->
+        <aside class="dsx-side">
+          <div class="grp">Sources — files</div>
+          <div class="dsx-nav"><i class="dot ok"></i> Local Disk <span class="ct">610</span></div>
+          <div class="dsx-nav"><i class="dot ok"></i> Studio NAS · SMB <span class="ct">578</span></div>
+          <div class="dsx-nav dim"><i class="dot off"></i> vendor · SFTP <span class="ct">—</span></div>
+          <div class="grp">Sources — federated <span class="dsx-fedtag">3DAM</span></div>
+          <div class="dsx-nav"><span class="dsx-fed">◈</span> asset-store <span class="ct">14.2k</span></div>
+          <div class="dsx-nav"><span class="dsx-fed">◈</span> teammate · lib <span class="ct">3,905</span></div>
+          <div class="grp">Library</div>
+          <div class="dsx-nav">▦ All assets <span class="ct">1,248</span></div>
+          <div class="dsx-nav">★ Favorites <span class="ct">64</span></div>
+          <div class="dsx-nav">◔ Recently added <span class="ct">84</span></div>
+          <div class="grp">Smart folders</div>
+          <div class="dsx-nav on">⚡ Footsteps <span class="ct">32</span></div>
+          <div class="dsx-nav">⚡ Low-poly props <span class="ct">211</span></div>
+          <div class="dsx-nav">⚡ Seamless textures <span class="ct">147</span></div>
+          <div class="grp">Tags</div>
+          <div class="dsx-tagrow">
+            <span class="dsx-tag">stone</span><span class="dsx-tag">wood</span>
+            <span class="dsx-tag">ambient</span><span class="dsx-tag">metal</span><span class="dsx-tag">foliage</span>
+          </div>
+        </aside>
+        <!-- grid -->
+        <main class="dsx-gridwrap">
+          <div class="dsx-crumb">All assets <b>›</b> Smart folder: <b>Footsteps</b> · 32 results · sorted by similarity</div>
+          <div class="dsx-grid">
+            <div class="dsx-card"><div class="dsx-thumb tx-moss"></div><span class="dsx-badge image bdg">IMG</span><div class="m"><div class="n">mossy_rock_albedo</div><div class="s">2048² · PNG</div></div></div>
+            <div class="dsx-card sel"><div class="dsx-thumb"><div class="dsx-wave" data-seed="7" data-bars="34"></div></div><span class="dsx-badge audio bdg">SFX</span><div class="m"><div class="n">footstep_gravel_03</div><div class="s">0:01 · Mono · WAV</div></div></div>
+            <div class="dsx-card"><div class="dsx-thumb"><svg width="70" height="70" viewBox="0 0 120 120" class="dsx-gem"></svg><span class="dsx-origin">◈ asset-store</span></div><span class="dsx-badge model bdg">3D</span><div class="m"><div class="n">boulder_lowpoly</div><div class="s">1,204 tris · glTF</div></div></div>
+            <div class="dsx-card"><div class="dsx-thumb tx-bark"></div><span class="dsx-badge image bdg">IMG</span><div class="m"><div class="n">bark_oak_02</div><div class="s">1024² · PNG</div></div></div>
+            <div class="dsx-card"><div class="dsx-thumb"><div class="dsx-wave" data-seed="19" data-bars="34"></div></div><span class="dsx-badge audio bdg">SFX</span><div class="m"><div class="n">ambience_forest</div><div class="s">1:12 · Stereo</div></div></div>
+            <div class="dsx-card"><div class="dsx-thumb"><svg width="70" height="70" viewBox="0 0 120 120" class="dsx-gem" data-variant="1"></svg></div><span class="dsx-badge model bdg">3D</span><div class="m"><div class="n">fern_plant_a</div><div class="s">3,402 tris · FBX</div></div></div>
+          </div>
+        </main>
+        <!-- inspector -->
+        <aside class="dsx-insp">
+          <div class="prev"><div class="dsx-wave" data-seed="7" data-bars="46" style="width:88%;height:72px"></div><div class="play">▶</div></div>
+          <h5>footstep_gravel_03.wav</h5>
+          <div class="badges"><span class="dsx-badge audio">SFX</span><span class="dsx-badge" style="background:var(--dsx-elev);color:var(--dsx-muted)">WAV</span></div>
+          <div class="dsx-lic attr"><span class="k">⚖ CC-BY 4.0</span><span class="r">Commercial ✓ · Modify ✓ · <b>Attribution required</b></span></div>
+          <div class="dsx-kv"><span>Attribution</span><b>© Kenney · CC-BY</b></div>
+          <div class="dsx-kv"><span>Duration</span><b>0:01.24</b></div>
+          <div class="dsx-kv"><span>Format</span><b>48 kHz · 24-bit · Mono</b></div>
+          <div class="dsx-kv"><span>Size</span><b>384 KB</b></div>
+          <div class="dsx-kv"><span>Source</span><b>Studio NAS</b></div>
+          <div class="dsx-sech">Extracted features</div>
+          <div class="dsx-kv"><span>Class</span><b>One-shot</b></div>
+          <div class="dsx-kv"><span>Loudness</span><b>-14 LUFS</b></div>
+          <div class="dsx-feat"><span class="fl">Brightness</span><div class="dsx-bar"><i style="width:58%"></i></div></div>
+          <div class="dsx-feat"><span class="fl">Harmonicity</span><div class="dsx-bar"><i style="width:22%"></i></div></div>
+          <div class="dsx-sech">Auto-tags · review</div>
+          <div class="r" style="display:flex;flex-wrap:wrap;gap:6px">
+            <span class="dsx-tag sug">gravel <span class="yn"><b class="y">✓</b><b class="n">✕</b></span></span>
+            <span class="dsx-tag sug">dry <span class="yn"><b class="y">✓</b><b class="n">✕</b></span></span>
+          </div>
+          <div class="dsx-sech">Tags</div>
+          <div class="r" style="display:flex;flex-wrap:wrap;gap:6px"><span class="dsx-tag">foley</span><span class="dsx-tag">sfx</span></div>
+          <div class="acts"><button class="dsx-btn primary">⚡ Find similar</button><button class="dsx-btn ghost">⇩</button></div>
+        </aside>
+      </div>
+      <div class="dsx-status">
+        <i class="dot busy"></i> Analysing 84 new assets…
+        <div class="dsx-prog"><i></i></div><span>62%</span>
+        <div class="dsx-spacer"></div>
+        <span>3D 412 · IMG 590 · SFX 246</span>
+      </div>
+    </div></div>
+    <p class="dsx-legend">Left: sources, library, smart folders &amp; tags. Center: grid/table browser. Right: the inspector — <b>license sits right under the title</b>, then extracted features and auto-tags to review.</p>
+  </div>
+
+  <!-- ===================== TABLE ===================== -->
+  <div class="dsx-block">
+    <h4>Table view — dense, sortable, unified</h4>
+    <div class="dsx-scroll">
+    <table class="dsx-table" style="min-width:720px">
+      <thead><tr><th style="width:26px"></th><th>Name ▾</th><th>Type</th><th>License</th><th>Size</th><th>Detail</th><th>Tags</th></tr></thead>
+      <tbody>
+        <tr class="sel"><td><span class="dsx-badge audio">SFX</span></td><td class="nm">footstep_gravel_03</td><td>Audio</td><td><span class="dsx-lm attr">CC-BY 4.0</span></td><td class="dsx-mut">384 KB</td><td><span class="miniwave" data-seed="7" data-bars="20"></span> <span class="dsx-mut">0:01 · Am</span></td><td class="dsx-mut">foley, gravel</td></tr>
+        <tr><td><span class="dsx-badge image">IMG</span></td><td class="nm">mossy_rock_albedo</td><td>Image</td><td><span class="dsx-lm ok">CC0</span></td><td class="dsx-mut">5.2 MB</td><td class="dsx-mut">2048 × 2048</td><td class="dsx-mut">moss, stone</td></tr>
+        <tr><td><span class="dsx-badge model">3D</span></td><td class="nm">boulder_lowpoly</td><td>Model</td><td><span class="dsx-lm warn">Store EULA</span></td><td class="dsx-mut">890 KB</td><td class="dsx-mut">1,204 tris</td><td class="dsx-mut">rock, prop</td></tr>
+        <tr><td><span class="dsx-badge audio">SFX</span></td><td class="nm">ambience_forest</td><td>Audio</td><td><span class="dsx-lm attr">CC-BY 4.0</span></td><td class="dsx-mut">12 MB</td><td><span class="miniwave" data-seed="19" data-bars="20"></span> <span class="dsx-mut">1:12 · loop</span></td><td class="dsx-mut">ambient, loop</td></tr>
+        <tr><td><span class="dsx-badge image">IMG</span></td><td class="nm">bark_oak_02</td><td>Image</td><td><span class="dsx-lm ok">CC0</span></td><td class="dsx-mut">2.1 MB</td><td class="dsx-mut">1024 × 1024</td><td class="dsx-mut">wood, bark</td></tr>
+        <tr><td><span class="dsx-badge model">3D</span></td><td class="nm">fern_plant_a</td><td>Model</td><td><span class="dsx-lm unknown">Unknown</span></td><td class="dsx-mut">1.4 MB</td><td class="dsx-mut">3,402 tris</td><td class="dsx-mut">foliage</td></tr>
+      </tbody>
+    </table>
+    </div>
+  </div>
+
+  <!-- ===================== SIMILARITY ===================== -->
+  <div class="dsx-block">
+    <h4>Content-aware similarity — the signature feature</h4>
+    <div class="dsx-sim">
+      <div class="q">
+        <div class="dsx-card sel" style="cursor:default">
+          <div class="dsx-thumb"><div class="dsx-wave" data-seed="7" data-bars="30"></div></div>
+          <span class="dsx-badge audio bdg">SFX</span>
+          <div class="m"><div class="n">footstep_gravel_03</div><div class="s">query</div></div>
+        </div>
+      </div>
+      <div class="dsx-arrow">→</div>
+      <div class="dsx-simres">
+        <div class="dsx-card" style="cursor:default"><div class="dsx-thumb"><div class="dsx-wave" data-seed="71" data-bars="24"></div></div><span class="dsx-match">98%</span><div class="m"><div class="n">step_gravel_A</div></div></div>
+        <div class="dsx-card" style="cursor:default"><div class="dsx-thumb"><div class="dsx-wave" data-seed="72" data-bars="24"></div></div><span class="dsx-match">94%</span><div class="m"><div class="n">boot_dirt_02</div></div></div>
+        <div class="dsx-card" style="cursor:default"><div class="dsx-thumb"><div class="dsx-wave" data-seed="73" data-bars="24"></div></div><span class="dsx-match">91%</span><div class="m"><div class="n">scuff_stone</div></div></div>
+        <div class="dsx-card" style="cursor:default"><div class="dsx-thumb"><div class="dsx-wave" data-seed="74" data-bars="24"></div></div><span class="dsx-match">88%</span><div class="m"><div class="n">gravel_shift</div></div></div>
+      </div>
+    </div>
+    <p class="dsx-legend">Same interaction works on an image or a 3D model — the embedding differs, the gesture doesn't.</p>
+  </div>
+
+</div>
+</div>
+
+<script>
+(function(){
+  var root = document.querySelector('.dsx');
+  if(!root) return;
+
+  // deterministic pseudo-random so waveforms look organic but stable
+  function seeded(s){ return function(){ s = (s*1103515245 + 12345) & 0x7fffffff; return s/0x7fffffff; }; }
+
+  document.querySelectorAll('.dsx-wave, .miniwave').forEach(function(el, idx){
+    var rnd = seeded((parseInt(el.dataset.seed)||7) * 131 + idx*7 + 3);
+    var n = parseInt(el.dataset.bars) || 32;
+    var html = '';
+    for(var k=0;k<n;k++){
+      var t = k/(n-1);
+      var env = Math.sin(t*Math.PI);           // fade in/out envelope
+      var spike = rnd() < 0.18 ? 1.35 : 1;      // occasional transients
+      var h = Math.max(6, Math.min(100, (0.30 + 0.72*rnd()) * env * 100 * spike));
+      html += '<i style="height:'+h.toFixed(0)+'%"></i>';
+    }
+    el.innerHTML = html;
+  });
+
+  // low-poly gem/rock for 3D thumbnails
+  var facets = [
+    ['35,42 60,34 60,48','#3a4552'],['60,34 85,42 60,48','#323c48'],
+    ['85,42 78,60 60,48','#2b343f'],['78,60 60,66 60,48','#252d37'],
+    ['60,66 42,60 60,48','#2b343f'],['42,60 35,42 60,48','#333d49'],
+    ['35,42 42,60 60,102','#222a34'],['42,60 60,66 60,102','#1d242d'],
+    ['60,66 78,60 60,102','#242c36'],['78,60 85,42 60,102','#2a323d']
+  ];
+  document.querySelectorAll('.dsx-gem').forEach(function(svg){
+    var accentFacet = svg.dataset.variant ? 2 : 3;
+    var s = '';
+    facets.forEach(function(f,i){
+      var fill = (i===accentFacet) ? 'var(--dsx-accent)' : f[1];
+      var op = (i===accentFacet) ? '0.55' : '1';
+      s += '<polygon points="'+f[0]+'" fill="'+fill+'" fill-opacity="'+op+'" stroke="#0d1117" stroke-width="0.8"/>';
+    });
+    svg.innerHTML = s;
+  });
+
+  // theme switcher
+  document.querySelectorAll('[data-set-accent]').forEach(function(btn){
+    btn.addEventListener('click', function(){
+      root.setAttribute('data-accent', btn.dataset.setAccent);
+      document.querySelectorAll('[data-set-accent]').forEach(function(b){ b.classList.toggle('active', b===btn); });
+    });
+  });
+  var toggle = document.querySelector('[data-toggle-light]');
+  if(toggle) toggle.addEventListener('click', function(){
+    var light = root.classList.toggle('light');
+    toggle.textContent = light ? '☾ Dark' : '☀ Light';
+  });
+})();
+</script>
+
+<h2 id="1-product-principles">1. Product principles</h2>
+<h3 id="11-speed-is-non-negotiable">1.1 Speed is non-negotiable</h3>
+<ul>
+<li>Target <strong>60 fps</strong> scrolling through a grid of 100k assets. Thumbnails and metadata load
+  lazily and are virtualised; the UI never blocks on I/O or analysis.</li>
+<li>All heavy work — scanning, decoding, feature extraction, thumbnailing — runs off the UI
+  thread on a bounded worker pool and reports progress incrementally.</li>
+<li>Prefer <strong>incremental</strong> over <strong>batch</strong>: results appear as they are computed, never in one
+  final dump. A partial index is usable immediately.</li>
+<li>Measure before optimising, but design for scale from the start. Assume libraries of
+  <strong>1M+ assets</strong> and datasets that do not fit in RAM.</li>
+</ul>
+<h3 id="12-automation-is-the-default-not-an-add-on">1.2 Automation is the default, not an add-on</h3>
+<ul>
+<li>The system proposes; the user disposes. Auto-categorisation, auto-tagging, and duplicate
+  detection run automatically on ingest and surface <strong>suggestions</strong>, never silent mutations.</li>
+<li>Every automated action is <strong>reviewable, reversible, and explainable</strong> — the user can see
+  <em>why</em> an asset was tagged "metallic" or flagged as a near-duplicate.</li>
+<li>No destructive automation without explicit opt-in. 3DAM never deletes, moves, or
+  overwrites source files unless the user directs it to.</li>
+</ul>
+<h3 id="13-local-first-and-non-destructive">1.3 Local-first and non-destructive</h3>
+<ul>
+<li>The source of truth is a <strong>local database</strong>; sources (disks, shares) are treated as
+  read-only unless the user asks otherwise.</li>
+<li>3DAM catalogues <strong>in place</strong>. Importing an asset records a reference, generates
+  derivatives (thumbnails, waveforms, embeddings), and never requires copying the original.</li>
+<li>All derived data lives outside the source tree, in 3DAM's own managed store.</li>
+</ul>
+<h3 id="14-one-engine-many-front-ends">1.4 One engine, many front-ends</h3>
+<ul>
+<li>GUI, CLI, and web client are all front-ends over the <strong>same engine</strong> (<code>3dam-core</code>). No
+  feature is GUI-only by architecture, and no front-end reaches past the engine's API.</li>
+<li>The CLI is first-class: scriptable, pipeable, machine-readable output (<code>--json</code>), stable
+  exit codes, no interactive prompts required in non-interactive mode.</li>
+<li><strong>The client is also the server.</strong> One binary provides the GUI client, the CLI client,
+  and — via <code>3dam serve</code> — the server that hosts the API and the web client. The engine runs
+  either <strong>embedded</strong> in a client (standalone, no network) or <strong>as a service</strong> that clients
+  connect to. Front-ends therefore talk to a <code>LibraryService</code> interface, never to a local
+  database directly, so the same UI code works whether the library is local or remote.</li>
+<li>Server mode is <strong>config-driven and headless-friendly</strong>: it reads a config file naming the
+  sources to index and starts unattended — suitable for a NAS, a workstation, or CI.</li>
+</ul>
+<h3 id="15-open-and-portable">1.5 Open and portable</h3>
+<ul>
+<li>Database format is documented and stable. Metadata is exportable to plain text
+  (JSON/CSV/sidecar files) at any time.</li>
+<li>No telemetry. No network calls the user did not initiate. No account required.</li>
+</ul>
+<h2 id="2-architecture-guidelines">2. Architecture guidelines</h2>
+<ul>
+<li><strong>Layered core.</strong> <code>3dam-core</code> (database, scanning, analysis, search) knows nothing about
+  the GUI, CLI, web, or transport. Front-ends depend on the core; the core depends on neither.</li>
+<li><strong>Transport-agnostic front-ends.</strong> Clients depend on a <code>LibraryService</code> trait with two
+  implementations — in-process (embedded engine) and API-client (remote <code>3dam serve</code>). The
+  server exposes that same surface over HTTP/WebSocket. Adding server/web support is
+  implementing the trait, not forking the UI. See <a href="product_spec.html">PRODUCT_SPEC.md</a> §4.</li>
+<li><strong>Media plugins.</strong> Each media type (audio, image, 3D) implements a common
+  <code>MediaHandler</code> trait: detect, decode, thumbnail, extract features, extract metadata.
+  Adding a new format or media type is adding an implementation, not editing the core.</li>
+<li><strong>One database, many media types.</strong> A shared asset schema holds what is common (path,
+  hash, size, tags, source, timestamps); media-specific attributes hang off it. See
+  <a href="product_spec.html">PRODUCT_SPEC.md</a> for the model.</li>
+<li><strong>Sources are abstract, in two kinds.</strong> <em>File sources</em> (local FS, SFTP, SMB) yield raw
+  bytes the engine processes; <em>federated sources</em> (a remote 3DAM server) yield catalog
+  results the engine merges. Both satisfy one <code>Source</code> trait so code above it treats them
+  uniformly; the query engine fans out and merges results across all sources.</li>
+<li><strong>Federate, don't reprocess.</strong> A federated peer already extracted features, built
+  thumbnails, and computed embeddings — 3DAM queries that catalog and never re-decodes or
+  re-analyses another instance's files. Federated assets are read-only references with
+  remote-owned previews. This line is load-bearing: local processing is only ever for
+  <em>your</em> file sources. See <a href="product_spec.html">PRODUCT_SPEC.md</a> §4.4.</li>
+<li><strong>Auth is a first-class layer, designed in early.</strong> Every remote interaction carries an
+  auth context (anonymous, token, or OIDC/OAuth2); credentials live in the OS secret store,
+  never in the library file. Start simple (tokens + anonymous read) but keep the seam clean
+  so open-standard identity slots in without a rewrite. Prefer open standards over bespoke
+  auth.</li>
+<li><strong>Capabilities are feature flags, off by default — not forks.</strong> Every server capability (the
+  MCP agent server, authentication, user accounts, inbound federation, remote connect, network
+  writes) is a runtime flag on the one shared surface, not a separate build or daemon. A server
+  ships locked down and each capability is switched on deliberately — from a config file or the
+  web admin UI, which are coequal control planes over one persisted state. Turning a capability
+  <strong>off removes its surface</strong> (route, tools, endpoint), so "off" actually shrinks exposure.
+  Accounts and roles are opt-in and server-side, never written into the portable library file.
+  See <a href="product_spec.html">PRODUCT_SPEC.md</a> §6.11.</li>
+<li><strong>Analysis is pluggable and optional.</strong> Feature extractors (embeddings, perceptual
+  hashes, spectral analysis) are modules that can be enabled/disabled and versioned, so a
+  library can be re-analysed when a model improves.</li>
+<li><strong>Fail soft.</strong> A corrupt file, an unreadable format, or a dropped network share degrades
+  one asset — never the scan, never the app.</li>
+</ul>
+<h2 id="3-interaction-ux-guidelines">3. Interaction &amp; UX guidelines</h2>
+<p>The desktop app draws on three proven layouts (see <code>docs/existing-product-screenshots/</code>):
+a <strong>hierarchical source/category sidebar</strong> (Connecter), a <strong>content grid + rich detail
+panel</strong> (Connecter / echo3D), and a <strong>sortable attribute table with inline previews and
+similarity search</strong> (Sononym). 3DAM unifies these into one workspace.</p>
+<h3 id="31-layout">3.1 Layout</h3>
+<ul>
+<li><strong>Three-region workspace:</strong> left navigation (sources, collections, tags, smart folders),
+  centre browser (grid or table, user-toggleable), right detail/inspector panel.</li>
+<li><strong>Grid and table are equal.</strong> Grid for visual scanning (thumbnails, turntables,
+  waveforms); table for dense, sortable, attribute-driven work (BPM, dimensions, poly
+  count). Any view switch preserves the current selection and filter.</li>
+<li>The <strong>inspector</strong> shows a large preview, full metadata, extracted features, tags, and
+  source info for the selected asset. It is the single place to review and correct
+  automated results.</li>
+<li><strong>License is prioritised in the inspector.</strong> Because different assets carry different
+  licenses, the license/rights of the selected asset appears high in the panel — directly
+  under the title, as a colour-coded badge (e.g. permissive / attribution-required /
+  restricted / unknown) with the key rights and attribution beside it — not buried among
+  technical metadata. An <strong>unknown or unverified</strong> license is shown as exactly that, and is
+  never styled as if it were safe. The goal: a user should never ship an asset without having
+  seen what they're allowed to do with it.</li>
+</ul>
+<h3 id="32-previews-per-media-type">3.2 Previews per media type</h3>
+<ul>
+<li><strong>Audio:</strong> waveform + scrubbable playback; spectral/feature readouts; space to play.</li>
+<li><strong>Image:</strong> thumbnail → full-resolution zoom/pan; format, dimensions, colour info.</li>
+<li><strong>3D:</strong> rendered thumbnail and an interactive orbit viewer; poly count, materials, bounds.</li>
+<li>Previews are generated once, cached, and regenerated only on source change.</li>
+</ul>
+<h3 id="33-search-and-discovery">3.3 Search and discovery</h3>
+<ul>
+<li><strong>Text search</strong> (names, tags, metadata) is always available and instant.</li>
+<li><strong>Similarity search</strong> ("find more like this") is a first-class action on any asset,
+  powered by content embeddings — the signature feature carried across all three media
+  types, not just audio.</li>
+<li><strong>Faceted filtering</strong> via chips/dropdowns (type, tags, format, source, size, and
+  media-specific facets). Filters compose; the active filter set is always visible.</li>
+<li><strong>Smart folders / saved searches</strong> persist a query as a live, self-updating collection.</li>
+</ul>
+<h3 id="34-feedback-and-control">3.4 Feedback and control</h3>
+<ul>
+<li>Long operations always show progress, are cancellable, and never freeze the UI.</li>
+<li>Every automated suggestion has a visible, one-action <strong>accept / reject</strong>.</li>
+<li>Bulk operations (retag, convert, export) preview their effect and are undoable where
+  physically possible.</li>
+</ul>
+<h3 id="35-accessibility-platform-fit">3.5 Accessibility &amp; platform fit</h3>
+<ul>
+<li>Full keyboard navigation; keyboard shortcuts for every high-frequency action.</li>
+<li>Honour OS light/dark preference; ship a dark default (the working context for most
+  game-dev tooling).</li>
+<li>Cross-platform first (Linux, Windows, macOS); no platform-exclusive core features.</li>
+</ul>
+<h3 id="36-server-administration-feature-flags">3.6 Server administration &amp; feature flags</h3>
+<p>The web client hosts an admin-only <strong>Settings / Administration</strong> area for the server's feature
+flags, authentication, and user accounts (see <a href="product_spec.html">PRODUCT_SPEC.md</a> §6.11). It is a
+first-class, beautifully presented surface — not a raw config editor:</p>
+<ul>
+<li><strong>Grouped toggle cards.</strong> Capabilities are grouped by area (Access, Authentication, Accounts,
+  Agents / MCP, Federation, Analysis). Each is a labelled toggle with a title, a one-line
+  description of what it does, and an obvious on/off state.</li>
+<li><strong>Progressive disclosure.</strong> Enabling a capability reveals its sub-options inline — turn on
+  Authentication and the mode picker appears; turn on Accounts and the user list + role editor
+  appear; turn on the MCP server and the read-only/writes choice appears. Nothing irrelevant is
+  shown until it applies.</li>
+<li><strong>Warn before exposure.</strong> Consequential toggles (exposing the server without auth, enabling
+  MCP or network writes beyond localhost) show a clear risk note and require confirmation before
+  taking effect — the no-surprises rule (§3.4) applied to configuration.</li>
+<li><strong>Live vs restart is explicit.</strong> Flags that apply immediately do so; any that need a restart
+  are labelled, never silently deferred.</li>
+<li><strong>Parity with config/CLI.</strong> Everything here is equivalently settable from the config file and
+  the CLI, so the admin UI is a convenience over one source of truth, never the only way in.</li>
+</ul>
+<h2 id="4-visual-design">4. Visual design</h2>
+<ul>
+<li><strong>Dark-first, low-chrome.</strong> The content — thumbnails, waveforms, models — is the bright
+  part of the screen; the UI recedes. One restrained accent colour for selection, focus,
+  and primary actions.</li>
+<li><strong>Information-dense but calm.</strong> Favour tables and tight grids over whitespace-heavy
+  cards, but keep typography and spacing consistent and legible at a glance.</li>
+<li><strong>Consistent iconography</strong> per media type and per action, used identically in GUI and in
+  CLI output labels where applicable.</li>
+<li><strong>Content-truthful thumbnails.</strong> Previews represent the real asset (correct aspect ratio,
+  colour, framing); no decorative placeholders masquerading as content.</li>
+<li><strong>State-truthful controls.</strong> In the admin surface (§3.6), a feature's on/off/at-risk state is
+  carried by colour and a clear control, using the one accent for "on" and a distinct warning
+  tone for exposure risk — the settings recede, the state reads at a glance, no decorative chrome
+  dressing up a config screen.</li>
+</ul>
+<h2 id="5-cli-guidelines">5. CLI guidelines</h2>
+<ul>
+<li><strong>Verb-noun command structure:</strong> <code>3dam scan &lt;source&gt;</code>, <code>3dam search &lt;query&gt;</code>,
+  <code>3dam similar &lt;asset&gt;</code>, <code>3dam convert &lt;asset&gt; --to &lt;format&gt;</code>, <code>3dam export</code>.</li>
+<li><strong>Human output by default, machine output on request:</strong> readable tables interactively;
+  <code>--json</code> / <code>--csv</code> for scripting. Detect non-TTY and quiet down automatically.</li>
+<li><strong>Composable:</strong> results stream, exit codes are meaningful, and output can be piped into
+  the next command or standard Unix tools.</li>
+<li><strong>No surprises:</strong> destructive commands require confirmation or an explicit <code>--yes</code>;
+  <code>--dry-run</code> is available for anything that writes.</li>
+<li><strong>Server from the CLI:</strong> <code>3dam serve</code> launches server mode from a config file (sources to
+  index, listen address, analysis settings, and <strong>feature flags</strong>) and runs headless;
+  <code>--connect &lt;host:port&gt;</code> points any client command at a remote library instead of the local
+  one. Feature flags and user accounts are readable and settable from the CLI, mirroring the web
+  admin surface (§3.6), so a server is fully administrable without a browser.</li>
+<li><strong>Shared config and database</strong> with the desktop app — run either against the same library.</li>
+</ul>
+<h2 id="6-quality-bar">6. Quality bar</h2>
+<ul>
+<li><strong>Non-destructive by default</strong>, everywhere. When in doubt, don't touch the user's files.</li>
+<li><strong>Reproducible analysis:</strong> feature extractors are versioned so results can be explained
+  and regenerated.</li>
+<li><strong>Graceful degradation:</strong> missing optional dependency, offline share, or unsupported
+  format produces a clear message and a still-usable app — never a crash.</li>
+<li><strong>Tested at scale:</strong> performance and correctness are validated against large, real,
+  messy libraries, not just tidy fixtures.</li>
+</ul>
+<hr />
+<p>See also: <a href="mission.html">MISSION.md</a> · <a href="product_spec.html">PRODUCT_SPEC.md</a></p>
+<nav class="docnav"><a class="prev" href="mission.html"><small>Previous</small><span>&larr; Mission</span></a><a class="next" href="product_spec.html"><small>Next</small><span>Spec &rarr;</span></a></nav>
+</main>
+<footer class="footer">3DAM — free &amp; open-source game asset manager · MIT licensed</footer>
+</body>
+</html>

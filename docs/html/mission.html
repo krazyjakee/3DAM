@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mission · 3DAM</title>
+<style>:root {
+  --bg: #0d1117;
+  --bg-soft: #161b22;
+  --bg-code: #0a0e14;
+  --border: #232a35;
+  --border-soft: #1c222c;
+  --fg: #d6dee8;
+  --fg-muted: #8b98a9;
+  --fg-dim: #6b7787;
+  --heading: #f0f4f9;
+  --accent: #35d0ba;
+  --accent-soft: rgba(53, 208, 186, 0.12);
+  --accent-line: rgba(53, 208, 186, 0.35);
+  --radius: 10px;
+  --maxw: 860px;
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --mono: "SFMono-Regular", "JetBrains Mono", "Fira Code", ui-monospace, Menlo, Consolas, monospace;
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0;
+  font-family: var(--font);
+  color: var(--fg);
+  background:
+    radial-gradient(1200px 600px at 80% -10%, rgba(53,208,186,0.06), transparent 60%),
+    radial-gradient(900px 500px at -10% 10%, rgba(80,120,255,0.05), transparent 55%),
+    var(--bg);
+  line-height: 1.65;
+  font-size: 16px;
+  -webkit-font-smoothing: antialiased;
+}
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+/* Top bar */
+.topbar {
+  position: sticky; top: 0; z-index: 20;
+  backdrop-filter: blur(10px);
+  background: rgba(13,17,23,0.72);
+  border-bottom: 1px solid var(--border);
+}
+.topbar-inner {
+  max-width: var(--maxw); margin: 0 auto; padding: 14px 24px;
+  display: flex; align-items: center; gap: 22px;
+}
+.brand { display: flex; align-items: baseline; gap: 10px; font-weight: 700; letter-spacing: .3px; }
+.brand .logo { color: var(--heading); font-size: 19px; }
+.brand .logo b { color: var(--accent); }
+.brand .tag { color: var(--fg-dim); font-size: 12px; font-weight: 500; }
+.nav { display: flex; gap: 6px; margin-left: auto; flex-wrap: wrap; }
+.nav a {
+  color: var(--fg-muted); padding: 6px 12px; border-radius: 8px;
+  font-size: 14px; font-weight: 500; border: 1px solid transparent;
+}
+.nav a:hover { color: var(--fg); background: var(--bg-soft); text-decoration: none; }
+.nav a.active { color: var(--accent); background: var(--accent-soft); border-color: var(--accent-line); }
+
+/* Page */
+main { max-width: var(--maxw); margin: 0 auto; padding: 48px 24px 96px; }
+.subtitle { color: var(--fg-dim); font-size: 14px; text-transform: uppercase; letter-spacing: 2px; margin: 0 0 6px; }
+
+h1, h2, h3, h4 { color: var(--heading); line-height: 1.25; font-weight: 700; }
+h1 { font-size: 2.1rem; margin: .2em 0 .6em; letter-spacing: -.5px; }
+h2 {
+  font-size: 1.4rem; margin: 2.4em 0 .8em; padding-bottom: .35em;
+  border-bottom: 1px solid var(--border);
+}
+h2::before {
+  content: ""; display: inline-block; width: 8px; height: 8px; margin-right: 12px;
+  border-radius: 2px; background: var(--accent); vertical-align: middle;
+  transform: translateY(-2px);
+}
+h3 { font-size: 1.12rem; margin: 1.8em 0 .5em; color: #cdd7e3; }
+h4 { font-size: 1rem; margin: 1.4em 0 .4em; color: var(--fg-muted); }
+
+p { margin: .8em 0; }
+strong { color: var(--heading); font-weight: 650; }
+hr { border: none; border-top: 1px solid var(--border); margin: 2.6em 0; }
+
+ul, ol { padding-left: 1.4em; }
+li { margin: .35em 0; }
+li::marker { color: var(--accent); }
+
+/* Inline + block code */
+code {
+  font-family: var(--mono); font-size: .88em;
+  background: var(--bg-soft); border: 1px solid var(--border-soft);
+  padding: .12em .4em; border-radius: 5px; color: #a7f3e4;
+}
+pre {
+  background: var(--bg-code); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 18px 20px; overflow-x: auto;
+  box-shadow: inset 0 0 0 1px rgba(255,255,255,0.01);
+}
+pre code {
+  background: none; border: none; padding: 0; color: #9fb0c3;
+  font-size: .84em; line-height: 1.55;
+}
+
+/* Tables */
+table {
+  border-collapse: collapse; width: 100%; margin: 1.2em 0; font-size: .95em;
+  border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden;
+}
+th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--border-soft); }
+th { background: var(--bg-soft); color: var(--heading); font-weight: 600; }
+tr:last-child td { border-bottom: none; }
+tbody tr:hover { background: rgba(255,255,255,0.015); }
+
+/* Blockquote */
+blockquote {
+  margin: 1.2em 0; padding: .6em 1.1em; color: var(--fg-muted);
+  border-left: 3px solid var(--accent-line); background: var(--accent-soft);
+  border-radius: 0 8px 8px 0;
+}
+
+/* Footer nav between docs */
+.docnav {
+  display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap;
+  margin-top: 3.5em; padding-top: 1.8em; border-top: 1px solid var(--border);
+}
+.docnav a {
+  flex: 1 1 220px; padding: 14px 18px; border: 1px solid var(--border);
+  border-radius: var(--radius); background: var(--bg-soft); color: var(--fg);
+}
+.docnav a:hover { border-color: var(--accent-line); text-decoration: none; }
+.docnav a small { display: block; color: var(--fg-dim); font-size: 12px; text-transform: uppercase; letter-spacing: 1px; }
+.docnav a span { color: var(--accent); font-weight: 600; }
+.docnav a.next { text-align: right; }
+
+.footer { max-width: var(--maxw); margin: 0 auto; padding: 0 24px 60px; color: var(--fg-dim); font-size: 13px; }
+
+/* Landing cards */
+.hero { text-align: center; padding: 40px 0 20px; }
+.hero h1 { font-size: 3rem; }
+.hero .lede { color: var(--fg-muted); font-size: 1.15rem; max-width: 640px; margin: 0 auto; }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 18px; margin: 40px 0; }
+.card {
+  display: block; padding: 22px; border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--bg-soft); color: var(--fg);
+}
+.card:hover { border-color: var(--accent-line); transform: translateY(-2px); text-decoration: none; }
+.card { transition: border-color .15s ease, transform .15s ease; }
+.card .k { color: var(--accent); font-size: 12px; text-transform: uppercase; letter-spacing: 2px; }
+.card h3 { margin: 8px 0 6px; color: var(--heading); }
+.card p { margin: 0; color: var(--fg-muted); font-size: .95em; }
+
+@media (max-width: 600px) {
+  body { font-size: 15px; }
+  h1 { font-size: 1.7rem; } .hero h1 { font-size: 2.2rem; }
+  main { padding: 32px 18px 72px; }
+  .topbar-inner { padding: 12px 18px; }
+}</style>
+</head>
+<body>
+<header class="topbar"><div class="topbar-inner">
+  <a class="brand" href="index.html" style="color:inherit">
+    <span class="logo">3D<b>AM</b></span>
+    <span class="tag">asset manager</span>
+  </a>
+  <nav class="nav">
+    <a href="index.html" class="">Home</a>
+    <a href="mission.html" class="active">Mission</a><a href="design_guidelines.html" class="">Design</a><a href="product_spec.html" class="">Spec</a><a href="roadmap.html" class="">Roadmap</a>
+  </nav>
+</div></header>
+<main>
+<p class="subtitle">Why 3DAM exists</p>
+<h1 id="3dam-mission-statement">3DAM — Mission Statement</h1>
+<p><strong>3DAM</strong> (pronounced "three-dee-A-M") is a free, open-source asset manager for game
+developers. It unifies <strong>sound</strong>, <strong>image</strong>, and <strong>3D model</strong> libraries into one fast,
+searchable database, and uses content-aware automation to do the tedious cataloguing work
+for you.</p>
+<h2 id="the-problem">The problem</h2>
+<p>Game asset libraries are sprawling, heterogeneous, and badly organised. A single project
+touches thousands of audio clips, textures, sprites, and meshes — spread across local
+drives, network shares, and vendor packs downloaded over years. The tools that exist today
+are fragmented and compromised:</p>
+<ul>
+<li>They specialise in <strong>one media type</strong> (a sample browser <em>or</em> a texture manager <em>or</em> a 3D
+  catalogue), forcing developers to juggle several apps with several databases.</li>
+<li>The good ones are <strong>proprietary, cloud-locked, or subscription-walled</strong> — your metadata
+  lives on someone else's server, and your workflow stops when your card expires.</li>
+<li>Organisation is <strong>manual</strong>. Tagging ten thousand files by hand is nobody's job, so it
+  never happens, and search degrades to guessing filenames.</li>
+</ul>
+<h2 id="our-answer">Our answer</h2>
+<p>One tool, three media types, one database, no subscription, no cloud lock-in.</p>
+<p>3DAM takes the best idea from each category-leading app and puts them under one roof:</p>
+<ul>
+<li><strong>Content-based analysis and similarity search</strong> for audio — inspired by sample browsers
+  like Sononym — extended to images and 3D models.</li>
+<li><strong>A unified asset browser</strong> with a rich metadata panel — in the spirit of Connecter —
+  that treats a <code>.wav</code>, a <code>.png</code>, and a <code>.glb</code> as first-class citizens of the same library.</li>
+<li><strong>A convert / compress / optimize pipeline</strong> and preview generation — as seen in tools
+  like echo3D — running locally and scriptably.</li>
+</ul>
+<h2 id="principles">Principles</h2>
+<ol>
+<li><strong>Speed is a feature.</strong> Scanning, indexing, previewing, and searching must feel instant
+   on libraries of hundreds of thousands of assets. Native Rust, no runtime tax.</li>
+<li><strong>Automation over data entry.</strong> The computer looks at the <em>content</em> — the waveform, the
+   pixels, the geometry — and proposes categories, tags, and duplicates. Humans confirm;
+   they don't type.</li>
+<li><strong>Your data is yours.</strong> Open format, local-first database, plain-text exports. You can
+   leave at any time and take everything with you.</li>
+<li><strong>One binary, every role.</strong> A single executable is the desktop GUI, the CLI, <em>and</em> the
+   server. Anything the app can do, the CLI can do; and <code>3dam serve</code> turns that same binary
+   into a self-hosted server with a web client — so a library can live on your workstation
+   or NAS and be browsed from anywhere on your network, with nothing to install.</li>
+<li><strong>Meet assets where they live.</strong> Local disks, SFTP, SMB/Samba, and other standard
+   network shares are all just sources. No forced import, no forced copy — and a <em>another
+   3DAM server</em> is a source too: connect one and its catalogue becomes an extension of your
+   own, searched side by side with your local library.</li>
+<li><strong>Federate, don't centralise.</strong> Querying a remote catalogue means asking the instance
+   that built it — not copying or re-processing its files. From that primitive, communities,
+   creators, and stores can host their own authenticated instances that compose into large
+   shared asset networks, with no central owner.</li>
+<li><strong>Free and open, permanently.</strong> MIT-licensed. No paid tier, no telemetry, no gate.</li>
+</ol>
+<h2 id="who-its-for">Who it's for</h2>
+<p>Indie developers, small studios, tech artists, sound designers, and modders who own large,
+messy, multi-format asset libraries and want to <em>find things fast</em> without paying rent or
+surrendering their catalogue to a cloud.</p>
+<h2 id="what-success-looks-like">What success looks like</h2>
+<p>A developer points 3DAM at a decade of accumulated asset packs across three drives and a
+NAS, walks away for coffee, and comes back to a browsable, auto-categorised, de-duplicated
+library where "find me more footstep sounds like this one" and "show me every low-poly rock"
+are one click — or one CLI command — away.</p>
+<hr />
+<p>See also: <a href="design_guidelines.html">DESIGN_GUIDELINES.md</a> · <a href="product_spec.html">PRODUCT_SPEC.md</a></p>
+<nav class="docnav"><a class="prev" href="index.html"><small>Back</small><span>&larr; Home</span></a><a class="next" href="design_guidelines.html"><small>Next</small><span>Design &rarr;</span></a></nav>
+</main>
+<footer class="footer">3DAM — free &amp; open-source game asset manager · MIT licensed</footer>
+</body>
+</html>

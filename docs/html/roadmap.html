@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Roadmap · 3DAM</title>
+<style>:root {
+  --bg: #0d1117;
+  --bg-soft: #161b22;
+  --bg-code: #0a0e14;
+  --border: #232a35;
+  --border-soft: #1c222c;
+  --fg: #d6dee8;
+  --fg-muted: #8b98a9;
+  --fg-dim: #6b7787;
+  --heading: #f0f4f9;
+  --accent: #35d0ba;
+  --accent-soft: rgba(53, 208, 186, 0.12);
+  --accent-line: rgba(53, 208, 186, 0.35);
+  --radius: 10px;
+  --maxw: 860px;
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --mono: "SFMono-Regular", "JetBrains Mono", "Fira Code", ui-monospace, Menlo, Consolas, monospace;
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0;
+  font-family: var(--font);
+  color: var(--fg);
+  background:
+    radial-gradient(1200px 600px at 80% -10%, rgba(53,208,186,0.06), transparent 60%),
+    radial-gradient(900px 500px at -10% 10%, rgba(80,120,255,0.05), transparent 55%),
+    var(--bg);
+  line-height: 1.65;
+  font-size: 16px;
+  -webkit-font-smoothing: antialiased;
+}
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+/* Top bar */
+.topbar {
+  position: sticky; top: 0; z-index: 20;
+  backdrop-filter: blur(10px);
+  background: rgba(13,17,23,0.72);
+  border-bottom: 1px solid var(--border);
+}
+.topbar-inner {
+  max-width: var(--maxw); margin: 0 auto; padding: 14px 24px;
+  display: flex; align-items: center; gap: 22px;
+}
+.brand { display: flex; align-items: baseline; gap: 10px; font-weight: 700; letter-spacing: .3px; }
+.brand .logo { color: var(--heading); font-size: 19px; }
+.brand .logo b { color: var(--accent); }
+.brand .tag { color: var(--fg-dim); font-size: 12px; font-weight: 500; }
+.nav { display: flex; gap: 6px; margin-left: auto; flex-wrap: wrap; }
+.nav a {
+  color: var(--fg-muted); padding: 6px 12px; border-radius: 8px;
+  font-size: 14px; font-weight: 500; border: 1px solid transparent;
+}
+.nav a:hover { color: var(--fg); background: var(--bg-soft); text-decoration: none; }
+.nav a.active { color: var(--accent); background: var(--accent-soft); border-color: var(--accent-line); }
+
+/* Page */
+main { max-width: var(--maxw); margin: 0 auto; padding: 48px 24px 96px; }
+.subtitle { color: var(--fg-dim); font-size: 14px; text-transform: uppercase; letter-spacing: 2px; margin: 0 0 6px; }
+
+h1, h2, h3, h4 { color: var(--heading); line-height: 1.25; font-weight: 700; }
+h1 { font-size: 2.1rem; margin: .2em 0 .6em; letter-spacing: -.5px; }
+h2 {
+  font-size: 1.4rem; margin: 2.4em 0 .8em; padding-bottom: .35em;
+  border-bottom: 1px solid var(--border);
+}
+h2::before {
+  content: ""; display: inline-block; width: 8px; height: 8px; margin-right: 12px;
+  border-radius: 2px; background: var(--accent); vertical-align: middle;
+  transform: translateY(-2px);
+}
+h3 { font-size: 1.12rem; margin: 1.8em 0 .5em; color: #cdd7e3; }
+h4 { font-size: 1rem; margin: 1.4em 0 .4em; color: var(--fg-muted); }
+
+p { margin: .8em 0; }
+strong { color: var(--heading); font-weight: 650; }
+hr { border: none; border-top: 1px solid var(--border); margin: 2.6em 0; }
+
+ul, ol { padding-left: 1.4em; }
+li { margin: .35em 0; }
+li::marker { color: var(--accent); }
+
+/* Inline + block code */
+code {
+  font-family: var(--mono); font-size: .88em;
+  background: var(--bg-soft); border: 1px solid var(--border-soft);
+  padding: .12em .4em; border-radius: 5px; color: #a7f3e4;
+}
+pre {
+  background: var(--bg-code); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 18px 20px; overflow-x: auto;
+  box-shadow: inset 0 0 0 1px rgba(255,255,255,0.01);
+}
+pre code {
+  background: none; border: none; padding: 0; color: #9fb0c3;
+  font-size: .84em; line-height: 1.55;
+}
+
+/* Tables */
+table {
+  border-collapse: collapse; width: 100%; margin: 1.2em 0; font-size: .95em;
+  border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden;
+}
+th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--border-soft); }
+th { background: var(--bg-soft); color: var(--heading); font-weight: 600; }
+tr:last-child td { border-bottom: none; }
+tbody tr:hover { background: rgba(255,255,255,0.015); }
+
+/* Blockquote */
+blockquote {
+  margin: 1.2em 0; padding: .6em 1.1em; color: var(--fg-muted);
+  border-left: 3px solid var(--accent-line); background: var(--accent-soft);
+  border-radius: 0 8px 8px 0;
+}
+
+/* Footer nav between docs */
+.docnav {
+  display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap;
+  margin-top: 3.5em; padding-top: 1.8em; border-top: 1px solid var(--border);
+}
+.docnav a {
+  flex: 1 1 220px; padding: 14px 18px; border: 1px solid var(--border);
+  border-radius: var(--radius); background: var(--bg-soft); color: var(--fg);
+}
+.docnav a:hover { border-color: var(--accent-line); text-decoration: none; }
+.docnav a small { display: block; color: var(--fg-dim); font-size: 12px; text-transform: uppercase; letter-spacing: 1px; }
+.docnav a span { color: var(--accent); font-weight: 600; }
+.docnav a.next { text-align: right; }
+
+.footer { max-width: var(--maxw); margin: 0 auto; padding: 0 24px 60px; color: var(--fg-dim); font-size: 13px; }
+
+/* Landing cards */
+.hero { text-align: center; padding: 40px 0 20px; }
+.hero h1 { font-size: 3rem; }
+.hero .lede { color: var(--fg-muted); font-size: 1.15rem; max-width: 640px; margin: 0 auto; }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 18px; margin: 40px 0; }
+.card {
+  display: block; padding: 22px; border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--bg-soft); color: var(--fg);
+}
+.card:hover { border-color: var(--accent-line); transform: translateY(-2px); text-decoration: none; }
+.card { transition: border-color .15s ease, transform .15s ease; }
+.card .k { color: var(--accent); font-size: 12px; text-transform: uppercase; letter-spacing: 2px; }
+.card h3 { margin: 8px 0 6px; color: var(--heading); }
+.card p { margin: 0; color: var(--fg-muted); font-size: .95em; }
+
+@media (max-width: 600px) {
+  body { font-size: 15px; }
+  h1 { font-size: 1.7rem; } .hero h1 { font-size: 2.2rem; }
+  main { padding: 32px 18px 72px; }
+  .topbar-inner { padding: 12px 18px; }
+}</style>
+</head>
+<body>
+<header class="topbar"><div class="topbar-inner">
+  <a class="brand" href="index.html" style="color:inherit">
+    <span class="logo">3D<b>AM</b></span>
+    <span class="tag">asset manager</span>
+  </a>
+  <nav class="nav">
+    <a href="index.html" class="">Home</a>
+    <a href="mission.html" class="">Mission</a><a href="design_guidelines.html" class="">Design</a><a href="product_spec.html" class="">Spec</a><a href="roadmap.html" class="active">Roadmap</a>
+  </nav>
+</div></header>
+<main>
+<p class="subtitle">What we build, in what order</p>
+<h1 id="3dam-roadmap">3DAM — Roadmap</h1>
+<p>Status: <strong>Draft v0.1</strong> · Scope: build order and delivery strategy. This is a
+high-level roadmap — the <em>order</em> we build things and <em>why</em>, not detailed technical
+design. It sits alongside the product spec's §9 phasing (which describes capability
+maturity) and records the sequencing decisions that phasing leaves open.</p>
+<p>See <a href="product_spec.html">PRODUCT_SPEC.md</a> for what 3DAM is, <a href="mission.html">MISSION.md</a> for
+why, and <a href="design_guidelines.html">DESIGN_GUIDELINES.md</a> for the rules.</p>
+<hr />
+<h2 id="guiding-decisions">Guiding decisions</h2>
+<p>Two decisions shape the order of work:</p>
+<ol>
+<li>
+<p><strong>Web UI before the desktop GUI.</strong> Build the browser-based web client first, then the
+   native egui desktop app. A web front end has a much faster iteration loop — hot reload,
+   browser devtools, no native rebuild/repackage cycle — so we get the layout, interaction,
+   and workflow right against real libraries sooner. The desktop GUI follows once those
+   patterns are settled, reusing the same engine and API.</p>
+</li>
+<li>
+<p><strong>A hybrid web front end, not egui-in-WASM for everything.</strong> The web client is its own
+   codebase — an ordinary <strong>React + CSS</strong> app served by <code>3dam serve</code> — and uses <strong>WASM only
+   for the parts that genuinely need it</strong> (the interactive 3D viewer, and any hot rendering
+   like waveform/thumbnail work). Everything else — browse grid, search, tags, panels,
+   navigation — is plain DOM. This mirrors the approach proven in the sibling <em>moghub</em>
+   project: React/CSS for chrome and layout, WASM reserved for the heavy canvas.</p>
+</li>
+</ol>
+<p>Rationale: a DOM front end gets responsive layout, touch handling, accessibility, and
+   text input essentially for free, where an all-egui-WASM canvas would have to re-implement
+   each of those by hand. It also keeps mobile/tablet degradation cheap (see below).</p>
+<p>These supersede the earlier open question in spec §10 ("shared Rust→WASM view code vs a
+separate web UI") in favour of the separate-web-UI path, and reorder spec §9 so the
+web client leads rather than trailing the desktop GUI.</p>
+<h2 id="indicative-build-order">Indicative build order</h2>
+<p>Coarse sequence — each stage assumes the engine work it depends on from spec §9.</p>
+<ol>
+<li><strong>Engine + API core.</strong> <code>3dam-core</code> (schema, local scan, SQLite store, search) behind a
+   <code>LibraryService</code> boundary, exposed early over the <code>3dam serve</code> HTTP/WS API. The CLI rides
+   the same API so it is usable from day one.</li>
+<li><strong>Web client (React + CSS).</strong> The three-region workspace as a DOM app against the serve
+   API: browse grid, search, facets, tags, previews. Fast feedback loop lives here. The
+   admin-only <strong>Settings / Administration</strong> surface — feature flags (MCP on/off, auth mode,
+   network access, analysis), and later user accounts — lands here as plain DOM riding the same
+   API (spec §6.11); it is cheap to build well precisely because it is DOM, not canvas.</li>
+<li><strong>WASM viewer islands.</strong> Drop the interactive 3D viewer (and any heavy render paths) into
+   the web client as focused WASM/<code>wgpu</code> components embedded in the DOM layout — not a
+   full-page canvas.</li>
+<li><strong>Responsive + touch pass.</strong> Make the web client degrade gracefully to tablet/phone
+   widths (see below) before it is considered done.</li>
+<li><strong>Desktop GUI (egui).</strong> The native app, reusing the settled interaction patterns and the
+   same engine/API. Parity with the web client's core workflows.</li>
+<li><strong>Everything after</strong> follows spec §9 from automation depth through federation and scale.
+   Opt-in <strong>user accounts and roles</strong> arrive with the federation &amp; auth phase (spec §9 step 6),
+   layered on the same auth surface the feature flags already gate.</li>
+</ol>
+<h2 id="mobile-tablet-posture">Mobile &amp; tablet posture</h2>
+<p>Desktop/tablet-first; phones are graceful-degrade, not a separate product. Because the web
+client is DOM-based this is cheap, and we follow moghub's pattern:</p>
+<ul>
+<li>Collapse the three-region workspace to a single scrollable column at tablet width.</li>
+<li><strong>44×44px minimum touch targets</strong>; <code>touch-action: manipulation</code> on canvas overlay controls.</li>
+<li>Stack side-by-side panes (e.g. viewer + detail) vertically with viewport-unit heights and
+  a <code>min-height</code> floor so the 3D canvas stays usable.</li>
+<li>Treat full small-screen polish and real-device testing as tracked UX debt, not a v1 gate.</li>
+</ul>
+<h2 id="release-distribution">Release &amp; distribution</h2>
+<p>Cross-platform releases follow the pattern proven in the sibling <em>mogen</em> project: a
+tag-triggered GitHub Actions matrix that builds native binaries, packages an installer per
+OS, and publishes one checksummed GitHub Release. Adapted to 3DAM's shape.</p>
+<ul>
+<li><strong>Trigger:</strong> push a <code>v*</code> tag (plus manual <code>workflow_dispatch</code>). <code>contents: write</code> so the
+  job can create the release.</li>
+<li><strong>Build matrix</strong> (<code>fail-fast: false</code>), one runner per target:</li>
+<li><code>x86_64-unknown-linux-gnu</code> on <code>ubuntu-22.04</code></li>
+<li><code>x86_64-apple-darwin</code> on <code>macos-*-intel</code></li>
+<li><code>aarch64-apple-darwin</code> on <code>macos-latest</code></li>
+<li><code>x86_64-pc-windows-msvc</code> on <code>windows-latest</code></li>
+<li><strong>Toolchain &amp; cache:</strong> <code>dtolnay/rust-toolchain</code> for the target triple, <code>Swatinem/rust-cache</code>.</li>
+<li><strong>Web client first.</strong> Unlike mogen, a release must <strong>build the React web client (Node/pnpm)
+  and embed its static assets into the <code>3dam</code> binary</strong> (e.g. <code>rust-embed</code>) <em>before</em>
+  <code>cargo build</code>, so the single binary serves the web UI with no separate deploy.</li>
+<li><strong>Native build:</strong> one <code>cargo build -p 3dam --release --locked --target &lt;triple&gt;</code> — one
+  binary, three roles, so packaging is simpler than mogen's two-binary case.</li>
+<li><strong>Linux system deps</strong> are heavier than mogen's: the egui/eframe stack (GTK, xkbcommon,
+  wayland, xcb, pkg-config, openssl) <strong>plus</strong> 3DAM's own — <code>wgpu</code>/Vulkan, audio
+  (<code>libasound2-dev</code> for <code>cpal</code>), and image/3D loaders; the headless-serve software rasteriser
+  (Mesa lavapipe/llvmpipe) is a runtime concern for the serve target, not the build.</li>
+<li><strong>Per-OS packaging</strong> (mirrors mogen):</li>
+<li>Linux — <code>tar.gz</code> of the binary + <code>.deb</code> via <code>cargo-deb</code>.</li>
+<li>Windows — <code>.zip</code> + <code>.msi</code> via <code>cargo-wix</code>, with a generated <code>.ico</code>.</li>
+<li>macOS — a <code>.app</code> bundle (iconset via <code>sips</code>/<code>iconutil</code>, <code>Info.plist</code>) wrapped in a
+    <code>.dmg</code> via <code>hdiutil</code>.</li>
+<li><strong>Publish:</strong> collect artifacts, generate <code>SHA256SUMS</code>, create the release with
+  <code>softprops/action-gh-release</code>.</li>
+<li><strong>Not carried over from mogen:</strong> the itch.io/butler push (game-store specific). 3DAM's
+  dev-facing channels (Homebrew tap, winget, AUR, <code>cargo-binstall</code>) are TBD — GitHub Releases
+  is the primary channel for v1.</li>
+</ul>
+<p>The actual <code>.github/workflows/release.yml</code> lands once the <code>3dam</code> crate exists; committing it
+before there's anything to build would only produce a workflow that fails on first tag.</p>
+<h2 id="open-questions">Open questions</h2>
+<ul>
+<li>Exact React stack (bundler, router, state) and how the WASM viewer islands are packaged
+  and handed data from the DOM side.</li>
+<li><strong>Code signing &amp; notarization:</strong> unsigned macOS <code>.dmg</code>/Windows <code>.msi</code> trip Gatekeeper and
+  SmartScreen (mogen ships unsigned). Whether v1 pays for an Apple Developer ID + notarization
+  and a Windows signing cert, or accepts the warnings.</li>
+<li>Distribution channels beyond GitHub Releases (Homebrew, winget, AUR, <code>cargo-binstall</code>) —
+  which, and when.</li>
+<li>How much view logic, if any, is worth sharing between the web client and the egui desktop
+  GUI once both exist, versus letting each own its presentation over the shared API.</li>
+<li>Whether the desktop GUI ever embeds the web client (webview) for any surfaces, or stays
+  fully native.</li>
+</ul>
+<hr />
+<p>See also: <a href="product_spec.html">PRODUCT_SPEC.md</a> · <a href="mission.html">MISSION.md</a> · <a href="design_guidelines.html">DESIGN_GUIDELINES.md</a></p>
+<nav class="docnav"><a class="prev" href="product_spec.html"><small>Previous</small><span>&larr; Spec</span></a></nav>
+</main>
+<footer class="footer">3DAM — free &amp; open-source game asset manager · MIT licensed</footer>
+</body>
+</html>

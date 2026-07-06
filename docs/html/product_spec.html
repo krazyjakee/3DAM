@@ -1,0 +1,897 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Spec · 3DAM</title>
+<style>:root {
+  --bg: #0d1117;
+  --bg-soft: #161b22;
+  --bg-code: #0a0e14;
+  --border: #232a35;
+  --border-soft: #1c222c;
+  --fg: #d6dee8;
+  --fg-muted: #8b98a9;
+  --fg-dim: #6b7787;
+  --heading: #f0f4f9;
+  --accent: #35d0ba;
+  --accent-soft: rgba(53, 208, 186, 0.12);
+  --accent-line: rgba(53, 208, 186, 0.35);
+  --radius: 10px;
+  --maxw: 860px;
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --mono: "SFMono-Regular", "JetBrains Mono", "Fira Code", ui-monospace, Menlo, Consolas, monospace;
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0;
+  font-family: var(--font);
+  color: var(--fg);
+  background:
+    radial-gradient(1200px 600px at 80% -10%, rgba(53,208,186,0.06), transparent 60%),
+    radial-gradient(900px 500px at -10% 10%, rgba(80,120,255,0.05), transparent 55%),
+    var(--bg);
+  line-height: 1.65;
+  font-size: 16px;
+  -webkit-font-smoothing: antialiased;
+}
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+/* Top bar */
+.topbar {
+  position: sticky; top: 0; z-index: 20;
+  backdrop-filter: blur(10px);
+  background: rgba(13,17,23,0.72);
+  border-bottom: 1px solid var(--border);
+}
+.topbar-inner {
+  max-width: var(--maxw); margin: 0 auto; padding: 14px 24px;
+  display: flex; align-items: center; gap: 22px;
+}
+.brand { display: flex; align-items: baseline; gap: 10px; font-weight: 700; letter-spacing: .3px; }
+.brand .logo { color: var(--heading); font-size: 19px; }
+.brand .logo b { color: var(--accent); }
+.brand .tag { color: var(--fg-dim); font-size: 12px; font-weight: 500; }
+.nav { display: flex; gap: 6px; margin-left: auto; flex-wrap: wrap; }
+.nav a {
+  color: var(--fg-muted); padding: 6px 12px; border-radius: 8px;
+  font-size: 14px; font-weight: 500; border: 1px solid transparent;
+}
+.nav a:hover { color: var(--fg); background: var(--bg-soft); text-decoration: none; }
+.nav a.active { color: var(--accent); background: var(--accent-soft); border-color: var(--accent-line); }
+
+/* Page */
+main { max-width: var(--maxw); margin: 0 auto; padding: 48px 24px 96px; }
+.subtitle { color: var(--fg-dim); font-size: 14px; text-transform: uppercase; letter-spacing: 2px; margin: 0 0 6px; }
+
+h1, h2, h3, h4 { color: var(--heading); line-height: 1.25; font-weight: 700; }
+h1 { font-size: 2.1rem; margin: .2em 0 .6em; letter-spacing: -.5px; }
+h2 {
+  font-size: 1.4rem; margin: 2.4em 0 .8em; padding-bottom: .35em;
+  border-bottom: 1px solid var(--border);
+}
+h2::before {
+  content: ""; display: inline-block; width: 8px; height: 8px; margin-right: 12px;
+  border-radius: 2px; background: var(--accent); vertical-align: middle;
+  transform: translateY(-2px);
+}
+h3 { font-size: 1.12rem; margin: 1.8em 0 .5em; color: #cdd7e3; }
+h4 { font-size: 1rem; margin: 1.4em 0 .4em; color: var(--fg-muted); }
+
+p { margin: .8em 0; }
+strong { color: var(--heading); font-weight: 650; }
+hr { border: none; border-top: 1px solid var(--border); margin: 2.6em 0; }
+
+ul, ol { padding-left: 1.4em; }
+li { margin: .35em 0; }
+li::marker { color: var(--accent); }
+
+/* Inline + block code */
+code {
+  font-family: var(--mono); font-size: .88em;
+  background: var(--bg-soft); border: 1px solid var(--border-soft);
+  padding: .12em .4em; border-radius: 5px; color: #a7f3e4;
+}
+pre {
+  background: var(--bg-code); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 18px 20px; overflow-x: auto;
+  box-shadow: inset 0 0 0 1px rgba(255,255,255,0.01);
+}
+pre code {
+  background: none; border: none; padding: 0; color: #9fb0c3;
+  font-size: .84em; line-height: 1.55;
+}
+
+/* Tables */
+table {
+  border-collapse: collapse; width: 100%; margin: 1.2em 0; font-size: .95em;
+  border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden;
+}
+th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--border-soft); }
+th { background: var(--bg-soft); color: var(--heading); font-weight: 600; }
+tr:last-child td { border-bottom: none; }
+tbody tr:hover { background: rgba(255,255,255,0.015); }
+
+/* Blockquote */
+blockquote {
+  margin: 1.2em 0; padding: .6em 1.1em; color: var(--fg-muted);
+  border-left: 3px solid var(--accent-line); background: var(--accent-soft);
+  border-radius: 0 8px 8px 0;
+}
+
+/* Footer nav between docs */
+.docnav {
+  display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap;
+  margin-top: 3.5em; padding-top: 1.8em; border-top: 1px solid var(--border);
+}
+.docnav a {
+  flex: 1 1 220px; padding: 14px 18px; border: 1px solid var(--border);
+  border-radius: var(--radius); background: var(--bg-soft); color: var(--fg);
+}
+.docnav a:hover { border-color: var(--accent-line); text-decoration: none; }
+.docnav a small { display: block; color: var(--fg-dim); font-size: 12px; text-transform: uppercase; letter-spacing: 1px; }
+.docnav a span { color: var(--accent); font-weight: 600; }
+.docnav a.next { text-align: right; }
+
+.footer { max-width: var(--maxw); margin: 0 auto; padding: 0 24px 60px; color: var(--fg-dim); font-size: 13px; }
+
+/* Landing cards */
+.hero { text-align: center; padding: 40px 0 20px; }
+.hero h1 { font-size: 3rem; }
+.hero .lede { color: var(--fg-muted); font-size: 1.15rem; max-width: 640px; margin: 0 auto; }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 18px; margin: 40px 0; }
+.card {
+  display: block; padding: 22px; border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--bg-soft); color: var(--fg);
+}
+.card:hover { border-color: var(--accent-line); transform: translateY(-2px); text-decoration: none; }
+.card { transition: border-color .15s ease, transform .15s ease; }
+.card .k { color: var(--accent); font-size: 12px; text-transform: uppercase; letter-spacing: 2px; }
+.card h3 { margin: 8px 0 6px; color: var(--heading); }
+.card p { margin: 0; color: var(--fg-muted); font-size: .95em; }
+
+@media (max-width: 600px) {
+  body { font-size: 15px; }
+  h1 { font-size: 1.7rem; } .hero h1 { font-size: 2.2rem; }
+  main { padding: 32px 18px 72px; }
+  .topbar-inner { padding: 12px 18px; }
+}</style>
+</head>
+<body>
+<header class="topbar"><div class="topbar-inner">
+  <a class="brand" href="index.html" style="color:inherit">
+    <span class="logo">3D<b>AM</b></span>
+    <span class="tag">asset manager</span>
+  </a>
+  <nav class="nav">
+    <a href="index.html" class="">Home</a>
+    <a href="mission.html" class="">Mission</a><a href="design_guidelines.html" class="">Design</a><a href="product_spec.html" class="active">Spec</a><a href="roadmap.html" class="">Roadmap</a>
+  </nav>
+</div></header>
+<main>
+<p class="subtitle">What it is, in detail</p>
+<h1 id="3dam-high-level-product-spec">3DAM — High-Level Product Spec</h1>
+<p>Status: <strong>Draft v0.1</strong> · Scope: product vision → system shape. This is a high-level spec:
+it defines <em>what</em> 3DAM is and the shape of its parts, not final APIs or schemas.</p>
+<p>See <a href="mission.html">MISSION.md</a> for the why and <a href="design_guidelines.html">DESIGN_GUIDELINES.md</a>
+for the rules that constrain the choices below.</p>
+<hr />
+<h2 id="1-product-summary">1. Product summary</h2>
+<p>3DAM is a cross-platform (Linux/Windows/macOS) <strong>Rust</strong> application that catalogues,
+analyses, searches, and converts game assets across <strong>audio, image, and 3D model</strong> media
+types. It reads from local disks and network shares, builds one unified database, and uses
+content-based analysis to auto-categorise, auto-tag, find similar assets, and detect
+duplicates.</p>
+<p>It ships as <strong>one executable with three roles</strong>:</p>
+<ul>
+<li><strong>GUI client</strong> — the native desktop app (<code>3dam</code> with no command).</li>
+<li><strong>CLI client</strong> — scriptable commands (<code>3dam &lt;verb&gt;</code>), for pipelines and CI.</li>
+<li><strong>Server</strong> — <code>3dam serve</code> reads a config, indexes the folders/sources it names, runs the
+  engine as a long-lived service, and exposes an <strong>API plus a browser-based web client</strong>.</li>
+</ul>
+<p>The client is also the server: the same <code>3dam-core</code> engine powers every role. A client can
+run the engine <strong>embedded</strong> (standalone, single process, no network) or <strong>connect</strong> to a
+remote <code>3dam serve</code> instance over its API — so the GUI, the CLI, and a web browser can all
+drive a library that lives on another machine.</p>
+<p>Crucially, <strong>a 3DAM server is itself a kind of source</strong>. Alongside local folders, SFTP, and
+SMB, you can add another 3DAM instance and it behaves like an extension of your own
+database: search, similarity, and smart folders <strong>federate</strong> across it. 3DAM does not fetch
+and re-process a peer's files — it <strong>queries the catalog the peer already built</strong> and merges
+the results into one unified view. An <strong>authentication</strong> layer (open standards such as
+OIDC/OAuth2, plus simple tokens) sits in front of remote instances, so creators and stores
+can host gated catalogs. Longer term, many federated instances compose into a <strong>mesh</strong> of
+shared asset networks.</p>
+<p>Everything the server exposes is <strong>opt-in and administrable</strong>. A server ships locked down —
+bound to localhost, no authentication, no user accounts, agent (MCP) access and inbound
+federation off, read-only to the network — and each capability is a named <strong>feature flag</strong> an
+operator turns on, either declaratively in the config file or from a <strong>beautifully presented
+administration surface in the web client</strong>. Authentication, user accounts, the MCP server, and
+remote access are all toggles (see §6.11), so the <em>same binary</em> is a zero-config personal
+library out of the box and a hardened multi-user host once configured — you never pay for a
+capability you have not deliberately switched on.</p>
+<h2 id="2-goals-and-non-goals">2. Goals and non-goals</h2>
+<h3 id="goals">Goals</h3>
+<ul>
+<li>One database and one browser for sound, image, and 3D assets.</li>
+<li>Content-aware automation: categorisation, tagging, similarity, de-duplication.</li>
+<li>Fast on very large libraries (design target: <strong>1M+ assets</strong>).</li>
+<li>Local-first, non-destructive, open, no subscription, no telemetry.</li>
+<li>One binary, three roles (GUI client, CLI client, server) over a shared engine, with
+  parity between them.</li>
+<li><strong>Self-hostable server</strong> with a browser-based web client — run the engine where the
+  assets live, browse from anywhere on your network.</li>
+<li><strong>Federated sources:</strong> add another 3DAM server as a source and query its catalog as if it
+  were local; blend local + remote results in one view.</li>
+<li><strong>Authentication built in from the start</strong> (basic tokens first, open standards such as
+  OIDC/OAuth2 as the extension path) so remote catalogs can be public or gated.</li>
+<li>Broad format support and standard network sources (SFTP, SMB/Samba).</li>
+<li><strong>AI-agent access built in (and switchable off):</strong> a comprehensive <strong>MCP server</strong> exposing
+  the library to LLM agents, served on the <strong>same port</strong> as the rest of the server (§6.10) —
+  and, because not everyone wants it, a first-class <strong>feature flag</strong> that turns the whole MCP
+  surface off (§6.11).</li>
+<li><strong>Administrable by feature flag, safe by default.</strong> Every server capability — the MCP agent
+  server, authentication, <strong>user accounts</strong>, inbound federation, remote client access, network
+  writes — is an explicit <strong>feature flag</strong>, off by default and toggled from a config file <em>or</em> a
+  polished admin UI in the web client (§6.11). Nothing sensitive is exposed until an operator
+  consciously turns it on.</li>
+</ul>
+<h3 id="non-goals-v1">Non-goals (v1)</h3>
+<ul>
+<li>Not a <strong>hosted / managed cloud service</strong> — 3DAM's server is something <em>you</em> run on <em>your</em>
+  hardware. There is no 3DAM-operated cloud, no CDN, and no sign-up to any 3DAM service. The
+  optional <strong>user accounts</strong> feature (§6.11) is an account <em>on your own self-hosted server</em>,
+  enabled by you — never an account <em>with us</em> — and it stays off by default, so the local-first,
+  no-account experience is untouched unless an operator turns it on.</li>
+<li>Not <strong>remote reprocessing</strong> — 3DAM never decodes or re-analyses a federated peer's files;
+  it queries the catalog that peer already built. Local processing is for <em>your</em> sources.</li>
+<li>Not a <strong>full mesh / relay network</strong> in v1 — v1 does direct client→server federation
+  (query a peer you connect to). Peer-to-peer relay, transitive fan-out, and instance
+  discovery are a documented future direction (§9), not initial scope.</li>
+<li>Not a <strong>content creation / editing</strong> tool — 3DAM manages and converts assets; it does not
+  author them (no DAW, no image editor, no modeller).</li>
+<li>Not a <strong>general-purpose DAM</strong> for documents/video — game audio, images, and 3D only in v1.</li>
+<li>Not a <strong>real-time collaborative</strong> editor — the server enables shared <em>access</em> to a
+  library; concurrent multi-user editing and sync are out of scope for v1.</li>
+</ul>
+<h2 id="3-primary-users-use-cases">3. Primary users &amp; use cases</h2>
+<ul>
+<li><strong>Sound designer:</strong> "Find footstep sounds similar to this one across my whole SFX
+  library, regardless of folder or filename."</li>
+<li><strong>Tech artist:</strong> "Show every low-poly prop under 5k tris with a PBR material set, from
+  both my local drive and the studio NAS."</li>
+<li><strong>Indie generalist:</strong> "Point it at ten years of asset packs and give me a clean,
+  de-duplicated, tagged library I can actually search."</li>
+<li><strong>Build engineer:</strong> "In CI, convert all source textures to KTX2 and export a manifest —
+  headless, scripted, reproducible."</li>
+<li><strong>Shipping a commercial game:</strong> "Show me only assets I'm licensed to use commercially, tell
+  me which ones need attribution, and export the credits list — before I ship, not after a
+  takedown."</li>
+</ul>
+<h2 id="4-system-architecture-high-level">4. System architecture (high level)</h2>
+<h3 id="41-one-binary-three-roles">4.1 One binary, three roles</h3>
+<p>A single executable dispatches on how it is invoked:</p>
+<pre><code>                       one binary:  3dam
+   ┌───────────────────┬───────────────────┬────────────────────┐
+   │  3dam             │  3dam &lt;verb&gt;      │  3dam serve        │
+   │  (GUI client)     │  (CLI client)     │  (server)          │
+   └───────────────────┴───────────────────┴────────────────────┘
+</code></pre>
+<ul>
+<li><strong>GUI client</strong> — native desktop app; the default when launched with no command.</li>
+<li><strong>CLI client</strong> — verb-driven, scriptable, machine-readable output; for pipelines and CI.</li>
+<li><strong>Server</strong> — reads a config file, indexes the folders/sources it lists, runs the engine
+  as a long-lived service, and exposes an HTTP/WebSocket <strong>API</strong> plus a <strong>web client</strong>.</li>
+</ul>
+<h3 id="42-the-client-is-also-the-server-embedded-vs-connected">4.2 The client is also the server: embedded vs connected</h3>
+<p>Every role is a thin shell around the same engine, <code>3dam-core</code>. What differs is <em>where the
+engine runs</em>:</p>
+<pre><code>  EMBEDDED (standalone, single process, no network)
+
+    ┌──────────────┐        ┌──────────────┐
+    │  GUI client  │   or   │  CLI client  │
+    └──────┬───────┘        └──────┬───────┘
+           └──────────┬────────────┘
+                      ▼  in-process call
+              ┌───────────────┐
+              │   3dam-core   │   ← engine linked directly in
+              └───────────────┘
+
+  CONNECTED (engine runs elsewhere; clients talk to it over the API)
+
+    ┌───────────┐  ┌───────────┐  ┌───────────────┐
+    │ GUI client│  │ CLI client│  │  web client   │
+    └─────┬─────┘  └─────┬─────┘  │ (browser, UI  │
+          │              │        │  served by    │
+          │              │        │  the server)  │
+          │              │        └───────┬───────┘
+          └──────────────┴────────────────┘
+                         ▼  HTTP / WebSocket API
+                 ┌───────────────────┐
+                 │   3dam serve      │
+                 │  ┌─────────────┐  │
+                 │  │  3dam-core  │  │   ← same engine, now a service
+                 │  └─────────────┘  │
+                 └───────────────────┘
+</code></pre>
+<p>Clients depend on a <strong><code>LibraryService</code> interface</strong>, not on the engine directly. Two
+implementations satisfy it: an <strong>in-process</strong> one (the embedded engine) and an <strong>API
+client</strong> one (talks to a remote <code>3dam serve</code>). The GUI and CLI pick either; the web client
+is always connected. This is what "the client is also the server" means in practice — the
+same code runs your laptop's standalone library <em>and</em> the always-on instance on your
+workstation or NAS.</p>
+<h3 id="43-the-engine-and-its-layers">4.3 The engine and its layers</h3>
+<p>Inside <code>3dam-core</code>, whether embedded or serving:</p>
+<pre><code>             ┌───────────────────────────────────┐
+             │             3dam-core             │
+             │  library / query API              │
+             │  scan &amp; watch engine              │
+             │  analysis pipeline                │
+             │  convert pipeline                 │
+             │  ─────────────────────────────    │
+             │  server extras (in `serve`):      │
+             │   HTTP/WS API + MCP · web host    │
+             └──┬───────────────┬─────────────┬──┘
+                ▼               ▼             ▼
+        ┌──────────────┐ ┌────────────┐ ┌──────────────┐
+        │Media handlers│ │Source layer│ │   Storage    │
+        │ audio/image/ │ │ local FS / │ │ metadata DB  │
+        │     3D       │ │ SFTP / SMB │ │ + vector idx │
+        │              │ │            │ │ + blob cache │
+        └──────────────┘ └────────────┘ └──────────────┘
+</code></pre>
+<ul>
+<li><strong><code>3dam-core</code></strong> owns the library model, scanning, analysis orchestration, search, and
+  conversion. It is UI- and transport-agnostic. In <code>serve</code> mode it additionally mounts an
+  API, an MCP endpoint for agents (§6.10), and hosts the web client's assets — all on one
+  port.</li>
+<li><strong>Media handlers</strong> implement a common trait per media type (detect, decode, thumbnail,
+  extract features, extract metadata). Formats plug in here.</li>
+<li><strong>Source layer</strong> abstracts where content comes from behind one trait, spanning two
+  categories (see §4.4): <strong>file sources</strong> (local FS, SFTP, SMB) that yield raw bytes the
+  engine processes, and <strong>federated sources</strong> (a remote 3DAM server) that yield catalog
+  results the engine merges without processing.</li>
+<li><strong>Storage</strong> = the metadata database + a vector index for similarity + a managed cache of
+  derived blobs (thumbnails, waveforms, embeddings).</li>
+</ul>
+<p>Three ways to reach remote content, worth keeping straight:</p>
+<ul>
+<li><strong>Remote <em>files</em></strong> — mount another machine's files as a <strong>file source</strong> (SFTP/SMB). Your
+  engine reads the bytes and processes them locally (decode, thumbnail, embed).</li>
+<li><strong>Remote <em>catalog</em></strong> — add a <strong>3DAM server as a source</strong> (§4.4). Your engine <em>queries</em> the
+  peer's already-built index and merges the hits; no bytes are processed. Your library is
+  the union of local + federated catalogs.</li>
+<li><strong>Remote <em>engine</em></strong> — run the GUI/CLI as a thin client of a single server via <code>--connect</code>;
+  that one server <em>is</em> your entire backend (no local library).</li>
+</ul>
+<h3 id="44-federation-a-3dam-server-as-a-source">4.4 Federation: a 3DAM server as a source</h3>
+<p>Adding a 3DAM server as a source turns search into a <strong>federated query</strong>: the local engine
+fans a query (text, facets, or a similarity vector) out to each connected peer, each peer
+runs it against the index <em>it</em> built, and results are merged and re-ranked into one view.</p>
+<pre><code>        your machine                    elsewhere on the network / internet
+   ┌────────────────────┐
+   │    3DAM (local)    │      federated query: search · similar · facets
+   │  ┌──────────────┐  │   ┌──────────────────────────────────────────────┐
+   │  │ query engine │──┼──▶│  auth ▶  3dam serve   (studio NAS catalog)    │
+   │  │  fan-out +   │──┼──▶│  auth ▶  3dam serve   (asset-store catalog)   │
+   │  │  merge/rank  │──┼──▶│  auth ▶  3dam serve   (teammate's library)    │
+   │  └──────────────┘  │   └──────────────────────────────────────────────┘
+   │  local index +     │   peers return catalog rows, previews &amp; similarity
+   │  file sources      │   hits from indexes THEY already built —
+   └────────────────────┘   no files are transferred or re-processed
+</code></pre>
+<ul>
+<li><strong>Query, don't reprocess.</strong> The peer already extracted features, built thumbnails, and
+  computed embeddings. The local engine asks; it never decodes or re-analyses the peer's
+  files. This is the hard line between a <em>file source</em> and a <em>federated source</em>.</li>
+<li><strong>Read-only and referenced.</strong> Federated assets are references, shown with their remote
+  previews (fetched on demand and cached). The original file is downloaded only if the user
+  explicitly asks and the peer's permissions allow it.</li>
+<li><strong>Similarity across peers.</strong> "Find similar" sends the query embedding to each peer's
+  similarity endpoint; each searches its own vector index and returns ranked hits, merged
+  locally. (Cross-peer ranking needs compatible embedding spaces — see §10.)</li>
+<li><strong>Authenticated.</strong> Each federated source carries an auth config — anonymous (public read),
+  a token/API key, or an OIDC/OAuth2 identity — so a peer can be open or gated. The server
+  side enforces it (see §6.7).</li>
+<li><strong>Composable.</strong> Smart folders and saved searches can span local + federated sources, so a
+  live collection can pull from your disk and a remote store at once.</li>
+</ul>
+<h2 id="5-unified-data-model-conceptual">5. Unified data model (conceptual)</h2>
+<p>The core is one <strong>Asset</strong> entity with shared fields plus a media-specific attribute set.</p>
+<p><strong>Asset (shared)</strong></p>
+<ul>
+<li>Identity: stable id, content hash (for dedup and change detection).</li>
+<li>Location: source ref + path; original filename; size; created/modified times.</li>
+<li>Type: media type (audio | image | model) + concrete format.</li>
+<li><strong>License / rights</strong> (a first-class, prioritised field — see below).</li>
+<li>Organisation: tags, collections, user rating/flags, notes.</li>
+<li>Derived: thumbnail ref, preview ref, embedding ref(s), analysis version.</li>
+<li>Provenance: which source, when scanned, when last analysed.</li>
+</ul>
+<p><strong>Media-specific attributes</strong></p>
+<ul>
+<li><strong>Audio:</strong> duration, sample rate, bit depth, channels; detected BPM, key, loudness;
+  spectral descriptors (brightness, harmonicity, etc.); class/category (e.g. one-shot vs
+  loop, SFX vs music).</li>
+<li><strong>Image:</strong> dimensions, colour depth, alpha, colour space; dominant colours; classified
+  type (texture / sprite / UI / concept); <strong>tileability metric</strong> (see below); perceptual
+  hash.</li>
+<li><strong>3D model:</strong> vertex/triangle count, mesh/material/texture counts, bounding box, has
+  rig/animation, UV presence; category guess; per-view render embedding.</li>
+</ul>
+<p><strong>Tileability metric (image)</strong></p>
+<p>For textures, 3DAM records how well an image tiles — a common, tedious thing to check by
+hand across a large texture library. It is a <strong>score plus a classification</strong>, not just a
+boolean, so users can sort and filter ("show non-seamless textures I need to fix" or "only
+truly seamless materials"):</p>
+<ul>
+<li><strong><code>tileability</code> score (0–1):</strong> how cleanly the image wraps. Derived from an
+  <strong>edge-continuity test</strong> — compare opposite edges as if tiled (left↔right, top↔bottom) and
+  score the seam discontinuity <em>relative to the texture's own internal gradient</em>, so noisy
+  and smooth textures are judged fairly rather than against a fixed threshold. Analysis runs
+  on a downscaled copy in linear colour space; normal maps are compared as decoded vectors,
+  not raw RGB.</li>
+<li><strong><code>repeat_period</code> (optional):</strong> whether the image itself already contains internal
+  repetition (e.g. a 512 tile packed 2×2 into a 1K file). Detected via autocorrelation / FFT
+  peaks; absent when the content is non-repeating.</li>
+<li><strong>classification</strong> derived from the two: <strong>seamless</strong> (wraps cleanly), <strong>tiled/repeating</strong>
+  (contains internal repetition), or <strong>non-tiling</strong> (neither).</li>
+</ul>
+<p>Cheap enough to run on every image at ingest (edge test is ~O(w+h); the periodicity pass
+runs on a thumbnail), consistent with the cost-tiered extraction rule (§6.2). Feeds
+auto-tagging (<code>seamless</code>, <code>tileable</code>) and becomes a <strong>search facet</strong> (§6.3).</p>
+<p><strong>Cross-cutting</strong></p>
+<ul>
+<li><strong>License / rights</strong> are first-class per-asset metadata, not a buried note — different
+  assets in one library carry different licenses, and knowing what you may ship is as
+  important as knowing what the asset <em>is</em>. Each asset records:</li>
+<li>a <strong>license identifier</strong> (SPDX where it exists — e.g. <code>CC-BY-4.0</code>, <code>CC0-1.0</code>, <code>MIT</code>,
+    <code>OFL-1.1</code> — or <code>Proprietary</code> / <code>Custom</code> / <code>Unknown</code>);</li>
+<li>a <strong>rights summary</strong> of the permissions that matter for games: commercial use,
+    modification, redistribution, and whether <strong>attribution</strong> is required;</li>
+<li><strong>attribution details</strong> (author/holder, and the credit string to reproduce);</li>
+<li><strong>provenance</strong> (license source URL / EULA link, and where the value came from — declared
+    by the source, read from a sidecar/pack manifest, or set by the user).
+  License is <strong>prioritised in the inspector</strong> (shown high, with a status colour) and is a
+  <strong>search facet</strong> (see §6.3), so "show only assets I can use commercially without
+  attribution" is one filter. Unknown/unverified licenses are flagged, never silently
+  assumed permissive.</li>
+<li><strong>Tags</strong> are shared and free-form, with a suggested/auto vs confirmed distinction.</li>
+<li><strong>Collections / smart folders</strong>: manual sets and saved-query live sets that may span local
+  and federated sources.</li>
+<li><strong>Sources</strong> are first-class records (kind, connection info, online/offline state, and —
+  for federated sources — auth config). Two kinds: <strong>file sources</strong> (local FS, SFTP, SMB)
+  and <strong>federated sources</strong> (a remote 3DAM server).</li>
+<li><strong>Federated assets</strong> are <strong>read-only references</strong> owned by a peer: 3DAM stores enough to
+  list, filter, and rank them (identity, key attributes, tags, remote preview refs) but
+  their derivatives were computed remotely and are fetched on demand, not regenerated. They
+  carry which peer they came from so results stay attributable.</li>
+</ul>
+<p>The next two are <strong>server-side records</strong>, and deliberately live <em>outside</em> the asset library —
+in the server's own store, never in the portable library file or in any export — because they
+are host configuration and identity, not catalog data:</p>
+<ul>
+<li><strong>Server settings / feature flags</strong> are a first-class, persisted, versioned record: which
+  capabilities are enabled (MCP server, auth mode, user accounts, inbound federation, remote
+  connect, network writes), the bind address, and analysis settings. The config file seeds it
+  and the admin UI edits it; both read and write the same state (§6.11).</li>
+<li><strong>User accounts</strong> are optional and <strong>off by default</strong>. When the accounts flag is on, each is
+  a server-side identity record: a name, hashed credentials, a <strong>role</strong> (admin / editor /
+  viewer) that grants <strong>scopes</strong>, and an optional <strong>visibility scope</strong> (which sources and
+  collections the account may see). Accounts gate every client uniformly through the one auth
+  surface (§6.7, §6.11); an account's scope is the ceiling on what it can see anywhere.</li>
+</ul>
+<p>Everything above is media-agnostic where it can be, so one grid, one search box, and one
+inspector work across all three types.</p>
+<h2 id="6-feature-areas">6. Feature areas</h2>
+<h3 id="61-ingest-sources">6.1 Ingest &amp; sources</h3>
+<ul>
+<li>Add a <strong>file source</strong> (local folder, SFTP host, SMB share) and scan it — incrementally,
+  with live progress, resumable, and cancellable. These bytes get processed locally.</li>
+<li>Add a <strong>federated source</strong> (a remote 3DAM server) — no scan or processing; the peer's
+  catalog becomes queryable immediately (§6.7). Mix both kinds freely in one library.</li>
+<li><strong>Watch</strong> local sources for changes; re-scan deltas automatically.</li>
+<li>Non-destructive: catalogue in place, never copy or move originals by default.</li>
+<li>Robust to offline/unreachable sources (mark offline, keep cached metadata/results usable).</li>
+</ul>
+<h3 id="62-analysis-automation-the-differentiator">6.2 Analysis &amp; automation (the differentiator)</h3>
+<ul>
+<li>On ingest, each asset is decoded and passed through its media handler's extractors:</li>
+<li><strong>Audio:</strong> decode → spectral/temporal features → audio embedding → BPM/key/class.</li>
+<li><strong>Image:</strong> decode → perceptual hash + colour analysis → image embedding → type classify.</li>
+<li><strong>3D:</strong> load → geometry stats → multi-view render → shape embedding → category classify.</li>
+<li>Outputs feed <strong>auto-tagging</strong>, <strong>auto-categorisation</strong>, <strong>duplicate/near-duplicate
+  detection</strong>, and the <strong>similarity index</strong>.</li>
+<li>Extraction is <strong>cost-tiered</strong>, which matters most for 3D: base stats (vertex/triangle
+  counts, mesh/material/texture counts, bounding box, rig/animation and UV presence) come
+  from a cheap container/header scan <strong>without decoding geometry or touching the GPU</strong>, so
+  they run on every asset at ingest scale (§8). Full decode + multi-view render + embedding
+  is deferred to preview/analysis. The <code>MediaHandler</code> split between <code>extract_metadata</code> and
+  <code>thumbnail</code>/<code>extract_features</code> exists to keep this cheap tier cheap.</li>
+<li>All results are suggestions surfaced in the inspector for one-action accept/reject;
+  extractors are <strong>versioned</strong> so a library can be re-analysed when models improve.</li>
+</ul>
+<h3 id="63-browse-search-discovery">6.3 Browse, search &amp; discovery</h3>
+<ul>
+<li>Grid and table views over the whole library or any filtered subset.</li>
+<li>Instant text search; faceted filtering; saved searches / smart folders.</li>
+<li><strong>License / rights is a facet:</strong> filter by license or by usage right ("commercial use
+  allowed", "no attribution required", "redistributable", "unknown license"), so a live
+  smart folder like <em>safe-to-ship</em> is a first-class thing.</li>
+<li><strong>Similarity search</strong> ("more like this") across every media type.</li>
+<li>Duplicate review view grouping exact and near-duplicates.</li>
+<li>Queries <strong>fan out across federated sources</strong> and merge, so results, facets, and
+  "find similar" span local + remote catalogs; each result shows its origin peer.</li>
+</ul>
+<h3 id="64-preview">6.4 Preview</h3>
+<ul>
+<li>Media-appropriate previews (waveform + playback, image zoom/pan, 3D orbit viewer), cached
+  and lazily generated. See <a href="design_guidelines.html">DESIGN_GUIDELINES.md</a> §3.2.</li>
+</ul>
+<h3 id="65-convert-compress-optimize">6.5 Convert / compress / optimize</h3>
+<ul>
+<li>Local, scriptable conversion between formats per media type (e.g. audio codec/rate,
+  image format/compression such as PNG↔KTX2, 3D format such as FBX↔glTF plus mesh
+  optimisation/compression).</li>
+<li>Batch conversion with preview and dry-run; outputs written to a user-chosen location,
+  never overwriting sources silently.</li>
+</ul>
+<h3 id="66-export-interop">6.6 Export &amp; interop</h3>
+<ul>
+<li>Export metadata and manifests (JSON/CSV/sidecar) for use in engines and pipelines.</li>
+<li>Stable, documented database format; the user can always get their data out.</li>
+</ul>
+<h3 id="67-federation-authentication">6.7 Federation &amp; authentication</h3>
+<ul>
+<li>Add a remote 3DAM server as a <strong>federated source</strong> (<code>3dam source add 3dam://host …</code>); its
+  catalog joins your library and every query fans out to it (§4.4). No files are pulled or
+  re-processed — 3DAM queries the index the peer already built.</li>
+<li><strong>Federated query</strong> covers text, facets, and similarity: the local engine forwards the
+  query (including a similarity vector) to each peer's API, each searches its own index, and
+  results merge + re-rank locally, tagged with their origin peer.</li>
+<li><strong>License travels with the asset.</strong> Federated catalogs (especially creator/store
+  instances) publish each asset's license and rights, so the same license facet works across
+  peers — e.g. "commercial-use assets across every store I've connected". A store can gate or
+  price by license; that stays the peer's concern.</li>
+<li><strong>Authentication, from the start (basic first):</strong></li>
+<li><em>Anonymous</em> read for public/open catalogs.</li>
+<li><em>Token / API key</em> per source — the simple default for private instances.</li>
+<li><em>Open standards</em> as the extension path — OIDC / OAuth2 for identity, so an instance can
+    sit behind an existing SSO/identity provider.</li>
+<li>Client credentials are stored in the OS keychain/secret store, per source; never in the
+    library file. The server enforces auth and can scope what a caller may see.</li>
+<li><em>Enabled by feature flag.</em> On the server side, the auth mode (off / anonymous · token ·
+    OIDC/OAuth2) and the optional <strong>user accounts</strong> layer are switched from the admin surface or
+    config file (§6.11). Turning auth on is the single gate that covers the web client, the HTTP
+    API, the MCP server, and inbound federation at once — one surface, one policy.</li>
+<li><strong>Non-goal reminder:</strong> v1 federates with peers you directly connect to. Relay/mesh
+  fan-out, transitive discovery, and trust/reputation are future directions (§9).</li>
+</ul>
+<h3 id="68-server-web-client">6.8 Server &amp; web client</h3>
+<ul>
+<li><code>3dam serve</code> starts the engine as a long-lived service from a <strong>config file</strong> that names
+  the folders/sources to index, the listen address/port, auth settings, and analysis
+  settings. On start it scans and watches those sources, then stays up serving requests.</li>
+<li>Exposes an <strong>HTTP/WebSocket API</strong> covering the same library operations as the local
+  clients (browse, search, similarity, tags, previews, convert jobs) — this same API is what
+  federated clients query. Live updates (scan/analysis progress, new assets) push over
+  WebSocket.</li>
+<li>Serves a <strong>browser-based web client</strong> — the same three-region workspace as the desktop
+  GUI, delivered as a <strong>separate React + CSS web app</strong> (with WASM only for the 3D viewer and
+  hot render paths; see §7), so a library can be browsed from any device on the network with
+  no install. Being DOM-based, it degrades responsively to tablet/phone widths — desktop and
+  tablet first, phones graceful-degrade (see <a href="roadmap.html">ROADMAP.md</a>).</li>
+<li>The desktop GUI and CLI can <strong>connect</strong> to a running server as their whole backend
+  (e.g. <code>3dam --connect host:port …</code>) — distinct from adding it as a federated <em>source</em>.</li>
+<li>Also exposes a <strong>built-in MCP server for AI agents on the same port</strong> (§6.10) — no separate
+  daemon, behind the same auth as everything else, and <strong>switchable off</strong> like every other
+  capability (§6.11).</li>
+<li><strong>Administered by feature flags.</strong> Which capabilities the server exposes — remote access, auth
+  mode, user accounts, the MCP server, network writes, inbound federation — are named flags,
+  <strong>off by default</strong>, set in the config file <em>and</em> editable at runtime from a dedicated
+  <strong>Settings / Administration</strong> area in the web client. The two are coequal: the config seeds
+  the state, the admin UI edits the same state, and the API/CLI can read and set it too, so a
+  headless operator never needs the browser (§6.11).</li>
+<li><strong>Access control:</strong> binds locally by default; exposing it beyond localhost requires explicitly
+  enabling the remote-access flag <em>and</em> choosing an auth mode (§6.7). The admin surface warns
+  before any exposure without auth. TLS and finer scopes tracked in §10.</li>
+<li><strong>Headless rendering is not guaranteed.</strong> 3D thumbnail/turntable generation is
+  GPU-accelerated (§7), but a serve host — a NAS, a container, a CI runner — often has no
+  display server and no GPU. Server mode must therefore run rendering on a <strong>software
+  rasteriser</strong> (e.g. Vulkan lavapipe / Mesa llvmpipe) when no GPU is present, and where even
+  that is unavailable, <strong>degrade gracefully</strong> (serve metadata, geometry stats, and previews
+  rendered elsewhere; defer or skip on-server renders) rather than fail — consistent with the
+  fail-soft rule (§8). The fallback strategy is an open question (§10).</li>
+</ul>
+<h3 id="69-cli">6.9 CLI</h3>
+<ul>
+<li>Full parity: <code>scan</code>, <code>search</code>, <code>similar</code>, <code>convert</code>, <code>tag</code>, <code>export</code>, <code>source</code> (incl.
+  adding file <em>and</em> federated sources), and <code>serve</code> (server mode), plus <code>--connect
+  &lt;host:port&gt;</code> to use a remote server as the backend.</li>
+<li>Machine-readable output (<code>--json</code>), <code>--dry-run</code>, meaningful exit codes; safe for CI.</li>
+<li>Includes <code>mcp</code> — run the MCP server over stdio for a local agent (§6.10).</li>
+<li>Administers a server headlessly: read and set <strong>feature flags</strong> and manage <strong>user accounts</strong>
+  from the CLI (and the config file), mirroring the web admin surface so nothing about
+  configuring a server requires a browser (§6.11).</li>
+</ul>
+<h3 id="610-mcp-server-ai-agent-interface">6.10 MCP server (AI-agent interface)</h3>
+<p>3DAM exposes its library to LLM agents through a built-in <strong>MCP (Model Context Protocol)</strong>
+server, so an assistant can search, inspect, tag, convert, and audit a library the same way
+a person does — but programmatically. This is directly inspired by the sibling <strong>MoGen</strong>
+project, which ships <code>mogen mcp</code> as a stdio server wrapping every CLI subcommand as a tool.
+3DAM follows the same instinct — <em>the whole product surface, reachable by an agent</em> — and
+goes further on two axes: it runs <strong>on the same port as the rest of the server</strong> (no second
+daemon), and it is a <strong>first-class in-process adapter over <code>LibraryService</code></strong>, not a
+subprocess shim.</p>
+<ul>
+<li><strong>One port, one endpoint.</strong> In <code>serve</code> mode the MCP server is mounted on the <strong>same server
+  and listen port</strong> as the HTTP/WS API and web client (§6.8), at a dedicated path
+  (e.g. <code>POST /mcp</code>) using the MCP <strong>Streamable HTTP</strong> transport. There is no separate MCP
+  port, process, or config block — one bind address, one auth surface, one TLS cert, and one
+  firewall rule cover the API, the web client, federated peers, <em>and</em> agents. This is the
+  headline difference from MoGen (which is stdio-only): everything under one port.</li>
+<li><strong>Also stdio, for local agents.</strong> <code>3dam mcp</code> runs the same tool surface over <strong>stdio</strong>
+  against an embedded engine — no network, no running server — the drop-in mode for editors
+  and desktop agents (Claude Desktop, Cursor, and similar) that spawn the binary directly.
+  Same tools, same results, different transport; this mirrors what MoGen ships, offered
+  alongside the flagship single-port HTTP transport.</li>
+<li><strong>A frontend over the engine, not a wrapper over the CLI.</strong> Because every client already
+  talks to the engine through one <code>LibraryService</code> boundary (§4.2), the MCP server is just
+  another consumer of it — peer to the HTTP API and the web client. It calls the engine
+  <strong>in-process</strong> and returns <strong>structured results</strong>, rather than (as MoGen must, to avoid
+  <code>exit()</code>/<code>println!</code> in its command functions) spawning a subprocess and scraping stdout.
+  It therefore inherits, for free: federation fan-out, authentication, and the
+  non-destructive guarantees below.</li>
+<li><strong>Comprehensive surface — tools, resources, and prompts</strong> (MCP's three primitives, where
+  MoGen exposes only tools):</li>
+<li><strong>Tools (actions).</strong> <em>Read:</em> <code>search</code> (text + facets, including the license facet, §5),
+    <code>find_similar</code> (by asset id or an uploaded reference), <code>get_asset</code>, <code>list_sources</code>,
+    <code>list_tags</code>, <code>find_duplicates</code>, <code>library_stats</code>. <em>Write (gated — see safety):</em> <code>tag</code> /
+    <code>untag</code>, <code>set_license</code>, <code>add_source</code>, <code>scan</code> / <code>rescan</code>, <code>convert</code> (a batch
+    convert/compress/optimize job), <code>export</code> (manifest/metadata). Tool names mirror the CLI
+    verbs (§6.9) so the two surfaces stay learnable together.</li>
+<li><strong>Resources.</strong> Assets and previews are addressable so an agent can pull them into
+    context: <code>3dam://asset/{id}</code> (JSON metadata including the license/rights block),
+    <code>3dam://asset/{id}/preview</code> (thumbnail PNG / waveform as MCP image content), plus
+    sources, saved searches, and smart folders — via resource templates for parameterised
+    addressing.</li>
+<li><strong>Prompts.</strong> A small set of canned workflows an agent can invoke directly — e.g.
+    <em>audit licenses</em> (surface unknown / no-commercial assets and the missing-attribution
+    list), <em>review duplicates</em>, and <em>find-similar-then-export-a-manifest</em>.</li>
+<li><strong>Federated by construction.</strong> Because the tools sit on <code>LibraryService</code>, <code>search</code> and
+  <code>find_similar</code> <strong>fan out across federated peers</strong> and merge / re-rank exactly as the HTTP
+  API does (§4.4), each hit tagged with its origin peer. An agent pointed at one server
+  transparently reaches the whole federation that server is connected to — and license
+  travels with every result (§5).</li>
+<li><strong>Safe by default, non-destructive always.</strong> Reads are always available; writes honour §8 —
+  never overwrite a source silently, outputs go to a chosen location, and expensive or
+  mutating tools support a <strong>dry-run</strong> and return structured diffs. When the server is exposed
+  beyond localhost, the MCP surface defaults to <strong>read-only</strong> unless writes are explicitly
+  enabled in config, and every call is subject to the same <strong>auth + scope</strong> as the rest of the
+  API (§6.7) — an anonymous caller sees only what an anonymous browser would.</li>
+<li><strong>Switchable off entirely.</strong> The served MCP endpoint is a <strong>feature flag</strong> (§6.11): one toggle
+  in the admin surface or config turns the whole agent interface off, and turning it off
+  <em>removes</em> the <code>POST /mcp</code> route and its tools from the server rather than leaving them dormant
+  behind auth. An operator who does not want agent access carries none of its surface. (The flag
+  governs the network endpoint; the local <code>3dam mcp</code> stdio mode is a separate, opt-in CLI
+  invocation over an embedded engine and is unaffected.)</li>
+</ul>
+<h3 id="611-server-administration-feature-flags-authentication-user-accounts">6.11 Server administration — feature flags, authentication &amp; user accounts</h3>
+<p>A 3DAM server is administered through <strong>feature flags</strong>: named capabilities that are <strong>off by
+default</strong> and switched on either declaratively in the <code>3dam serve</code> config file or from a
+<strong>Settings / Administration</strong> area in the web client. The two control planes are <strong>coequal</strong> —
+the config seeds the state, the admin UI edits the same persisted state (§5), and the API/CLI
+can read and set it too — so nothing is browser-only and a headless operator is never blocked.</p>
+<ul>
+<li>
+<p><strong>Safe-by-default posture.</strong> Out of the box a server binds to localhost, requires no auth, has
+  no user accounts, keeps the MCP agent server and inbound federation off, and is read-only to
+  the network. Every capability beyond that is a flag an operator consciously enables — the
+  local-first, zero-config experience (and the "no account" principle, §2) is the default, not a
+  thing you have to switch back on.</p>
+</li>
+<li>
+<p><strong>The v1 flag set:</strong></p>
+</li>
+<li><strong>Remote access / bind</strong> — localhost-only (default) vs a bind address reachable on the
+    LAN/internet. Exposing beyond localhost requires choosing an auth mode first.</li>
+<li><strong>Authentication</strong> — off / anonymous · token / API key · OIDC/OAuth2 (§6.7). One gate for
+    the web client, API, MCP, and inbound federation.</li>
+<li><strong>User accounts</strong> — off by default (single-tenant). When on, named accounts with roles and
+    scopes (below).</li>
+<li><strong>MCP agent server</strong> — on/off, and when on, read-only vs writes-enabled (§6.10). This is the
+    switch that turns the agent interface off entirely.</li>
+<li><strong>Network writes</strong> — server read-only vs writes-enabled (tag, set_license, convert, scan,
+    export); defaults to read-only whenever bound beyond localhost, independent of transport.</li>
+<li><strong>Inbound federation</strong> — whether this server answers federated queries from peers, and under
+    which auth (§4.4, §6.7).</li>
+<li><strong>Remote client connect</strong> — whether GUI/CLI <code>--connect</code> sessions are accepted as a backend.</li>
+<li>
+<p><strong>Analysis &amp; watch</strong> — which extractors run and whether sources are watched/auto-rescanned
+    (§6.2), so a low-powered host can serve a static catalog without background work.</p>
+</li>
+<li>
+<p><strong>User accounts &amp; roles (opt-in).</strong> Off by default; when enabled, each account carries hashed
+  credentials, a <strong>role</strong>, and an optional visibility scope:</p>
+</li>
+<li><strong>admin</strong> — manage feature flags, sources, and other accounts;</li>
+<li><strong>editor</strong> — everything a viewer can do plus writes (tag / set_license / convert / scan /
+    export), subject to the network-writes flag;</li>
+<li><strong>viewer</strong> — read-only browse, search, similarity, preview.</li>
+<li>
+<p>An optional <strong>visibility scope</strong> limits which sources and collections an account sees.
+    Accounts gate the web client, the API, federated access, <em>and</em> the MCP server uniformly —
+    everything sits on the one auth surface (§6.7, <a href="adr/0004-feature-flags-admin.md">ADR 0004</a>) —
+    and an account's scope is the ceiling on what it can reach in any client. Identity records
+    live in the server's own store, never in the portable library file or in exports.</p>
+</li>
+<li>
+<p><strong>The admin surface — beautifully presented.</strong> The web client's <strong>Settings / Administration</strong>
+  area (admin-only) is where flags are toggled, and it is designed to be a first-class,
+  legible surface, not a raw config dump:</p>
+</li>
+<li>Capabilities are grouped into <strong>cards by area</strong> — Access, Authentication, Accounts,
+    Agents / MCP, Federation, Analysis — each a labelled <strong>toggle</strong> with a title, one-line
+    description, and current state.</li>
+<li>Enabling a capability <strong>reveals its sub-options inline</strong> — turning on Authentication reveals
+    the mode picker; turning on Accounts reveals the user list and role editor; turning on the
+    MCP server reveals the read-only/writes choice.</li>
+<li><strong>Consequential toggles carry a warning and a confirm</strong> — exposing the server without auth,
+    or enabling MCP/network writes beyond localhost, shows a clear risk note before it takes
+    effect (the no-surprises rule, DESIGN_GUIDELINES §3.4).</li>
+<li>Flags that need a <strong>restart</strong> are marked as such; the rest apply live.</li>
+<li>
+<p>Visuals follow the dark-first, low-chrome, information-dense language (DESIGN_GUIDELINES §4):
+    status colours for on / off / at-risk, no decorative chrome — the settings recede, the state
+    is obvious at a glance.</p>
+</li>
+<li>
+<p><strong>Auditable &amp; reversible.</strong> Every flag change is logged with who and when. Turning a capability
+  off <strong>removes its surface</strong> — the route, the tools, the endpoint — rather than leaving it
+  dormant behind auth, so "off" genuinely reduces attack surface (§6.10, above).</p>
+</li>
+</ul>
+<h2 id="7-technology-direction-candidate-stack">7. Technology direction (candidate stack)</h2>
+<p>Choices to be validated by spikes; listed to establish direction, not to lock in.</p>
+<ul>
+<li><strong>Language:</strong> Rust across core, CLI, and GUI.</li>
+<li><strong>GUI:</strong> a native, GPU-accelerated Rust UI toolkit — leading candidates <strong>egui/eframe</strong>
+  or <strong>Iced</strong> — with <strong>wgpu</strong> for the embedded 3D viewer and custom thumbnail/waveform
+  rendering. (Decision recorded in a later ADR.)</li>
+<li><strong>Database:</strong> embedded <strong>SQLite</strong> (via <code>rusqlite</code>/<code>sqlx</code>) for metadata; a vector index
+  for similarity (e.g. <code>sqlite-vec</code>, <code>usearch</code>, or an HNSW crate). Local, single-file,
+  portable.</li>
+<li><strong>Audio:</strong> <code>symphonia</code> (decode) + FFT/DSP crates (<code>rustfft</code>/<code>realfft</code>) for feature
+  extraction; playback via <code>cpal</code>/<code>rodio</code>.</li>
+<li><strong>Image:</strong> <code>image</code> + <code>imageproc</code>; perceptual hashing (<code>img_hash</code>); optional GPU decode.</li>
+<li><strong>3D:</strong> <code>gltf</code> and format loaders (glTF/FBX/OBJ/etc.), <code>wgpu</code> for rendering turntable
+  thumbnails and the interactive viewer; mesh optimisation via <code>meshopt</code>-style tooling.</li>
+<li><strong>ML / embeddings:</strong> on-device inference via <code>candle</code> or ONNX Runtime (<code>ort</code>) to run
+  CLIP-style image models, audio embedding models, and shape/multi-view models — all local,
+  no cloud calls.</li>
+<li><strong>File sources:</strong> SFTP via <code>russh</code>/<code>ssh2</code>; SMB/Samba via an SMB client crate; behind the
+  common <code>Source</code> trait.</li>
+<li><strong>Federated sources:</strong> a 3DAM-server <code>Source</code> implementation that satisfies the same trait
+  by calling a peer's API (search, facets, similarity-by-vector, preview fetch) instead of
+  reading bytes — so the query engine treats local index and remote peers uniformly, then
+  merges and re-ranks.</li>
+<li><strong>Server &amp; API:</strong> an async HTTP/WebSocket server (e.g. <code>axum</code>/<code>hyper</code> on <code>tokio</code>) mounting
+  the same operations the clients call locally; the client↔engine boundary is one
+  <code>LibraryService</code> trait with in-process and API-client implementations.</li>
+<li><strong>MCP server:</strong> the Rust MCP SDK (<strong><code>rmcp</code></strong>, the same crate MoGen uses) exposing library
+  operations as tools/resources/prompts. Mounted on the shared <code>axum</code> server via the
+  <strong>Streamable HTTP</strong> transport (one port, §6.10) and also runnable over <strong>stdio</strong> (<code>3dam
+  mcp</code>). Unlike MoGen's subprocess-per-tool design, tools call <code>LibraryService</code> in-process.</li>
+<li><strong>Authentication:</strong> token/API-key and OIDC/OAuth2 (open standards) via crates like
+  <code>oauth2</code>/<code>openidconnect</code>; credentials in the OS secret store (<code>keyring</code>); TLS via
+  <code>rustls</code>. Server enforces; each federated source carries its own auth config.</li>
+<li><strong>Feature flags &amp; user accounts:</strong> server capabilities are runtime flags persisted in the
+  server's own config store (a small versioned table beside the metadata DB, seeded by the
+  config file), read and written by both the config loader and the admin API so there is one
+  source of truth. User accounts are server-side identity records with hashed credentials
+  (e.g. <code>argon2</code>) and a role/scope, layered on the same auth crates. All of it is exposed over
+  the serve API so the admin UI, the CLI, and the config file are interchangeable control
+  planes (§6.11).</li>
+<li><strong>Web client:</strong> a <strong>separate front-end codebase</strong> served by <code>3dam serve</code> — an ordinary
+  <strong>React + CSS</strong> app for the workspace (browse grid, search, tags, panels, navigation, and the
+  <strong>Settings / Administration</strong> surface for feature flags and accounts, §6.11),
+  with <strong>WASM/<code>wgpu</code> islands only for the parts that need it</strong> (the interactive 3D viewer and
+  any hot render paths like waveforms/thumbnails) embedded in the DOM layout. Talks to the
+  engine purely over the serve API. The DOM shell gets responsive layout, touch, text input,
+  and accessibility for free; WASM is reserved for the heavy canvas. See
+  <a href="roadmap.html">ROADMAP.md</a> for why this leads over egui-in-WASM and why it ships before the
+  desktop GUI.</li>
+<li><strong>Concurrency:</strong> bounded worker pools (<code>rayon</code> for CPU-parallel analysis, async runtime
+  for I/O-bound source access) feeding an incremental, non-blocking pipeline.</li>
+</ul>
+<h2 id="8-cross-cutting-requirements">8. Cross-cutting requirements</h2>
+<ul>
+<li><strong>Performance:</strong> 60 fps browsing at 100k+ visible-scale libraries; instant search;
+  analysis saturates cores without blocking the UI. Design for 1M+ assets and
+  out-of-core datasets.</li>
+<li><strong>Reliability:</strong> fail-soft on bad files and offline sources; no crash from one bad asset.</li>
+<li><strong>Privacy:</strong> no telemetry, no unsolicited network calls, no account.</li>
+<li><strong>Portability:</strong> one engine codebase, three OSes; documented DB and plain-text export.
+  Cross-platform binaries + native installers (<code>.deb</code>/<code>.msi</code>/<code>.dmg</code>) ship from a tag-triggered
+  CI matrix — see <a href="roadmap.html">ROADMAP.md</a> §Release &amp; distribution.</li>
+<li><strong>Reproducibility:</strong> versioned analysis; explainable automated results.</li>
+</ul>
+<h2 id="9-phasing-indicative">9. Phasing (indicative)</h2>
+<blockquote>
+<p>This phasing tracks <strong>capability maturity</strong> (what works), not front-end build order. The
+<strong>front-end sequence is web-first</strong> — the React + CSS web client ships before the egui
+desktop GUI, and the <code>LibraryService</code>/serve API is pulled early to support it. Where the
+steps below mention a GUI or web client, read the order from <a href="roadmap.html">ROADMAP.md</a>.</p>
+</blockquote>
+<ol>
+<li><strong>Foundation:</strong> <code>3dam-core</code> skeleton, unified schema, local source scanning, SQLite
+   store, basic grid/table browser + text search, CLI <code>scan</code>/<code>search</code>.</li>
+<li><strong>Media depth:</strong> per-type decode + preview (waveform, image, 3D viewer), thumbnail
+   cache, conversion pipeline (CLI-first).</li>
+<li><strong>Automation:</strong> feature extraction + embeddings per media type, similarity search,
+   auto-tag/auto-categorise, duplicate detection, review UX.</li>
+<li><strong>Reach:</strong> SFTP + SMB sources, watch/auto-rescan, smart folders, export/manifests,
+   CLI/GUI parity hardening.</li>
+<li><strong>Server &amp; web:</strong> factor the client↔engine boundary into <code>LibraryService</code>, add
+   <code>3dam serve</code> (config-driven indexing + HTTP/WS API + MCP endpoint on the same port),
+   <code>3dam mcp</code> (stdio), <code>--connect</code> for GUI/CLI, and the web client; <strong>feature flags with the
+   Settings / Administration surface</strong> (§6.11) and basic access control (anonymous + token
+   auth), including the toggle that turns the MCP server off.</li>
+<li><strong>Federation &amp; auth:</strong> 3DAM-server source type, federated query fan-out + merge/re-rank,
+   similarity-by-vector across peers, per-source credentials, OIDC/OAuth2 support, and
+   <strong>opt-in user accounts with roles/scopes</strong> (§6.11) layered on the same auth surface.</li>
+<li><strong>Polish &amp; scale:</strong> performance work at 1M assets, accessibility, packaging/distribution
+   for all three OSes.</li>
+<li><strong>Future — asset networks:</strong> peer relay/mesh fan-out, instance discovery, and trust /
+   reputation so communities and stores can form large shared catalogs (beyond v1).</li>
+</ol>
+<h2 id="10-open-questions">10. Open questions</h2>
+<ul>
+<li>GUI toolkit final choice (egui vs Iced vs other) — needs a rendering/perf spike.</li>
+<li>Which concrete embedding models per media type balance quality, size, and speed on-device.</li>
+<li>Vector index: embedded extension vs standalone crate; on-disk vs in-memory at scale.</li>
+<li>Extent of write-back to sources (rename/relocate) vs strictly-read-only default.</li>
+<li>Format coverage matrix for v1 vs later (which loaders/converters ship first).</li>
+<li>~~Web client approach: shared Rust→WASM view code vs a separate web UI.~~ <strong>Decided:</strong>
+  separate <strong>React + CSS</strong> web app with WASM only for viewer/render islands, built before the
+  desktop GUI (see <a href="roadmap.html">ROADMAP.md</a>). Remaining detail — the React stack (bundler,
+  router, state) and how WASM islands are packaged/fed data — tracked in the roadmap.</li>
+<li>Server auth/security model: token vs account, TLS, and how far the server hardens for
+  exposure beyond localhost/LAN in v1.</li>
+<li><strong>Feature-flag store &amp; lifecycle:</strong> where flag state persists (a table beside the metadata DB
+  vs a watched config file), how config-file and admin-UI edits reconcile when both change, and
+  which flags can flip <strong>live</strong> vs require a restart (§6.11).</li>
+<li><strong>User-accounts scope for v1:</strong> how far the role/scope model goes (fixed admin/editor/viewer
+  vs custom roles), where per-account visibility scoping bottoms out (source- and
+  collection-level vs per-asset), account recovery/first-admin bootstrap, and session/token
+  lifetime. Accounts are opt-in, so v1 can start minimal.</li>
+<li><strong>Headless 3D rendering on GPU-less servers:</strong> software-raster fallback (lavapipe/llvmpipe)
+  vs a CPU thumbnail path vs render-on-demand by a GPU-capable client. Needs a spike on a
+  headless Linux box with no display and no discrete GPU — the exact §6.8 serve target.</li>
+<li><strong>Cross-peer similarity:</strong> ranking similarity hits across peers needs compatible embedding
+  spaces (same model + version). Options: advertise embedding model/version in the API and
+  gate cross-peer ranking on a match, negotiate a shared space, or fall back to
+  per-peer-ranked, grouped results. Needs a spike.</li>
+<li><strong>Federated query semantics:</strong> timeouts, partial results when a peer is slow/offline,
+  pagination and result caps across N peers, and how much of a peer's catalog to cache
+  locally for responsiveness.</li>
+<li><strong>Federation protocol &amp; versioning:</strong> the API contract between instances (and how it
+  evolves) as the seed of a future mesh; auth-standard subset to support first.</li>
+<li><strong>MCP surface &amp; safety:</strong> tool granularity (one <code>search</code> vs many narrow tools), how far to
+  lean on resources/prompts vs tools, and exactly which write tools to expose and how they are
+  gated when the server is exposed beyond localhost (read-only default, auth scopes, per-tool
+  opt-in). Also: whether federated peers' MCP endpoints should be reachable transitively.</li>
+<li><strong>License taxonomy &amp; detection:</strong> how far to lean on SPDX vs a 3DAM rights model for
+  non-code assets; how much to auto-detect (from pack manifests, sidecars, <code>LICENSE</code>/readme
+  files, store metadata) vs require the user to set; and how to represent per-asset overrides
+  within a pack that has one blanket license. 3DAM records and surfaces license — it is not
+  legal advice, and unknown stays unknown.</li>
+</ul>
+<hr />
+<p>See also: <a href="mission.html">MISSION.md</a> · <a href="design_guidelines.html">DESIGN_GUIDELINES.md</a></p>
+<nav class="docnav"><a class="prev" href="design_guidelines.html"><small>Previous</small><span>&larr; Design</span></a><a class="next" href="roadmap.html"><small>Next</small><span>Roadmap &rarr;</span></a></nav>
+</main>
+<footer class="footer">3DAM — free &amp; open-source game asset manager · MIT licensed</footer>
+</body>
+</html>

@@ -1,0 +1,481 @@
+<!-- ============================================================= -->
+<!--  3DAM design showcase — injected into design_guidelines.html  -->
+<!--  Self-contained: scoped styles (.dsx*), markup, small script.  -->
+<!-- ============================================================= -->
+<style>
+.dsx {
+  --dsx-bg:#0d1117; --dsx-panel:#12171f; --dsx-panel-2:#161b22; --dsx-elev:#1b222c;
+  --dsx-border:#232a35; --dsx-border-soft:#1c2029;
+  --dsx-fg:#d6dee8; --dsx-muted:#8b98a9; --dsx-dim:#6b7787; --dsx-head:#f0f4f9;
+  --dsx-accent:#35d0ba; --dsx-accent-soft:rgba(53,208,186,.14); --dsx-accent-ink:#04211d;
+  --dsx-ok:#3fb950; --dsx-warn:#d29922; --dsx-off:#586170; --dsx-sug:#a371f7;
+  --dsx-audio:#35d0ba; --dsx-image:#f0883e; --dsx-model:#7c8cff;
+  --dsx-r:10px;
+  color:var(--dsx-fg);
+}
+.dsx[data-accent="violet"]  { --dsx-accent:#a371f7; --dsx-accent-soft:rgba(163,113,247,.16); --dsx-accent-ink:#150a2b; }
+.dsx[data-accent="amber"]   { --dsx-accent:#e3a008; --dsx-accent-soft:rgba(227,160,8,.16);  --dsx-accent-ink:#241a02; }
+.dsx[data-accent="sky"]     { --dsx-accent:#4c9ffe; --dsx-accent-soft:rgba(76,159,254,.16);  --dsx-accent-ink:#04182e; }
+.dsx[data-accent="rose"]    { --dsx-accent:#f778ba; --dsx-accent-soft:rgba(247,120,186,.16); --dsx-accent-ink:#2b0a1c; }
+.dsx.light {
+  --dsx-bg:#f4f6f9; --dsx-panel:#ffffff; --dsx-panel-2:#eef1f6; --dsx-elev:#e8ecf2;
+  --dsx-border:#d7dee7; --dsx-border-soft:#e5e9f0;
+  --dsx-fg:#2a333f; --dsx-muted:#5c6835; --dsx-muted:#5a6674; --dsx-dim:#8592a1; --dsx-head:#121821;
+  --dsx-off:#a2adba; --dsx-accent-ink:#ffffff;
+}
+.dsx * { box-sizing:border-box; }
+.dsx-wrap {
+  margin:1.5em 0 0; padding:20px; border:1px solid var(--dsx-border); border-radius:14px;
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--dsx-panel) 70%, transparent), transparent 40%),
+    var(--dsx-bg);
+  transition:background .25s ease, border-color .25s ease;
+}
+.dsx-eyebrow { font-size:11px; letter-spacing:2px; text-transform:uppercase; color:var(--dsx-accent); font-weight:700; }
+.dsx-h { color:var(--dsx-head); font-weight:700; margin:4px 0 2px; }
+.dsx-sub { color:var(--dsx-muted); font-size:14px; margin:0 0 14px; }
+.dsx-block { margin:26px 0; }
+.dsx-block > h4 { color:var(--dsx-head); font-size:13px; letter-spacing:1.5px; text-transform:uppercase; margin:0 0 12px; display:flex; align-items:center; gap:8px; }
+.dsx-block > h4::before { content:""; width:6px; height:6px; border-radius:2px; background:var(--dsx-accent); display:inline-block; }
+
+/* ---- theme controls ---- */
+.dsx-controls { display:flex; flex-wrap:wrap; gap:10px; align-items:center; padding:12px 14px; border:1px solid var(--dsx-border); border-radius:var(--dsx-r); background:var(--dsx-panel); }
+.dsx-controls .lbl { font-size:12px; color:var(--dsx-dim); text-transform:uppercase; letter-spacing:1px; margin-right:2px; }
+.dsx-acc { width:26px; height:26px; border-radius:50%; border:2px solid var(--dsx-border); cursor:pointer; padding:0; position:relative; transition:transform .12s ease; }
+.dsx-acc:hover { transform:scale(1.12); }
+.dsx-acc.active { border-color:var(--dsx-fg); box-shadow:0 0 0 3px var(--dsx-accent-soft); }
+.dsx-acc[data-set-accent="teal"]{background:#35d0ba} .dsx-acc[data-set-accent="violet"]{background:#a371f7}
+.dsx-acc[data-set-accent="amber"]{background:#e3a008} .dsx-acc[data-set-accent="sky"]{background:#4c9ffe}
+.dsx-acc[data-set-accent="rose"]{background:#f778ba}
+.dsx-toggle { margin-left:auto; font:inherit; font-size:13px; font-weight:600; color:var(--dsx-fg); background:var(--dsx-elev); border:1px solid var(--dsx-border); border-radius:8px; padding:6px 14px; cursor:pointer; }
+.dsx-toggle:hover { border-color:var(--dsx-accent); }
+
+/* ---- palette ---- */
+.dsx-swatches { display:grid; grid-template-columns:repeat(auto-fill,minmax(120px,1fr)); gap:10px; }
+.dsx-sw { border:1px solid var(--dsx-border); border-radius:var(--dsx-r); overflow:hidden; background:var(--dsx-panel); }
+.dsx-sw .chip { height:56px; }
+.dsx-sw .lab { padding:8px 10px; font-size:12px; }
+.dsx-sw .lab b { display:block; color:var(--dsx-head); font-weight:600; }
+.dsx-sw .lab span { color:var(--dsx-dim); font-family:var(--mono,monospace); font-size:11px; }
+.dsx-ramp { display:flex; border:1px solid var(--dsx-border); border-radius:var(--dsx-r); overflow:hidden; }
+.dsx-ramp div { flex:1; height:40px; display:flex; align-items:flex-end; justify-content:center; padding-bottom:4px; font-size:10px; color:#0009; font-weight:700; }
+
+/* ---- type scale ---- */
+.dsx-type { border:1px solid var(--dsx-border); border-radius:var(--dsx-r); background:var(--dsx-panel); padding:6px 16px; }
+.dsx-type .row { display:flex; align-items:baseline; gap:16px; padding:9px 0; border-bottom:1px solid var(--dsx-border-soft); }
+.dsx-type .row:last-child { border-bottom:none; }
+.dsx-type .tag { width:120px; flex:none; color:var(--dsx-dim); font-size:12px; font-family:var(--mono,monospace); }
+.dsx-type .samp { color:var(--dsx-head); }
+
+/* ---- components ---- */
+.dsx-cgrid { display:grid; grid-template-columns:repeat(auto-fill,minmax(200px,1fr)); gap:12px; }
+.dsx-comp { border:1px solid var(--dsx-border); border-radius:var(--dsx-r); background:var(--dsx-panel); padding:14px; }
+.dsx-comp .t { font-size:11px; letter-spacing:1px; text-transform:uppercase; color:var(--dsx-dim); margin-bottom:10px; }
+.dsx-comp .r { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+.dsx-btn { font:inherit; font-size:13px; font-weight:600; border-radius:8px; padding:7px 14px; cursor:pointer; border:1px solid transparent; }
+.dsx-btn.primary { background:var(--dsx-accent); color:var(--dsx-accent-ink); }
+.dsx-btn.ghost { background:transparent; color:var(--dsx-fg); border-color:var(--dsx-border); }
+.dsx-btn.icon { background:var(--dsx-elev); color:var(--dsx-fg); border-color:var(--dsx-border); padding:7px 10px; }
+.dsx-field { display:flex; align-items:center; gap:8px; background:var(--dsx-elev); border:1px solid var(--dsx-border); border-radius:8px; padding:7px 10px; color:var(--dsx-muted); font-size:13px; min-width:150px; }
+.dsx-field .kbd { margin-left:auto; font-size:11px; color:var(--dsx-dim); border:1px solid var(--dsx-border); border-radius:5px; padding:1px 5px; }
+.dsx-fchip { display:inline-flex; align-items:center; gap:6px; font-size:12.5px; color:var(--dsx-fg); background:var(--dsx-elev); border:1px solid var(--dsx-border); border-radius:20px; padding:5px 11px; cursor:pointer; }
+.dsx-fchip.on { color:var(--dsx-accent); background:var(--dsx-accent-soft); border-color:color-mix(in srgb,var(--dsx-accent) 40%,transparent); }
+.dsx-badge { font-size:10px; font-weight:800; letter-spacing:.6px; padding:2px 6px; border-radius:5px; }
+.dsx-badge.audio { color:var(--dsx-audio); background:color-mix(in srgb,var(--dsx-audio) 16%,transparent); }
+.dsx-badge.image { color:var(--dsx-image); background:color-mix(in srgb,var(--dsx-image) 16%,transparent); }
+.dsx-badge.model { color:var(--dsx-model); background:color-mix(in srgb,var(--dsx-model) 16%,transparent); }
+.dsx-tag { font-size:12px; padding:3px 9px; border-radius:6px; background:var(--dsx-elev); color:var(--dsx-muted); border:1px solid var(--dsx-border); }
+.dsx-tag.sug { border-style:dashed; color:var(--dsx-sug); border-color:color-mix(in srgb,var(--dsx-sug) 45%,transparent); background:color-mix(in srgb,var(--dsx-sug) 10%,transparent); display:inline-flex; align-items:center; gap:6px; }
+.dsx-tag.sug .yn { display:inline-flex; gap:3px; }
+.dsx-tag.sug .yn b { cursor:pointer; width:15px; height:15px; line-height:14px; text-align:center; border-radius:4px; font-size:10px; }
+.dsx-tag.sug .yn .y { background:color-mix(in srgb,var(--dsx-ok) 25%,transparent); color:var(--dsx-ok); }
+.dsx-tag.sug .yn .n { background:color-mix(in srgb,#f85149 25%,transparent); color:#f85149; }
+.dsx-bar { height:6px; border-radius:4px; background:var(--dsx-elev); overflow:hidden; flex:1; min-width:90px; }
+.dsx-bar i { display:block; height:100%; background:var(--dsx-accent); border-radius:4px; }
+.dot { width:8px; height:8px; border-radius:50%; display:inline-block; }
+.dot.ok{background:var(--dsx-ok)} .dot.busy{background:var(--dsx-accent)} .dot.off{background:var(--dsx-off)}
+
+/* ---- license badges ---- */
+.dsx-lic { display:flex; flex-direction:column; gap:1px; border-radius:8px; padding:6px 10px; border:1px solid; font-size:12px; }
+.dsx-lic .k { font-weight:800; letter-spacing:.3px; display:flex; align-items:center; gap:6px; }
+.dsx-lic .r { font-size:10.5px; opacity:.9; }
+.dsx-lic.ok { color:#3fb950; background:color-mix(in srgb,#3fb950 12%,transparent); border-color:color-mix(in srgb,#3fb950 40%,transparent); }
+.dsx-lic.attr { color:#e3a008; background:color-mix(in srgb,#e3a008 13%,transparent); border-color:color-mix(in srgb,#e3a008 45%,transparent); }
+.dsx-lic.warn { color:#f85149; background:color-mix(in srgb,#f85149 12%,transparent); border-color:color-mix(in srgb,#f85149 42%,transparent); }
+.dsx-lic.unknown { color:var(--dsx-muted); background:transparent; border-style:dashed; border-color:var(--dsx-border); }
+.dsx-lm { font-weight:700; font-size:11px; display:inline-flex; align-items:center; gap:5px; }
+.dsx-lm::before { content:""; width:7px; height:7px; border-radius:2px; background:currentColor; }
+.dsx-lm.ok{color:#3fb950} .dsx-lm.attr{color:#e3a008} .dsx-lm.warn{color:#f85149} .dsx-lm.unknown{color:var(--dsx-dim)}
+
+/* ---- app window mockup ---- */
+.dsx-scroll { overflow-x:auto; margin-top:6px; padding-bottom:4px; }
+.dsx-win { min-width:760px; border:1px solid var(--dsx-border); border-radius:12px; overflow:hidden; background:var(--dsx-bg); box-shadow:0 20px 50px -20px #0009; }
+.dsx-titlebar { display:flex; align-items:center; gap:10px; padding:9px 14px; background:var(--dsx-panel-2); border-bottom:1px solid var(--dsx-border); }
+.dsx-dots { display:flex; gap:6px; } .dsx-dots i{ width:11px;height:11px;border-radius:50%;background:var(--dsx-elev);border:1px solid var(--dsx-border); }
+.dsx-title { color:var(--dsx-muted); font-size:12.5px; }
+.dsx-conn { margin-left:auto; display:flex; align-items:center; gap:6px; font-size:12px; color:var(--dsx-muted); }
+.dsx-toolbar { display:flex; align-items:center; gap:9px; padding:10px 12px; border-bottom:1px solid var(--dsx-border); background:var(--dsx-panel); flex-wrap:wrap; }
+.dsx-seg { display:flex; border:1px solid var(--dsx-border); border-radius:8px; overflow:hidden; }
+.dsx-seg button { font:inherit; font-size:12.5px; color:var(--dsx-muted); background:transparent; border:none; padding:6px 11px; cursor:pointer; }
+.dsx-seg button.on { background:var(--dsx-accent-soft); color:var(--dsx-accent); }
+.dsx-count { font-size:12px; color:var(--dsx-dim); }
+.dsx-body { display:grid; grid-template-columns:194px 1fr 250px; min-height:430px; }
+.dsx-side { border-right:1px solid var(--dsx-border); background:var(--dsx-panel); padding:12px 8px; overflow:hidden; }
+.dsx-side .grp { font-size:10.5px; letter-spacing:1.4px; text-transform:uppercase; color:var(--dsx-dim); margin:14px 8px 6px; }
+.dsx-side .grp:first-child { margin-top:2px; }
+.dsx-nav { display:flex; align-items:center; gap:8px; padding:6px 9px; border-radius:7px; font-size:13px; color:var(--dsx-fg); cursor:pointer; }
+.dsx-nav:hover { background:var(--dsx-elev); }
+.dsx-nav.on { background:var(--dsx-accent-soft); color:var(--dsx-accent); font-weight:600; }
+.dsx-nav.dim { color:var(--dsx-dim); }
+.dsx-nav .ct { margin-left:auto; font-size:11px; color:var(--dsx-dim); }
+.dsx-fed { color:var(--dsx-accent); font-size:11px; }
+.dsx-fedtag { font-size:9px; font-weight:800; letter-spacing:.5px; color:var(--dsx-accent); background:var(--dsx-accent-soft); border:1px solid color-mix(in srgb,var(--dsx-accent) 35%,transparent); border-radius:4px; padding:0 4px; margin-left:4px; }
+.dsx-origin { position:absolute; bottom:6px; right:6px; display:flex; align-items:center; gap:3px; font-size:9px; font-weight:700; color:var(--dsx-accent); background:color-mix(in srgb,var(--dsx-bg) 78%,transparent); border:1px solid color-mix(in srgb,var(--dsx-accent) 30%,transparent); border-radius:20px; padding:1px 6px; }
+.dsx-tagrow { display:flex; flex-wrap:wrap; gap:5px; padding:4px 8px; }
+.dsx-gridwrap { padding:12px 14px; overflow:hidden; }
+.dsx-crumb { font-size:12px; color:var(--dsx-muted); margin-bottom:12px; }
+.dsx-crumb b { color:var(--dsx-fg); }
+.dsx-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; }
+.dsx-card { border:1px solid var(--dsx-border); border-radius:9px; overflow:hidden; background:var(--dsx-panel-2); cursor:pointer; position:relative; transition:border-color .12s ease, transform .12s ease; }
+.dsx-card:hover { transform:translateY(-2px); border-color:color-mix(in srgb,var(--dsx-accent) 40%,transparent); }
+.dsx-card.sel { border-color:var(--dsx-accent); box-shadow:0 0 0 2px var(--dsx-accent-soft); }
+.dsx-thumb { height:84px; display:flex; align-items:center; justify-content:center; position:relative; background:var(--dsx-elev); }
+.dsx-card .m { padding:7px 9px; }
+.dsx-card .m .n { font-size:12px; color:var(--dsx-head); font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.dsx-card .m .s { font-size:10.5px; color:var(--dsx-dim); }
+.dsx-card .bdg { position:absolute; top:6px; left:6px; }
+.dsx-wave { display:flex; align-items:center; gap:2px; height:56px; width:82%; }
+.dsx-wave i { flex:1; background:var(--dsx-audio); border-radius:1px; min-height:2px; opacity:.9; }
+.tx-moss{background:radial-gradient(circle at 30% 30%,#4a6b3a,#243a1e 70%),repeating-linear-gradient(45deg,#0002 0 3px,#0000 3px 7px)}
+.tx-bark{background:linear-gradient(90deg,#5a3a24,#3d2716),repeating-linear-gradient(90deg,#0003 0 2px,#0000 2px 6px)}
+.tx-stone{background:radial-gradient(circle at 60% 40%,#7a8390,#3b444f 75%)}
+.tx-metal{background:linear-gradient(120deg,#9aa4b2,#4b5563 60%,#8b95a3)}
+
+/* inspector */
+.dsx-insp { border-left:1px solid var(--dsx-border); background:var(--dsx-panel); padding:14px; overflow:hidden; }
+.dsx-insp .prev { height:104px; border-radius:8px; background:var(--dsx-elev); border:1px solid var(--dsx-border); display:flex; align-items:center; justify-content:center; position:relative; margin-bottom:10px; }
+.dsx-insp .play { position:absolute; width:34px; height:34px; border-radius:50%; background:var(--dsx-accent); color:var(--dsx-accent-ink); display:flex; align-items:center; justify-content:center; font-size:13px; }
+.dsx-insp h5 { margin:2px 0 3px; color:var(--dsx-head); font-size:15px; }
+.dsx-insp .badges { display:flex; gap:6px; margin-bottom:10px; }
+.dsx-kv { display:flex; justify-content:space-between; font-size:12px; padding:3px 0; border-bottom:1px solid var(--dsx-border-soft); }
+.dsx-kv span { color:var(--dsx-dim); } .dsx-kv b { color:var(--dsx-fg); font-weight:500; }
+.dsx-sech { font-size:10.5px; letter-spacing:1.2px; text-transform:uppercase; color:var(--dsx-dim); margin:13px 0 7px; }
+.dsx-feat { display:flex; align-items:center; gap:8px; font-size:11.5px; color:var(--dsx-muted); margin:5px 0; }
+.dsx-feat .fl { width:74px; flex:none; }
+.dsx-insp .acts { display:flex; gap:8px; margin-top:13px; }
+.dsx-insp .acts .dsx-btn { flex:1; text-align:center; }
+
+/* statusbar */
+.dsx-status { display:flex; align-items:center; gap:10px; padding:7px 14px; background:var(--dsx-panel-2); border-top:1px solid var(--dsx-border); font-size:11.5px; color:var(--dsx-muted); }
+.dsx-prog { width:130px; height:5px; border-radius:3px; background:var(--dsx-elev); overflow:hidden; }
+.dsx-prog i { display:block; height:100%; width:62%; background:var(--dsx-accent); }
+.dsx-spacer { flex:1; }
+
+/* ---- table view ---- */
+.dsx-table { width:100%; border-collapse:collapse; border:1px solid var(--dsx-border); border-radius:var(--dsx-r); overflow:hidden; font-size:13px; }
+.dsx-table th { text-align:left; padding:9px 12px; background:var(--dsx-panel-2); color:var(--dsx-muted); font-weight:600; font-size:11.5px; letter-spacing:.4px; border-bottom:1px solid var(--dsx-border); }
+.dsx-table td { padding:8px 12px; border-bottom:1px solid var(--dsx-border-soft); color:var(--dsx-fg); }
+.dsx-table tr:last-child td { border-bottom:none; }
+.dsx-table tbody tr { background:var(--dsx-panel); cursor:pointer; }
+.dsx-table tbody tr:hover { background:var(--dsx-elev); }
+.dsx-table tbody tr.sel { background:var(--dsx-accent-soft); }
+.dsx-table .nm { color:var(--dsx-head); font-weight:600; }
+.dsx-table .miniwave { display:inline-flex; align-items:center; gap:1.5px; height:16px; width:74px; vertical-align:middle; }
+.dsx-table .miniwave i { flex:1; background:var(--dsx-audio); opacity:.85; border-radius:1px; min-height:2px; }
+.dsx-mut { color:var(--dsx-dim); }
+
+/* ---- similarity ---- */
+.dsx-sim { display:grid; grid-template-columns:auto 34px 1fr; gap:12px; align-items:center; border:1px solid var(--dsx-border); border-radius:var(--dsx-r); background:var(--dsx-panel); padding:14px; }
+.dsx-sim .q { width:150px; }
+.dsx-arrow { text-align:center; color:var(--dsx-accent); font-size:20px; }
+.dsx-simres { display:grid; grid-template-columns:repeat(4,1fr); gap:10px; }
+.dsx-match { position:absolute; top:6px; right:6px; font-size:10px; font-weight:800; background:var(--dsx-accent); color:var(--dsx-accent-ink); padding:1px 6px; border-radius:20px; }
+
+.dsx-legend { font-size:12px; color:var(--dsx-dim); margin-top:10px; }
+@media (max-width:560px){ .dsx-body{ grid-template-columns:150px 1fr; } .dsx-insp{ display:none; } }
+</style>
+
+<div class="dsx" data-accent="teal">
+<div class="dsx-wrap">
+  <div class="dsx-eyebrow">Visual language</div>
+  <div class="dsx-h" style="font-size:1.5rem">What 3DAM looks like</div>
+  <p class="dsx-sub">An interactive preview of the interface, its color system, and core components.
+  Pick an accent or flip light/dark — every mockup below re-themes live.</p>
+
+  <div class="dsx-controls">
+    <span class="lbl">Accent</span>
+    <button class="dsx-acc active" data-set-accent="teal"   title="Teal (default)"></button>
+    <button class="dsx-acc"        data-set-accent="violet" title="Violet"></button>
+    <button class="dsx-acc"        data-set-accent="sky"    title="Sky"></button>
+    <button class="dsx-acc"        data-set-accent="amber"  title="Amber"></button>
+    <button class="dsx-acc"        data-set-accent="rose"   title="Rose"></button>
+    <button class="dsx-toggle" data-toggle-light>☀ Light</button>
+  </div>
+
+  <!-- ===================== COLOR ===================== -->
+  <div class="dsx-block">
+    <h4>Color system — dark-first</h4>
+    <div class="dsx-swatches">
+      <div class="dsx-sw"><div class="chip" style="background:#0d1117"></div><div class="lab"><b>Canvas</b><span>#0D1117</span></div></div>
+      <div class="dsx-sw"><div class="chip" style="background:#12171f"></div><div class="lab"><b>Panel</b><span>#12171F</span></div></div>
+      <div class="dsx-sw"><div class="chip" style="background:#1b222c"></div><div class="lab"><b>Elevated</b><span>#1B222C</span></div></div>
+      <div class="dsx-sw"><div class="chip" style="background:#232a35"></div><div class="lab"><b>Border</b><span>#232A35</span></div></div>
+      <div class="dsx-sw"><div class="chip" style="background:#d6dee8"></div><div class="lab"><b>Text</b><span>#D6DEE8</span></div></div>
+      <div class="dsx-sw"><div class="chip" style="background:#8b98a9"></div><div class="lab"><b>Muted</b><span>#8B98A9</span></div></div>
+      <div class="dsx-sw"><div class="chip" style="background:var(--dsx-accent)"></div><div class="lab"><b>Accent</b><span>live</span></div></div>
+    </div>
+
+    <h4 style="margin-top:20px">Semantic &amp; media colors</h4>
+    <div class="dsx-swatches">
+      <div class="dsx-sw"><div class="chip" style="background:var(--dsx-audio)"></div><div class="lab"><b>Audio</b><span>media type</span></div></div>
+      <div class="dsx-sw"><div class="chip" style="background:var(--dsx-image)"></div><div class="lab"><b>Image</b><span>media type</span></div></div>
+      <div class="dsx-sw"><div class="chip" style="background:var(--dsx-model)"></div><div class="lab"><b>3D model</b><span>media type</span></div></div>
+      <div class="dsx-sw"><div class="chip" style="background:#3fb950"></div><div class="lab"><b>Online</b><span>source up</span></div></div>
+      <div class="dsx-sw"><div class="chip" style="background:#586170"></div><div class="lab"><b>Offline</b><span>source down</span></div></div>
+      <div class="dsx-sw"><div class="chip" style="background:#a371f7"></div><div class="lab"><b>Suggested</b><span>auto tag</span></div></div>
+      <div class="dsx-sw"><div class="chip" style="background:#f85149"></div><div class="lab"><b>Danger</b><span>destructive</span></div></div>
+    </div>
+  </div>
+
+  <!-- ===================== TYPE ===================== -->
+  <div class="dsx-block">
+    <h4>Type scale</h4>
+    <div class="dsx-type">
+      <div class="row"><span class="tag">Display / 34</span><span class="samp" style="font-size:2.1rem;font-weight:700">3DAM</span></div>
+      <div class="row"><span class="tag">Heading / 22</span><span class="samp" style="font-size:1.4rem;font-weight:700">Unified asset library</span></div>
+      <div class="row"><span class="tag">Subhead / 18</span><span class="samp" style="font-size:1.12rem;font-weight:600">Content-aware search</span></div>
+      <div class="row"><span class="tag">Body / 16</span><span class="samp" style="font-size:1rem">Find more assets like this one — across audio, image, and 3D.</span></div>
+      <div class="row"><span class="tag">Small / 13</span><span class="samp" style="font-size:.82rem;color:var(--dsx-muted)">2048 × 2048 · PNG · Studio NAS</span></div>
+      <div class="row"><span class="tag">Mono / 13</span><span class="samp" style="font-size:.82rem;font-family:var(--mono,monospace);color:var(--dsx-muted)">3dam similar footstep_gravel_03.wav</span></div>
+    </div>
+  </div>
+
+  <!-- ===================== COMPONENTS ===================== -->
+  <div class="dsx-block">
+    <h4>Core components</h4>
+    <div class="dsx-cgrid">
+      <div class="dsx-comp"><div class="t">Buttons</div><div class="r">
+        <button class="dsx-btn primary">Find similar</button>
+        <button class="dsx-btn ghost">Convert</button>
+        <button class="dsx-btn icon">☰</button>
+      </div></div>
+      <div class="dsx-comp"><div class="t">Search</div><div class="r">
+        <div class="dsx-field">⌕ footstep gravel <span class="kbd">⌘K</span></div>
+      </div></div>
+      <div class="dsx-comp"><div class="t">Filter chips</div><div class="r">
+        <span class="dsx-fchip on">Type: Audio ✕</span><span class="dsx-fchip">Tags ▾</span><span class="dsx-fchip">Source ▾</span>
+      </div></div>
+      <div class="dsx-comp"><div class="t">Media badges</div><div class="r">
+        <span class="dsx-badge audio">SFX</span><span class="dsx-badge image">IMG</span><span class="dsx-badge model">3D</span>
+      </div></div>
+      <div class="dsx-comp"><div class="t">License — colour-coded by rights</div><div class="r">
+        <span class="dsx-lm ok">CC0 · public domain</span><span class="dsx-lm attr">CC-BY · attribution</span>
+        <span class="dsx-lm warn">Proprietary · restricted</span><span class="dsx-lm unknown">Unknown</span>
+      </div></div>
+      <div class="dsx-comp"><div class="t">Tags — confirmed</div><div class="r">
+        <span class="dsx-tag">foley</span><span class="dsx-tag">stone</span><span class="dsx-tag">dry</span>
+      </div></div>
+      <div class="dsx-comp"><div class="t">Tags — auto-suggested</div><div class="r">
+        <span class="dsx-tag sug">gravel <span class="yn"><b class="y">✓</b><b class="n">✕</b></span></span>
+        <span class="dsx-tag sug">footstep <span class="yn"><b class="y">✓</b><b class="n">✕</b></span></span>
+      </div></div>
+      <div class="dsx-comp"><div class="t">Feature readout</div><div class="r" style="flex-direction:column;align-items:stretch;gap:7px">
+        <div class="dsx-feat"><span class="fl">Brightness</span><div class="dsx-bar"><i style="width:58%"></i></div></div>
+        <div class="dsx-feat"><span class="fl">Harmonicity</span><div class="dsx-bar"><i style="width:24%"></i></div></div>
+      </div></div>
+      <div class="dsx-comp"><div class="t">Source status</div><div class="r" style="flex-direction:column;align-items:stretch;gap:6px">
+        <span style="display:flex;gap:8px;align-items:center;font-size:12.5px"><i class="dot ok"></i> Studio NAS · SMB</span>
+        <span style="display:flex;gap:8px;align-items:center;font-size:12.5px" class="dsx-mut"><i class="dot off"></i> vendor · SFTP — offline</span>
+        <span style="display:flex;gap:8px;align-items:center;font-size:12.5px"><i class="dot busy"></i> Analysing 84 assets…</span>
+      </div></div>
+    </div>
+  </div>
+
+  <!-- ===================== WORKSPACE ===================== -->
+  <div class="dsx-block">
+    <h4>The workspace — three-region layout</h4>
+    <div class="dsx-scroll"><div class="dsx-win">
+      <div class="dsx-titlebar">
+        <span class="dsx-dots"><i></i><i></i><i></i></span>
+        <span class="dsx-title">3DAM — Forest Pack</span>
+        <span class="dsx-conn"><i class="dot ok"></i> Local engine · 3 sources</span>
+      </div>
+      <div class="dsx-toolbar">
+        <button class="dsx-btn icon">☰</button>
+        <div class="dsx-field" style="flex:1;min-width:160px">⌕ footstep gravel <span class="kbd">⌘K</span></div>
+        <div class="dsx-seg"><button class="on">▦ Grid</button><button>▤ Table</button></div>
+        <span class="dsx-fchip on">Type: All</span>
+        <span class="dsx-fchip">Tags ▾</span>
+        <span class="dsx-fchip">⚖ License ▾</span>
+        <span class="dsx-count">1,248 assets</span>
+      </div>
+      <div class="dsx-body">
+        <!-- sidebar -->
+        <aside class="dsx-side">
+          <div class="grp">Sources — files</div>
+          <div class="dsx-nav"><i class="dot ok"></i> Local Disk <span class="ct">610</span></div>
+          <div class="dsx-nav"><i class="dot ok"></i> Studio NAS · SMB <span class="ct">578</span></div>
+          <div class="dsx-nav dim"><i class="dot off"></i> vendor · SFTP <span class="ct">—</span></div>
+          <div class="grp">Sources — federated <span class="dsx-fedtag">3DAM</span></div>
+          <div class="dsx-nav"><span class="dsx-fed">◈</span> asset-store <span class="ct">14.2k</span></div>
+          <div class="dsx-nav"><span class="dsx-fed">◈</span> teammate · lib <span class="ct">3,905</span></div>
+          <div class="grp">Library</div>
+          <div class="dsx-nav">▦ All assets <span class="ct">1,248</span></div>
+          <div class="dsx-nav">★ Favorites <span class="ct">64</span></div>
+          <div class="dsx-nav">◔ Recently added <span class="ct">84</span></div>
+          <div class="grp">Smart folders</div>
+          <div class="dsx-nav on">⚡ Footsteps <span class="ct">32</span></div>
+          <div class="dsx-nav">⚡ Low-poly props <span class="ct">211</span></div>
+          <div class="dsx-nav">⚡ Seamless textures <span class="ct">147</span></div>
+          <div class="grp">Tags</div>
+          <div class="dsx-tagrow">
+            <span class="dsx-tag">stone</span><span class="dsx-tag">wood</span>
+            <span class="dsx-tag">ambient</span><span class="dsx-tag">metal</span><span class="dsx-tag">foliage</span>
+          </div>
+        </aside>
+        <!-- grid -->
+        <main class="dsx-gridwrap">
+          <div class="dsx-crumb">All assets <b>›</b> Smart folder: <b>Footsteps</b> · 32 results · sorted by similarity</div>
+          <div class="dsx-grid">
+            <div class="dsx-card"><div class="dsx-thumb tx-moss"></div><span class="dsx-badge image bdg">IMG</span><div class="m"><div class="n">mossy_rock_albedo</div><div class="s">2048² · PNG</div></div></div>
+            <div class="dsx-card sel"><div class="dsx-thumb"><div class="dsx-wave" data-seed="7" data-bars="34"></div></div><span class="dsx-badge audio bdg">SFX</span><div class="m"><div class="n">footstep_gravel_03</div><div class="s">0:01 · Mono · WAV</div></div></div>
+            <div class="dsx-card"><div class="dsx-thumb"><svg width="70" height="70" viewBox="0 0 120 120" class="dsx-gem"></svg><span class="dsx-origin">◈ asset-store</span></div><span class="dsx-badge model bdg">3D</span><div class="m"><div class="n">boulder_lowpoly</div><div class="s">1,204 tris · glTF</div></div></div>
+            <div class="dsx-card"><div class="dsx-thumb tx-bark"></div><span class="dsx-badge image bdg">IMG</span><div class="m"><div class="n">bark_oak_02</div><div class="s">1024² · PNG</div></div></div>
+            <div class="dsx-card"><div class="dsx-thumb"><div class="dsx-wave" data-seed="19" data-bars="34"></div></div><span class="dsx-badge audio bdg">SFX</span><div class="m"><div class="n">ambience_forest</div><div class="s">1:12 · Stereo</div></div></div>
+            <div class="dsx-card"><div class="dsx-thumb"><svg width="70" height="70" viewBox="0 0 120 120" class="dsx-gem" data-variant="1"></svg></div><span class="dsx-badge model bdg">3D</span><div class="m"><div class="n">fern_plant_a</div><div class="s">3,402 tris · FBX</div></div></div>
+          </div>
+        </main>
+        <!-- inspector -->
+        <aside class="dsx-insp">
+          <div class="prev"><div class="dsx-wave" data-seed="7" data-bars="46" style="width:88%;height:72px"></div><div class="play">▶</div></div>
+          <h5>footstep_gravel_03.wav</h5>
+          <div class="badges"><span class="dsx-badge audio">SFX</span><span class="dsx-badge" style="background:var(--dsx-elev);color:var(--dsx-muted)">WAV</span></div>
+          <div class="dsx-lic attr"><span class="k">⚖ CC-BY 4.0</span><span class="r">Commercial ✓ · Modify ✓ · <b>Attribution required</b></span></div>
+          <div class="dsx-kv"><span>Attribution</span><b>© Kenney · CC-BY</b></div>
+          <div class="dsx-kv"><span>Duration</span><b>0:01.24</b></div>
+          <div class="dsx-kv"><span>Format</span><b>48 kHz · 24-bit · Mono</b></div>
+          <div class="dsx-kv"><span>Size</span><b>384 KB</b></div>
+          <div class="dsx-kv"><span>Source</span><b>Studio NAS</b></div>
+          <div class="dsx-sech">Extracted features</div>
+          <div class="dsx-kv"><span>Class</span><b>One-shot</b></div>
+          <div class="dsx-kv"><span>Loudness</span><b>-14 LUFS</b></div>
+          <div class="dsx-feat"><span class="fl">Brightness</span><div class="dsx-bar"><i style="width:58%"></i></div></div>
+          <div class="dsx-feat"><span class="fl">Harmonicity</span><div class="dsx-bar"><i style="width:22%"></i></div></div>
+          <div class="dsx-sech">Auto-tags · review</div>
+          <div class="r" style="display:flex;flex-wrap:wrap;gap:6px">
+            <span class="dsx-tag sug">gravel <span class="yn"><b class="y">✓</b><b class="n">✕</b></span></span>
+            <span class="dsx-tag sug">dry <span class="yn"><b class="y">✓</b><b class="n">✕</b></span></span>
+          </div>
+          <div class="dsx-sech">Tags</div>
+          <div class="r" style="display:flex;flex-wrap:wrap;gap:6px"><span class="dsx-tag">foley</span><span class="dsx-tag">sfx</span></div>
+          <div class="acts"><button class="dsx-btn primary">⚡ Find similar</button><button class="dsx-btn ghost">⇩</button></div>
+        </aside>
+      </div>
+      <div class="dsx-status">
+        <i class="dot busy"></i> Analysing 84 new assets…
+        <div class="dsx-prog"><i></i></div><span>62%</span>
+        <div class="dsx-spacer"></div>
+        <span>3D 412 · IMG 590 · SFX 246</span>
+      </div>
+    </div></div>
+    <p class="dsx-legend">Left: sources, library, smart folders &amp; tags. Center: grid/table browser. Right: the inspector — <b>license sits right under the title</b>, then extracted features and auto-tags to review.</p>
+  </div>
+
+  <!-- ===================== TABLE ===================== -->
+  <div class="dsx-block">
+    <h4>Table view — dense, sortable, unified</h4>
+    <div class="dsx-scroll">
+    <table class="dsx-table" style="min-width:720px">
+      <thead><tr><th style="width:26px"></th><th>Name ▾</th><th>Type</th><th>License</th><th>Size</th><th>Detail</th><th>Tags</th></tr></thead>
+      <tbody>
+        <tr class="sel"><td><span class="dsx-badge audio">SFX</span></td><td class="nm">footstep_gravel_03</td><td>Audio</td><td><span class="dsx-lm attr">CC-BY 4.0</span></td><td class="dsx-mut">384 KB</td><td><span class="miniwave" data-seed="7" data-bars="20"></span> <span class="dsx-mut">0:01 · Am</span></td><td class="dsx-mut">foley, gravel</td></tr>
+        <tr><td><span class="dsx-badge image">IMG</span></td><td class="nm">mossy_rock_albedo</td><td>Image</td><td><span class="dsx-lm ok">CC0</span></td><td class="dsx-mut">5.2 MB</td><td class="dsx-mut">2048 × 2048</td><td class="dsx-mut">moss, stone</td></tr>
+        <tr><td><span class="dsx-badge model">3D</span></td><td class="nm">boulder_lowpoly</td><td>Model</td><td><span class="dsx-lm warn">Store EULA</span></td><td class="dsx-mut">890 KB</td><td class="dsx-mut">1,204 tris</td><td class="dsx-mut">rock, prop</td></tr>
+        <tr><td><span class="dsx-badge audio">SFX</span></td><td class="nm">ambience_forest</td><td>Audio</td><td><span class="dsx-lm attr">CC-BY 4.0</span></td><td class="dsx-mut">12 MB</td><td><span class="miniwave" data-seed="19" data-bars="20"></span> <span class="dsx-mut">1:12 · loop</span></td><td class="dsx-mut">ambient, loop</td></tr>
+        <tr><td><span class="dsx-badge image">IMG</span></td><td class="nm">bark_oak_02</td><td>Image</td><td><span class="dsx-lm ok">CC0</span></td><td class="dsx-mut">2.1 MB</td><td class="dsx-mut">1024 × 1024</td><td class="dsx-mut">wood, bark</td></tr>
+        <tr><td><span class="dsx-badge model">3D</span></td><td class="nm">fern_plant_a</td><td>Model</td><td><span class="dsx-lm unknown">Unknown</span></td><td class="dsx-mut">1.4 MB</td><td class="dsx-mut">3,402 tris</td><td class="dsx-mut">foliage</td></tr>
+      </tbody>
+    </table>
+    </div>
+  </div>
+
+  <!-- ===================== SIMILARITY ===================== -->
+  <div class="dsx-block">
+    <h4>Content-aware similarity — the signature feature</h4>
+    <div class="dsx-sim">
+      <div class="q">
+        <div class="dsx-card sel" style="cursor:default">
+          <div class="dsx-thumb"><div class="dsx-wave" data-seed="7" data-bars="30"></div></div>
+          <span class="dsx-badge audio bdg">SFX</span>
+          <div class="m"><div class="n">footstep_gravel_03</div><div class="s">query</div></div>
+        </div>
+      </div>
+      <div class="dsx-arrow">→</div>
+      <div class="dsx-simres">
+        <div class="dsx-card" style="cursor:default"><div class="dsx-thumb"><div class="dsx-wave" data-seed="71" data-bars="24"></div></div><span class="dsx-match">98%</span><div class="m"><div class="n">step_gravel_A</div></div></div>
+        <div class="dsx-card" style="cursor:default"><div class="dsx-thumb"><div class="dsx-wave" data-seed="72" data-bars="24"></div></div><span class="dsx-match">94%</span><div class="m"><div class="n">boot_dirt_02</div></div></div>
+        <div class="dsx-card" style="cursor:default"><div class="dsx-thumb"><div class="dsx-wave" data-seed="73" data-bars="24"></div></div><span class="dsx-match">91%</span><div class="m"><div class="n">scuff_stone</div></div></div>
+        <div class="dsx-card" style="cursor:default"><div class="dsx-thumb"><div class="dsx-wave" data-seed="74" data-bars="24"></div></div><span class="dsx-match">88%</span><div class="m"><div class="n">gravel_shift</div></div></div>
+      </div>
+    </div>
+    <p class="dsx-legend">Same interaction works on an image or a 3D model — the embedding differs, the gesture doesn't.</p>
+  </div>
+
+</div>
+</div>
+
+<script>
+(function(){
+  var root = document.querySelector('.dsx');
+  if(!root) return;
+
+  // deterministic pseudo-random so waveforms look organic but stable
+  function seeded(s){ return function(){ s = (s*1103515245 + 12345) & 0x7fffffff; return s/0x7fffffff; }; }
+
+  document.querySelectorAll('.dsx-wave, .miniwave').forEach(function(el, idx){
+    var rnd = seeded((parseInt(el.dataset.seed)||7) * 131 + idx*7 + 3);
+    var n = parseInt(el.dataset.bars) || 32;
+    var html = '';
+    for(var k=0;k<n;k++){
+      var t = k/(n-1);
+      var env = Math.sin(t*Math.PI);           // fade in/out envelope
+      var spike = rnd() < 0.18 ? 1.35 : 1;      // occasional transients
+      var h = Math.max(6, Math.min(100, (0.30 + 0.72*rnd()) * env * 100 * spike));
+      html += '<i style="height:'+h.toFixed(0)+'%"></i>';
+    }
+    el.innerHTML = html;
+  });
+
+  // low-poly gem/rock for 3D thumbnails
+  var facets = [
+    ['35,42 60,34 60,48','#3a4552'],['60,34 85,42 60,48','#323c48'],
+    ['85,42 78,60 60,48','#2b343f'],['78,60 60,66 60,48','#252d37'],
+    ['60,66 42,60 60,48','#2b343f'],['42,60 35,42 60,48','#333d49'],
+    ['35,42 42,60 60,102','#222a34'],['42,60 60,66 60,102','#1d242d'],
+    ['60,66 78,60 60,102','#242c36'],['78,60 85,42 60,102','#2a323d']
+  ];
+  document.querySelectorAll('.dsx-gem').forEach(function(svg){
+    var accentFacet = svg.dataset.variant ? 2 : 3;
+    var s = '';
+    facets.forEach(function(f,i){
+      var fill = (i===accentFacet) ? 'var(--dsx-accent)' : f[1];
+      var op = (i===accentFacet) ? '0.55' : '1';
+      s += '<polygon points="'+f[0]+'" fill="'+fill+'" fill-opacity="'+op+'" stroke="#0d1117" stroke-width="0.8"/>';
+    });
+    svg.innerHTML = s;
+  });
+
+  // theme switcher
+  document.querySelectorAll('[data-set-accent]').forEach(function(btn){
+    btn.addEventListener('click', function(){
+      root.setAttribute('data-accent', btn.dataset.setAccent);
+      document.querySelectorAll('[data-set-accent]').forEach(function(b){ b.classList.toggle('active', b===btn); });
+    });
+  });
+  var toggle = document.querySelector('[data-toggle-light]');
+  if(toggle) toggle.addEventListener('click', function(){
+    var light = root.classList.toggle('light');
+    toggle.textContent = light ? '☾ Dark' : '☀ Light';
+  });
+})();
+</script>
