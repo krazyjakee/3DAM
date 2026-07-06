@@ -25,7 +25,7 @@ with current status. The spec is authoritative; this table just adds where we ar
 <thead><tr><th>#</th><th>Phase (spec §9)</th><th>Status</th></tr></thead>
 <tbody>
 <tr><td>1</td><td><strong>Foundation</strong> — schema, local scan, SQLite store, grid/table browse + text search, CLI <code>scan</code>/<code>search</code> <span class="sub">Embedded engine, <code>3dam serve</code> API, and CLI parity landed.</span></td><td><span class="pill done">Shipped</span></td></tr>
-<tr><td>2</td><td><strong>Media depth</strong> — per-type decode + preview (waveform, image, 3D), thumbnail cache, convert pipeline (CLI-first) <span class="sub">Honest typed inspector tiles in place; real previews/thumbnails/convert are the current work.</span></td><td><span class="pill active">In progress</span></td></tr>
+<tr><td>2</td><td><strong>Media depth</strong> — per-type decode + preview (waveform, image, 3D), thumbnail cache, convert pipeline (CLI-first) <span class="sub">Cheap per-type metadata, server image thumbnails + cache, interactive audio/3D islands, and the CLI convert pipeline all landed; deeper codec/format coverage staged.</span></td><td><span class="pill done">Shipped</span></td></tr>
 <tr><td>3</td><td><strong>Automation</strong> — feature extraction + embeddings, similarity search, auto-tag/categorise, dedup, review UX <span class="sub">The differentiator. Spikes done (embedding models, cross-peer similarity, vector index).</span></td><td><span class="pill next">Next</span></td></tr>
 <tr><td>4</td><td><strong>Reach</strong> — SFTP + SMB sources, watch/auto-rescan, smart folders, export/manifests, CLI/GUI parity</td><td><span class="pill todo">Planned</span></td></tr>
 <tr><td>5</td><td><strong>Server &amp; web</strong> — <code>LibraryService</code> boundary, <code>3dam serve</code>, <code>3dam mcp</code>, <code>--connect</code>, web client, feature flags + Settings, basic auth <span class="sub">Boundary, serve, <code>--connect</code>, and web client landed early; flags/MCP/auth remain.</span></td><td><span class="pill active">Partly done</span></td></tr>
@@ -96,7 +96,7 @@ the seam holds).</p>
 
 <div class="log">
 <p class="when">2026-07-06</p>
-<h4>Web client, viewer islands, responsive pass — first cut <span class="pill active">In progress</span></h4>
+<h4>Web client, viewer islands, responsive pass — first cut <span class="pill done">Shipped</span></h4>
 <p>The browser front-end exists as a <code>web/</code> codebase — <strong>React + TypeScript + Tailwind on
 Vite/pnpm</strong> (<a href="adr/0008-web-client-stack.md">ADR 0008</a>), the sole non-Rust codebase —
 talking to the engine purely over the serve API. It delivers the three-region workspace as DOM:
@@ -106,8 +106,29 @@ talking to the engine purely over the serve API. It delivers the three-region wo
 caches so scans and new assets stream in live. <code>3dam serve</code> <strong>embeds the built bundle</strong>
 (<code>rust-embed</code> over <code>web/dist/</code>) with SPA-fallback routing. The <code>dam-viewer</code> crate
 (wgpu 3D + waveform islands, WebGPU/WebGL2 via <code>wasm-pack</code>) and the responsive/touch collapse
-(single-column below <code>lg</code> with drawers, 44px touch targets) are built; wiring the live viewer
-into the Inspector and the real previews/convert of phase 2 are the current work.</p>
+(single-column below <code>lg</code> with drawers, 44px touch targets) are built and the live viewer is
+wired into the Inspector.</p>
+</div>
+
+<div class="log">
+<p class="when">2026-07-06</p>
+<h4>Media depth — cheap metadata, thumbnails, convert <span class="pill done">Shipped</span></h4>
+<p>Capability <strong>phase 2</strong> landed end-to-end (<a href="tech-spec/04-media-handlers.md">tech-spec 04</a>,
+<a href="tech-spec/08-convert-pipeline.md">08</a>). The <strong>cost-tiered media handlers</strong> now fill
+real attributes at scan: audio via a <code>symphonia</code> container probe (sample rate, channels, bit
+depth, duration, codec — no PCM decode), images via header dimensions + a PNG IHDR alpha/depth sniff,
+and 3D by hand-walking the <strong>GLB JSON chunk</strong> / glTF / OBJ / STL / PLY for vertex, triangle,
+mesh, material, texture, and rig/anim/UV counts — <strong>never decoding geometry or the BIN chunk</strong>
+(the cheap contract, §4). These persist to the per-type attribute tables and surface on the grid rows
+(<code>key_attrs</code>) and the Inspector. <strong>Server-rendered image thumbnails</strong> (downscaled PNG,
+content-hash-keyed on-disk cache) serve at <code>GET /api/v1/assets/{id}/thumbnail</code>, with audio
+waveforms and 3D turntables kept as the interactive WASM islands; the web grid/inspector render real
+previews with a graceful fall-back to the honest typed tile. The <strong>convert pipeline</strong> (CLI-first,
+<code>3dam convert</code>) decodes via the same handlers and re-encodes non-destructively — image
+transcode/resize and audio→WAV — with dry-run planning, the <strong>source-safety invariant</strong> (never
+writes into a registered source), atomic temp-write-then-rename, and collision policy. Deeper codec and
+format coverage (DDS/KTX2, MP4/AAC decode, mesh optimise/compression, more encode targets) stages behind
+the same seams.</p>
 </div>
 
 ## Mobile &amp; tablet posture

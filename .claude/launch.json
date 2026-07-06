@@ -24,6 +24,13 @@
       "runtimeExecutable": "pnpm",
       "runtimeArgs": ["--dir", "web", "dev", "--port", "5273", "--strictPort"],
       "port": 5273
+    },
+    {
+      "name": "web-verify",
+      "runtimeExecutable": "pnpm",
+      "runtimeArgs": ["--dir", "web", "dev"],
+      "port": 5173,
+      "autoPort": true
     }
   ]
 }

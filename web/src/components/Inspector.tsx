@@ -214,10 +214,13 @@ function MediaFacts({ attrs }: { attrs: MediaAttributes }) {
     if (attrs.duration_ms != null) rows.push(["Duration", duration(attrs.duration_ms)]);
     if (attrs.sample_rate != null) rows.push(["Sample rate", `${attrs.sample_rate} Hz`]);
     if (attrs.bit_depth != null) rows.push(["Bit depth", `${attrs.bit_depth}-bit`]);
-    if (attrs.channels != null) rows.push(["Channels", String(attrs.channels)]);
+    if (attrs.channels != null) rows.push(["Channels", channelLabel(attrs.channels)]);
+    if (attrs.codec) rows.push(["Codec", attrs.codec]);
+    if (attrs.container) rows.push(["Container", attrs.container]);
   } else if (attrs.media === "image") {
     if (attrs.width != null && attrs.height != null)
       rows.push(["Dimensions", `${attrs.width} × ${attrs.height}`]);
+    if (attrs.color_depth != null) rows.push(["Bit depth", `${attrs.color_depth}-bit`]);
     if (attrs.has_alpha != null) rows.push(["Alpha", attrs.has_alpha ? "yes" : "no"]);
     if (attrs.color_space) rows.push(["Color space", attrs.color_space]);
   } else if (attrs.media === "model") {
@@ -225,6 +228,11 @@ function MediaFacts({ attrs }: { attrs: MediaAttributes }) {
     if (attrs.triangle_count != null)
       rows.push(["Triangles", attrs.triangle_count.toLocaleString()]);
     if (attrs.mesh_count != null) rows.push(["Meshes", String(attrs.mesh_count)]);
+    if (attrs.material_count != null) rows.push(["Materials", String(attrs.material_count)]);
+    if (attrs.texture_count != null) rows.push(["Textures", String(attrs.texture_count)]);
+    if (attrs.has_rig != null) rows.push(["Rigged", attrs.has_rig ? "yes" : "no"]);
+    if (attrs.has_animation != null) rows.push(["Animation", attrs.has_animation ? "yes" : "no"]);
+    if (attrs.has_uvs != null) rows.push(["UVs", attrs.has_uvs ? "yes" : "no"]);
   }
   if (rows.length === 0) return null;
   return (
@@ -234,6 +242,13 @@ function MediaFacts({ attrs }: { attrs: MediaAttributes }) {
       ))}
     </Group>
   );
+}
+
+/** Human channel label: 1 → Mono, 2 → Stereo, otherwise "N ch". */
+function channelLabel(n: number): string {
+  if (n === 1) return "Mono";
+  if (n === 2) return "Stereo";
+  return `${n} ch`;
 }
 
 function Group({ title, children }: { title: string; children: React.ReactNode }) {

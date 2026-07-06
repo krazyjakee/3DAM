@@ -2,6 +2,7 @@
 //! store, media handlers, and sources (tech-spec 01 §3). No UI, transport, or GPU (ADR 0002).
 //! This is the standalone, no-network path; `3dam-server` serves the same object over HTTP/WS.
 
+mod convert;
 mod paths;
 mod scan;
 
@@ -28,6 +29,75 @@ const EVENT_CHANNEL_CAPACITY: usize = 1024;
 /// not arbitrary blobs; a larger file returns a typed error and the UI degrades to metadata. Config-
 /// tunable later (ADR 0009 §11 storage knobs); a constant for now.
 const MAX_CONTENT_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Clamp for a thumbnail's long edge (tech-spec 04 §6.4). Small enough that generation stays cheap
+/// and the cache stays compact; large enough for a crisp inspector preview.
+const THUMB_MIN_EDGE: u32 = 16;
+const THUMB_MAX_EDGE: u32 = 1024;
+
+/// Render (or read from cache) a downscaled PNG thumbnail for an image asset. Pure/blocking — runs
+/// inside `spawn_blocking`. The cache lives under `<data_dir>/cache/thumbnails/<key>-<edge>.png`,
+/// keyed by content hash (falling back to the asset id) so identical bytes share one derivative.
+fn gen_thumbnail(
+    data_dir: &Path,
+    source_root: &str,
+    asset: &Asset,
+    max_edge: u32,
+) -> Result<AssetContent, LibError> {
+    let key = asset
+        .hash
+        .map(|h| h.to_hex())
+        .unwrap_or_else(|| asset.summary.id.to_string());
+    let cache_dir = data_dir.join("cache").join("thumbnails");
+    let cache_path = cache_dir.join(format!("{key}-{max_edge}.png"));
+    if let Ok(bytes) = std::fs::read(&cache_path) {
+        return Ok(png_content(bytes));
+    }
+
+    // Resolve + traversal-guard the source file (same rule as read_content).
+    let rel = Path::new(&asset.path);
+    if rel
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(LibError::BadRequest(
+            "asset path escapes its source root".to_string(),
+        ));
+    }
+    let abs = Path::new(source_root).join(rel);
+    let det = dam_media::Detected {
+        media: asset.summary.media,
+        format: asset.summary.format.clone(),
+    };
+    let thumb = dam_media::render_thumbnail(&abs, &det, max_edge).map_err(map_handler_err)?;
+
+    // Best-effort cache write (a cold cache is a slow path, not an error).
+    if std::fs::create_dir_all(&cache_dir).is_ok() {
+        let tmp = cache_dir.join(format!(".{key}-{max_edge}.png.tmp"));
+        if std::fs::write(&tmp, &thumb.bytes).is_ok() {
+            let _ = std::fs::rename(&tmp, &cache_path);
+        }
+    }
+    Ok(png_content(thumb.bytes))
+}
+
+fn png_content(bytes: Vec<u8>) -> AssetContent {
+    AssetContent {
+        bytes,
+        content_type: "image/png".to_string(),
+        format: "png".to_string(),
+        media: MediaType::Image,
+    }
+}
+
+/// Map a media-handler fault onto the service error model (tech-spec 03 §5). `Unsupported` becomes
+/// a 415 so the web thumbnail falls back to the honest typed tile.
+fn map_handler_err(e: dam_media::HandlerError) -> LibError {
+    match e {
+        dam_media::HandlerError::Unsupported(s) => LibError::Unsupported(s),
+        other => LibError::Internal(other.to_string()),
+    }
+}
 
 /// Resolve an asset to its on-disk file (source root + stored relative path) and read the bytes,
 /// bounded and traversal-guarded. Pure/blocking — called inside a `spawn_blocking` closure.
@@ -137,8 +207,35 @@ impl LibraryService for EmbeddedLibrary {
         .await
     }
 
+    async fn read_thumbnail(
+        &self,
+        _ctx: &AuthContext,
+        id: &AssetId,
+        max_edge: u32,
+    ) -> Result<AssetContent, LibError> {
+        let id = *id;
+        let edge = max_edge.clamp(THUMB_MIN_EDGE, THUMB_MAX_EDGE);
+        let data_dir = self.data_dir.clone();
+        self.db(move |s| {
+            let asset = s.get_asset(&id)?;
+            let source = s
+                .get_source(&asset.source_id)?
+                .ok_or_else(|| LibError::NotFound(format!("source {}", asset.source_id)))?;
+            gen_thumbnail(&data_dir, &source.uri, &asset, edge)
+        })
+        .await
+    }
+
     async fn library_stats(&self, _ctx: &AuthContext) -> Result<LibraryStats, LibError> {
         self.db(|s| s.stats()).await
+    }
+
+    async fn convert(
+        &self,
+        _ctx: &AuthContext,
+        req: ConvertRequest,
+    ) -> Result<ConvertReport, LibError> {
+        self.db(move |s| convert::run_convert(s, req)).await
     }
 
     async fn list_sources(&self, _ctx: &AuthContext) -> Result<Vec<SourceInfo>, LibError> {

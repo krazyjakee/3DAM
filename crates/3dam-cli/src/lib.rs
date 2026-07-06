@@ -75,6 +75,30 @@ enum Cmd {
     Jobs,
     /// Show one job's status.
     Job { id: String },
+    /// Convert/optimise assets non-destructively into an output directory (tech-spec 08).
+    Convert {
+        /// Asset ids to convert.
+        #[arg(required = true)]
+        ids: Vec<String>,
+        /// Target format: `png`|`jpg`|`webp`|`bmp`|`tga`|`tiff`|`gif` (image) or `wav` (audio).
+        #[arg(long)]
+        to: String,
+        /// Output directory (never a source tree — convert is non-destructive).
+        #[arg(long)]
+        out: PathBuf,
+        /// Plan only: resolve outputs + report, write nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Images: fit within this box on the long edge (aspect preserved).
+        #[arg(long)]
+        max_edge: Option<u32>,
+        /// JPEG quality 1..=100 (lossy image targets only).
+        #[arg(long)]
+        quality: Option<u8>,
+        /// Collision handling: `fail` (default) | `suffix` | `skip` | `overwrite`.
+        #[arg(long, default_value = "fail")]
+        on_collision: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -276,8 +300,120 @@ async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 println!("{job:#?}");
             }
         }
+
+        Cmd::Convert {
+            ids,
+            to,
+            out,
+            dry_run,
+            max_edge,
+            quality,
+            on_collision,
+        } => {
+            let inputs: Vec<AssetId> = ids
+                .iter()
+                .map(|s| {
+                    s.parse::<AssetId>()
+                        .map_err(|_| anyhow::anyhow!("invalid asset id: {s}"))
+                })
+                .collect::<anyhow::Result<_>>()?;
+            let target = build_convert_target(&to)?;
+            let target = apply_image_opts(target, max_edge, quality);
+            let req = ConvertRequest {
+                inputs,
+                target,
+                output_dir: out.to_string_lossy().into_owned(),
+                dry_run,
+                on_collision: parse_collision(&on_collision)?,
+            };
+            let report = lib.convert(&ctx, req).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print_convert(&report);
+            }
+        }
     }
     Ok(())
+}
+
+/// Pick the media-typed target from the requested `--to` format (audio = `wav`, else image).
+fn build_convert_target(to: &str) -> anyhow::Result<ConvertTarget> {
+    let to = to.to_ascii_lowercase();
+    match to.as_str() {
+        "wav" => Ok(ConvertTarget::Audio { format: to }),
+        "png" | "jpg" | "jpeg" | "webp" | "bmp" | "tga" | "tiff" | "tif" | "gif" => {
+            Ok(ConvertTarget::Image {
+                format: to,
+                max_edge: None,
+                quality: None,
+            })
+        }
+        other => Err(anyhow::anyhow!(
+            "unsupported target format '{other}' (image: png|jpg|webp|bmp|tga|tiff|gif; audio: wav)"
+        )),
+    }
+}
+
+fn apply_image_opts(
+    target: ConvertTarget,
+    max_edge: Option<u32>,
+    quality: Option<u8>,
+) -> ConvertTarget {
+    match target {
+        ConvertTarget::Image { format, .. } => ConvertTarget::Image {
+            format,
+            max_edge,
+            quality,
+        },
+        other => other,
+    }
+}
+
+fn parse_collision(s: &str) -> anyhow::Result<CollisionRule> {
+    match s.to_ascii_lowercase().as_str() {
+        "fail" => Ok(CollisionRule::Fail),
+        "suffix" => Ok(CollisionRule::Suffix),
+        "skip" => Ok(CollisionRule::Skip),
+        "overwrite" => Ok(CollisionRule::Overwrite),
+        other => Err(anyhow::anyhow!(
+            "invalid --on-collision '{other}' (fail|suffix|skip|overwrite)"
+        )),
+    }
+}
+
+fn print_convert(r: &ConvertReport) {
+    for item in &r.items {
+        let name = std::path::Path::new(&item.planned_output)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| item.input.to_string());
+        let detail = match &item.error {
+            Some(e) => format!("  ({e})"),
+            None => match (item.output_bytes, item.ratio) {
+                (Some(b), Some(ratio)) => format!("  {} ({:.0}%)", human_size(b), ratio * 100.0),
+                _ => String::new(),
+            },
+        };
+        println!(
+            "{:<11} {}{}",
+            format!("{:?}", item.disposition).to_lowercase(),
+            name,
+            detail
+        );
+    }
+    let verb = if r.dry_run { "planned" } else { "done" };
+    println!(
+        "{verb}: {} ok, {} failed, {} collision, {} unsupported → {}",
+        r.done, r.failed, r.collisions, r.unsupported, r.output_dir
+    );
+    if !r.dry_run && r.total_output_bytes > 0 {
+        println!(
+            "bytes: {} → {}",
+            human_size(r.total_input_bytes),
+            human_size(r.total_output_bytes)
+        );
+    }
 }
 
 async fn wait_for_job(

@@ -210,6 +210,16 @@ function Grid({ items, selected, onSelect, hasMore, loadMore, loading }: ListPro
   );
 }
 
+/** The one cheap media attribute worth showing on a grid row (from the store's `key_attrs`):
+ *  image dimensions, audio duration, or model triangle count. */
+function primaryAttr(asset: AssetSummary): string | null {
+  const k = asset.key_attrs;
+  if (k.dimensions) return k.dimensions;
+  if (k.duration) return k.duration;
+  if (k.tris) return `${k.tris} tris`;
+  return null;
+}
+
 function GridCell({
   asset,
   active,
@@ -239,7 +249,9 @@ function GridCell({
       </div>
       <div className="flex items-center justify-between px-1.5 pb-1">
         <LicenseBadge badge={asset.license} />
-        <span className="text-[10px] text-fg-dim tabular-nums">{bytes(asset.size)}</span>
+        <span className="text-[10px] text-fg-dim tabular-nums">
+          {primaryAttr(asset) ? `${primaryAttr(asset)} · ${bytes(asset.size)}` : bytes(asset.size)}
+        </span>
       </div>
     </button>
   );

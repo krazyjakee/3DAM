@@ -153,4 +153,9 @@ pub const MIGRATIONS: &[&str] = &[
     ) STRICT;
     CREATE INDEX idx_job_state ON job(state, kind);
     "#,
+    // ── V2: persist the audio codec/container the cheap tier now reads (tech-spec 04 §5) ──────
+    r#"
+    ALTER TABLE audio_attr ADD COLUMN codec     TEXT;
+    ALTER TABLE audio_attr ADD COLUMN container TEXT;
+    "#,
 ];

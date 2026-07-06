@@ -178,8 +178,55 @@ impl LibraryService for ApiClient {
         })
     }
 
+    async fn read_thumbnail(
+        &self,
+        _ctx: &AuthContext,
+        id: &AssetId,
+        max_edge: u32,
+    ) -> Result<AssetContent, LibError> {
+        let resp = self
+            .http
+            .get(self.url(&format!("/api/v1/assets/{id}/thumbnail?edge={max_edge}"))?)
+            .send()
+            .await
+            .map_err(|e| LibError::SourceUnavailable(e.to_string()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let bytes = resp.bytes().await.unwrap_or_default();
+            return match serde_json::from_slice::<ErrorBody>(&bytes) {
+                Ok(body) => Err(LibError::from_body(body)),
+                Err(_) => Err(LibError::Upstream(format!("HTTP {}", status.as_u16()))),
+            };
+        }
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("image/png")
+            .to_string();
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| LibError::Upstream(e.to_string()))?
+            .to_vec();
+        Ok(AssetContent {
+            bytes,
+            content_type,
+            format: "png".to_string(),
+            media: MediaType::Image,
+        })
+    }
+
     async fn library_stats(&self, _ctx: &AuthContext) -> Result<LibraryStats, LibError> {
         self.get("/api/v1/stats").await
+    }
+
+    async fn convert(
+        &self,
+        _ctx: &AuthContext,
+        req: ConvertRequest,
+    ) -> Result<ConvertReport, LibError> {
+        self.post("/api/v1/convert", &req).await
     }
 
     async fn list_sources(&self, _ctx: &AuthContext) -> Result<Vec<SourceInfo>, LibError> {

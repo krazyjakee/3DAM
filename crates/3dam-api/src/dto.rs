@@ -213,12 +213,18 @@ pub struct AudioAttributes {
     pub sample_rate: Option<i64>,
     pub bit_depth: Option<i64>,
     pub channels: Option<i64>,
+    #[serde(default)]
+    pub codec: Option<String>,
+    #[serde(default)]
+    pub container: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ImageAttributes {
     pub width: Option<i64>,
     pub height: Option<i64>,
+    #[serde(default)]
+    pub color_depth: Option<i64>,
     pub has_alpha: Option<bool>,
     pub color_space: Option<String>,
 }
@@ -228,6 +234,16 @@ pub struct ModelAttributes {
     pub vertex_count: Option<i64>,
     pub triangle_count: Option<i64>,
     pub mesh_count: Option<i64>,
+    #[serde(default)]
+    pub material_count: Option<i64>,
+    #[serde(default)]
+    pub texture_count: Option<i64>,
+    #[serde(default)]
+    pub has_rig: Option<bool>,
+    #[serde(default)]
+    pub has_animation: Option<bool>,
+    #[serde(default)]
+    pub has_uvs: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -493,6 +509,127 @@ pub struct JobListRequest {
     pub state: Option<JobState>,
     #[serde(default)]
     pub page: PageParams,
+}
+
+// ── convert (tech-spec 08) ───────────────────────────────────────────────────
+
+/// A submitted convert plan: an input set, one target spec, and where outputs land. One request →
+/// one report (one item per input). CLI-first in v1 (tech-spec 08 §1; the job/progress model layers
+/// on later). Non-destructive by construction — outputs always go under `output_dir`, never over a
+/// source (§5.1).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ConvertRequest {
+    pub inputs: Vec<AssetId>,
+    pub target: ConvertTarget,
+    /// User-chosen destination directory (required; never a source tree — §5.1).
+    pub output_dir: String,
+    /// Plan only: resolve outputs + estimate, write nothing (§4.2).
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub on_collision: CollisionRule,
+}
+
+/// The media-typed encode spec (tech-spec 08 §3). One target per request; a batch that mixes media
+/// types against a single-media target fails those items as `unsupported` (fail-soft).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "media", rename_all = "lowercase")]
+pub enum ConvertTarget {
+    Image {
+        /// `png` | `jpg` | `webp` | `bmp` | `tga` | `tiff` | `gif`.
+        format: String,
+        /// Fit within this box on the long edge (aspect preserved); None keeps source size.
+        #[serde(default)]
+        max_edge: Option<u32>,
+        /// Lossy-encoder quality 1..=100 (JPEG); ignored for lossless formats.
+        #[serde(default)]
+        quality: Option<u8>,
+    },
+    Audio {
+        /// `wav` in v1 (lossless PCM); other codecs stage later (tech-spec 08 §3.1).
+        format: String,
+    },
+}
+
+impl ConvertTarget {
+    pub fn media(&self) -> MediaType {
+        match self {
+            ConvertTarget::Image { .. } => MediaType::Image,
+            ConvertTarget::Audio { .. } => MediaType::Audio,
+        }
+    }
+    /// The concrete output format token (drives the output extension).
+    pub fn format(&self) -> &str {
+        match self {
+            ConvertTarget::Image { format, .. } => format,
+            ConvertTarget::Audio { format } => format,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollisionRule {
+    /// Planned path exists → the item fails (§5.3). The safe default.
+    #[default]
+    Fail,
+    /// Disambiguate: `foo.png` → `foo-1.png`, `foo-2.png`, …
+    Suffix,
+    /// Leave the existing file; the item is done-but-skipped.
+    Skip,
+    /// Replace a non-source file (never a source — §5.1).
+    Overwrite,
+}
+
+/// How one input resolved during planning/commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Disposition {
+    /// Would be / was written.
+    Write,
+    /// Planned path already exists and the rule forbids replacing it.
+    Collision,
+    /// Existing output left in place (Skip rule).
+    Skipped,
+    /// (from → to) not encodable in this build.
+    Unsupported,
+    /// Successfully written (commit).
+    Done,
+    /// Encode/IO/source-safety failure.
+    Failed,
+}
+
+/// Per-input row of a convert report (dry-run or commit).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ConvertItemReport {
+    pub input: AssetId,
+    pub input_path: String,
+    /// The exact path that would be / was written.
+    pub planned_output: String,
+    pub disposition: Disposition,
+    pub input_bytes: u64,
+    #[serde(default)]
+    pub output_bytes: Option<u64>,
+    /// output_bytes / input_bytes, filled on a real (committed) encode.
+    #[serde(default)]
+    pub ratio: Option<f32>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// The whole-batch result. Fail-soft: the request succeeds as long as it ran, even if some items
+/// failed; counts summarise the outcome (tech-spec 08 §1.1).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ConvertReport {
+    pub dry_run: bool,
+    pub output_dir: String,
+    pub items: Vec<ConvertItemReport>,
+    pub total_input_bytes: u64,
+    pub total_output_bytes: u64,
+    pub done: usize,
+    pub failed: usize,
+    pub collisions: usize,
+    pub unsupported: usize,
 }
 
 // ── stats ──────────────────────────────────────────────────────────────────

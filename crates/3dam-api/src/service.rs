@@ -57,13 +57,31 @@ pub trait LibraryService: Send + Sync {
     /// Read an asset's raw bytes for a preview (the out-of-band data-handoff the WASM viewer islands
     /// consume — tech-spec 09 §B.3). Bounded to preview-sized reads; large assets return an error
     /// rather than streaming the whole file. Read-only, non-destructive (PRODUCT_SPEC §8).
-    async fn read_content(
+    async fn read_content(&self, ctx: &AuthContext, id: &AssetId)
+        -> Result<AssetContent, LibError>;
+
+    /// Read (generating + caching on miss) a downscaled PNG thumbnail for an asset preview
+    /// (tech-spec 04 §6.4). `max_edge` bounds the long side. Only raster images produce one;
+    /// audio/3D return `Unsupported` (their previews are WASM islands) and the UI falls back to
+    /// the honest typed tile. Returned as an `AssetContent` with `image/png`.
+    async fn read_thumbnail(
         &self,
         ctx: &AuthContext,
         id: &AssetId,
+        max_edge: u32,
     ) -> Result<AssetContent, LibError>;
 
     async fn library_stats(&self, ctx: &AuthContext) -> Result<LibraryStats, LibError>;
+
+    // ── convert (tech-spec 08) ───────────────────────────────────────────────
+    /// Run a convert plan: dry-run (plan + estimate, no writes) or commit (encode + atomic write
+    /// under `output_dir`). Non-destructive and source-safe by construction (§5.1). CLI-first in
+    /// v1; returns the full per-item report.
+    async fn convert(
+        &self,
+        ctx: &AuthContext,
+        req: ConvertRequest,
+    ) -> Result<ConvertReport, LibError>;
 
     // ── sources ──────────────────────────────────────────────────────────────
     async fn list_sources(&self, ctx: &AuthContext) -> Result<Vec<SourceInfo>, LibError>;

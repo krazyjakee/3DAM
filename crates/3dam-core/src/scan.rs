@@ -63,17 +63,24 @@ pub(crate) fn run_scan(
                     match store.upsert_asset(&na) {
                         Ok((id, inserted)) => {
                             done += 1;
+                            // CHEAP tier (tech-spec 04 §4): read header-only media attributes and
+                            // persist them. Runs on insert and delta re-scan; fail-soft — a bad
+                            // decode yields empty attributes, never a scan abort.
+                            let attrs = dam_media::extract_metadata(&fe.abs_path, &det);
+                            if let Err(e) = store.set_media_attrs(&id, &attrs) {
+                                tracing::warn!(path = %fe.rel_path, error = %e, "attr persist failed");
+                            }
                             if inserted {
                                 let summary = AssetSummary {
                                     id,
                                     name: na.filename.clone(),
                                     media: det.media,
-                                    format: det.format,
+                                    format: det.format.clone(),
                                     size: fe.size,
                                     license: LicenseBadge::default(),
                                     top_tags: Vec::new(),
                                     origin: Origin::Local,
-                                    key_attrs: SmallMap::new(),
+                                    key_attrs: key_attrs_of(&attrs),
                                 };
                                 let _ = events.send(LibraryEvent::AssetAdded(summary));
                             }
@@ -126,6 +133,35 @@ pub(crate) fn run_scan(
     }
     emit_progress(&store, &events, &job);
     tracing::info!(%job, done, warnings, "scan finished");
+}
+
+/// A couple of display attributes for the live-added grid row, mirroring the store's grid map so a
+/// freshly scanned asset shows its dimensions/duration/tris immediately (before any refetch).
+fn key_attrs_of(attrs: &MediaAttributes) -> SmallMap {
+    let mut m = SmallMap::new();
+    match attrs {
+        MediaAttributes::Image(i) => {
+            if let (Some(w), Some(h)) = (i.width, i.height) {
+                m.insert("dimensions".into(), format!("{w}×{h}"));
+            }
+        }
+        MediaAttributes::Audio(a) => {
+            if let Some(ms) = a.duration_ms {
+                let secs = ms as f64 / 1000.0;
+                m.insert(
+                    "duration".into(),
+                    format!("{:.0}:{:02}", (secs / 60.0).floor(), (secs % 60.0) as i64),
+                );
+            }
+        }
+        MediaAttributes::Model(md) => {
+            if let Some(t) = md.triangle_count {
+                m.insert("tris".into(), t.to_string());
+            }
+        }
+        MediaAttributes::None => {}
+    }
+    m
 }
 
 fn emit_progress(store: &Store, events: &broadcast::Sender<LibraryEvent>, job: &JobId) {

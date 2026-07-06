@@ -7,3 +7,8 @@ description = "MediaHandler trait + format detection and per-media handlers (tec
 
 [dependencies]
 dam-api.workspace = true
+image.workspace = true
+symphonia.workspace = true
+hound.workspace = true
+serde_json.workspace = true
+tracing.workspace = true

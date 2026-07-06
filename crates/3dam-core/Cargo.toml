@@ -21,3 +21,5 @@ directories.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread"] }
+image.workspace = true
+hound.workspace = true

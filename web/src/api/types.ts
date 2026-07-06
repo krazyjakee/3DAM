@@ -61,10 +61,13 @@ export interface AudioAttributes {
   sample_rate: number | null;
   bit_depth: number | null;
   channels: number | null;
+  codec?: string | null;
+  container?: string | null;
 }
 export interface ImageAttributes {
   width: number | null;
   height: number | null;
+  color_depth?: number | null;
   has_alpha: boolean | null;
   color_space: string | null;
 }
@@ -72,6 +75,11 @@ export interface ModelAttributes {
   vertex_count: number | null;
   triangle_count: number | null;
   mesh_count: number | null;
+  material_count?: number | null;
+  texture_count?: number | null;
+  has_rig?: boolean | null;
+  has_animation?: boolean | null;
+  has_uvs?: boolean | null;
 }
 
 export interface TagRef {

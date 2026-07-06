@@ -91,6 +91,14 @@ console_error_panic_hook = "0.1"
 console_log = "1"
 log = "0.4"
 
+# media decode / encode (tech-spec 04 handlers + 08 convert). Pure-Rust where possible.
+# `image` covers the v1 raster matrix (ADR 0009 §8); DDS/KTX2/EXR/HDR stage later.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "tga", "tiff", "webp"] }
+# `symphonia` is the audio decode/probe path (tech-spec 04 §7.1); curated to the v1 codec set.
+symphonia = { version = "0.5", default-features = false, features = ["mp3", "flac", "vorbis", "ogg", "wav", "pcm", "adpcm", "isomp4", "aac", "aiff"] }
+# WAV/PCM encode for the convert pipeline (tech-spec 08 §3.1).
+hound = "3"
+
 # diagnostics
 thiserror = "2"
 anyhow = "1"

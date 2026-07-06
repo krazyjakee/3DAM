@@ -5,7 +5,7 @@
 
 use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path as AxPath, State};
+use axum::extract::{Path as AxPath, Query, State};
 use axum::http::{header, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -75,7 +75,9 @@ pub fn router(lib: Arc<EmbeddedLibrary>) -> Router {
         .route("/api/v1/query", post(query))
         .route("/api/v1/assets/{id}", get(get_asset))
         .route("/api/v1/assets/{id}/content", get(asset_content))
+        .route("/api/v1/assets/{id}/thumbnail", get(asset_thumbnail))
         .route("/api/v1/stats", get(stats))
+        .route("/api/v1/convert", post(convert))
         .route("/api/v1/sources", get(list_sources).post(add_source))
         .route(
             "/api/v1/sources/{id}",
@@ -179,7 +181,7 @@ async fn version() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "api": "v1",
         "server": concat!("3dam ", env!("CARGO_PKG_VERSION")),
-        "capabilities": ["query", "sources", "scan", "stats", "ws", "web"],
+        "capabilities": ["query", "sources", "scan", "stats", "ws", "web", "thumbnail", "convert"],
     }))
 }
 
@@ -217,8 +219,42 @@ async fn asset_content(
         .into_response())
 }
 
+/// A downscaled PNG thumbnail for an image asset (tech-spec 04 §6.4). `?edge=N` bounds the long
+/// side (default 256). Non-image assets return a 415 so the web client falls back to the typed tile.
+async fn asset_thumbnail(
+    State(st): State<AppState>,
+    AxPath(id): AxPath<String>,
+    Query(q): Query<ThumbQuery>,
+) -> Result<Response, ApiError> {
+    let id: AssetId = parse_id(&id, "asset")?;
+    let edge = q.edge.unwrap_or(256);
+    let content = st.lib.read_thumbnail(&ctx(), &id, edge).await?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, content.content_type),
+            // Derivatives are keyed by content hash server-side, but a re-scan can change bytes,
+            // so cache privately for a short window rather than immutably-forever.
+            (header::CACHE_CONTROL, "private, max-age=300".to_string()),
+        ],
+        Body::from(content.bytes),
+    )
+        .into_response())
+}
+
+#[derive(serde::Deserialize)]
+struct ThumbQuery {
+    edge: Option<u32>,
+}
+
 async fn stats(State(st): State<AppState>) -> Result<Json<LibraryStats>, ApiError> {
     Ok(Json(st.lib.library_stats(&ctx()).await?))
+}
+
+async fn convert(
+    State(st): State<AppState>,
+    Json(req): Json<ConvertRequest>,
+) -> Result<Json<ConvertReport>, ApiError> {
+    Ok(Json(st.lib.convert(&ctx(), req).await?))
 }
 
 async fn list_sources(State(st): State<AppState>) -> Result<Json<Vec<SourceInfo>>, ApiError> {
