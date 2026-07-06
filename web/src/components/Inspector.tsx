@@ -31,13 +31,16 @@ import { Drawer } from "./Drawer";
 
 /** Inspector — a persistent right rail on `lg`, an overlay drawer below it (responsive + touch pass). Both
  *  render the same {@link InspectorPanel}, so a 360px phone and a wide desktop show identical detail. */
-export function Inspector() {
+export function Inspector({ width }: { width?: number }) {
   const { state, patch } = useViewState();
   const close = () => patch({ selected: null });
 
   return (
     <>
-      <aside className="hidden w-[300px] shrink-0 flex-col border-l border-border bg-surface lg:flex">
+      <aside
+        className="hidden shrink-0 flex-col border-l border-border bg-surface lg:flex"
+        style={{ width }}
+      >
         <InspectorPanel selected={state.selected} onClose={close} />
       </aside>
       <Drawer open={!!state.selected} onClose={close} side="right" label="Inspector">
