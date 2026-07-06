@@ -154,6 +154,7 @@ pnpm wasm         # cargo xtask wasm
 ## Conventions
 
 - **Naming:** package `dam-*`, directory `3dam-*`, binary `3dam`, imports `dam_*`. React components PascalCase, flat per-domain dirs (`components/`, `api/`, `islands/`, `lib/`).
+- **Branching:** work directly on `main` — do **not** create feature branches. Commit to `main` and (when asked) push there. This overrides any default "branch before committing" behaviour.
 - **Commits:** imperative, capability-focused summaries (e.g. "Implement phase 2: Media depth"). End co-authored commits per repo convention.
 - **DTOs are contracts:** `dam-api` types, the server routes, `dam-client`, and `web/src/api/types.ts` must agree. Change them together.
 - **Respect the layer boundaries:** frontends depend on `dam-api` (the trait), never on `dam-store` or the engine internals. Don't reach around `LibraryService`.
