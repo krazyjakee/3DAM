@@ -10,11 +10,12 @@ import {
   Library,
   RefreshCw,
   Settings as SettingsIcon,
+  Sparkles,
   Tag as TagIcon,
   Trash2,
   WifiOff,
 } from "lucide-react";
-import { useScan, useSources, useStats, useRemoveSource } from "@/api/queries";
+import { useAnalyze, useScan, useSources, useStats, useRemoveSource } from "@/api/queries";
 import { useConnection } from "@/api/connection";
 import type { LicenseStatus, MediaType, SourceInfo } from "@/api/types";
 import { licenseColorVar, licenseLabel, sourceStateLabel } from "@/lib/format";
@@ -74,6 +75,7 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
   const stats = useStats();
   const sources = useSources();
   const scan = useScan();
+  const analyze = useAnalyze();
   const removeSource = useRemoveSource();
   const conn = useConnection();
   const [showAdd, setShowAdd] = useState(false);
@@ -92,7 +94,17 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
         </div>
         <button
           className="btn ml-auto px-1.5 py-1 coarse:min-h-11 coarse:min-w-11 coarse:justify-center"
+          title="Analyze library (embeddings, similarity, auto-tags)"
+          aria-label="Analyze library"
+          onClick={() => analyze.mutate({})}
+          disabled={analyze.isPending}
+        >
+          <Sparkles size={13} className={analyze.isPending ? "animate-pulse" : ""} />
+        </button>
+        <button
+          className="btn px-1.5 py-1 coarse:min-h-11 coarse:min-w-11 coarse:justify-center"
           title="Rescan all sources"
+          aria-label="Rescan all sources"
           onClick={() => scan.mutate({ mode: "delta" })}
           disabled={scan.isPending}
         >
@@ -230,16 +242,23 @@ function SourceRow({
         className="flex min-w-0 flex-1 items-center gap-2 text-left coarse:min-h-11"
         onClick={onSelect}
       >
+        {/* State is also carried by shape (filled circle / hollow ring / square), not colour alone,
+            and exposed to assistive tech — issue #28. */}
         <span
-          className="h-1.5 w-1.5 shrink-0 rounded-full"
+          role="img"
+          aria-label={`Source status: ${sourceStateLabel(source.state)}`}
+          title={sourceStateLabel(source.state)}
+          className={`h-2 w-2 shrink-0 ${errored ? "rounded-[1px]" : "rounded-full"} ${
+            scanning ? "animate-pulse border" : ""
+          }`}
           style={{
             background: errored
               ? "var(--color-danger)"
               : scanning
-                ? "var(--color-warn)"
+                ? "transparent"
                 : "var(--color-lic-permissive)",
+            borderColor: scanning ? "var(--color-warn)" : undefined,
           }}
-          title={sourceStateLabel(source.state)}
         />
         <span className="truncate" title={source.uri}>
           {source.name}

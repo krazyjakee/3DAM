@@ -215,6 +215,14 @@ export interface SourceOptions {
   watch?: boolean;
   include?: string[];
   exclude?: string[];
+  // Connection auth for network sources (SFTP/SMB); ignored for local. Values here override any
+  // userinfo parsed from the URI (mirrors dam-api SourceOptions).
+  username?: string;
+  password?: string;
+  private_key?: string;
+  passphrase?: string;
+  domain?: string;
+  port?: number;
 }
 export interface AddSource {
   kind: SourceKind;
@@ -232,6 +240,10 @@ export type ScanMode = "full" | "delta";
 export interface ScanRequest {
   sources?: SourceId[];
   mode?: ScanMode;
+}
+export interface AnalyzeRequest {
+  assets?: AssetId[]; // empty → every asset due for (re)analysis
+  force?: boolean; // re-run even if already up to date
 }
 export type JobKind = "scan" | "analyze" | "convert" | "export";
 export type JobState =

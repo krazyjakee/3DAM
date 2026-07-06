@@ -11,6 +11,7 @@ import {
 import { api } from "./client";
 import type {
   AddSource,
+  AnalyzeRequest,
   AssetId,
   JobListRequest,
   QueryRequest,
@@ -94,6 +95,16 @@ export function useScan() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (req: ScanRequest) => api.submitScan(req),
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.jobs }),
+  });
+}
+
+/** Kick the analysis pass (embeddings, tileability/pHash, auto-tag suggestions) — library-wide or
+ *  scoped to specific assets. Progress surfaces through the shared job plumbing (StatusBar). */
+export function useAnalyze() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (req: AnalyzeRequest) => api.submitAnalyze(req),
     onSuccess: () => qc.invalidateQueries({ queryKey: qk.jobs }),
   });
 }

@@ -10,14 +10,25 @@ impl Store {
 
         let (where_sql, binds) = build_where(req)?;
 
-        let order = match req.sort.field {
-            SortField::Name | SortField::Relevance => "filename",
-            SortField::Size => "size_bytes",
-            SortField::Scanned => "scanned_at",
-        };
         let dir = match req.sort.dir {
             SortDir::Asc => "ASC",
             SortDir::Desc => "DESC",
+        };
+        // ORDER BY, plus any binds it needs (only relevance, which references the search term). A
+        // relevance sort without a text query has nothing to rank, so it degrades to name order.
+        let rank_text = req.text.as_ref().filter(|t| !t.is_empty());
+        let (order_clause, order_binds): (String, Vec<Value>) = match req.sort.field {
+            SortField::Relevance if rank_text.is_some() => (
+                // No FTS in v1 — a cheap proxy over the filename LIKE match: earliest substring hit
+                // wins, then the shortest name (closest to an exact match), then name for stability.
+                "INSTR(LOWER(filename), LOWER(?)) ASC, LENGTH(filename) ASC, filename ASC".into(),
+                vec![Value::Text(rank_text.unwrap().clone())],
+            ),
+            SortField::Relevance | SortField::Name => {
+                (format!("filename {dir}, asset.id ASC"), Vec::new())
+            }
+            SortField::Size => (format!("size_bytes {dir}, asset.id ASC"), Vec::new()),
+            SortField::Scanned => (format!("scanned_at {dir}, asset.id ASC"), Vec::new()),
         };
 
         let conn = self.conn.lock().unwrap();
@@ -40,9 +51,12 @@ impl Store {
              LEFT JOIN image_attr ON image_attr.asset_id = asset.id
              LEFT JOIN audio_attr ON audio_attr.asset_id = asset.id
              LEFT JOIN model_attr ON model_attr.asset_id = asset.id
-             {where_sql} ORDER BY {order} {dir}, asset.id ASC LIMIT ? OFFSET ?"
+             {where_sql} ORDER BY {order_clause} LIMIT ? OFFSET ?"
         );
+        // Bind order is positional across the whole statement: WHERE binds, then the ORDER BY term,
+        // then LIMIT/OFFSET.
         let mut page_binds = binds.clone();
+        page_binds.extend(order_binds);
         page_binds.push(Value::Integer(limit as i64));
         page_binds.push(Value::Integer(offset as i64));
 

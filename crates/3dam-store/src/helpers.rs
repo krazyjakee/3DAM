@@ -128,12 +128,108 @@ pub(crate) fn apply_filter(
                 _ => return Err(LibError::BadRequest("unsupported size filter".into())),
             }
         }
-        other => {
-            return Err(LibError::Unsupported(format!(
-                "filter on {other:?} is not implemented in this build"
-            )));
+        // `license_status` lives on the asset row itself, so it filters inline like media/format.
+        License => {
+            eq_or_in(f, "license_status", where_sql, binds)?;
         }
+        // A usage right is a granted-permission flag (`rights_*` = 1) on the asset row. The value
+        // names which right; presence of the filter means "must be granted".
+        UsageRight => {
+            let col = match &f.value {
+                FilterValue::Str(s) => match s.as_str() {
+                    "commercial" => "rights_commercial",
+                    "modify" => "rights_modify",
+                    "redistribute" => "rights_redistribute",
+                    "attribution" => "rights_attribution",
+                    _ => return Err(LibError::BadRequest(format!("unknown usage right {s:?}"))),
+                },
+                _ => {
+                    return Err(LibError::BadRequest(
+                        "usage_right filter wants a right name string".into(),
+                    ))
+                }
+            };
+            where_sql.push_str(&format!(" AND {col} = 1"));
+        }
+        // Tag/attr facets live in side tables. Express them as correlated subqueries on `asset.id`
+        // rather than relying on the JOINs `query_assets` adds — the COUNT(*) query filters bare
+        // `FROM asset`, so a joined-column reference there would fail to resolve.
+        Tag => match (&f.op, &f.value) {
+            (FilterOp::Eq | FilterOp::Contains, FilterValue::Str(s)) => {
+                where_sql.push_str(
+                    " AND asset.id IN (SELECT at.asset_id FROM asset_tag at \
+                     JOIN tag t ON t.id = at.tag_id \
+                     WHERE t.name = ? COLLATE NOCASE AND at.state <> 'rejected')",
+                );
+                binds.push(Value::Text(s.clone()));
+            }
+            (FilterOp::In, FilterValue::List(items)) => {
+                let placeholders = items.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                where_sql.push_str(&format!(
+                    " AND asset.id IN (SELECT at.asset_id FROM asset_tag at \
+                     JOIN tag t ON t.id = at.tag_id \
+                     WHERE t.name COLLATE NOCASE IN ({placeholders}) AND at.state <> 'rejected')"
+                ));
+                for it in items {
+                    if let FilterValue::Str(s) = it {
+                        binds.push(Value::Text(s.clone()));
+                    } else {
+                        return Err(LibError::BadRequest("tag IN list wants strings".into()));
+                    }
+                }
+            }
+            _ => return Err(LibError::BadRequest("unsupported tag filter".into())),
+        },
+        Width => attr_num_filter(f, "image_attr", "width", where_sql, binds)?,
+        Height => attr_num_filter(f, "image_attr", "height", where_sql, binds)?,
+        Bpm => attr_num_filter(f, "audio_attr", "bpm", where_sql, binds)?,
+        TriCount => attr_num_filter(f, "model_attr", "triangle_count", where_sql, binds)?,
     }
+    Ok(())
+}
+
+/// A numeric comparison against a per-media attribute column (`image_attr.width`,
+/// `audio_attr.bpm`, …), emitted as a correlated `asset.id IN (…)` subquery so it composes with the
+/// bare-`FROM asset` COUNT(*) query as well as the JOINed page query. Values bind as REAL — SQLite's
+/// numeric comparison treats `100 = 100.0` as equal, so integer columns compare correctly too.
+fn attr_num_filter(
+    f: &Filter,
+    table: &str,
+    col: &str,
+    where_sql: &mut String,
+    binds: &mut Vec<Value>,
+) -> Result<(), LibError> {
+    let cond = match (&f.op, &f.value) {
+        (FilterOp::Eq, FilterValue::Num(n)) => {
+            binds.push(Value::Real(*n));
+            format!("{col} = ?")
+        }
+        (FilterOp::Gt, FilterValue::Num(n)) => {
+            binds.push(Value::Real(*n));
+            format!("{col} > ?")
+        }
+        (FilterOp::Gte, FilterValue::Num(n)) => {
+            binds.push(Value::Real(*n));
+            format!("{col} >= ?")
+        }
+        (FilterOp::Lt, FilterValue::Num(n)) => {
+            binds.push(Value::Real(*n));
+            format!("{col} < ?")
+        }
+        (FilterOp::Lte, FilterValue::Num(n)) => {
+            binds.push(Value::Real(*n));
+            format!("{col} <= ?")
+        }
+        (FilterOp::Range, FilterValue::Range(lo, hi)) => {
+            binds.push(Value::Real(*lo));
+            binds.push(Value::Real(*hi));
+            format!("{col} BETWEEN ? AND ?")
+        }
+        _ => return Err(LibError::BadRequest(format!("unsupported filter on {col}"))),
+    };
+    where_sql.push_str(&format!(
+        " AND asset.id IN (SELECT asset_id FROM {table} WHERE {cond})"
+    ));
     Ok(())
 }
 
@@ -173,4 +269,81 @@ pub(crate) fn push_cmp(
 ) {
     where_sql.push_str(&format!(" AND {col} {op} ?"));
     binds.push(Value::Integer(n as i64));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dam_api::dto::{FacetField, Filter, FilterOp, FilterValue, QueryRequest};
+
+    /// A well-formed filter for every `FacetField` variant. If a variant is added without a query
+    /// arm, the exhaustive `match` below stops compiling — a nudge to wire it before the API can
+    /// express a filter the store can't run (issue #37).
+    fn representative(field: FacetField) -> Filter {
+        use FacetField::*;
+        let (op, value) = match field {
+            MediaType => (FilterOp::Eq, FilterValue::Str("image".into())),
+            Format => (FilterOp::Eq, FilterValue::Str("png".into())),
+            Source => (
+                FilterOp::Eq,
+                FilterValue::Str("00000000-0000-0000-0000-000000000000".into()),
+            ),
+            Tag => (FilterOp::Eq, FilterValue::Str("brick".into())),
+            SizeBytes => (FilterOp::Gt, FilterValue::Num(1024.0)),
+            License => (FilterOp::Eq, FilterValue::Str("permissive".into())),
+            UsageRight => (FilterOp::Eq, FilterValue::Str("commercial".into())),
+            Width => (FilterOp::Gte, FilterValue::Num(512.0)),
+            Height => (FilterOp::Lte, FilterValue::Num(512.0)),
+            Bpm => (FilterOp::Range, FilterValue::Range(90.0, 130.0)),
+            TriCount => (FilterOp::Lt, FilterValue::Num(50_000.0)),
+        };
+        Filter { field, op, value }
+    }
+
+    /// Acceptance for #37: no `FacetField` variant reachable from the API is `Unsupported`, and each
+    /// builds a WHERE clause that a live SQLite catalog accepts.
+    #[test]
+    fn every_facet_field_builds_and_runs() {
+        let fields = [
+            FacetField::MediaType,
+            FacetField::Format,
+            FacetField::Source,
+            FacetField::Tag,
+            FacetField::SizeBytes,
+            FacetField::License,
+            FacetField::UsageRight,
+            FacetField::Width,
+            FacetField::Height,
+            FacetField::Bpm,
+            FacetField::TriCount,
+        ];
+
+        // The schema the store runs against — enough for SQLite to plan each filter's subquery.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        for step in crate::schema::MIGRATIONS {
+            conn.execute_batch(step).unwrap();
+        }
+
+        for field in fields {
+            let req = QueryRequest {
+                filters: vec![representative(field)],
+                ..Default::default()
+            };
+            let (where_sql, binds) = match build_where(&req) {
+                Ok(v) => v,
+                Err(e) => panic!("filter on {field:?} failed to build: {e:?}"),
+            };
+            assert!(
+                !matches!(build_where(&req), Err(LibError::Unsupported(_))),
+                "filter on {field:?} is Unsupported"
+            );
+            // Prove the SQL is executable against the real schema (both the JOINed page query and
+            // the bare COUNT(*) query must accept it).
+            let count_sql = format!("SELECT COUNT(*) FROM asset{where_sql}");
+            conn.query_row(&count_sql, rusqlite::params_from_iter(binds.iter()), |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap_or_else(|e| panic!("count with {field:?} filter failed: {e}"));
+        }
+    }
 }

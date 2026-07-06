@@ -111,6 +111,11 @@ function Toolbar({
           patch({ sort, dir });
         }}
       >
+        {/* Relevance only ranks a text search — offer it when a query is active (or already picked,
+            so the control never falls to a blank value after the query is cleared). */}
+        {(state.q || state.sort === "relevance") && (
+          <option value="relevance:desc">Best match</option>
+        )}
         <option value="name:asc">Name ↑</option>
         <option value="name:desc">Name ↓</option>
         <option value="size:desc">Largest</option>

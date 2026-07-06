@@ -5,6 +5,7 @@
 
 import type {
   AddSource,
+  AnalyzeRequest,
   Asset,
   AssetId,
   JobId,
@@ -99,6 +100,8 @@ export const api = {
 
   // jobs
   submitScan: (req: ScanRequest) => send<{ job_id: JobId }>("POST", `${API}/jobs/scan`, req),
+  submitAnalyze: (req: AnalyzeRequest) =>
+    send<{ job_id: JobId }>("POST", `${API}/jobs/analyze`, req),
   listJobs: (req: JobListRequest = {}) => send<Page<JobStatus>>("POST", `${API}/jobs/list`, req),
   cancelJob: (id: JobId) => send<void>("POST", `${API}/jobs/${id}/cancel`),
 };

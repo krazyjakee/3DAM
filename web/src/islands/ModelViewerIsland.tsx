@@ -125,6 +125,8 @@ export function ModelViewerIsland({ src }: { src: string }) {
     <div ref={containerRef} className="relative h-full w-full bg-bg">
       <canvas
         ref={canvasRef}
+        role="img"
+        aria-label="Interactive 3D model preview — drag to orbit, scroll to zoom"
         className="h-full w-full touch-none select-none"
         style={{ cursor: status === "ready" ? "grab" : "default" }}
       />
