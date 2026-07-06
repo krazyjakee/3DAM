@@ -25,6 +25,7 @@ import { useViewState } from "@/lib/view-state";
 import { ModelViewerIsland } from "@/islands/ModelViewerIsland";
 import { WaveformIsland } from "@/islands/WaveformIsland";
 import { LicenseBadge } from "./LicenseBadge";
+import { ImageViewer } from "./ImageViewer";
 import { Thumbnail } from "./Thumbnail";
 import { MediaIcon } from "./MediaIcon";
 import { Drawer } from "./Drawer";
@@ -110,6 +111,15 @@ function Preview({ asset }: { asset: Asset }) {
     return (
       <div className="h-24 border-b border-border">
         <WaveformIsland src={src} />
+      </div>
+    );
+  }
+  if (summary.media === "image") {
+    // Full-resolution content image in a zoom/pan viewer — 1:1 is pixel-accurate for inspecting
+    // texture detail / tileability (issue #17). Keyed by id so switching assets resets the view.
+    return (
+      <div className="aspect-square border-b border-border">
+        <ImageViewer key={summary.id} src={src} alt={summary.name} />
       </div>
     );
   }
