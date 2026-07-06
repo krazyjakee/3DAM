@@ -156,8 +156,10 @@ impl EmbeddedLibrary {
         let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let watchers =
             watch::WatchManager::new(store.clone(), events.clone(), tokio::runtime::Handle::current());
-        // Resume watching any source configured to auto-rescan (tech-spec 07 §3.1).
-        watchers.start_all();
+        // NB: watchers are *not* started here. Auto-rescan only makes sense for long-running roles
+        // (serve/mcp), which call `start_watchers()` explicitly. A run-and-exit CLI command must not
+        // register OS watches — they add nothing to a one-shot and their setup would outlive the
+        // command (keeping the runtime from shutting down). See tech-spec 07 §3.1.
         Ok(EmbeddedLibrary {
             store,
             events,
@@ -170,6 +172,14 @@ impl EmbeddedLibrary {
     /// Open at the platform default location.
     pub async fn open_default() -> Result<EmbeddedLibrary, LibError> {
         EmbeddedLibrary::open(&default_data_dir()).await
+    }
+
+    /// Resume auto-rescan for every `watch`-enabled source (tech-spec 07 §3.1). Long-running roles
+    /// (`serve`, `mcp`) call this once after open; one-shot CLI commands never do. Non-blocking:
+    /// each OS watch is registered off the async runtime, so a huge or network-backed root can't
+    /// stall startup.
+    pub fn start_watchers(&self) {
+        self.watchers.start_all();
     }
 
     /// Run a synchronous store operation on the blocking pool (tech-spec 14).

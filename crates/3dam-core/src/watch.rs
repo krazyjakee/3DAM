@@ -34,13 +34,16 @@ enum WatchEntry {
     Local(#[allow(dead_code)] notify::RecommendedWatcher),
     /// A detached poll task marks its source watched here (nothing to keep alive).
     Poll,
+    /// Slot reserved while a local watcher is being registered off-thread. Reserving synchronously
+    /// stops a second `ensure()` from double-spawning before the background setup lands.
+    Pending,
 }
 
 pub(crate) struct WatchManager {
     store: Arc<Store>,
     events: broadcast::Sender<LibraryEvent>,
     rt: tokio::runtime::Handle,
-    live: Mutex<HashMap<SourceId, WatchEntry>>,
+    live: Arc<Mutex<HashMap<SourceId, WatchEntry>>>,
     in_flight: Arc<Mutex<HashSet<SourceId>>>,
 }
 
@@ -54,7 +57,7 @@ impl WatchManager {
             store,
             events,
             rt,
-            live: Mutex::new(HashMap::new()),
+            live: Arc::new(Mutex::new(HashMap::new())),
             in_flight: Arc::new(Mutex::new(HashSet::new())),
         }
     }
@@ -71,56 +74,79 @@ impl WatchManager {
     /// Idempotently begin watching one source. No-op if already watched, not flagged `watch`, or a
     /// federated peer. Best-effort: a watcher that can't be set up is logged, never fatal.
     pub(crate) fn ensure(&self, id: SourceId) {
-        let mut live = self.live.lock().unwrap();
-        if live.contains_key(&id) {
-            return;
+        // Reserve the slot under the lock so overlapping `ensure()` calls can't both spawn.
+        {
+            let mut live = self.live.lock().unwrap();
+            if live.contains_key(&id) {
+                return;
+            }
+            live.insert(id, WatchEntry::Pending);
         }
         let info = match self.store.get_source(&id) {
             Ok(Some(i)) if i.watch => i,
-            _ => return,
+            _ => {
+                self.live.lock().unwrap().remove(&id);
+                return;
+            }
         };
         match info.kind {
-            SourceKind::LocalFs => match self.spawn_local(id, &info.uri) {
-                Some(w) => {
-                    live.insert(id, WatchEntry::Local(w));
-                }
-                None => tracing::warn!(source = %id, "could not start local watcher"),
-            },
+            SourceKind::LocalFs => self.spawn_local(id, info.uri),
             SourceKind::Sftp | SourceKind::Smb => {
                 self.spawn_poll(id);
-                live.insert(id, WatchEntry::Poll);
+                self.live.lock().unwrap().insert(id, WatchEntry::Poll);
             }
-            SourceKind::Federated => {}
+            SourceKind::Federated => {
+                self.live.lock().unwrap().remove(&id);
+            }
         }
     }
 
-    fn spawn_local(&self, id: SourceId, root: &str) -> Option<notify::RecommendedWatcher> {
-        let (tx, mut rx) = mpsc::unbounded_channel::<()>();
-        let mut watcher =
-            notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-                if res.is_ok() {
-                    let _ = tx.send(());
-                }
-            })
-            .ok()?;
-        watcher.watch(Path::new(root), RecursiveMode::Recursive).ok()?;
-
+    /// Register a recursive OS watch for a local source **off the async runtime**. Adding a recursive
+    /// inotify/FSEvents watch walks the whole subtree synchronously — seconds-to-forever on a huge or
+    /// network-backed (CIFS/NFS) root — so doing it inline would stall `EmbeddedLibrary::open()` and
+    /// every role with it. The slot is left `Pending` until the watcher lands (or is dropped on error).
+    fn spawn_local(&self, id: SourceId, root: String) {
         let store = self.store.clone();
         let events = self.events.clone();
         let in_flight = self.in_flight.clone();
-        self.rt.spawn(async move {
-            while rx.recv().await.is_some() {
-                // Coalesce the burst: keep resetting the quiet timer until it elapses.
-                loop {
-                    tokio::select! {
-                        _ = tokio::time::sleep(DEBOUNCE) => break,
-                        more = rx.recv() => if more.is_none() { return },
+        let live = self.live.clone();
+        let rt = self.rt.clone();
+        self.rt.spawn_blocking(move || {
+            let (tx, mut rx) = mpsc::unbounded_channel::<()>();
+            let mut watcher =
+                match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+                    if res.is_ok() {
+                        let _ = tx.send(());
                     }
-                }
-                trigger_delta(&store, &events, &in_flight, id);
+                }) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        tracing::warn!(source = %id, error = %e, "could not create local watcher");
+                        live.lock().unwrap().remove(&id);
+                        return;
+                    }
+                };
+            if let Err(e) = watcher.watch(Path::new(&root), RecursiveMode::Recursive) {
+                tracing::warn!(source = %id, error = %e, "could not start local watcher");
+                live.lock().unwrap().remove(&id);
+                return;
             }
+
+            rt.spawn(async move {
+                while rx.recv().await.is_some() {
+                    // Coalesce the burst: keep resetting the quiet timer until it elapses.
+                    loop {
+                        tokio::select! {
+                            _ = tokio::time::sleep(DEBOUNCE) => break,
+                            more = rx.recv() => if more.is_none() { return },
+                        }
+                    }
+                    trigger_delta(&store, &events, &in_flight, id);
+                }
+            });
+            // Publish the live watcher, replacing the `Pending` reservation.
+            live.lock().unwrap().insert(id, WatchEntry::Local(watcher));
         });
-        Some(watcher)
     }
 
     fn spawn_poll(&self, id: SourceId) {

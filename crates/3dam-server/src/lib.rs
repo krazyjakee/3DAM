@@ -184,6 +184,7 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
 
     // 2. Stores: open the engine and the server store; seed flags from the config file (seed-only).
     let lib = Arc::new(EmbeddedLibrary::open(&cfg.data_dir).await?);
+    lib.start_watchers(); // long-running role: resume auto-rescan for watch-enabled sources.
     let store = Arc::new(ServerStore::open(&cfg.data_dir.join("server.db"))?);
     for (key, value) in file.flag_seeds() {
         store.seed_flag(key, value)?;
@@ -232,6 +233,7 @@ async fn shutdown_signal() {
 /// writes are allowed (still non-destructive). Unaffected by the served `McpServer` flag (§7).
 pub async fn mcp_stdio(data_dir: PathBuf) -> anyhow::Result<()> {
     let lib = Arc::new(EmbeddedLibrary::open(&data_dir).await?);
+    lib.start_watchers(); // long-running role: resume auto-rescan for watch-enabled sources.
     let library: Arc<dyn LibraryService> = lib;
     let adapter = McpAdapter::new(library, WriteGate::local_stdio());
     adapter.serve_stdio(ectx()).await
