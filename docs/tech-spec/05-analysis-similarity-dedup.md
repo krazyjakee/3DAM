@@ -164,9 +164,10 @@ trait, so either can back it.
   Downside: a native dependency to ship and load per platform, larger footprint, and a
   heavier packaging story that cuts against the single-binary ideal.
 
-**Direction:** lean `candle` for the single-binary/no-native-dep win, with `ort` as the
-fallback where a required model has no viable `candle` port. The runtime is selected behind the
-`Embedder` trait and compile-time feature gated
+**Decided: `candle`** ([ADR 0006](../adr/0006-inference-runtime-candle.md), 2026-07-06) — the
+single-binary/no-native-dep win keeps the "one binary" promise (PRODUCT_SPEC §2), with `ort` kept
+as a **compile-time feature-gated fallback** only where a required model has no viable `candle`
+port. The runtime sits behind the `Embedder` trait and is feature gated
 ([01-architecture-and-crates.md](01-architecture-and-crates.md)); heavy analysis is optional
 and pluggable (DESIGN_GUIDELINES §2 "analysis is pluggable and optional").
 
@@ -485,8 +486,7 @@ Carried from PRODUCT_SPEC §10 and rolled up in [00-overview.md](00-overview.md)
   multi-view/shape models balance quality, size, and on-device speed. The pipeline is written
   to the `Embedder` contract (§2.1) so this stays a version bump (§7), not a rewrite. Needs a
   spike (also gates dims in §2.1).
-- **Inference runtime pick** (`candle` vs `ort`, §2.2) — a spike-gated ADR follow-up on
-  single-binary packaging vs model availability. Defaulting to `candle`, `ort` as fallback.
+- ~~**Inference runtime pick**~~ — **Decided: `candle`** ([ADR 0006](../adr/0006-inference-runtime-candle.md), 2026-07-06), `ort` as a feature-gated fallback. Only the *concrete models* (above) remain open.
 - **Vector index choice** (§3.1) — embedded extension (`sqlite-vec`) vs standalone crate
   (`usearch`/HNSW), in-memory vs on-disk at 1M+ scale. Storage layout is 02's; the
   perf/out-of-core call is shared with [14](14-concurrency-performance-reliability.md).

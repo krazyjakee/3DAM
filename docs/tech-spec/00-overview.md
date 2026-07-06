@@ -136,15 +136,16 @@ questions (PRODUCT_SPEC §10) and the roadmap's ([ROADMAP.md](../ROADMAP.md)).
   [`spikes/headless-render/`](../../spikes/headless-render/README.md): wgpu renders headless to
   PNG and lavapipe serves it correctly. Remaining: confirm on genuinely GPU-less hardware, and
   wire the explicit fallback ladder (06 §4.1) rather than relying on env.
-- **GUI toolkit final choice** (egui/eframe vs Iced) — needs the rendering/perf spike, then an
-  ADR. Owned by [12](12-desktop-gui.md).
+- ~~**GUI toolkit final choice**~~ — **Decided: egui/eframe** ([ADR 0005](../adr/0005-gui-toolkit-egui.md),
+  2026-07-06). The rendering/perf spike is now a validation follow-up, not a gate. Owned by [12](12-desktop-gui.md).
 - **Cross-peer similarity** — ranking hits across peers needs compatible embedding spaces
   (`EmbeddingSpace` match); advertise + gate, negotiate, or per-peer-grouped fallback. Owned by
   [05](05-analysis-similarity-dedup.md)/[07](07-sources-and-federation.md).
 
 **Model & analysis:**
-- Concrete embedding models per media type (quality/size/speed on-device); `candle` vs `ort`.
-  [05](05-analysis-similarity-dedup.md).
+- Concrete embedding models per media type (quality/size/speed on-device) — still open.
+  **Runtime decided: `candle`** ([ADR 0006](../adr/0006-inference-runtime-candle.md), 2026-07-06),
+  `ort` as feature-gated fallback. [05](05-analysis-similarity-dedup.md).
 - Vector-index storage: embedded extension (`sqlite-vec`) vs sidecar HNSW; on-disk vs in-memory
   at 1M+. [02](02-data-model-and-storage.md)/[05](05-analysis-similarity-dedup.md).
   **✅ Decided 2026-07-06** by [`spikes/vector-index/`](../../spikes/vector-index/README.md):

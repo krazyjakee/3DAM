@@ -8,9 +8,9 @@ It stays inside its border. The `LibraryService` trait, its DTOs, pagination and
 
 ---
 
-## 1. Toolkit choice — framed, not chosen
+## 1. Toolkit choice — **egui / eframe** ([ADR 0005](../adr/0005-gui-toolkit-egui.md))
 
-The GUI toolkit is an **open decision** (PRODUCT_SPEC §7, §10; a later ADR settles it). Two native Rust candidates lead, both on **wgpu**, so [06](06-3d-render.md)'s viewer embeds either way. This section frames the tradeoffs for *this specific product* — a dense, dark, virtualised tooling UI over a `LibraryService` — and does **not** pick.
+**Decided: `egui`/`eframe`.** The GUI toolkit is settled by [ADR 0005](../adr/0005-gui-toolkit-egui.md) — immediate-mode fits the dense, virtualised, dark tooling UI (100k-row grid/table via `ScrollArea::show_rows`), `egui-wgpu` gives first-class embedding of [06](06-3d-render.md)'s viewer onto the toolkit's own wgpu device, and the ecosystem (`egui_extras`, dev-tool precedent incl. `mogen-studio`) matches the product. The rendering/perf spike below is now a **validation** step, not a gate. The tradeoff table and Iced comparison are retained for the record; where this file says "under Iced …", read it as the road not taken.
 
 The product's demands, in priority order (DESIGN_GUIDELINES §1.1 first):
 
@@ -376,7 +376,7 @@ An immediate-mode toolkit (egui) redraws every frame unless told otherwise; naiv
 
 ## Open questions
 
-- **GUI toolkit final choice** (egui/eframe vs Iced vs other) — carried from PRODUCT_SPEC §10. Blocked on the §1 rendering/perf spike: virtualised grid+table at 100k+ with the real derivative cache, embedded [06](06-3d-render.md) viewer in a mid-layout rect, sustained scroll frame time *and* idle CPU (§7.3) measured in each; settled by a later ADR. Everything in this file is written to hold under either outcome.
+- ~~**GUI toolkit final choice**~~ — **Decided: egui/eframe** ([ADR 0005](../adr/0005-gui-toolkit-egui.md), 2026-07-06). The §1 rendering/perf spike (virtualised grid+table at 100k+ over the real derivative cache, embedded [06](06-3d-render.md) viewer, sustained scroll frame time *and* idle CPU §7.3) remains as a **validation** follow-up, not a gate on the choice.
 - **View-logic sharing between web and desktop** — carried from [ROADMAP.md](../ROADMAP.md) Open questions. The web client (file 09) ships first and settles the interaction patterns; how much *presentation* logic (query/facet modelling, virtual-window bookkeeping, selection/keyboard semantics) is worth sharing across the React web UI and this native GUI — versus letting each own its presentation over the shared [03](03-library-service-and-api.md) API — is open. The `LibraryService` seam is shared by construction; the view layer above it may or may not be.
 - **Where the frontend-shared helper lives** — [01](01-architecture-and-crates.md) Open questions defers `open_backend`/`Backend` and `classify`/`Role` placement (in `3dam-cli`, a new `3dam-frontend` crate, or `3dam-api`) to this file. Leaning toward a small `3dam-frontend` crate so `3dam-gui` need not link the whole clap tree just to reach the backend constructor; to settle with [13-cli.md](13-cli.md).
 - **Windowed-rows reconciliation with live updates.** When the §2.4 stream splices new assets into a sorted, windowed result set, how insertions/removals reconcile against the engine's ordering without a full re-query (stable positions vs periodic window refresh) needs pinning down against [03](03-library-service-and-api.md)'s pagination/stream contract.

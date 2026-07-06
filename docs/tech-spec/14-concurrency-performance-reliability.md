@@ -2,6 +2,8 @@
 
 Status: **Draft v0.1** · Scope: the execution model — the tokio (I/O) + rayon (CPU) split, bounded worker pools with backpressure, the incremental non-blocking pipeline, cancellation/resumability, out-of-core data access at 1M+ assets, fail-soft as a pipeline mechanism, and the performance targets and how they are benchmarked.
 
+The **tokio (async I/O) + rayon (CPU) foundation** described here is ratified by [ADR 0007](../adr/0007-concurrency-runtime-tokio-rayon.md) (2026-07-06); scale is validated by the [15](15-observability-config-testing-packaging.md) benchmark harness as a standing regression guard, not a go/no-go spike.
+
 This file is the **cross-cutting concurrency/performance/reliability layer**. It does not decide *what* work is done — scanning ([07](07-sources-and-federation.md)), cheap metadata and decode ([04](04-media-handlers.md)), feature extraction / embeddings / similarity ([05](05-analysis-similarity-dedup.md)), render ([06](06-3d-render.md)), and convert ([08](08-convert-pipeline.md)) each own their domain logic — it owns **how that work is scheduled, bounded, cancelled, and streamed**. Those files plug their per-item functions into the primitives defined here; this file guarantees the UI stays at 60 fps and the process stays inside its memory/FD budget while they run ([PRODUCT_SPEC](../PRODUCT_SPEC.md) §7, §8; [DESIGN_GUIDELINES](../DESIGN_GUIDELINES.md) §1.1, §2, §6).
 
 **Borders (do not write outside them).**

@@ -593,20 +593,20 @@ can read and set it too — so nothing is browser-only and a headless operator i
 Choices to be validated by spikes; listed to establish direction, not to lock in.
 
 - **Language:** Rust across core, CLI, and GUI.
-- **GUI:** a native, GPU-accelerated Rust UI toolkit — leading candidates **egui/eframe**
-  or **Iced** — with **wgpu** for the embedded 3D viewer and custom thumbnail/waveform
-  rendering. (Decision recorded in a later ADR.)
-- **Database:** embedded **SQLite** (via `rusqlite`/`sqlx`) for metadata; a vector index
-  for similarity (e.g. `sqlite-vec`, `usearch`, or an HNSW crate). Local, single-file,
-  portable.
+- **GUI:** a native, GPU-accelerated Rust UI toolkit — **`egui`/`eframe`**
+  ([ADR 0005](adr/0005-gui-toolkit-egui.md)) — with **wgpu** for the embedded 3D viewer and
+  custom thumbnail/waveform rendering.
+- **Database:** embedded **SQLite** (via `rusqlite`/`sqlx`) for metadata; the vector index for
+  similarity is a **sidecar HNSW (`usearch`)** ([spike](../spikes/vector-index/README.md)), with
+  `sqlite-vec` retained for small libraries / exact re-rank. Local, single-file, portable.
 - **Audio:** `symphonia` (decode) + FFT/DSP crates (`rustfft`/`realfft`) for feature
   extraction; playback via `cpal`/`rodio`.
 - **Image:** `image` + `imageproc`; perceptual hashing (`img_hash`); optional GPU decode.
 - **3D:** `gltf` and format loaders (glTF/FBX/OBJ/etc.), `wgpu` for rendering turntable
   thumbnails and the interactive viewer; mesh optimisation via `meshopt`-style tooling.
-- **ML / embeddings:** on-device inference via `candle` or ONNX Runtime (`ort`) to run
-  CLIP-style image models, audio embedding models, and shape/multi-view models — all local,
-  no cloud calls.
+- **ML / embeddings:** on-device inference via **`candle`** ([ADR 0006](adr/0006-inference-runtime-candle.md);
+  ONNX Runtime `ort` a feature-gated fallback) to run CLIP-style image models, audio embedding
+  models, and shape/multi-view models — all local, no cloud calls.
 - **File sources:** SFTP via `russh`/`ssh2`; SMB/Samba via an SMB client crate; behind the
   common `Source` trait.
 - **Federated sources:** a 3DAM-server `Source` implementation that satisfies the same trait
@@ -684,9 +684,14 @@ Choices to be validated by spikes; listed to establish direction, not to lock in
 
 ## 10. Open questions
 
-- GUI toolkit final choice (egui vs Iced vs other) — needs a rendering/perf spike.
+- ~~GUI toolkit final choice (egui vs Iced vs other).~~ **Decided:** `egui`/`eframe`
+  ([ADR 0005](adr/0005-gui-toolkit-egui.md)); the perf spike is a validation follow-up.
 - Which concrete embedding models per media type balance quality, size, and speed on-device.
-- Vector index: embedded extension vs standalone crate; on-disk vs in-memory at scale.
+  (The *runtime* is decided — `candle`, [ADR 0006](adr/0006-inference-runtime-candle.md); the
+  concrete models remain open.)
+- ~~Vector index: embedded extension vs standalone crate; on-disk vs in-memory at scale.~~
+  **Decided:** sidecar HNSW (`usearch`) as the primary index, `sqlite-vec` for small libraries /
+  exact re-rank ([spike](../spikes/vector-index/README.md)).
 - Extent of write-back to sources (rename/relocate) vs strictly-read-only default.
 - Format coverage matrix for v1 vs later (which loaders/converters ship first).
 - ~~Web client approach: shared Rust→WASM view code vs a separate web UI.~~ **Decided:**
