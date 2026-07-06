@@ -1,5 +1,6 @@
 import type React from "react";
 import { useState } from "react";
+import { Link } from "react-router-dom";
 import {
   AudioLines,
   Box,
@@ -8,6 +9,7 @@ import {
   Layers,
   Library,
   RefreshCw,
+  Settings as SettingsIcon,
   Tag as TagIcon,
   Trash2,
 } from "lucide-react";
@@ -169,6 +171,14 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
       </div>
 
       <div className="mt-auto" />
+      {/* Admin / Settings surface (tech-spec 09 §B.4). */}
+      <Link
+        to="/settings"
+        onClick={onNavigate}
+        className="flex items-center gap-2 border-t border-border px-3 py-2 text-xs text-fg-dim hover:text-accent coarse:min-h-11"
+      >
+        <SettingsIcon size={14} /> Settings &amp; Administration
+      </Link>
       {showAdd && <AddSourceDialog onClose={() => setShowAdd(false)} />}
     </nav>
   );

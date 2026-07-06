@@ -2,17 +2,20 @@
 //! store, media handlers, and sources (tech-spec 01 §3). No UI, transport, or GPU (ADR 0002).
 //! This is the standalone, no-network path; `3dam-server` serves the same object over HTTP/WS.
 
+mod analysis;
 mod convert;
+mod export;
 mod paths;
 mod scan;
+mod watch;
 
 pub use paths::default_data_dir;
 
 use async_trait::async_trait;
 use dam_api::dto::*;
-use dam_api::event::{LibraryEvent, SubscribeRequest};
-use dam_api::id::{AssetId, JobId, SourceId};
-use dam_api::page::Page;
+use dam_api::event::{ChangeKind, LibraryEvent, SubscribeRequest};
+use dam_api::id::{AssetId, CollectionId, JobId, SourceId};
+use dam_api::page::{Page, PageParams};
 use dam_api::service::{AuthContext, EventStream, LibraryService};
 use dam_api::LibError;
 use dam_store::Store;
@@ -40,7 +43,7 @@ const THUMB_MAX_EDGE: u32 = 1024;
 /// keyed by content hash (falling back to the asset id) so identical bytes share one derivative.
 fn gen_thumbnail(
     data_dir: &Path,
-    source_root: &str,
+    store: &Store,
     asset: &Asset,
     max_edge: u32,
 ) -> Result<AssetContent, LibError> {
@@ -51,25 +54,17 @@ fn gen_thumbnail(
     let cache_dir = data_dir.join("cache").join("thumbnails");
     let cache_path = cache_dir.join(format!("{key}-{max_edge}.png"));
     if let Ok(bytes) = std::fs::read(&cache_path) {
-        return Ok(png_content(bytes));
+        return Ok(png_content(bytes)); // cache hit → no source access at all
     }
 
-    // Resolve + traversal-guard the source file (same rule as read_content).
-    let rel = Path::new(&asset.path);
-    if rel
-        .components()
-        .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
-        return Err(LibError::BadRequest(
-            "asset path escapes its source root".to_string(),
-        ));
-    }
-    let abs = Path::new(source_root).join(rel);
+    // Cache miss: resolve the source file (in place for local, downloaded for remote). `fetch`
+    // guards `..` traversal out of the source root.
+    let fetched = fetch_asset(store, asset)?;
     let det = dam_media::Detected {
         media: asset.summary.media,
         format: asset.summary.format.clone(),
     };
-    let thumb = dam_media::render_thumbnail(&abs, &det, max_edge).map_err(map_handler_err)?;
+    let thumb = dam_media::render_thumbnail(fetched.path(), &det, max_edge).map_err(map_handler_err)?;
 
     // Best-effort cache write (a cold cache is a slow path, not an error).
     if std::fs::create_dir_all(&cache_dir).is_ok() {
@@ -79,6 +74,14 @@ fn gen_thumbnail(
         }
     }
     Ok(png_content(thumb.bytes))
+}
+
+/// Serialise an optional saved query to JSON for the `collection.query` column.
+fn serialize_opt_query(q: &Option<QueryRequest>) -> Result<Option<String>, LibError> {
+    q.as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|e| LibError::Internal(e.to_string()))
 }
 
 fn png_content(bytes: Vec<u8>) -> AssetContent {
@@ -99,27 +102,27 @@ fn map_handler_err(e: dam_media::HandlerError) -> LibError {
     }
 }
 
-/// Resolve an asset to its on-disk file (source root + stored relative path) and read the bytes,
-/// bounded and traversal-guarded. Pure/blocking — called inside a `spawn_blocking` closure.
-fn read_asset_file(source_root: &str, asset: &Asset) -> Result<AssetContent, LibError> {
-    let rel = Path::new(&asset.path);
-    // Defence in depth: stored paths come from our own walk, but never let one escape the root.
-    if rel
-        .components()
-        .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
-        return Err(LibError::BadRequest(
-            "asset path escapes its source root".to_string(),
-        ));
-    }
+/// Rebuild the asset's source backend and resolve its bytes to a local path (in place for local,
+/// downloaded to a temp file for SFTP/SMB). Traversal-guarded inside `fetch`. Pure/blocking.
+fn fetch_asset(store: &Store, asset: &Asset) -> Result<dam_sources::Fetched, LibError> {
+    let conn = store.get_source_connection(&asset.source_id)?;
+    let fs = dam_sources::open_source(&conn)?;
+    fs.fetch(&asset.path)
+}
+
+/// Read an asset's bytes for a preview, bounded by the content cap. The size gate is checked
+/// against the stored size *before* any (possibly remote) fetch, so an oversized asset never
+/// triggers a download. Pure/blocking — called inside a `spawn_blocking` closure.
+fn read_asset_content(store: &Store, asset: &Asset) -> Result<AssetContent, LibError> {
     let size = asset.summary.size;
     if size > MAX_CONTENT_BYTES {
         return Err(LibError::Unsupported(format!(
             "asset is {size} bytes; preview content is capped at {MAX_CONTENT_BYTES} bytes"
         )));
     }
-    let abs = Path::new(source_root).join(rel);
-    let bytes = std::fs::read(&abs)
+    let fetched = fetch_asset(store, asset)?;
+    let abs = fetched.path();
+    let bytes = std::fs::read(abs)
         .map_err(|e| LibError::Internal(format!("read {}: {e}", abs.display())))?;
     let media = asset.summary.media;
     let format = asset.summary.format.clone();
@@ -136,9 +139,10 @@ fn read_asset_file(source_root: &str, asset: &Asset) -> Result<AssetContent, Lib
 pub struct EmbeddedLibrary {
     store: Arc<Store>,
     events: broadcast::Sender<LibraryEvent>,
-    #[allow(dead_code)]
     data_dir: PathBuf,
     cancels: Mutex<HashMap<JobId, Arc<AtomicBool>>>,
+    /// Auto-rescan watchers for `watch`-enabled sources (tech-spec 07 §3.1).
+    watchers: watch::WatchManager,
 }
 
 impl EmbeddedLibrary {
@@ -148,12 +152,18 @@ impl EmbeddedLibrary {
         let store = tokio::task::spawn_blocking(move || Store::open(&dir))
             .await
             .map_err(|e| LibError::Internal(e.to_string()))??;
+        let store = Arc::new(store);
         let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        let watchers =
+            watch::WatchManager::new(store.clone(), events.clone(), tokio::runtime::Handle::current());
+        // Resume watching any source configured to auto-rescan (tech-spec 07 §3.1).
+        watchers.start_all();
         Ok(EmbeddedLibrary {
-            store: Arc::new(store),
+            store,
             events,
             data_dir: data_dir.to_path_buf(),
             cancels: Mutex::new(HashMap::new()),
+            watchers,
         })
     }
 
@@ -198,11 +208,7 @@ impl LibraryService for EmbeddedLibrary {
         let id = *id;
         self.db(move |s| {
             let asset = s.get_asset(&id)?;
-            // Asset paths are stored relative to their source root (scan.rs); rejoin to read.
-            let source = s
-                .get_source(&asset.source_id)?
-                .ok_or_else(|| LibError::NotFound(format!("source {}", asset.source_id)))?;
-            read_asset_file(&source.uri, &asset)
+            read_asset_content(s, &asset)
         })
         .await
     }
@@ -218,10 +224,7 @@ impl LibraryService for EmbeddedLibrary {
         let data_dir = self.data_dir.clone();
         self.db(move |s| {
             let asset = s.get_asset(&id)?;
-            let source = s
-                .get_source(&asset.source_id)?
-                .ok_or_else(|| LibError::NotFound(format!("source {}", asset.source_id)))?;
-            gen_thumbnail(&data_dir, &source.uri, &asset, edge)
+            gen_thumbnail(&data_dir, s, &asset, edge)
         })
         .await
     }
@@ -252,32 +255,47 @@ impl LibraryService for EmbeddedLibrary {
     }
 
     async fn add_source(&self, _ctx: &AuthContext, req: AddSource) -> Result<SourceId, LibError> {
-        if req.kind != SourceKind::LocalFs {
-            return Err(LibError::Unsupported(format!(
-                "source kind {:?} is not supported in this build (phase 1 = local filesystem)",
-                req.kind
-            )));
-        }
-        // Normalise the path and check it exists up front (fail early on an obvious typo).
-        let path = PathBuf::from(&req.uri);
-        if !path.exists() {
-            return Err(LibError::BadRequest(format!(
-                "path does not exist: {}",
-                req.uri
-            )));
-        }
-        let uri = path
-            .canonicalize()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or(req.uri.clone());
-        let name = req.name.clone().unwrap_or_else(|| {
-            path.file_name()
+        let opts = dam_sources::ConnOptions {
+            username: req.options.username.clone(),
+            password: req.options.password.clone(),
+            private_key: req.options.private_key.clone(),
+            passphrase: req.options.passphrase.clone(),
+            domain: req.options.domain.clone(),
+            port: req.options.port,
+        };
+        let mut conn = dam_sources::SourceConnection::parse(req.kind.as_str(), &req.uri, &opts)?;
+
+        // Local FS: normalise + existence-check up front (fail early on a typo). Remote sources are
+        // allowed to be offline at add-time — the scan surfaces reachability, fail-soft (§3).
+        let default_name: String;
+        if let dam_sources::SourceConnection::LocalFs { root } = &mut conn {
+            let path = PathBuf::from(&*root);
+            if !path.exists() {
+                return Err(LibError::BadRequest(format!("path does not exist: {root}")));
+            }
+            let canon = path
+                .canonicalize()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| root.clone());
+            default_name = path
+                .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| uri.clone())
-        });
+                .unwrap_or_else(|| canon.clone());
+            *root = canon;
+        } else {
+            default_name = conn.display_uri();
+        }
+
+        let name = req.name.clone().unwrap_or(default_name);
         let watch = req.options.watch;
-        self.db(move |s| s.add_source(SourceKind::LocalFs, &uri, &name, watch))
-            .await
+        let id = self
+            .db(move |s| s.add_source(&conn, &name, watch))
+            .await?;
+        // Start watching immediately if requested (tech-spec 07 §3.1).
+        if watch {
+            self.watchers.ensure(id);
+        }
+        Ok(id)
     }
 
     async fn remove_source(
@@ -291,24 +309,129 @@ impl LibraryService for EmbeddedLibrary {
             .await
     }
 
+    // ── collections / smart folders ──────────────────────────────────────────
+    async fn list_collections(&self, _ctx: &AuthContext) -> Result<Vec<Collection>, LibError> {
+        self.db(|s| s.list_collections()).await
+    }
+
+    async fn get_collection(
+        &self,
+        _ctx: &AuthContext,
+        id: &CollectionId,
+    ) -> Result<Collection, LibError> {
+        let id = *id;
+        self.db(move |s| {
+            let mut c = s.get_collection(&id)?;
+            // A smart folder's count is the live match count — compute it on the single-item read.
+            if c.kind == CollectionKind::Smart {
+                let ids = s.query_asset_ids(&c.query.clone().unwrap_or_default())?;
+                c.count = Some(ids.len() as u64);
+            }
+            Ok(c)
+        })
+        .await
+    }
+
+    async fn create_collection(
+        &self,
+        _ctx: &AuthContext,
+        req: NewCollection,
+    ) -> Result<CollectionId, LibError> {
+        if req.kind == CollectionKind::Smart && req.query.is_none() {
+            return Err(LibError::BadRequest(
+                "a smart folder requires a query".into(),
+            ));
+        }
+        let query_json = serialize_opt_query(&req.query)?;
+        let name = req.name.clone();
+        let kind = req.kind;
+        self.db(move |s| s.create_collection(&name, kind, query_json.as_deref()))
+            .await
+    }
+
+    async fn update_collection(
+        &self,
+        _ctx: &AuthContext,
+        id: &CollectionId,
+        req: UpdateCollection,
+    ) -> Result<(), LibError> {
+        let id = *id;
+        let query_json = serialize_opt_query(&req.query)?;
+        let name = req.name.clone();
+        self.db(move |s| s.update_collection(&id, name.as_deref(), query_json.as_deref()))
+            .await
+    }
+
+    async fn delete_collection(
+        &self,
+        _ctx: &AuthContext,
+        id: &CollectionId,
+    ) -> Result<(), LibError> {
+        let id = *id;
+        self.db(move |s| s.delete_collection(&id)).await
+    }
+
+    async fn modify_collection_members(
+        &self,
+        _ctx: &AuthContext,
+        id: &CollectionId,
+        req: CollectionMembers,
+    ) -> Result<(), LibError> {
+        let id = *id;
+        let add = req.add.clone();
+        let remove = req.remove.clone();
+        self.db(move |s| s.modify_collection_members(&id, &add, &remove))
+            .await
+    }
+
+    async fn collection_assets(
+        &self,
+        _ctx: &AuthContext,
+        id: &CollectionId,
+        page: PageParams,
+    ) -> Result<Page<AssetSummary>, LibError> {
+        let id = *id;
+        self.db(move |s| {
+            let coll = s.get_collection(&id)?;
+            match coll.kind {
+                CollectionKind::Manual => {
+                    let items = s.collection_summaries(&id, page.clamped(500))?;
+                    Ok(Page::new(items, None))
+                }
+                CollectionKind::Smart => {
+                    // Live resolution: run the saved query with the caller's page window.
+                    let mut q = coll.query.unwrap_or_default();
+                    q.page = page;
+                    s.query_assets(&q)
+                }
+            }
+        })
+        .await
+    }
+
+    async fn export(&self, _ctx: &AuthContext, req: ExportRequest) -> Result<ExportReport, LibError> {
+        self.db(move |s| export::run_export(s, req)).await
+    }
+
     async fn submit_scan(&self, _ctx: &AuthContext, req: ScanRequest) -> Result<JobId, LibError> {
-        // Resolve target sources (all local_fs when none specified).
+        // Resolve target sources (all file sources when none specified; federated peers excluded).
         let all = self.db(|s| s.list_sources()).await?;
         let sources: Vec<SourceInfo> = if req.sources.is_empty() {
             all.into_iter()
-                .filter(|s| s.kind == SourceKind::LocalFs)
+                .filter(|s| s.kind != SourceKind::Federated)
                 .collect()
         } else {
             all.into_iter()
-                .filter(|s| req.sources.contains(&s.id))
+                .filter(|s| req.sources.contains(&s.id) && s.kind != SourceKind::Federated)
                 .collect()
         };
         if sources.is_empty() {
             return Err(LibError::BadRequest(
-                "no scannable (local filesystem) sources selected".into(),
+                "no scannable file sources selected".into(),
             ));
         }
 
+        let mode = req.mode;
         let params = serde_json::to_string(&req).unwrap_or_else(|_| "{}".into());
         let job = self
             .db(move |s| s.create_job(JobKind::Scan, &params, None))
@@ -320,10 +443,91 @@ impl LibraryService for EmbeddedLibrary {
         let store = self.store.clone();
         let events = self.events.clone();
         tokio::task::spawn_blocking(move || {
-            scan::run_scan(store, events, job, sources, cancel);
+            scan::run_scan(store, events, job, sources, mode, cancel);
         });
 
         Ok(job)
+    }
+
+    async fn submit_analyze(
+        &self,
+        _ctx: &AuthContext,
+        req: AnalyzeRequest,
+    ) -> Result<JobId, LibError> {
+        // Plan: resolve the due (or requested) targets up front so the job total is known (§1.2).
+        let assets = req.assets.clone();
+        let force = req.force;
+        let targets = self
+            .db(move |s| s.list_analysis_targets(analysis::PIPELINE_VERSION, force, &assets))
+            .await?;
+        if targets.is_empty() {
+            return Err(LibError::BadRequest(
+                "nothing to analyse (all assets are up to date; pass --force to re-run)".into(),
+            ));
+        }
+
+        let params = serde_json::to_string(&req).unwrap_or_else(|_| "{}".into());
+        let total = targets.len() as u64;
+        let job = self
+            .db(move |s| s.create_job(JobKind::Analyze, &params, Some(total)))
+            .await?;
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.cancels.lock().unwrap().insert(job, cancel.clone());
+
+        let store = self.store.clone();
+        let events = self.events.clone();
+        tokio::task::spawn_blocking(move || {
+            analysis::run_analyze(store, events, job, targets, cancel);
+        });
+        Ok(job)
+    }
+
+    async fn find_similar(
+        &self,
+        _ctx: &AuthContext,
+        req: SimilarRequest,
+    ) -> Result<Page<SimilarHit>, LibError> {
+        let SimilarRequest { asset, k, filters } = req;
+        let hits = self
+            .db(move |s| s.similar(&asset, k, &filters))
+            .await?
+            .into_iter()
+            // Tag each hit with the media space it was ranked in (the explanation, §3.2).
+            .map(|(asset, score)| SimilarHit {
+                space: format!("{}-stats-v1", asset.media.as_str()),
+                asset,
+                score,
+            })
+            .collect::<Vec<_>>();
+        Ok(Page::new(hits, None))
+    }
+
+    async fn list_duplicates(
+        &self,
+        _ctx: &AuthContext,
+        req: DupRequest,
+    ) -> Result<Vec<DupGroup>, LibError> {
+        self.db(move |s| s.duplicates(&req)).await
+    }
+
+    async fn review_suggestion(
+        &self,
+        _ctx: &AuthContext,
+        req: SuggestionReview,
+    ) -> Result<(), LibError> {
+        let state = match req.action {
+            ReviewAction::Accept => "confirmed",
+            ReviewAction::Reject => "rejected",
+        };
+        let id = req.asset;
+        let tag = req.tag.clone();
+        self.db(move |s| s.set_tag_state(&id, &tag, state)).await?;
+        let _ = self.events.send(LibraryEvent::AssetChanged {
+            id: req.asset,
+            kind: ChangeKind::Retagged,
+        });
+        Ok(())
     }
 
     async fn get_job(&self, _ctx: &AuthContext, id: &JobId) -> Result<JobStatus, LibError> {

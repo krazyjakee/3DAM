@@ -5,6 +5,7 @@
 //! HTTP, so it costs nothing to link everywhere and imposes no transitive weight. Everyone
 //! depends on it; it depends on no other workspace crate.
 
+pub mod admin;
 pub mod dto;
 pub mod error;
 pub mod event;
@@ -18,4 +19,4 @@ pub use error::{ErrorBody, LibError};
 pub use event::{ChangeKind, EventTopic, JobEvent, LibraryEvent, SubscribeRequest};
 pub use id::{AssetId, CollectionId, ContentHash, JobId, SourceId, TagId};
 pub use page::{Cursor, ItemWarning, Page, PageParams, PartialStatus};
-pub use service::{AuthContext, EventStream, LibraryService};
+pub use service::{AuthContext, EventStream, LibraryService, Scope, Scopes};

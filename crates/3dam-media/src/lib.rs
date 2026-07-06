@@ -8,8 +8,11 @@
 //! server-rendered thumbnail here.
 
 mod audio;
+mod features;
 mod image;
 mod model;
+
+pub use features::{extract_image_features, ImageFeatures};
 
 use dam_api::dto::{MediaAttributes, MediaType};
 use std::path::Path;

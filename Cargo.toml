@@ -32,7 +32,9 @@ rust-version = "1.85"
 dam-api = { path = "crates/3dam-api" }
 dam-store = { path = "crates/3dam-store" }
 dam-media = { path = "crates/3dam-media" }
-dam-sources = { path = "crates/3dam-sources" }
+# default-features off here so light consumers (the store) skip the SFTP/SMB network stack; the
+# engine (dam-core) opts the backends back in via `features = ["sftp", "smb"]`.
+dam-sources = { path = "crates/3dam-sources", default-features = false }
 dam-render = { path = "crates/3dam-render" }
 dam-viewer = { path = "crates/3dam-viewer" }
 dam-core = { path = "crates/3dam-core" }
@@ -43,7 +45,7 @@ dam-gui = { path = "crates/3dam-gui" }
 dam-cli = { path = "crates/3dam-cli" }
 
 # async / runtime
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs", "signal", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs", "signal", "time", "io-std", "io-util"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 async-trait = "0.1"
 futures = "0.3"
@@ -69,10 +71,28 @@ rust-embed = { version = "8", features = ["mime-guess"] }
 
 # cli
 clap = { version = "4", features = ["derive"] }
+# serve config file (tech-spec 09 §A.1): TOML is the documented default; the loader is serde-driven.
+toml = "0.8"
 
 # fs / platform
 walkdir = "2"
 directories = "5"
+# temp files for materialising remote-source bytes to a local path the (path-based) media
+# handlers can read (tech-spec 07 §2); suffixed with the logical extension so detection holds.
+tempfile = "3"
+# local-FS change notification for watch/auto-rescan (tech-spec 07 §3.1). Debounced → delta scan.
+notify = "7"
+
+# network file sources (tech-spec 07 §3.2–§3.3). SFTP via russh (pure-Rust async SSH) + its SFTP
+# subsystem; SMB2/3 via the pure-Rust `smb` crate. russh is pinned to 0.51: newer russh wants
+# crypto-bigint 0.7.5 while `smb`'s `sspi` pins the =0.7.0-rc.8 prerelease, and the two cannot be
+# unified — 0.51 resolves cleanly alongside `smb`. Bump both together, deliberately.
+russh = "0.51"
+russh-sftp = "2"
+smb = "0.11"
+
+# CSV manifest export (tech-spec, phase 4 Reach — export/manifests).
+csv = "1"
 
 # render / gpu (wgpu pinned exactly — it breaks across minors; bump deliberately, tech-spec 06 §2).
 # Consumed by the `wasm32` viewer islands now (tech-spec 09 §B.3) and by `dam-render` later (ADR 0002).

@@ -126,6 +126,7 @@ fn from_gltf_json(root: &Value) -> ModelAttributes {
         has_rig,
         has_animation,
         has_uvs: Some(has_uvs),
+        class: None,
     }
 }
 
@@ -177,6 +178,7 @@ fn obj(path: &Path) -> Option<ModelAttributes> {
         has_rig: Some(false),
         has_animation: Some(false),
         has_uvs: Some(has_uvs),
+        class: None,
     })
 }
 
@@ -229,6 +231,7 @@ fn model_from_tris(tris: i64) -> ModelAttributes {
         has_rig: Some(false),
         has_animation: Some(false),
         has_uvs: Some(false),
+        class: None,
     }
 }
 
@@ -267,6 +270,7 @@ fn ply(path: &Path) -> Option<ModelAttributes> {
         has_rig: Some(false),
         has_animation: Some(false),
         has_uvs: None,
+        class: None,
     })
 }
 

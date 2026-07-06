@@ -217,6 +217,9 @@ pub struct AudioAttributes {
     pub codec: Option<String>,
     #[serde(default)]
     pub container: Option<String>,
+    /// Auto-category guess from analysis (`one_shot` | `loop` | `music` | `sfx`); tech-spec 05 §4.
+    #[serde(default)]
+    pub class: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -227,6 +230,25 @@ pub struct ImageAttributes {
     pub color_depth: Option<i64>,
     pub has_alpha: Option<bool>,
     pub color_space: Option<String>,
+    // ── derived by analysis (tech-spec 05 §5, §6); None until the analyze pass runs ──
+    /// Perceptual (dHash) hash, hex-encoded — the near-dup signal (§4.2).
+    #[serde(default)]
+    pub phash: Option<String>,
+    /// Edge-continuity tileability score in [0,1] (§6.2).
+    #[serde(default)]
+    pub tileability: Option<f32>,
+    /// Detected internal repeat period in source pixels, if the image already tiles (§6.3).
+    #[serde(default)]
+    pub repeat_period: Option<i64>,
+    /// `seamless` | `tiled` | `non_tiling` (§6.4).
+    #[serde(default)]
+    pub tile_class: Option<String>,
+    /// Dominant colours as `#rrggbb` hex, most-prominent first.
+    #[serde(default)]
+    pub dominant_colors: Vec<String>,
+    /// Auto-category guess (`texture` | `photo` | `sprite` | …).
+    #[serde(default)]
+    pub class: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -244,6 +266,9 @@ pub struct ModelAttributes {
     pub has_animation: Option<bool>,
     #[serde(default)]
     pub has_uvs: Option<bool>,
+    /// Auto-category guess (`prop` | `character` | `environment` | …); tech-spec 05 §5.
+    #[serde(default)]
+    pub class: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -437,6 +462,25 @@ pub struct SourceOptions {
     pub include: Vec<String>,
     #[serde(default)]
     pub exclude: Vec<String>,
+    // ── connection auth for network sources (SFTP/SMB); ignored for local (tech-spec 07 §3.2) ──
+    /// Login user (overrides any `user@` in the URI).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    /// Password (SFTP or SMB). Stored in the source's connection blob, never returned to clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    /// Path to a private key file for SFTP key auth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_key: Option<String>,
+    /// Passphrase for an encrypted private key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passphrase: Option<String>,
+    /// SMB domain/workgroup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    /// Override the default port (22 SFTP / 445 SMB).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -641,4 +685,232 @@ pub struct LibraryStats {
     pub by_source: CountMap,
     pub unanalyzed: u64,
     pub sources: u64,
+}
+
+// ── analysis / automation (tech-spec 05, phase 3) ────────────────────────────
+
+/// Submit an analysis pass. With no `assets`, the runner plans every asset that is *due* — behind
+/// the current extractor versions (§1.2, §7.2) — so a re-run is incremental, not a full re-sweep.
+/// `force` re-analyses even up-to-date assets (e.g. after tuning thresholds). Background job.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct AnalyzeRequest {
+    #[serde(default)]
+    pub assets: Vec<AssetId>,
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// A "find similar" query. By-asset-id in v1 ("more like this"); the upload-a-reference entry point
+/// (tech-spec 05 §3.2) lands with the MCP/web upload path. Scoped to the query asset's media space.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SimilarRequest {
+    pub asset: AssetId,
+    /// How many neighbours to return (post-filter, post-self-drop).
+    #[serde(default = "default_k")]
+    pub k: u32,
+    /// Compose with the same faceted filters as text search (§3.3).
+    #[serde(default)]
+    pub filters: Vec<Filter>,
+}
+
+fn default_k() -> u32 {
+    24
+}
+
+/// One similarity hit: the neighbour plus its cosine score and the space it was ranked in
+/// (the explanation, DESIGN_GUIDELINES §1.2).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SimilarHit {
+    pub asset: AssetSummary,
+    /// Cosine similarity in [0,1] (1 = identical direction).
+    pub score: f32,
+    /// The `EmbeddingSpace` id the ranking happened in.
+    pub space: String,
+}
+
+/// Which duplicate tier to surface for the review view (tech-spec 05 §4).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DupKind {
+    /// Byte-identical (content-hash groups) — free, exact.
+    #[default]
+    Exact,
+    /// Perceptually close but not identical (pHash / embedding cosine).
+    Near,
+}
+
+/// Request the duplicate groups for review. Optionally scoped to one media type.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DupRequest {
+    #[serde(default)]
+    pub kind: DupKind,
+    #[serde(default)]
+    pub media: Option<MediaType>,
+    #[serde(default = "default_dup_limit")]
+    pub limit: u32,
+}
+
+fn default_dup_limit() -> u32 {
+    100
+}
+
+/// A cluster of duplicates for the review view (§4.3). Never auto-deleted — 3DAM only groups.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DupGroup {
+    pub kind: DupKind,
+    pub media: MediaType,
+    pub members: Vec<AssetSummary>,
+    /// The pairwise signal that linked the group — the explanation (§4.3).
+    pub signal: String,
+    /// A suggested "keep" (highest resolution / most-permissive / largest); the user disposes.
+    pub suggested_keep: AssetId,
+}
+
+/// Accept or reject one auto-suggested tag (the one-action lifecycle, §1.4). Accept promotes the
+/// suggestion to a confirmed tag; reject records a negative so re-analysis won't re-suggest it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SuggestionReview {
+    pub asset: AssetId,
+    pub tag: String,
+    pub action: ReviewAction,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewAction {
+    Accept,
+    Reject,
+}
+
+// ── collections / smart folders (phase 4 Reach; PRODUCT_SPEC §3, §6.4) ────────────────────────
+
+/// Two kinds of set. A **manual** collection holds an explicit, hand-curated member list. A
+/// **smart** folder holds a saved query and resolves *live* — its members are whatever currently
+/// matches, so a smart folder like *safe-to-ship* stays correct as the library changes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollectionKind {
+    #[default]
+    Manual,
+    Smart,
+}
+
+impl CollectionKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CollectionKind::Manual => "manual",
+            CollectionKind::Smart => "smart",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "manual" => Some(CollectionKind::Manual),
+            "smart" => Some(CollectionKind::Smart),
+            _ => None,
+        }
+    }
+}
+
+/// A collection or smart folder record.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Collection {
+    pub id: CollectionId,
+    pub name: String,
+    pub kind: CollectionKind,
+    /// The saved query backing a smart folder (live set); `None` for a manual collection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<QueryRequest>,
+    /// Member count: exact for a manual collection; the current match count for a smart folder when
+    /// it was computed, else `None` (list views may skip the per-folder query for cheapness).
+    #[serde(default)]
+    pub count: Option<u64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// Create a collection. A smart folder must carry a `query`; a manual collection ignores it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NewCollection {
+    pub name: String,
+    #[serde(default)]
+    pub kind: CollectionKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<QueryRequest>,
+}
+
+/// Patch a collection: rename and/or (smart folders) replace the saved query. Absent fields are
+/// left unchanged.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct UpdateCollection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<QueryRequest>,
+}
+
+/// Add/remove members of a **manual** collection (a smart folder's membership is query-driven and
+/// cannot be edited directly).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CollectionMembers {
+    #[serde(default)]
+    pub add: Vec<AssetId>,
+    #[serde(default)]
+    pub remove: Vec<AssetId>,
+}
+
+// ── export / manifests (phase 4 Reach; PRODUCT_SPEC §6.4 — "export a manifest") ───────────────
+
+/// What to export. Exactly one selector; defaults to the whole library when all are empty.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ExportRequest {
+    /// Explicit asset ids (takes precedence).
+    #[serde(default)]
+    pub assets: Vec<AssetId>,
+    /// A collection / smart folder to export.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collection: Option<CollectionId>,
+    /// A search to export (the same faceted query as browse).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<QueryRequest>,
+    pub format: ExportFormat,
+    /// Destination: a file path for `json`/`csv`, a directory for `sidecar`.
+    pub output: String,
+    /// Restrict a manifest to license/attribution fields (the "credits list" use case).
+    #[serde(default)]
+    pub attribution_only: bool,
+}
+
+/// Manifest shape (tech-spec: JSON/CSV/sidecar).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExportFormat {
+    /// A single JSON document: `{ "assets": [ … ] }`.
+    #[default]
+    Json,
+    /// A single CSV file, one row per asset.
+    Csv,
+    /// One `<name>.json` sidecar per asset, written under the output directory.
+    Sidecar,
+}
+
+impl ExportFormat {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "json" => Some(ExportFormat::Json),
+            "csv" => Some(ExportFormat::Csv),
+            "sidecar" => Some(ExportFormat::Sidecar),
+            _ => None,
+        }
+    }
+}
+
+/// Result of an export run.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ExportReport {
+    pub format: ExportFormat,
+    /// The file (json/csv) or directory (sidecar) written.
+    pub output: String,
+    pub assets: u64,
+    /// Number of files written (1 for json/csv, N for sidecar).
+    pub files_written: u64,
 }

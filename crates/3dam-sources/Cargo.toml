@@ -3,8 +3,27 @@ name = "dam-sources"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Source trait + file sources (local FS now; SFTP/SMB/federated later) — tech-spec 07."
+description = "Source trait + file sources (local FS, SFTP, SMB; federated later) — tech-spec 07."
+
+[features]
+# SFTP/SMB backends are on by default but gated so a minimal build can drop the network stack.
+# Both are pure-Rust (no native libs). See the workspace manifest for the russh version pin.
+default = ["sftp", "smb"]
+sftp = ["dep:russh", "dep:russh-sftp"]
+smb = ["dep:smb"]
 
 [dependencies]
 dam-api.workspace = true
 walkdir.workspace = true
+tempfile.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+tracing.workspace = true
+# Remote backends are async; the sync FileSource methods drive them on a private current-thread
+# runtime (scan runs inside spawn_blocking, off the async workers — tech-spec 14).
+tokio = { workspace = true }
+futures = { workspace = true }
+
+russh = { workspace = true, optional = true }
+russh-sftp = { workspace = true, optional = true }
+smb = { workspace = true, optional = true }

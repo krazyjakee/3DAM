@@ -9,15 +9,19 @@ description = "The pure engine: EmbeddedLibrary over the store + handlers + sour
 dam-api.workspace = true
 dam-store.workspace = true
 dam-media.workspace = true
-dam-sources.workspace = true
+dam-sources = { workspace = true, features = ["sftp", "smb"] }
 tokio.workspace = true
 tokio-stream.workspace = true
 futures.workspace = true
 async-trait.workspace = true
 blake3.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 directories.workspace = true
+# watch/auto-rescan (local FS change notification) + CSV manifest export (phase 4 Reach).
+notify.workspace = true
+csv.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread"] }

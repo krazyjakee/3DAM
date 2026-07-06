@@ -4,10 +4,13 @@
 //! of the seam. Phase 1 covers the REST slice; the WS live-update transport lands with the server WS.
 
 use async_trait::async_trait;
+use dam_api::admin::{
+    AdminStatus, AuditEntry, FlagInfo, NewToken, NewTokenReply, SetFlag, TokenInfo,
+};
 use dam_api::dto::*;
 use dam_api::event::{LibraryEvent, SubscribeRequest};
-use dam_api::id::{AssetId, JobId, SourceId};
-use dam_api::page::Page;
+use dam_api::id::{AssetId, CollectionId, JobId, SourceId};
+use dam_api::page::{Page, PageParams};
 use dam_api::service::{AuthContext, EventStream, LibraryService};
 use dam_api::{ErrorBody, LibError};
 use serde::de::DeserializeOwned;
@@ -17,6 +20,10 @@ use url::Url;
 #[derive(serde::Deserialize)]
 struct IdReply {
     id: SourceId,
+}
+#[derive(serde::Deserialize)]
+struct CollectionIdReply {
+    id: CollectionId,
 }
 #[derive(serde::Deserialize)]
 struct JobIdReply {
@@ -52,9 +59,26 @@ fn media_from_content_type(ct: &str) -> (MediaType, String) {
 }
 
 impl ApiClient {
-    /// Connect to a remote server. `endpoint` is its base URL (e.g. `http://127.0.0.1:7878`).
+    /// Connect to a remote server without a credential (auth `Off`/`Anonymous` peers).
     pub async fn connect(endpoint: Url) -> Result<ApiClient, LibError> {
-        let http = reqwest::Client::builder()
+        Self::connect_with_token(endpoint, None).await
+    }
+
+    /// Connect presenting a bearer `token` on every request (required for a Token-mode peer). The
+    /// credential is set as a default header on the reqwest client so it rides every call uniformly.
+    pub async fn connect_with_token(
+        endpoint: Url,
+        token: Option<String>,
+    ) -> Result<ApiClient, LibError> {
+        let mut builder = reqwest::Client::builder();
+        if let Some(t) = &token {
+            let mut headers = reqwest::header::HeaderMap::new();
+            let value = reqwest::header::HeaderValue::from_str(&format!("Bearer {t}"))
+                .map_err(|e| LibError::BadRequest(format!("invalid token: {e}")))?;
+            headers.insert(reqwest::header::AUTHORIZATION, value);
+            builder = builder.default_headers(headers);
+        }
+        let http = builder
             .build()
             .map_err(|e| LibError::Internal(e.to_string()))?;
         Ok(ApiClient {
@@ -120,6 +144,58 @@ impl ApiClient {
             .await
             .map_err(|e| LibError::SourceUnavailable(e.to_string()))?;
         Self::decode(resp).await
+    }
+
+    async fn put<B: Serialize, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T, LibError> {
+        let resp = self
+            .http
+            .put(self.url(path)?)
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| LibError::SourceUnavailable(e.to_string()))?;
+        Self::decode(resp).await
+    }
+
+    // ── admin API (tech-spec 10 §5) — the CLI's `--connect` admin path ────────
+
+    /// `GET /admin/api/status`.
+    pub async fn admin_status(&self) -> Result<AdminStatus, LibError> {
+        self.get("/admin/api/status").await
+    }
+    /// `GET /admin/api/flags`.
+    pub async fn admin_flags(&self) -> Result<Vec<FlagInfo>, LibError> {
+        self.get("/admin/api/flags").await
+    }
+    /// `PUT /admin/api/flags/{key}`.
+    pub async fn admin_set_flag(&self, key: &str, req: &SetFlag) -> Result<FlagInfo, LibError> {
+        self.put(&format!("/admin/api/flags/{key}"), req).await
+    }
+    /// `GET /admin/api/tokens`.
+    pub async fn admin_tokens(&self) -> Result<Vec<TokenInfo>, LibError> {
+        self.get("/admin/api/tokens").await
+    }
+    /// `POST /admin/api/tokens` — returns the plaintext secret once.
+    pub async fn admin_create_token(&self, req: &NewToken) -> Result<NewTokenReply, LibError> {
+        self.post("/admin/api/tokens", req).await
+    }
+    /// `DELETE /admin/api/tokens/{id}`.
+    pub async fn admin_revoke_token(&self, id: &str) -> Result<(), LibError> {
+        let resp = self
+            .http
+            .delete(self.url(&format!("/admin/api/tokens/{id}"))?)
+            .send()
+            .await
+            .map_err(|e| LibError::SourceUnavailable(e.to_string()))?;
+        Self::expect_no_content(resp).await
+    }
+    /// `GET /admin/api/audit?limit=N`.
+    pub async fn admin_audit(&self, limit: u32) -> Result<Vec<AuditEntry>, LibError> {
+        self.get(&format!("/admin/api/audit?limit={limit}")).await
     }
 }
 
@@ -256,6 +332,127 @@ impl LibraryService for ApiClient {
             .await
             .map_err(|e| LibError::SourceUnavailable(e.to_string()))?;
         Self::expect_no_content(resp).await
+    }
+
+    async fn submit_analyze(
+        &self,
+        _ctx: &AuthContext,
+        req: AnalyzeRequest,
+    ) -> Result<JobId, LibError> {
+        let reply: JobIdReply = self.post("/api/v1/jobs/analyze", &req).await?;
+        Ok(reply.job_id)
+    }
+
+    async fn find_similar(
+        &self,
+        _ctx: &AuthContext,
+        req: SimilarRequest,
+    ) -> Result<Page<SimilarHit>, LibError> {
+        self.post("/api/v1/similar", &req).await
+    }
+
+    async fn list_duplicates(
+        &self,
+        _ctx: &AuthContext,
+        req: DupRequest,
+    ) -> Result<Vec<DupGroup>, LibError> {
+        self.post("/api/v1/duplicates", &req).await
+    }
+
+    async fn review_suggestion(
+        &self,
+        _ctx: &AuthContext,
+        req: SuggestionReview,
+    ) -> Result<(), LibError> {
+        let resp = self
+            .http
+            .post(self.url("/api/v1/suggestions/review")?)
+            .json(&req)
+            .send()
+            .await
+            .map_err(|e| LibError::SourceUnavailable(e.to_string()))?;
+        Self::expect_no_content(resp).await
+    }
+
+    async fn list_collections(&self, _ctx: &AuthContext) -> Result<Vec<Collection>, LibError> {
+        self.get("/api/v1/collections").await
+    }
+
+    async fn get_collection(
+        &self,
+        _ctx: &AuthContext,
+        id: &CollectionId,
+    ) -> Result<Collection, LibError> {
+        self.get(&format!("/api/v1/collections/{id}")).await
+    }
+
+    async fn create_collection(
+        &self,
+        _ctx: &AuthContext,
+        req: NewCollection,
+    ) -> Result<CollectionId, LibError> {
+        let reply: CollectionIdReply = self.post("/api/v1/collections", &req).await?;
+        Ok(reply.id)
+    }
+
+    async fn update_collection(
+        &self,
+        _ctx: &AuthContext,
+        id: &CollectionId,
+        req: UpdateCollection,
+    ) -> Result<(), LibError> {
+        let resp = self
+            .http
+            .put(self.url(&format!("/api/v1/collections/{id}"))?)
+            .json(&req)
+            .send()
+            .await
+            .map_err(|e| LibError::SourceUnavailable(e.to_string()))?;
+        Self::expect_no_content(resp).await
+    }
+
+    async fn delete_collection(
+        &self,
+        _ctx: &AuthContext,
+        id: &CollectionId,
+    ) -> Result<(), LibError> {
+        let resp = self
+            .http
+            .delete(self.url(&format!("/api/v1/collections/{id}"))?)
+            .send()
+            .await
+            .map_err(|e| LibError::SourceUnavailable(e.to_string()))?;
+        Self::expect_no_content(resp).await
+    }
+
+    async fn modify_collection_members(
+        &self,
+        _ctx: &AuthContext,
+        id: &CollectionId,
+        req: CollectionMembers,
+    ) -> Result<(), LibError> {
+        let resp = self
+            .http
+            .post(self.url(&format!("/api/v1/collections/{id}/members"))?)
+            .json(&req)
+            .send()
+            .await
+            .map_err(|e| LibError::SourceUnavailable(e.to_string()))?;
+        Self::expect_no_content(resp).await
+    }
+
+    async fn collection_assets(
+        &self,
+        _ctx: &AuthContext,
+        id: &CollectionId,
+        page: PageParams,
+    ) -> Result<Page<AssetSummary>, LibError> {
+        self.post(&format!("/api/v1/collections/{id}/assets"), &page)
+            .await
+    }
+
+    async fn export(&self, _ctx: &AuthContext, req: ExportRequest) -> Result<ExportReport, LibError> {
+        self.post("/api/v1/export", &req).await
     }
 
     async fn submit_scan(&self, _ctx: &AuthContext, req: ScanRequest) -> Result<JobId, LibError> {

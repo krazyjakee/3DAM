@@ -26,9 +26,9 @@ with current status. The spec is authoritative; this table just adds where we ar
 <tbody>
 <tr><td>1</td><td><strong>Foundation</strong> — schema, local scan, SQLite store, grid/table browse + text search, CLI <code>scan</code>/<code>search</code> <span class="sub">Embedded engine, <code>3dam serve</code> API, and CLI parity landed.</span></td><td><span class="pill done">Shipped</span></td></tr>
 <tr><td>2</td><td><strong>Media depth</strong> — per-type decode + preview (waveform, image, 3D), thumbnail cache, convert pipeline (CLI-first) <span class="sub">Cheap per-type metadata, server image thumbnails + cache, interactive audio/3D islands, and the CLI convert pipeline all landed; deeper codec/format coverage staged.</span></td><td><span class="pill done">Shipped</span></td></tr>
-<tr><td>3</td><td><strong>Automation</strong> — feature extraction + embeddings, similarity search, auto-tag/categorise, dedup, review UX <span class="sub">The differentiator. Spikes done (embedding models, cross-peer similarity, vector index).</span></td><td><span class="pill next">Next</span></td></tr>
-<tr><td>4</td><td><strong>Reach</strong> — SFTP + SMB sources, watch/auto-rescan, smart folders, export/manifests, CLI/GUI parity</td><td><span class="pill todo">Planned</span></td></tr>
-<tr><td>5</td><td><strong>Server &amp; web</strong> — <code>LibraryService</code> boundary, <code>3dam serve</code>, <code>3dam mcp</code>, <code>--connect</code>, web client, feature flags + Settings, basic auth <span class="sub">Boundary, serve, <code>--connect</code>, and web client landed early; flags/MCP/auth remain.</span></td><td><span class="pill active">Partly done</span></td></tr>
+<tr><td>3</td><td><strong>Automation</strong> — feature extraction + embeddings, similarity search, auto-tag/categorise, dedup, review UX <span class="sub">The differentiator. Analyze pass (embeddings + tileability/pHash + auto-tag/-category suggestions), embedding-cosine <code>find_similar</code>, exact + near dedup grouping, and the accept/reject suggestion lifecycle all landed CLI-first over the same seam (embedded + <code>--connect</code>). Model-free v1 behind the <code>EmbeddingSpace</code> seam (ADR 0006): SigLIP/CLAP weights are a later feature-gated bump; the web review surface and HNSW-at-scale follow.</span></td><td><span class="pill done">Shipped</span></td></tr>
+<tr><td>4</td><td><strong>Reach</strong> — SFTP + SMB sources, watch/auto-rescan, smart folders, export/manifests, CLI/GUI parity <span class="sub">The <code>FileSource</code> seam now spans local FS, <strong>SFTP</strong> (<code>russh</code>) and <strong>SMB2/3</strong> (pure-Rust <code>smb</code>) behind one <code>open_source</code>/<code>fetch</code> path; delta re-scan skips unchanged files and marks vanished ones absent; <strong>watch/auto-rescan</strong> (local FS events + remote polling) drives delta scans; <strong>smart folders</strong> (live saved queries) and manual collections; and <strong>export/manifests</strong> (JSON/CSV/sidecar, incl. attribution-only). All CLI-first over the same seam, embedded + <code>--connect</code>. Desktop GUI stays phase 5.</span></td><td><span class="pill done">Shipped</span></td></tr>
+<tr><td>5</td><td><strong>Server &amp; web</strong> — <code>LibraryService</code> boundary, <code>3dam serve</code>, <code>3dam mcp</code>, <code>--connect</code>, web client, feature flags + Settings, basic auth <span class="sub">Complete for v1: the runtime feature-flag store + audited <code>/admin/api</code> + web Settings surface, basic access control (anonymous + token auth), and the MCP server (<code>3dam mcp</code> stdio + flag-gated <code>POST /mcp</code>) all landed on the one auth surface. Opt-in <strong>user accounts + OIDC</strong> layer on the same seam in phase 6.</span></td><td><span class="pill done">Shipped</span></td></tr>
 <tr><td>6</td><td><strong>Federation &amp; auth</strong> — 3DAM-server source, federated fan-out + re-rank, cross-peer vector similarity, OIDC/OAuth2, opt-in accounts &amp; roles</td><td><span class="pill later">Later</span></td></tr>
 <tr><td>7</td><td><strong>Polish &amp; scale</strong> — performance at 1M assets, accessibility, packaging/distribution for all three OSes</td><td><span class="pill later">Later</span></td></tr>
 <tr><td>8</td><td><strong>Future — asset networks</strong> — peer relay/mesh, instance discovery, trust/reputation (beyond v1)</td><td><span class="pill later">Beyond v1</span></td></tr>
@@ -129,6 +129,76 @@ transcode/resize and audio→WAV — with dry-run planning, the <strong>source-s
 writes into a registered source), atomic temp-write-then-rename, and collision policy. Deeper codec and
 format coverage (DDS/KTX2, MP4/AAC decode, mesh optimise/compression, more encode targets) stages behind
 the same seams.</p>
+</div>
+
+<div class="log">
+<p class="when">2026-07-06</p>
+<h4>Automation — analysis, similarity, dedup, review <span class="pill done">Shipped</span></h4>
+<p>Capability <strong>phase 3</strong> — the differentiator — landed end-to-end
+(<a href="tech-spec/05-analysis-similarity-dedup.md">tech-spec 05</a>). A new <strong><code>AnalysisRunner</code></strong>
+(<code>3dam-core::analysis</code>) runs the versioned Plan→Extract→Derive→Classify→Index→Dedup pipeline as a
+background job (<code>3dam analyze</code>, incremental via <code>analysis_version</code>; <code>--force</code> re-runs).
+Per image it derives the <strong>tileability metric</strong> (edge-continuity vs internal gradient + autocorrelation
+repeat-period, §6), a <strong>dHash perceptual hash</strong>, and dominant colours, and it emits
+<strong>auto-tag / auto-category suggestions</strong> that are written <em>suggested</em>, never confirmed. Each media
+type gets a normalised embedding in its own <strong><code>EmbeddingSpace</code></strong> (schema V3 <code>embedding</code>
+table); <strong><code>find_similar</code></strong> ranks neighbours by cosine (brute-force exact in v1) and composes with the
+same facet filters as search. <strong>Duplicate review</strong> surfaces exact (content-hash) and near (embedding-cosine,
+union-find) groups with a suggested keep — grouping only, never deletion. The <strong>accept/reject suggestion
+lifecycle</strong> (<code>3dam tag &lt;id&gt; &lt;name&gt; [--reject]</code>) promotes/negates tags reversibly and a reject
+survives re-analysis. All four surfaces ride the <code>LibraryService</code> seam — embedded and remote
+(<code>--connect</code>) return identical results. <strong>Model-free v1</strong> per
+<a href="adr/0006-inference-runtime-candle.md">ADR 0006</a>: the default build runs offline with no weights, behind
+the exact seam the SigLIP/CLAP path plugs into as a <code>model_version</code> bump; the web review UX and
+HNSW-at-scale index are named follow-ups.</p>
+</div>
+
+<div class="log">
+<p class="when">2026-07-06</p>
+<h4>Reach — network sources, watch, smart folders, export <span class="pill done">Shipped</span></h4>
+<p>Capability <strong>phase 4</strong> landed end-to-end (<a href="tech-spec/07-sources-and-federation.md">tech-spec 07</a>).
+The <strong><code>FileSource</code> seam</strong> was generalised: every source resolves an entry's bytes to a local
+path via <code>fetch</code> (in place for local, a downloaded temp file suffixed with the logical extension for
+remote), and a <code>SourceConnection</code> model + <code>open_source</code> factory rebuild the backend from the
+persisted connection blob (secret held server-side; clients only ever see the sanitised URI). Two real
+network backends ride that seam: <strong>SFTP</strong> via <code>russh</code> + <code>russh-sftp</code> and
+<strong>SMB2/3</strong> via the pure-Rust <code>smb</code> crate, driven from a private current-thread runtime
+because the scan runs off the async workers. Unreachable hosts/bad creds mark the source offline and are
+skipped, never fatal (fail-soft). <strong>Delta re-scan</strong> compares each entry's size+mtime change token
+and only re-opens changed files, marking vanished ones absent (non-destructive). <strong>Watch/auto-rescan</strong>
+uses OS change notification for local sources (debounced) and polling for remote, each triggering a delta scan.
+<strong>Smart folders</strong> resolve a saved query live; manual collections hold an explicit set, surfaced on the
+inspector record. <strong>Export/manifests</strong> emit JSON, CSV, or per-asset JSON sidecars over a selector
+(ids / collection / query / whole library), with an <em>attribution-only</em> credits mode. All CLI-first
+(<code>sources add sftp://…|smb://…</code>, <code>scan --delta</code>, <code>collections …</code>,
+<code>export …</code>) over the <code>LibraryService</code> seam — embedded and <code>--connect</code> return
+identical results. Remote-source <em>analysis/convert</em> (fetch-through) and the web-client surfaces for
+collections/export are named follow-ups; the desktop GUI stays phase 5.</p>
+</div>
+
+<div class="log">
+<p class="when">2026-07-06</p>
+<h4>Server &amp; web — feature flags, basic auth, MCP <span class="pill done">Shipped</span></h4>
+<p>Capability <strong>phase 5</strong>'s remaining half landed (<a href="tech-spec/10-auth-accounts-and-flags.md">tech-spec 10</a>,
+<a href="tech-spec/11-mcp-server.md">11</a>, <a href="adr/0003-mcp-server.md">ADR 0003</a>/<a href="adr/0004-feature-flags-admin.md">0004</a>) — the
+serve/<code>--connect</code>/web-client half shipped earlier. A <strong>server config store</strong> (<code>server.db</code>,
+separate from the library file) holds a versioned <strong>feature-flag</strong> table, token records, and an append-only
+<strong>audit log</strong>; the live flag state is seeded by a <code>serve.toml</code> config file (<code>config_authority =
+seed-only</code>) and thereafter owned by the admin surface. Three flags gate real surfaces — <code>authentication</code>
+(off/anonymous/token), <code>mcp_server</code> (off/read-only/read-write), <code>network_writes</code> — each live-toggleable,
+with optimistic-concurrency versioning and a server-side <strong>confirm-on-exposure</strong> gate. <strong>Basic access
+control</strong> resolves every request to an <code>AuthContext</code> + scope set through one auth layer over the whole
+surface (API, admin, MCP); <code>Off</code> grants the localhost owner full trust, <code>Token</code> requires a bearer key,
+and read/write/admin scopes gate handlers (writes further gated by the network ceiling beyond localhost). Bearer
+<strong>API tokens</strong> are issued through the audited admin API (secret shown once, blake3-hashed at rest). The
+<strong>admin API</strong> (<code>/admin/api/*</code>) is the single source of truth driven by both the CLI (<code>3dam admin
+flags|flag|token|status|audit</code>, embedded or <code>--connect</code>) and the web <strong>Settings / Administration</strong>
+surface (grouped flag cards, warn-and-confirm, token management, audit trail). The <strong>MCP server</strong> (ADR 0003,
+hand-rolled JSON-RPC over <code>dyn LibraryService</code> — no subprocess) serves tools/resources/prompts over both
+<code>3dam mcp</code> stdio (locally trusted) and <code>POST /mcp</code> on the shared port; the <code>mcp_server</code>
+flag mounts/unmounts it (<code>Off ⇒ 404</code>) and a <code>WriteGate</code> (bind + flag + caller scope) filters the write
+tools. Binding beyond localhost without TLS is refused unless <code>--insecure</code> (ADR 0009 §4). <strong>User accounts,
+sessions, OIDC, and TLS</strong> layer on the same <code>AuthContext</code> seam in phase 6.</p>
 </div>
 
 ## Mobile &amp; tablet posture

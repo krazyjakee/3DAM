@@ -21,8 +21,12 @@ pub use dam_core::default_data_dir;
 pub enum Backend {
     /// Standalone: the engine is linked in-process. No network.
     Embedded { data_dir: PathBuf },
-    /// Thin client: talk to a remote `3dam serve` over its API.
-    Connected { endpoint: Url },
+    /// Thin client: talk to a remote `3dam serve` over its API. `token` is the bearer credential
+    /// presented on every request (tech-spec 10 §1.2) — required when the peer runs in Token mode.
+    Connected {
+        endpoint: Url,
+        token: Option<String>,
+    },
 }
 
 /// Resolve a `LibraryService` from how the tool was invoked. The front-end code above the trait is
@@ -33,8 +37,8 @@ pub async fn open_backend(b: Backend) -> Result<Box<dyn LibraryService>, LibErro
             let engine = EmbeddedLibrary::open(&data_dir).await?;
             Ok(Box::new(engine))
         }
-        Backend::Connected { endpoint } => {
-            let client = ApiClient::connect(endpoint).await?;
+        Backend::Connected { endpoint, token } => {
+            let client = ApiClient::connect_with_token(endpoint, token).await?;
             Ok(Box::new(client))
         }
     }

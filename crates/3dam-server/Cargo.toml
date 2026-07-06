@@ -17,3 +17,14 @@ serde_json.workspace = true
 futures.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
+# server config/flags/token/audit store — a small SQLite `server.db`, separate from the metadata
+# DB (tech-spec 10 §2.1). blake3 hashes token secrets; uuid mints token ids + high-entropy secrets.
+rusqlite.workspace = true
+blake3.workspace = true
+uuid.workspace = true
+# serve config file (tech-spec 09 §A.1).
+toml.workspace = true
+
+[dev-dependencies]
+# drive the router in-process (no port bind) via `ServiceExt::oneshot` (phase-5 integration tests).
+tower = { workspace = true, features = ["util"] }
