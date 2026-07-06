@@ -9,6 +9,7 @@ import { bytes } from "@/lib/format";
 import { Thumbnail } from "./Thumbnail";
 import { LicenseBadge } from "./LicenseBadge";
 import { MediaIcon } from "./MediaIcon";
+import { ContextMenu, useLongPress, type MenuState } from "./ContextMenu";
 
 const CELL_W = 150; // grid cell target width (px); actual columns computed from container
 const CELL_H = 132;
@@ -21,12 +22,24 @@ const ROW_H = COARSE_POINTER ? 44 : 30;
 export function Browser({ onOpenNav }: { onOpenNav?: () => void }) {
   const { state, patch, request } = useViewState();
   const assets = useAssets(request, state.collection);
+  const [menu, setMenu] = useState<MenuState | null>(null);
 
   const items = useMemo(
     () => assets.data?.pages.flatMap((p) => p.items) ?? [],
     [assets.data],
   );
   const total = assets.data?.pages[0]?.total ?? null;
+
+  const openMenu = (asset: AssetSummary, x: number, y: number) => setMenu({ asset, x, y });
+
+  const listProps = {
+    selected: state.selected,
+    onSelect: (id: string) => patch({ selected: id }),
+    onContext: openMenu,
+    hasMore: assets.hasNextPage,
+    loadMore: () => assets.fetchNextPage(),
+    loading: assets.isFetchingNextPage,
+  };
 
   return (
     <section className="flex h-full min-w-0 flex-1 flex-col bg-bg">
@@ -41,25 +54,12 @@ export function Browser({ onOpenNav }: { onOpenNav?: () => void }) {
             No assets match. Add a source and scan, or clear the filters.
           </Centered>
         ) : state.view === "grid" ? (
-          <Grid
-            items={items}
-            selected={state.selected}
-            onSelect={(id) => patch({ selected: id })}
-            hasMore={assets.hasNextPage}
-            loadMore={() => assets.fetchNextPage()}
-            loading={assets.isFetchingNextPage}
-          />
+          <Grid items={items} {...listProps} />
         ) : (
-          <Table
-            items={items}
-            selected={state.selected}
-            onSelect={(id) => patch({ selected: id })}
-            hasMore={assets.hasNextPage}
-            loadMore={() => assets.fetchNextPage()}
-            loading={assets.isFetchingNextPage}
-          />
+          <Table items={items} {...listProps} />
         )}
       </div>
+      <ContextMenu menu={menu} onClose={() => setMenu(null)} />
     </section>
   );
 }
@@ -172,13 +172,14 @@ interface ListProps {
   items: AssetSummary[];
   selected: string | null;
   onSelect: (id: string) => void;
+  onContext: (asset: AssetSummary, x: number, y: number) => void;
   hasMore: boolean;
   loadMore: () => void;
   loading: boolean;
 }
 
 /** Windowed grid — a 100k+ library scrolls at 60fps (DESIGN_GUIDELINES §1.1, §3.1). */
-function Grid({ items, selected, onSelect, hasMore, loadMore, loading }: ListProps) {
+function Grid({ items, selected, onSelect, onContext, hasMore, loadMore, loading }: ListProps) {
   const parentRef = useRef<HTMLDivElement>(null);
   const cols = useColumns(parentRef, CELL_W);
   const rowCount = Math.ceil(items.length / cols);
@@ -213,6 +214,7 @@ function Grid({ items, selected, onSelect, hasMore, loadMore, loading }: ListPro
                   asset={a}
                   active={a.id === selected}
                   onClick={() => onSelect(a.id)}
+                  onContext={onContext}
                 />
               ))}
             </div>
@@ -237,14 +239,22 @@ function GridCell({
   asset,
   active,
   onClick,
+  onContext,
 }: {
   asset: AssetSummary;
   active: boolean;
   onClick: () => void;
+  onContext: (asset: AssetSummary, x: number, y: number) => void;
 }) {
+  const longPress = useLongPress((x, y) => onContext(asset, x, y));
   return (
     <button
       onClick={onClick}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        onContext(asset, e.clientX, e.clientY);
+      }}
+      {...longPress}
       className="flex flex-col overflow-hidden rounded border text-left transition-colors"
       style={{
         height: CELL_H - 8,
@@ -271,7 +281,7 @@ function GridCell({
 }
 
 /** Windowed table — same query, toggle preserves selection + filter (tech-spec 09 §B.1). */
-function Table({ items, selected, onSelect, hasMore, loadMore, loading }: ListProps) {
+function Table({ items, selected, onSelect, onContext, hasMore, loadMore, loading }: ListProps) {
   const parentRef = useRef<HTMLDivElement>(null);
   const virt = useVirtualizer({
     count: items.length,
@@ -292,34 +302,63 @@ function Table({ items, selected, onSelect, hasMore, loadMore, loading }: ListPr
       <div style={{ height: virt.getTotalSize(), position: "relative" }}>
         {virt.getVirtualItems().map((vr) => {
           const a = items[vr.index];
-          const active = a.id === selected;
           return (
-            <button
+            <TableRow
               key={vr.key}
-              onClick={() => onSelect(a.id)}
-              className="absolute top-0 left-0 grid w-full grid-cols-[1fr_90px_110px_90px] items-center gap-2 px-3 text-left text-xs"
-              style={{
-                height: ROW_H,
-                transform: `translateY(${vr.start}px)`,
-                background: active ? "var(--color-accent-muted)" : "transparent",
-                color: active ? "var(--color-accent)" : "var(--color-fg-muted)",
-              }}
-            >
-              <span className="flex min-w-0 items-center gap-2">
-                <MediaIcon media={a.media} size={13} />
-                <span className="truncate text-fg" title={a.name}>
-                  {a.name}
-                </span>
-              </span>
-              <span className="truncate uppercase">{a.format}</span>
-              <LicenseBadge badge={a.license} />
-              <span className="text-right tabular-nums">{bytes(a.size)}</span>
-            </button>
+              asset={a}
+              active={a.id === selected}
+              top={vr.start}
+              onSelect={() => onSelect(a.id)}
+              onContext={onContext}
+            />
           );
         })}
       </div>
       {loading && <div className="py-2 text-center text-[11px] text-fg-dim">Loading more…</div>}
     </div>
+  );
+}
+
+function TableRow({
+  asset,
+  active,
+  top,
+  onSelect,
+  onContext,
+}: {
+  asset: AssetSummary;
+  active: boolean;
+  top: number;
+  onSelect: () => void;
+  onContext: (asset: AssetSummary, x: number, y: number) => void;
+}) {
+  const longPress = useLongPress((x, y) => onContext(asset, x, y));
+  return (
+    <button
+      onClick={onSelect}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        onContext(asset, e.clientX, e.clientY);
+      }}
+      {...longPress}
+      className="absolute top-0 left-0 grid w-full grid-cols-[1fr_90px_110px_90px] items-center gap-2 px-3 text-left text-xs"
+      style={{
+        height: ROW_H,
+        transform: `translateY(${top}px)`,
+        background: active ? "var(--color-accent-muted)" : "transparent",
+        color: active ? "var(--color-accent)" : "var(--color-fg-muted)",
+      }}
+    >
+      <span className="flex min-w-0 items-center gap-2">
+        <MediaIcon media={asset.media} size={13} />
+        <span className="truncate text-fg" title={asset.name}>
+          {asset.name}
+        </span>
+      </span>
+      <span className="truncate uppercase">{asset.format}</span>
+      <LicenseBadge badge={asset.license} />
+      <span className="text-right tabular-nums">{bytes(asset.size)}</span>
+    </button>
   );
 }
 
