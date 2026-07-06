@@ -1,8 +1,8 @@
 import type React from "react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { LayoutGrid, Menu, Rows3, Search, X } from "lucide-react";
-import { useAssets } from "@/api/queries";
+import { LayoutGrid, Menu, Rows3, Search, Sparkles, X } from "lucide-react";
+import { useAnalyze, useAssets, useCollectionMembers, useCollections } from "@/api/queries";
 import type { AssetSummary, SortField } from "@/api/types";
 import { useViewState } from "@/lib/view-state";
 import { bytes } from "@/lib/format";
@@ -10,6 +10,12 @@ import { Thumbnail } from "./Thumbnail";
 import { LicenseBadge } from "./LicenseBadge";
 import { MediaIcon } from "./MediaIcon";
 import { ContextMenu, useLongPress, type MenuState } from "./ContextMenu";
+
+/** Modifier keys that change what a click does to the multi-selection (issue #10/#22). */
+export interface ClickMods {
+  meta: boolean; // ctrl/cmd → toggle one
+  shift: boolean; // shift → extend a range from the anchor
+}
 
 const CELL_W = 150; // grid cell target width (px); actual columns computed from container
 const CELL_H = 132;
@@ -23,18 +29,83 @@ export function Browser({ onOpenNav }: { onOpenNav?: () => void }) {
   const { state, patch, request } = useViewState();
   const assets = useAssets(request, state.collection);
   const [menu, setMenu] = useState<MenuState | null>(null);
+  // Multi-selection lives here (Browser-local, not the URL): the ids to batch-act on. Distinct from
+  // the single Inspector focus (`state.selected`). `anchor` is the pivot for shift-range.
+  const [selection, setSelection] = useState<Set<string>>(new Set());
+  const [anchor, setAnchor] = useState<string | null>(null);
 
   const items = useMemo(
     () => assets.data?.pages.flatMap((p) => p.items) ?? [],
     [assets.data],
   );
   const total = assets.data?.pages[0]?.total ?? null;
+  const byId = useMemo(() => new Map(items.map((a) => [a.id, a])), [items]);
 
-  const openMenu = (asset: AssetSummary, x: number, y: number) => setMenu({ asset, x, y });
+  const clearSelection = useCallback(() => setSelection(new Set()), []);
+  const selectAll = useCallback(() => setSelection(new Set(items.map((a) => a.id))), [items]);
+
+  // Click semantics: plain = single-select + inspect; ctrl/cmd = toggle; shift = extend range from
+  // the anchor. Every click also sets the Inspector focus so the detail panel tracks the last click.
+  const onItemClick = useCallback(
+    (asset: AssetSummary, mods: ClickMods) => {
+      const id = asset.id;
+      patch({ selected: id });
+      if (mods.shift && anchor) {
+        const ids = items.map((a) => a.id);
+        const a = ids.indexOf(anchor);
+        const b = ids.indexOf(id);
+        if (a >= 0 && b >= 0) {
+          const [lo, hi] = a < b ? [a, b] : [b, a];
+          const range = ids.slice(lo, hi + 1);
+          setSelection((prev) => new Set([...prev, ...range]));
+        }
+      } else if (mods.meta) {
+        setSelection((prev) => {
+          const next = new Set(prev);
+          next.has(id) ? next.delete(id) : next.add(id);
+          return next;
+        });
+        setAnchor(id);
+      } else {
+        setSelection(new Set([id]));
+        setAnchor(id);
+      }
+    },
+    [anchor, items, patch],
+  );
+
+  // Right-click / long-press targets the whole selection when the clicked item is part of a
+  // multi-selection; otherwise just that item (issue #22).
+  const openMenu = useCallback(
+    (asset: AssetSummary, x: number, y: number) => {
+      const targetIds =
+        selection.has(asset.id) && selection.size > 1 ? [...selection] : [asset.id];
+      const targets = targetIds.map((id) => byId.get(id)).filter((a): a is AssetSummary => !!a);
+      setMenu({ assets: targets.length ? targets : [asset], x, y });
+    },
+    [selection, byId],
+  );
+
+  // Keyboard: Ctrl/Cmd+A selects all, Escape clears — but never while typing in the search box.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const el = document.activeElement;
+      if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT"))
+        return;
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "a") {
+        e.preventDefault();
+        selectAll();
+      } else if (e.key === "Escape" && selection.size > 0) {
+        clearSelection();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [selectAll, clearSelection, selection.size]);
 
   const listProps = {
-    selected: state.selected,
-    onSelect: (id: string) => patch({ selected: id }),
+    selection,
+    onItemClick,
     onContext: openMenu,
     hasMore: assets.hasNextPage,
     loadMore: () => assets.fetchNextPage(),
@@ -44,6 +115,14 @@ export function Browser({ onOpenNav }: { onOpenNav?: () => void }) {
   return (
     <section className="flex h-full min-w-0 flex-1 flex-col bg-bg">
       <Toolbar count={items.length} total={total} onOpenNav={onOpenNav} />
+      {selection.size > 1 && (
+        <SelectionBar
+          count={selection.size}
+          ids={[...selection]}
+          onSelectAll={selectAll}
+          onClear={clearSelection}
+        />
+      )}
       <div className="min-h-0 flex-1">
         {assets.isLoading ? (
           <Centered>Loading…</Centered>
@@ -61,6 +140,66 @@ export function Browser({ onOpenNav }: { onOpenNav?: () => void }) {
       </div>
       <ContextMenu menu={menu} onClose={() => setMenu(null)} />
     </section>
+  );
+}
+
+/** Batch-action affordance for a multi-selection (issue #10 enabler). Feature actions hang off here;
+ *  today: analyze all, add all to a collection, select-all, clear. */
+function SelectionBar({
+  count,
+  ids,
+  onSelectAll,
+  onClear,
+}: {
+  count: number;
+  ids: string[];
+  onSelectAll: () => void;
+  onClear: () => void;
+}) {
+  const analyze = useAnalyze();
+  const collections = useCollections();
+  const members = useCollectionMembers();
+  const manual = (collections.data ?? []).filter((c) => c.kind === "manual");
+
+  return (
+    <div className="flex items-center gap-2 border-b border-border bg-surface px-3 py-1.5 text-xs">
+      <span className="font-medium text-fg tabular-nums">{count} selected</span>
+      <button
+        className="btn coarse:min-h-11"
+        onClick={() => analyze.mutate({ assets: ids })}
+        disabled={analyze.isPending}
+      >
+        <Sparkles size={12} /> Analyze
+      </button>
+      <select
+        className="field w-auto"
+        value=""
+        disabled={manual.length === 0 || members.isPending}
+        onChange={(e) => {
+          if (e.target.value) members.mutate({ id: e.target.value, members: { add: ids } });
+          e.currentTarget.value = "";
+        }}
+        title={manual.length === 0 ? "No manual collections yet" : "Add selection to a collection"}
+      >
+        <option value="" disabled>
+          Add to collection…
+        </option>
+        {manual.map((c) => (
+          <option key={c.id} value={c.id}>
+            {c.name}
+          </option>
+        ))}
+      </select>
+      <button className="text-fg-dim hover:text-fg" onClick={onSelectAll}>
+        Select all
+      </button>
+      <button
+        className="ml-auto flex items-center gap-1 text-fg-dim hover:text-fg coarse:min-h-11"
+        onClick={onClear}
+      >
+        <X size={13} /> Clear
+      </button>
+    </div>
   );
 }
 
@@ -170,16 +309,21 @@ function ViewBtn({
 
 interface ListProps {
   items: AssetSummary[];
-  selected: string | null;
-  onSelect: (id: string) => void;
+  selection: Set<string>;
+  onItemClick: (asset: AssetSummary, mods: ClickMods) => void;
   onContext: (asset: AssetSummary, x: number, y: number) => void;
   hasMore: boolean;
   loadMore: () => void;
   loading: boolean;
 }
 
+/** Normalise a mouse click into our modifier model (cmd on macOS, ctrl elsewhere). */
+function mods(e: React.MouseEvent): ClickMods {
+  return { meta: e.metaKey || e.ctrlKey, shift: e.shiftKey };
+}
+
 /** Windowed grid — a 100k+ library scrolls at 60fps (DESIGN_GUIDELINES §1.1, §3.1). */
-function Grid({ items, selected, onSelect, onContext, hasMore, loadMore, loading }: ListProps) {
+function Grid({ items, selection, onItemClick, onContext, hasMore, loadMore, loading }: ListProps) {
   const parentRef = useRef<HTMLDivElement>(null);
   const cols = useColumns(parentRef, CELL_W);
   const rowCount = Math.ceil(items.length / cols);
@@ -212,8 +356,8 @@ function Grid({ items, selected, onSelect, onContext, hasMore, loadMore, loading
                 <GridCell
                   key={a.id}
                   asset={a}
-                  active={a.id === selected}
-                  onClick={() => onSelect(a.id)}
+                  active={selection.has(a.id)}
+                  onClick={onItemClick}
                   onContext={onContext}
                 />
               ))}
@@ -243,13 +387,13 @@ function GridCell({
 }: {
   asset: AssetSummary;
   active: boolean;
-  onClick: () => void;
+  onClick: (asset: AssetSummary, mods: ClickMods) => void;
   onContext: (asset: AssetSummary, x: number, y: number) => void;
 }) {
   const longPress = useLongPress((x, y) => onContext(asset, x, y));
   return (
     <button
-      onClick={onClick}
+      onClick={(e) => onClick(asset, mods(e))}
       onContextMenu={(e) => {
         e.preventDefault();
         onContext(asset, e.clientX, e.clientY);
@@ -281,7 +425,7 @@ function GridCell({
 }
 
 /** Windowed table — same query, toggle preserves selection + filter (tech-spec 09 §B.1). */
-function Table({ items, selected, onSelect, onContext, hasMore, loadMore, loading }: ListProps) {
+function Table({ items, selection, onItemClick, onContext, hasMore, loadMore, loading }: ListProps) {
   const parentRef = useRef<HTMLDivElement>(null);
   const virt = useVirtualizer({
     count: items.length,
@@ -306,9 +450,9 @@ function Table({ items, selected, onSelect, onContext, hasMore, loadMore, loadin
             <TableRow
               key={vr.key}
               asset={a}
-              active={a.id === selected}
+              active={selection.has(a.id)}
               top={vr.start}
-              onSelect={() => onSelect(a.id)}
+              onClick={onItemClick}
               onContext={onContext}
             />
           );
@@ -323,19 +467,19 @@ function TableRow({
   asset,
   active,
   top,
-  onSelect,
+  onClick,
   onContext,
 }: {
   asset: AssetSummary;
   active: boolean;
   top: number;
-  onSelect: () => void;
+  onClick: (asset: AssetSummary, mods: ClickMods) => void;
   onContext: (asset: AssetSummary, x: number, y: number) => void;
 }) {
   const longPress = useLongPress((x, y) => onContext(asset, x, y));
   return (
     <button
-      onClick={onSelect}
+      onClick={(e) => onClick(asset, mods(e))}
       onContextMenu={(e) => {
         e.preventDefault();
         onContext(asset, e.clientX, e.clientY);

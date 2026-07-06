@@ -14,7 +14,9 @@ import { useViewState } from "@/lib/view-state";
 export interface MenuState {
   x: number;
   y: number;
-  asset: AssetSummary;
+  /** The target(s): a single right-clicked asset, or the whole multi-selection when the clicked
+   *  item is part of it (issue #22). Length ≥ 1. */
+  assets: AssetSummary[];
 }
 
 /** Long-press (touch) helper — returns pointer handlers that fire `onLongPress` after ~500ms of a
@@ -83,7 +85,10 @@ export function ContextMenu({ menu, onClose }: { menu: MenuState | null; onClose
   }, [menu]);
 
   if (!menu) return null;
-  const asset = menu.asset;
+  const assets = menu.assets;
+  const ids = assets.map((a) => a.id);
+  const single = assets.length === 1;
+  const heading = single ? assets[0].name : `${assets.length} items`;
 
   const run = (fn: () => void) => {
     fn();
@@ -94,7 +99,7 @@ export function ContextMenu({ menu, onClose }: { menu: MenuState | null; onClose
 
   const copyPath = async () => {
     try {
-      const full = await api.getAsset(asset.id);
+      const full = await api.getAsset(ids[0]);
       await navigator.clipboard?.writeText(full.path);
     } catch {
       /* clipboard blocked / fetch failed — fail-soft, no crash */
@@ -108,16 +113,19 @@ export function ContextMenu({ menu, onClose }: { menu: MenuState | null; onClose
       className="fixed z-50 min-w-44 rounded-md border border-border bg-surface py-1 text-xs text-fg-muted shadow-xl"
       style={{ left: pos.x, top: pos.y }}
     >
-      <div className="truncate px-3 py-1 text-[10px] text-fg-dim" title={asset.name}>
-        {asset.name}
+      <div className="truncate px-3 py-1 text-[10px] text-fg-dim" title={heading}>
+        {heading}
       </div>
       <div className="my-1 border-t border-border" />
 
-      <Item icon={<Search size={13} />} label="Open" onClick={() => run(() => patch({ selected: asset.id }))} />
+      {/* Open + Copy path are single-asset only; the rest apply to the whole target set. */}
+      {single && (
+        <Item icon={<Search size={13} />} label="Open" onClick={() => run(() => patch({ selected: ids[0] }))} />
+      )}
       <Item
         icon={<Sparkles size={13} />}
-        label="Analyze"
-        onClick={() => run(() => analyze.mutate({ assets: [asset.id] }))}
+        label={single ? "Analyze" : `Analyze ${assets.length}`}
+        onClick={() => run(() => analyze.mutate({ assets: ids }))}
       />
 
       {/* Add to collection — submenu of manual collections (smart folders are query-driven). */}
@@ -141,9 +149,7 @@ export function ContextMenu({ menu, onClose }: { menu: MenuState | null; onClose
                 <Item
                   key={c.id}
                   label={c.name}
-                  onClick={() =>
-                    run(() => members.mutate({ id: c.id, members: { add: [asset.id] } }))
-                  }
+                  onClick={() => run(() => members.mutate({ id: c.id, members: { add: ids } }))}
                 />
               ))
             )}
@@ -151,12 +157,16 @@ export function ContextMenu({ menu, onClose }: { menu: MenuState | null; onClose
         )}
       </div>
 
-      <div className="my-1 border-t border-border" />
-      <Item
-        icon={<ClipboardCopy size={13} />}
-        label="Copy path"
-        onClick={() => run(() => void copyPath())}
-      />
+      {single && (
+        <>
+          <div className="my-1 border-t border-border" />
+          <Item
+            icon={<ClipboardCopy size={13} />}
+            label="Copy path"
+            onClick={() => run(() => void copyPath())}
+          />
+        </>
+      )}
     </div>
   );
 }
