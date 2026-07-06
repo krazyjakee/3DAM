@@ -1,7 +1,8 @@
-import { useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { FolderPlus, X } from "lucide-react";
 import { useAddSource, useScan } from "@/api/queries";
 import { ApiError } from "@/api/client";
+import { useFocusTrap } from "@/lib/use-focus-trap";
 import type { SourceKind, SourceOptions } from "@/api/types";
 
 // local_fs, sftp and smb are all backed by the phase-4 engine; federated peers are not built yet, so
@@ -40,6 +41,15 @@ export function AddSourceDialog({ onClose }: { onClose: () => void }) {
   const [port, setPort] = useState("");
 
   const remote = kind === "sftp" || kind === "smb";
+
+  // Modal focus management + Escape-to-close (issue #26): trap Tab within the dialog, return focus
+  // to the trigger on close, and close on Escape (mirroring the Drawer, which already did).
+  const dialogRef = useFocusTrap<HTMLDivElement>(true);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
 
   const submit = async () => {
     setErr(null);
@@ -89,11 +99,15 @@ export function AddSourceDialog({ onClose }: { onClose: () => void }) {
       onClick={onClose}
     >
       <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="add-source-title"
         className="max-h-[90vh] w-full max-w-[380px] overflow-y-auto rounded-lg border border-border bg-surface p-4 shadow-xl"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="mb-3 flex items-center justify-between">
-          <h2 className="flex items-center gap-2 text-sm font-semibold">
+          <h2 id="add-source-title" className="flex items-center gap-2 text-sm font-semibold">
             <FolderPlus size={15} /> Add source
           </h2>
           <button
