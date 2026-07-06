@@ -33,6 +33,8 @@ use rust_embed::RustEmbed;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::watch;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
@@ -69,6 +71,9 @@ pub(crate) struct AppState {
     pub bind: String,
     pub localhost_only: bool,
     pub tls: bool,
+    /// Flips `false → true` once when shutdown begins, so long-lived handlers (the `/api/v1/ws`
+    /// loop) can stop awaiting and close cleanly instead of pinning the graceful drain open.
+    pub shutdown: watch::Receiver<bool>,
 }
 
 /// Full-scope context for the in-process engine call (the engine trusts its caller; the boundary is
@@ -153,12 +158,17 @@ pub fn router(
     localhost_only: bool,
 ) -> Router {
     let bind = bind.into();
+    // No signal plumbing in the test seam; leak the sender so the receiver never observes a change
+    // (a dropped sender would make `changed()` resolve and close WS loops immediately).
+    let (tx, shutdown) = watch::channel(false);
+    Box::leak(Box::new(tx));
     build_router(AppState {
         lib,
         store,
         bind,
         localhost_only,
         tls: false,
+        shutdown,
     })
 }
 
@@ -190,12 +200,15 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
         store.seed_flag(key, value)?;
     }
 
+    // Shutdown fan-out: the signal task flips this once, and every long-lived handler watches it.
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let state = AppState {
-        lib,
+        lib: lib.clone(),
         store: store.clone(),
         bind: addr.to_string(),
         localhost_only,
         tls,
+        shutdown: shutdown_rx,
     };
     let app = build_router(state);
 
@@ -217,15 +230,75 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
     if s.exposed_without_auth {
         eprintln!("  ⚠ exposed beyond localhost with no auth and no TLS — set the authentication flag");
     }
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    // Graceful shutdown, in three moves:
+    //   1. `wait_for_signal()` resolves on Ctrl-C / SIGTERM,
+    //   2. we flip the watch so the WS loops send a Close frame and return (otherwise an idle
+    //      browser tab would pin the drain open forever),
+    //   3. axum stops accepting and drains in-flight requests. A grace timer is the backstop so a
+    //      wedged connection can't hang the process — past the window we stop waiting and exit.
+    let shutdown_rx_backstop = shutdown_tx.subscribe();
+    let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
+        wait_for_signal().await;
+        tracing::info!("shutdown signal received; draining connections");
+        eprintln!(
+            "3dam serve → shutting down (draining connections, ≤{}s)",
+            SHUTDOWN_GRACE.as_secs()
+        );
+        let _ = shutdown_tx.send(true);
+    });
+    tokio::select! {
+        res = serve => {
+            res?;
+            tracing::info!("shutdown complete; all connections drained");
+        }
+        _ = force_after_grace(shutdown_rx_backstop) => {
+            tracing::warn!(
+                grace = ?SHUTDOWN_GRACE,
+                "grace period elapsed with connections still open; exiting anyway"
+            );
+        }
+    }
     Ok(())
 }
 
-async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
-    tracing::info!("shutdown signal received");
+/// How long the graceful drain may run before we stop waiting on stragglers and exit.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+
+/// Resolves only once shutdown has begun *and* the grace window has then elapsed — the backstop that
+/// bounds the drain. Idle until the watch flips, so it never fires during normal operation.
+async fn force_after_grace(mut shutdown: watch::Receiver<bool>) {
+    // `wait_for` returns immediately if the value is already `true`, else awaits the flip.
+    if shutdown.wait_for(|v| *v).await.is_err() {
+        // Sender dropped without signalling — nothing to bound; idle forever so `serve` wins.
+        std::future::pending::<()>().await;
+    }
+    tokio::time::sleep(SHUTDOWN_GRACE).await;
+}
+
+/// Resolve when the OS asks us to stop. Ctrl-C (SIGINT) on every platform, **plus** SIGTERM on Unix —
+/// what `systemd`, `docker stop`, and a bare `kill` send. Without the SIGTERM arm those would bypass
+/// the drain and hard-kill the process mid-request.
+async fn wait_for_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "could not install SIGTERM handler; Ctrl-C only");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 /// The MCP stdio transport (`3dam mcp`, tech-spec 11 §2.2). Opens an embedded engine — no network,
@@ -559,14 +632,25 @@ async fn ws_loop(mut socket: WebSocket, st: AppState) {
         Ok(s) => s,
         Err(_) => return,
     };
-    while let Some(ev) = stream.next().await {
-        match serde_json::to_string(&ev) {
-            Ok(txt) => {
-                if socket.send(Message::Text(txt.into())).await.is_err() {
-                    break;
+    let mut shutdown = st.shutdown.clone();
+    loop {
+        tokio::select! {
+            // Server is stopping: send a courteous Close frame and let the drain complete.
+            _ = shutdown.changed() => {
+                let _ = socket.send(Message::Close(None)).await;
+                break;
+            }
+            ev = stream.next() => {
+                let Some(ev) = ev else { break }; // event bus closed (engine shutting down)
+                match serde_json::to_string(&ev) {
+                    Ok(txt) => {
+                        if socket.send(Message::Text(txt.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => continue,
                 }
             }
-            Err(_) => continue,
         }
     }
 }
