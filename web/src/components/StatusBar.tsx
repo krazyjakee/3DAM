@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { ChevronUp, Loader2, X } from "lucide-react";
-import { useCancelJob, useJobs, useVersion } from "@/api/queries";
+import { useCancelJob, useJobs, useStats, useVersion } from "@/api/queries";
 import { useConnection, type ConnState } from "@/api/connection";
-import type { JobStatus } from "@/api/types";
+import type { JobStatus, MediaType } from "@/api/types";
 
 /** Bottom status strip: active scan/analysis jobs with live progress, the live-connection state, and
  *  the server build. A single job shows inline; concurrent jobs condense into one aggregate bar with
@@ -29,9 +29,43 @@ export function StatusBar() {
       ) : (
         <AggregateJobs jobs={active} onCancel={(id) => cancel.mutate(id)} />
       )}
+      <MediaBreakdown />
       <ConnectionPill state={conn.state} />
       <span className="tabular-nums">{version.data?.server ?? ""}</span>
     </footer>
+  );
+}
+
+/** Per-media asset totals on the right of the bar — `3D 412 · IMG 590 · SFX 246` (issue #64,
+ *  DESIGN_GUIDELINES footer). Same hue + short label per media type as the grid/table `MediaBadge`
+ *  (model → 3D indigo, image → IMG orange, audio → SFX teal); reads the already-cached `by_media`
+ *  stats. Media types with no assets are omitted so an audio-free library shows just `3D · IMG`. */
+const MEDIA_BREAKDOWN: { key: MediaType; label: string; full: string; color: string }[] = [
+  { key: "model", label: "3D", full: "3D models", color: "var(--color-media-model)" },
+  { key: "image", label: "IMG", full: "images", color: "var(--color-media-image)" },
+  { key: "audio", label: "SFX", full: "audio", color: "var(--color-media-audio)" },
+];
+
+function MediaBreakdown() {
+  const stats = useStats();
+  const byMedia = stats.data?.by_media ?? {};
+  const shown = MEDIA_BREAKDOWN.map((m) => ({ ...m, count: byMedia[m.key] ?? 0 })).filter(
+    (m) => m.count > 0,
+  );
+  if (shown.length === 0) return null;
+  return (
+    <span
+      className="hidden items-center gap-2 sm:flex"
+      aria-label={`Assets by media type: ${shown.map((m) => `${m.count} ${m.full}`).join(", ")}`}
+    >
+      {shown.map((m, i) => (
+        <span key={m.key} className="flex items-center gap-1.5">
+          {i > 0 && <span className="text-fg-dim/60">·</span>}
+          <span style={{ color: m.color }}>{m.label}</span>
+          <span className="tabular-nums text-fg">{m.count.toLocaleString()}</span>
+        </span>
+      ))}
+    </span>
   );
 }
 
