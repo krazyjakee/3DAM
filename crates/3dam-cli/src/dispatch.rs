@@ -50,6 +50,7 @@ pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             media,
             format,
             limit,
+            mode,
         } => {
             let mut filters = Vec::new();
             if let Some(m) = media {
@@ -70,6 +71,7 @@ pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 text,
                 filters,
                 page: dam_api::page::PageParams { after: None, limit },
+                mode: mode.into(),
                 ..Default::default()
             };
             let page = lib.query(&ctx, req).await?;

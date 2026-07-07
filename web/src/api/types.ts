@@ -179,12 +179,18 @@ export interface PageParams {
   limit: number;
 }
 
+/** Text-search strategy (semantic-search M5). Mirrors `dam-api` `SearchMode`. `lexical` is the
+ *  FTS + synonym path; `hybrid` also pulls in embedding neighbours of the matches; `semantic` ranks
+ *  by that neighbourhood. Omitting it (or `lexical`) preserves the classic behaviour. */
+export type SearchMode = "lexical" | "hybrid" | "semantic";
+
 export interface QueryRequest {
   text?: string | null;
   filters?: Filter[];
   sort?: Sort;
   scope?: QueryScope;
   page?: PageParams;
+  mode?: SearchMode;
 }
 
 export interface ItemWarning {
@@ -428,6 +434,16 @@ export interface AnalyzeRequest {
   assets?: AssetId[]; // empty → every asset due for (re)analysis
   force?: boolean; // re-run even if already up to date
 }
+/** Force-rebuild the derived preview cache for specific assets (mirrors `dam-api`
+ *  `ThumbnailRegenRequest`): drop each asset's cached thumbnail/preview so the next view re-renders
+ *  from source. Non-destructive; the source bytes are untouched. */
+export interface ThumbnailRegenRequest {
+  assets: AssetId[];
+}
+export interface ThumbnailRegenReport {
+  assets: number;
+  files_deleted: number;
+}
 export type JobKind = "scan" | "analyze" | "convert" | "export";
 export type JobState =
   | "queued"
@@ -460,6 +476,8 @@ export interface LibraryStats {
   total: number;
   by_media: Record<string, number>;
   by_source: Record<string, number>;
+  /** Most-used confirmed tags (asset count per tag) — the vocabulary behind the Tags filter facet. */
+  tags: Record<string, number>;
   unanalyzed: number;
   sources: number;
 }

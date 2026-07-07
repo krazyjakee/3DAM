@@ -2,7 +2,7 @@
 //! other front-end via `open_backend`, so `--connect` transparently swaps the embedded engine for
 //! a remote server. Also owns the `serve`/`mcp` entry points (they dispatch into `3dam-server`).
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use dam_api::admin::{
     AdminStatus, AuditEntry, AuthMode, CacheTarget, ClearAnalysisReport, ClearCacheReport,
     FactoryResetReport, FlagInfo, FlagKey, FlagValue, McpMode, NewToken, NewTokenReply, SetFlag,

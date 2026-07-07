@@ -8,6 +8,7 @@ import type {
   Filter,
   MediaType,
   QueryRequest,
+  SearchMode,
   SortDir,
   SortField,
 } from "@/api/types";
@@ -19,11 +20,16 @@ export interface ViewState {
   media: MediaType | null;
   source: string | null;
   license: string | null;
+  /** Confirmed-tag facet — composes with media/source/license, mutually exclusive with a collection. */
+  tag: string | null;
   /** When set, the Browser shows this collection's assets instead of the faceted search. Mutually
    *  exclusive with the facet filters — selecting one clears the other (see Navigation). */
   collection: string | null;
   sort: SortField;
   dir: SortDir;
+  /** Text-search strategy (semantic-search M5). `lexical` is the default FTS+synonym path;
+   *  `hybrid`/`semantic` widen with embedding neighbours of the matches. */
+  mode: SearchMode;
   view: ViewMode;
   selected: string | null;
 }
@@ -37,9 +43,11 @@ export function useViewState() {
       media: (params.get("media") as MediaType | null) || null,
       source: params.get("source"),
       license: params.get("license"),
+      tag: params.get("tag"),
       collection: params.get("col"),
       sort: (params.get("sort") as SortField | null) ?? "name",
       dir: (params.get("dir") as SortDir | null) ?? "asc",
+      mode: (params.get("mode") as SearchMode | null) ?? "lexical",
       view: (params.get("view") as ViewMode | null) ?? "grid",
       selected: params.get("sel"),
     }),
@@ -59,9 +67,11 @@ export function useViewState() {
           if ("media" in next) set("media", next.media);
           if ("source" in next) set("source", next.source);
           if ("license" in next) set("license", next.license);
+          if ("tag" in next) set("tag", next.tag);
           if ("collection" in next) set("col", next.collection);
           if ("sort" in next) set("sort", next.sort);
           if ("dir" in next) set("dir", next.dir);
+          if ("mode" in next) set("mode", next.mode === "lexical" ? null : next.mode);
           if ("view" in next) set("view", next.view);
           if ("selected" in next) set("sel", next.selected);
           return p;
@@ -78,10 +88,12 @@ export function useViewState() {
     if (state.source) filters.push({ field: "source", op: "eq", value: { str: state.source } });
     if (state.license)
       filters.push({ field: "license", op: "eq", value: { str: state.license } });
+    if (state.tag) filters.push({ field: "tag", op: "eq", value: { str: state.tag } });
     return {
       text: state.q || null,
       filters,
       sort: { field: state.sort, dir: state.dir },
+      mode: state.mode,
     };
   }, [state]);
 

@@ -1,12 +1,13 @@
 import type React from "react";
 import { useEffect, useState } from "react";
-import { Check, Grid3x3, PanelRightClose, Sparkles, X } from "lucide-react";
+import { Check, Grid3x3, PanelRightClose, RefreshCw, Sparkles, X } from "lucide-react";
 import {
   useAnalyze,
   useAsset,
   useCollectionMembers,
   useCollections,
   useDuplicates,
+  useRegenerateThumbnail,
   useReviewSuggestion,
   useSimilar,
   useSources,
@@ -199,6 +200,9 @@ function Body({ asset }: { asset: Asset }) {
           </h1>
         </div>
 
+        {/* per-asset actions — reanalyze + rebuild the preview thumbnail (mirrors the context menu) */}
+        <Actions asset={asset} />
+
         {/* license — HIGH in the inspector (DESIGN_GUIDELINES §3.1) */}
         <div className="mt-2">
           <LicenseBadge badge={{ id: license.id, status: license.status }} prominent />
@@ -251,6 +255,45 @@ function Body({ asset }: { asset: Asset }) {
         {/* find similar — cosine over embeddings, ranked in this asset's media space (phase 3) */}
         <SimilarSection asset={asset} />
       </div>
+    </div>
+  );
+}
+
+/** Per-asset maintenance actions, mirrored from the grid context menu so they're reachable from the
+ *  focused-asset view too. "Reanalyze" forces a re-run (never a silent no-op on an up-to-date asset);
+ *  its label reflects whether analysis has ever run. "Regenerate thumbnail" drops the cached preview
+ *  so it re-renders from the current source — only shown for media that has a server thumbnail. */
+function Actions({ asset }: { asset: Asset }) {
+  const analyze = useAnalyze();
+  const regenerateThumbnail = useRegenerateThumbnail();
+  const { summary } = asset;
+  const analyzed = asset.timestamps.analyzed != null;
+  const thumbable = summary.media === "image" || summary.media === "model";
+
+  return (
+    <div className="mt-3 flex flex-wrap gap-2">
+      <button
+        type="button"
+        className="btn"
+        disabled={analyze.isPending}
+        onClick={() => analyze.mutate({ assets: [summary.id], force: true })}
+        title="Re-run analysis (embeddings, tileability, auto-tags) for this asset"
+      >
+        <Sparkles size={13} />
+        {analyzed ? "Reanalyze" : "Analyze"}
+      </button>
+      {thumbable && (
+        <button
+          type="button"
+          className="btn"
+          disabled={regenerateThumbnail.isPending}
+          onClick={() => regenerateThumbnail.mutate([summary.id])}
+          title="Rebuild the preview thumbnail from the current source file"
+        >
+          <RefreshCw size={13} />
+          Regenerate thumbnail
+        </button>
+      )}
     </div>
   );
 }

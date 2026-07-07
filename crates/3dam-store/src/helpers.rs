@@ -79,10 +79,10 @@ pub(crate) fn grid_key_attrs(
                     format!("{:.0}:{:02}", (secs / 60.0).floor(), (secs % 60.0) as i64),
                 );
             }
-            // The cheap onset/loop classifier (analysis §4.2) marks longer clips as loops — surface
-            // it so the table/grid can show "loop" alongside the duration.
-            if audio_class == Some("loop") {
-                m.insert("loop".into(), "loop".into());
+            // The DSP classifier (analysis §4.2) labels audio one_shot | loop | music | sfx — surface
+            // it so the table/grid can show the type alongside the duration.
+            if let Some(class) = audio_class.filter(|c| !c.is_empty()) {
+                m.insert("type".into(), class.replace('_', "-"));
             }
         }
         MediaType::Model => {
@@ -124,14 +124,32 @@ pub(crate) fn escape_like(s: &str) -> String {
         .replace('_', "\\_")
 }
 
-/// Build the shared `WHERE` clause (text `LIKE` + facet filters) and its bind values from a query
+/// Build the shared `WHERE` clause (FTS text match + facet filters) and its bind values from a query
 /// request — the common prefix of both `query_assets` (paged) and `query_asset_ids` (unbounded).
-pub(crate) fn build_where(req: &QueryRequest) -> Result<(String, Vec<Value>), LibError> {
+///
+/// Text search hits the `asset_fts` inverted index (M1), widened by the synonym map (M3), expressed
+/// as a composable `asset.rowid IN (…)` subquery so it drops into both the JOINed page query and the
+/// bare `COUNT(*) FROM asset`. A `filename LIKE` OR-arm is kept so in-word substrings the tokenizer
+/// can't reach (e.g. a partial `k47`) never regress below the old scan's recall.
+pub(crate) fn build_where(
+    req: &QueryRequest,
+    syn: &crate::search::SynonymMap,
+) -> Result<(String, Vec<Value>), LibError> {
     let mut where_sql = String::from(" WHERE 1=1");
     let mut binds: Vec<Value> = Vec::new();
     if let Some(text) = req.text.as_ref().filter(|t| !t.is_empty()) {
-        where_sql.push_str(" AND filename LIKE ?");
-        binds.push(Value::Text(format!("%{}%", escape_like(text))));
+        if let Some(m) = crate::search::fts_match_expr(text, syn) {
+            where_sql.push_str(
+                " AND (asset.rowid IN (SELECT rowid FROM asset_fts WHERE asset_fts MATCH ?) \
+                 OR filename LIKE ?)",
+            );
+            binds.push(Value::Text(m));
+            binds.push(Value::Text(format!("%{}%", escape_like(text))));
+        } else {
+            // No usable FTS token (all punctuation) — fall back to the plain substring scan.
+            where_sql.push_str(" AND filename LIKE ?");
+            binds.push(Value::Text(format!("%{}%", escape_like(text))));
+        }
     }
     for f in &req.filters {
         apply_filter(f, &mut where_sql, &mut binds)?;
@@ -382,12 +400,13 @@ mod tests {
                 filters: vec![representative(field)],
                 ..Default::default()
             };
-            let (where_sql, binds) = match build_where(&req) {
+            let syn = crate::search::SynonymMap::default();
+            let (where_sql, binds) = match build_where(&req, &syn) {
                 Ok(v) => v,
                 Err(e) => panic!("filter on {field:?} failed to build: {e:?}"),
             };
             assert!(
-                !matches!(build_where(&req), Err(LibError::Unsupported(_))),
+                !matches!(build_where(&req, &syn), Err(LibError::Unsupported(_))),
                 "filter on {field:?} is Unsupported"
             );
             // Prove the SQL is executable against the real schema (both the JOINed page query and

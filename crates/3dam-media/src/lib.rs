@@ -8,11 +8,15 @@
 //! server-rendered thumbnail here.
 
 mod audio;
+mod audio_features;
 mod features;
 mod image;
+mod mel;
 mod model;
 
+pub use audio_features::{decode_mono, extract_audio_features, AudioFeatures, LoopSource};
 pub use features::{extract_image_features, l2_normalise, ImageFeatures};
+pub use mel::{log_mel, mel_from_samples, MelConfig, MelSpectrogram};
 
 use dam_api::dto::{MediaAttributes, MediaType};
 use std::path::Path;

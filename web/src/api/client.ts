@@ -36,6 +36,8 @@ import type {
   SourceId,
   SourceInfo,
   SuggestionReview,
+  ThumbnailRegenRequest,
+  ThumbnailRegenReport,
   UpdateCollection,
   ErrorBody,
 } from "./types";
@@ -139,8 +141,11 @@ export const api = {
 
   /** URL for a server-rendered PNG thumbnail (tech-spec 04 §6.4): a raster downscale for images, a
    *  wgpu turntable render for 3D models. Audio (and any render that fails) returns an error and the
-   *  caller falls back to the honest typed tile. `edge` bounds the long side. */
-  assetThumbnailUrl: (id: AssetId, edge = 256) => `${API}/assets/${id}/thumbnail?edge=${edge}`,
+   *  caller falls back to the honest typed tile. `edge` bounds the long side. `v` is a regeneration
+   *  epoch (see thumbnail-cache.ts): bumping it after a forced regenerate defeats the browser + `Cache-Control`
+   *  cache, whose key (content hash) is otherwise unchanged, so the fresh render is fetched. */
+  assetThumbnailUrl: (id: AssetId, edge = 256, v = 0) =>
+    `${API}/assets/${id}/thumbnail?edge=${edge}${v ? `&v=${v}` : ""}`,
 
   // collections / smart folders (tech-spec: phase 4 Reach)
   listCollections: () => get<Collection[]>(`${API}/collections`),
@@ -165,6 +170,10 @@ export const api = {
   submitScan: (req: ScanRequest) => send<{ job_id: JobId }>("POST", `${API}/jobs/scan`, req),
   submitAnalyze: (req: AnalyzeRequest) =>
     send<{ job_id: JobId }>("POST", `${API}/jobs/analyze`, req),
+  /** Force the derived preview cache for specific assets to be rebuilt (drop cached thumbnail +
+   *  3D preview so the next view re-renders from source). Synchronous — returns what it dropped. */
+  regenerateThumbnails: (req: ThumbnailRegenRequest) =>
+    send<ThumbnailRegenReport>("POST", `${API}/thumbnails/regenerate`, req),
   listJobs: (req: JobListRequest = {}) => send<Page<JobStatus>>("POST", `${API}/jobs/list`, req),
   cancelJob: (id: JobId) => send<void>("POST", `${API}/jobs/${id}/cancel`),
 };

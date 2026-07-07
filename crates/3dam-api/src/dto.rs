@@ -298,6 +298,25 @@ pub struct QueryRequest {
     pub page: PageParams,
     #[serde(default)]
     pub include_facets: bool,
+    /// How the `text` query is matched (semantic-search M5). Defaults to `Lexical` so existing
+    /// callers and stored queries are unchanged; `Hybrid`/`Semantic` widen results with embedding
+    /// neighbours of the lexical hits.
+    #[serde(default)]
+    pub mode: SearchMode,
+}
+
+/// Text-search strategy (semantic-search M5). `Lexical` is the FTS/synonym path (M1–M3). `Hybrid`
+/// keeps every lexical hit and *adds* embedding-nearest neighbours of those hits, reciprocal-rank
+/// fused — so "ak47" also surfaces visually/geometrically similar props. `Semantic` ranks purely by
+/// that embedding neighbourhood (lexical hits seed it). With no embeddings present both degrade to
+/// `Lexical`. When the model-backed spaces land (M4) the same fusion simply gets better vectors.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchMode {
+    #[default]
+    Lexical,
+    Hybrid,
+    Semantic,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -701,6 +720,10 @@ pub struct LibraryStats {
     pub total: u64,
     pub by_media: CountMap,
     pub by_source: CountMap,
+    /// The most-used confirmed tags (asset count per tag) — the vocabulary that powers the Tags
+    /// filter facet. Capped to the top handful so the sidebar stays a browsable summary, not the
+    /// full long tail. Empty until assets carry confirmed tags.
+    pub tags: CountMap,
     pub unanalyzed: u64,
     pub sources: u64,
 }
@@ -716,6 +739,23 @@ pub struct AnalyzeRequest {
     pub assets: Vec<AssetId>,
     #[serde(default)]
     pub force: bool,
+}
+
+/// Force the derived preview cache to be rebuilt for specific assets: drop each asset's cached
+/// thumbnail PNG(s) (all edges + renderer variants) and its 3D preview blob, so the next read
+/// re-renders from source. Content-keyed and non-destructive — only regenerable derivatives are
+/// removed; the source bytes are never touched (PRODUCT_SPEC §8). Unlike the whole-tier admin
+/// clear-cache, this is a per-asset front-end action (e.g. after a source file was edited in place).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ThumbnailRegenRequest {
+    pub assets: Vec<AssetId>,
+}
+
+/// What a thumbnail-regen pass dropped: how many assets were visited and cache files removed.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct ThumbnailRegenReport {
+    pub assets: u64,
+    pub files_deleted: u64,
 }
 
 /// A "find similar" query. By-asset-id in v1 ("more like this"); the upload-a-reference entry point

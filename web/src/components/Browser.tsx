@@ -19,7 +19,7 @@ import {
   useCollections,
   useDuplicates,
 } from "@/api/queries";
-import type { AssetSummary, DupGroup, SortField } from "@/api/types";
+import type { AssetSummary, DupGroup, SearchMode, SortField } from "@/api/types";
 import { useViewState } from "@/lib/view-state";
 import { useDebounced } from "@/lib/use-debounced";
 import { bytes } from "@/lib/format";
@@ -371,6 +371,23 @@ function Toolbar({
         )}
       </div>
 
+      {/* Search-mode selector (semantic-search M5): only meaningful with a text query, so it appears
+          alongside the box when one is active. Hybrid/Semantic widen results with embedding
+          neighbours of the matches. */}
+      {state.q && (
+        <select
+          className="field w-auto"
+          value={state.mode}
+          title="How the search text is matched"
+          aria-label="Search mode"
+          onChange={(e) => patch({ mode: e.target.value as SearchMode, collection: null })}
+        >
+          <option value="lexical">Keywords</option>
+          <option value="hybrid">Keywords + similar</option>
+          <option value="semantic">Most similar</option>
+        </select>
+      )}
+
       <select
         className="field w-auto"
         value={`${state.sort}:${state.dir}`}
@@ -693,13 +710,13 @@ function TableSkeleton() {
 }
 
 /** The media-specific "detail" from the store's `key_attrs` — image dimensions, audio duration
- *  (with a loop marker when analysis classed it so), or model triangle count (issue #55). One value
- *  per media type so a mixed grid/table has a single meaningful column. */
+ *  (with the analysis type: loop / music / one-shot / sfx), or model triangle count (issue #55). One
+ *  value per media type so a mixed grid/table has a single meaningful column. */
 function detailAttr(asset: AssetSummary): string | null {
   const k = asset.key_attrs;
   if (asset.media === "image") return k.dimensions ?? null;
   if (asset.media === "audio")
-    return k.duration ? (k.loop ? `${k.duration} · loop` : k.duration) : k.loop ? "loop" : null;
+    return k.duration ? (k.type ? `${k.duration} · ${k.type}` : k.duration) : (k.type ?? null);
   if (asset.media === "model") return k.tris ? `${k.tris} tris` : null;
   return null;
 }

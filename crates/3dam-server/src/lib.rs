@@ -118,6 +118,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/api/v1/duplicates", post(list_duplicates))
         .route("/api/v1/suggestions/review", post(review_suggestion))
         .route("/api/v1/jobs/analyze", post(submit_analyze))
+        .route("/api/v1/thumbnails/regenerate", post(regenerate_thumbnails))
         .route("/api/v1/sources", get(list_sources).post(add_source))
         .route(
             "/api/v1/sources/{id}",
@@ -489,6 +490,14 @@ async fn submit_analyze(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let job_id = st.lib.submit_analyze(&ctx, req).await?;
     Ok(Json(serde_json::json!({ "job_id": job_id })))
+}
+
+async fn regenerate_thumbnails(
+    Writer(ctx): Writer,
+    State(st): State<AppState>,
+    Json(req): Json<ThumbnailRegenRequest>,
+) -> Result<Json<ThumbnailRegenReport>, ApiError> {
+    Ok(Json(st.lib.regenerate_thumbnails(&ctx, req).await?))
 }
 
 async fn find_similar(

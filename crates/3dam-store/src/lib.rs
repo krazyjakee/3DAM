@@ -2,6 +2,8 @@
 //! links it (dependency rule 4, tech-spec 01 §2). Methods are synchronous and internally locked;
 //! `3dam-core` calls them from a blocking context off the async runtime (tech-spec 14).
 
+#[cfg(feature = "ann")]
+mod ann;
 mod schema;
 
 use dam_api::dto::*;
@@ -63,6 +65,16 @@ pub struct ImageAnalysis {
 
 pub struct Store {
     conn: Mutex<Connection>,
+    /// Query-expansion vocabulary for text search (semantic-search M3). Built-in defaults plus any
+    /// user `synonyms.txt`; loaded once at open so a query never touches the filesystem.
+    synonyms: search::SynonymMap,
+    /// Bumped on every embedding write so the ANN cache (M6) knows its indexes are stale. Always
+    /// present (a cheap atomic); only *read* by the `ann` feature.
+    embed_gen: std::sync::atomic::AtomicU64,
+    /// Per-space HNSW index cache (semantic-search M6): `space_id → (generation, index)`. Rebuilt
+    /// lazily when `embed_gen` has moved on. Only compiled under the `ann` feature.
+    #[cfg(feature = "ann")]
+    ann_cache: Mutex<std::collections::HashMap<String, (u64, std::sync::Arc<ann::AnnIndex>)>>,
 }
 
 impl Store {
@@ -71,16 +83,16 @@ impl Store {
         std::fs::create_dir_all(data_dir).map_err(internal)?;
         let db_path = data_dir.join("library.db");
         let conn = Connection::open(&db_path).map_err(internal)?;
-        Self::from_conn(conn)
+        Self::from_conn(conn, search::SynonymMap::load(data_dir))
     }
 
     /// Open an in-memory store (tests).
     pub fn open_in_memory() -> Result<Store, LibError> {
         let conn = Connection::open_in_memory().map_err(internal)?;
-        Self::from_conn(conn)
+        Self::from_conn(conn, search::SynonymMap::builtin())
     }
 
-    fn from_conn(conn: Connection) -> Result<Store, LibError> {
+    fn from_conn(conn: Connection, synonyms: search::SynonymMap) -> Result<Store, LibError> {
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(internal)?;
         conn.pragma_update(None, "synchronous", "NORMAL")
@@ -89,6 +101,10 @@ impl Store {
             .map_err(internal)?;
         let store = Store {
             conn: Mutex::new(conn),
+            synonyms,
+            embed_gen: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(feature = "ann")]
+            ann_cache: Mutex::new(std::collections::HashMap::new()),
         };
         store.migrate()?;
         Ok(store)
@@ -130,4 +146,5 @@ mod helpers;
 mod jobs;
 mod maintenance;
 mod query;
+pub mod search;
 mod sources;

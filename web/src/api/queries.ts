@@ -9,6 +9,7 @@ import {
   useQueryClient,
 } from "@tanstack/react-query";
 import { api } from "./client";
+import { bustThumbnails } from "@/lib/thumbnail-cache";
 import type {
   AddSource,
   AnalyzeRequest,
@@ -138,6 +139,18 @@ export function useAnalyze() {
     mutationFn: (req: AnalyzeRequest) => api.submitAnalyze(req),
     meta: { success: "Analysis started", errorPrefix: "Couldn’t start analysis" },
     onSuccess: () => qc.invalidateQueries({ queryKey: qk.jobs }),
+  });
+}
+
+/** Force a rebuild of the derived thumbnail(s) for specific assets: the server drops each asset's
+ *  cached PNG + 3D preview so the next view re-renders from source (e.g. after a source file was
+ *  edited in place). On success we bump each asset's regeneration epoch so its `<img>` re-fetches past
+ *  the browser + response cache — the cache key (content hash) is otherwise unchanged. */
+export function useRegenerateThumbnail() {
+  return useMutation({
+    mutationFn: (ids: AssetId[]) => api.regenerateThumbnails({ assets: ids }),
+    meta: { success: "Thumbnail regenerated", errorPrefix: "Couldn’t regenerate thumbnail" },
+    onSuccess: (_data, ids) => bustThumbnails(ids),
   });
 }
 

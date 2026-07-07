@@ -254,6 +254,17 @@ pub trait LibraryService: Send + Sync {
         req: AnalyzeRequest,
     ) -> Result<JobId, LibError>;
 
+    /// Force the derived preview cache to be rebuilt for specific assets: drop each asset's cached
+    /// thumbnail PNG(s) and 3D preview blob so the next read re-renders from source. Content-keyed
+    /// and non-destructive — only regenerable derivatives are removed; the source is never touched
+    /// (PRODUCT_SPEC §8). Synchronous (a cache purge, not a background job); regeneration happens
+    /// lazily on the next thumbnail read.
+    async fn regenerate_thumbnails(
+        &self,
+        ctx: &AuthContext,
+        req: ThumbnailRegenRequest,
+    ) -> Result<ThumbnailRegenReport, LibError>;
+
     /// "More like this": nearest neighbours of an asset in its media's embedding space, cosine-ranked
     /// and facet-filterable (§3). Returns empty if the asset has no embedding yet (§1.3).
     async fn find_similar(

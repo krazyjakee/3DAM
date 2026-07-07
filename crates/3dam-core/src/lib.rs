@@ -7,6 +7,7 @@ mod convert;
 mod export;
 mod paths;
 mod scan;
+pub mod semantic;
 mod watch;
 
 pub use paths::default_data_dir;
@@ -365,6 +366,10 @@ pub struct EmbeddedLibrary {
     cancels: Mutex<HashMap<JobId, Arc<AtomicBool>>>,
     /// Auto-rescan watchers for `watch`-enabled sources (tech-spec 07 §3.1).
     watchers: watch::WatchManager,
+    /// Model-backed semantic embedder (semantic-search M4), or `None` when no weights ship — the
+    /// default. When present, the analysis pass also writes its space and text search can encode a
+    /// query into it. Held behind the [`semantic::SemanticModel`] seam.
+    semantic: Option<Arc<dyn semantic::SemanticModel>>,
 }
 
 impl EmbeddedLibrary {
@@ -385,12 +390,16 @@ impl EmbeddedLibrary {
         // (serve/mcp), which call `start_watchers()` explicitly. A run-and-exit CLI command must not
         // register OS watches — they add nothing to a one-shot and their setup would outlive the
         // command (keeping the runtime from shutting down). See tech-spec 07 §3.1.
+        // Load the semantic model if this build ships one (M4). `None` by default — the model-free
+        // embeddings stand in — so this is a cheap, always-safe call.
+        let semantic = semantic::load(data_dir).map(Arc::from);
         Ok(EmbeddedLibrary {
             store,
             events,
             data_dir: data_dir.to_path_buf(),
             cancels: Mutex::new(HashMap::new()),
             watchers,
+            semantic,
         })
     }
 
@@ -538,6 +547,30 @@ fn clear_dir(dir: &Path) -> CacheUsage {
     freed
 }
 
+/// Delete every cached derivative keyed to one asset — its thumbnail PNGs (across edges + renderer
+/// variants) and its 3D preview blob — returning how many files were removed. Both cache tiers are
+/// flat and every entry is named `{key}-…`, so a prefix match cleanly scopes deletion to this asset's
+/// slice without disturbing others. Best-effort per file (fail-soft, DESIGN_GUIDELINES §2).
+fn purge_asset_cache(data_dir: &Path, key: &str) -> u64 {
+    let prefix = format!("{key}-");
+    let mut removed = 0u64;
+    for tier in ["thumbnails", "previews"] {
+        let dir = data_dir.join("cache").join(tier);
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            if entry.file_name().to_string_lossy().starts_with(&prefix)
+                && entry.metadata().map(|m| m.is_file()).unwrap_or(false)
+                && std::fs::remove_file(entry.path()).is_ok()
+            {
+                removed += 1;
+            }
+        }
+    }
+    removed
+}
+
 #[async_trait]
 impl LibraryService for EmbeddedLibrary {
     async fn query(
@@ -545,7 +578,21 @@ impl LibraryService for EmbeddedLibrary {
         _ctx: &AuthContext,
         req: QueryRequest,
     ) -> Result<Page<AssetSummary>, LibError> {
-        self.db(move |s| s.query_assets(&req)).await
+        let model = self.semantic.clone();
+        self.db(move |s| {
+            // Model-backed text→asset search (semantic-search M4): when a semantic model is loaded and
+            // this is a Hybrid/Semantic text query, encode the query string into the model's shared
+            // space so assets that match the *meaning* (not the filename) rank in. Encoding is
+            // CPU-bound and runs here on the blocking DB thread. No model ⇒ `None` ⇒ model-free path.
+            let text_vec = match (&model, req.mode, req.text.as_deref()) {
+                (Some(m), SearchMode::Hybrid | SearchMode::Semantic, Some(t)) if !t.is_empty() => m
+                    .encode_text(MediaType::Image, t)
+                    .map(|v| (m.space_id(MediaType::Image), v)),
+                _ => None,
+            };
+            s.query_assets_semantic(&req, text_vec)
+        })
+        .await
     }
 
     async fn get_asset(&self, _ctx: &AuthContext, id: &AssetId) -> Result<Asset, LibError> {
@@ -884,10 +931,36 @@ impl LibraryService for EmbeddedLibrary {
 
         let store = self.store.clone();
         let events = self.events.clone();
+        let model = self.semantic.clone();
         tokio::task::spawn_blocking(move || {
-            analysis::run_analyze(store, events, job, targets, cancel);
+            analysis::run_analyze(store, events, job, targets, cancel, model);
         });
         Ok(job)
+    }
+
+    async fn regenerate_thumbnails(
+        &self,
+        _ctx: &AuthContext,
+        req: ThumbnailRegenRequest,
+    ) -> Result<ThumbnailRegenReport, LibError> {
+        let data_dir = self.data_dir.clone();
+        // Resolve each asset's content key inside the store lock, then purge its cache slice; the
+        // next thumbnail read re-renders from source. A missing asset fails the whole request (the
+        // caller passed a bad id) — per-item fail-soft applies to the file deletes, not the lookup.
+        self.db(move |s| {
+            let mut report = ThumbnailRegenReport::default();
+            for id in &req.assets {
+                let asset = s.get_asset(id)?;
+                let key = asset
+                    .hash
+                    .map(|h| h.to_hex())
+                    .unwrap_or_else(|| asset.summary.id.to_string());
+                report.files_deleted += purge_asset_cache(&data_dir, &key);
+                report.assets += 1;
+            }
+            Ok(report)
+        })
+        .await
     }
 
     async fn find_similar(

@@ -22,7 +22,9 @@ use tokio::sync::broadcast;
 
 /// The current analysis pipeline version. Bump when any extractor's algorithm/output changes so the
 /// Plan stage re-enqueues assets behind it (§7.2). One monotonic number covers the v1 extractor set.
-pub const PIPELINE_VERSION: i64 = 1;
+/// V2: the audio classifier moved from a duration heuristic to measured DSP features (loopability,
+/// tonality/key, tempo, envelope) — every audio asset re-analyses to get an honest class.
+pub const PIPELINE_VERSION: i64 = 2;
 
 /// Embedding-space ids (§2.1). Model-free descriptors in v1 — see module docs. One logical index per
 /// media type; vectors from different spaces are never cross-ranked (§3.1).
@@ -41,6 +43,7 @@ pub(crate) fn run_analyze(
     job: JobId,
     targets: Vec<AnalysisTarget>,
     cancel: Arc<AtomicBool>,
+    model: Option<Arc<dyn crate::semantic::SemanticModel>>,
 ) {
     let total = targets.len() as u64;
     let _ = store.update_job_progress(&job, JobState::Running, 0, Some(total), None);
@@ -51,7 +54,7 @@ pub(crate) fn run_analyze(
         if cancel.load(Ordering::Relaxed) {
             break;
         }
-        match analyze_one(&store, &t) {
+        match analyze_one(&store, &t, model.as_deref()) {
             Ok(()) => {
                 let _ = events.send(LibraryEvent::AssetChanged {
                     id: t.id,
@@ -89,7 +92,11 @@ pub(crate) fn run_analyze(
 
 /// Analyse one asset end-to-end: extract features, derive signals, classify → suggest, index the
 /// embedding, and mark it analysed at the current version. Fail-soft per stage.
-fn analyze_one(store: &Store, t: &AnalysisTarget) -> Result<(), String> {
+fn analyze_one(
+    store: &Store,
+    t: &AnalysisTarget,
+    model: Option<&dyn crate::semantic::SemanticModel>,
+) -> Result<(), String> {
     let abs = resolve(&t.source_uri, &t.path)?;
     let det = dam_media::Detected {
         media: t.media,
@@ -100,10 +107,55 @@ fn analyze_one(store: &Store, t: &AnalysisTarget) -> Result<(), String> {
         MediaType::Audio => analyze_audio(store, t, &abs, &det)?,
         MediaType::Model => analyze_model(store, t, &abs, &det)?,
     }
+    // Model-backed semantic embedding (semantic-search M4): when a model ships, also index the
+    // shared text/media space so text queries can rank against it (M5 semantic mode). Additive to
+    // the model-free space above — different `space_id`, never cross-ranked. `None` on the default
+    // build, so this is a no-op there.
+    if let Some(m) = model {
+        if let Some(vec) = m.encode_asset(t.media, &abs) {
+            let space = m.space_id(t.media);
+            if let Err(e) = store.set_embedding(&t.id, &space, t.media, &vec, "semantic@1") {
+                tracing::warn!(asset = %t.id, error = %e, "semantic embedding failed");
+            }
+        }
+        // Zero-shot content labels — the semantic tier CLAP/SigLIP add on top of the model-free DSP
+        // class (music/speech/sfx by timbre, genre, mood, instrument): tags pure DSP can't derive.
+        // Suggested (not confirmed) so they share the accept/reject lifecycle. No-op when the model
+        // has no taxonomy for this media (default trait impl returns empty).
+        for (tag, conf) in m.zero_shot_labels(t.media, &abs) {
+            if let Err(e) = store.suggest_tag(&t.id, &tag, conf, "semantic@1") {
+                tracing::warn!(asset = %t.id, tag = %tag, error = %e, "semantic label suggest_tag failed");
+            }
+        }
+    }
+    // Filename-derived tag suggestions (semantic-search M2): the words in a name ("ak47", "lowpoly")
+    // are a real, if weak, content signal. Suggested (not confirmed) so they flow through the same
+    // accept/reject lifecycle as the media-derived tags — a reject is remembered.
+    suggest_filename_tags(store, t);
     store
         .mark_analysed(&t.id, PIPELINE_VERSION)
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Suggest a tag for each meaningful whole word in the filename: alphanumeric runs of ≥3 chars that
+/// aren't purely numeric and aren't the format/extension. Low confidence — a name is a weaker signal
+/// than a decoded attribute. Fail-soft per tag.
+fn suggest_filename_tags(store: &Store, t: &AnalysisTarget) {
+    let filename = Path::new(&t.path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&t.path);
+    let fmt = t.format.to_lowercase();
+    for run in filename.split(|c: char| !c.is_alphanumeric()) {
+        let tok = run.to_lowercase();
+        if tok.len() < 3 || tok == fmt || tok.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        if let Err(e) = store.suggest_tag(&t.id, &tok, 0.4, "filename@1") {
+            tracing::warn!(asset = %t.id, tag = %tok, error = %e, "filename suggest_tag failed");
+        }
+    }
 }
 
 fn analyze_image(store: &Store, t: &AnalysisTarget, abs: &Path) -> Result<(), String> {
@@ -163,17 +215,53 @@ fn analyze_audio(
     store
         .set_embedding(&t.id, AUDIO_SPACE, MediaType::Audio, &vec, "audio-stats@1")
         .map_err(|e| e.to_string())?;
-    // Category guess from duration (a cheap heuristic; a real onset/loop analysis is a later
-    // extractor version, §4.2). Short clips read as one-shots, longer ones as loops/music.
-    let (class, conf) = match a.duration_ms {
-        Some(ms) if ms < 2_000 => ("one_shot", 0.6),
-        Some(_) => ("loop", 0.5),
-        None => ("one_shot", 0.3),
-    };
+    // Classify from *measured* DSP signals, not duration (§4.2). A full decode yields loopability
+    // (authored `smpl` loop points, else a seamless wrap boundary), tonality + key, tempo, and
+    // envelope shape — the orthogonal "does it loop" and "what is it" axes a length threshold
+    // conflates. Fail-soft: if the decode fails we fall back to a neutral duration split so the asset
+    // still gets *a* class (never silently "loop", the old bug).
+    let (class, conf, mut extra): (&str, f32, Vec<(&str, f32)>) =
+        match dam_media::extract_audio_features(abs, &det.format) {
+            Ok(f) => {
+                let mut tags: Vec<(&str, f32)> = Vec::new();
+                if f.is_loop {
+                    tags.push(("loop", 0.6));
+                }
+                tags.push(if f.tonal {
+                    ("tonal", 0.6)
+                } else {
+                    ("atonal", 0.5)
+                });
+                if f.bpm.is_some() {
+                    tags.push(("rhythmic", 0.6));
+                }
+                tags.push(if f.sustained {
+                    ("sustained", 0.5)
+                } else {
+                    ("transient", 0.5)
+                });
+                suggest_audio_extras(store, &t.id, &f);
+                let conf = if f.loop_source == dam_media::LoopSource::Metadata {
+                    0.95
+                } else {
+                    0.6
+                };
+                (f.class, conf, tags)
+            }
+            Err(e) => {
+                tracing::warn!(asset = %t.id, error = %e, "audio feature extraction failed; duration fallback");
+                let (c, cf) = match a.duration_ms {
+                    Some(ms) if ms < 2_000 => ("one_shot", 0.4),
+                    _ => ("sfx", 0.3),
+                };
+                (c, cf, Vec::new())
+            }
+        };
     store
         .set_media_class(&t.id, MediaType::Audio, class)
         .map_err(|e| e.to_string())?;
-    suggest_all(store, &t.id, &[(class, conf)]);
+    extra.insert(0, (class, conf));
+    suggest_all(store, &t.id, &extra);
     Ok(())
 }
 
@@ -223,6 +311,25 @@ fn analyze_model(
     }
     suggest_all(store, &t.id, &suggestions);
     Ok(())
+}
+
+/// Suggest the audio tags that need an owned string (tempo bucket, musical key) — kept out of the
+/// `&'static str` batch below. Tempo is bucketed to the nearest 5 BPM so near-identical estimates
+/// collapse to one filterable tag. Fail-soft per tag.
+fn suggest_audio_extras(store: &Store, id: &dam_api::id::AssetId, f: &dam_media::AudioFeatures) {
+    if let Some(bpm) = f.bpm {
+        let bucket = ((bpm / 5.0).round() * 5.0) as i64;
+        let tag = format!("{bucket}bpm");
+        if let Err(e) = store.suggest_tag(id, &tag, 0.5, "analyze@1") {
+            tracing::warn!(asset = %id, tag = %tag, error = %e, "bpm suggest_tag failed");
+        }
+    }
+    if let Some(key) = f.key {
+        let tag = format!("key-{key}");
+        if let Err(e) = store.suggest_tag(id, &tag, 0.5, "analyze@1") {
+            tracing::warn!(asset = %id, tag = %tag, error = %e, "key suggest_tag failed");
+        }
+    }
 }
 
 /// Write a batch of suggested tags fail-soft (a single insert failure never sinks the asset).

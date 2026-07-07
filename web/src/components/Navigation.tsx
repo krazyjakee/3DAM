@@ -48,6 +48,48 @@ const MEDIA: { key: MediaType; label: string; Icon: typeof AudioLines }[] = [
 
 const LICENSES: LicenseStatus[] = ["permissive", "attribution", "restricted", "unknown"];
 
+/** Tags filter facet (design: the sidebar "Tags" chip row). Renders the most-used confirmed tags
+ *  from stats as clickable chips; the active tag is highlighted. Hidden entirely until the library
+ *  has confirmed tags, so a fresh/unanalysed catalog shows no empty header. */
+function TagFacet({
+  tags,
+  active,
+  onSelect,
+}: {
+  tags: Record<string, number>;
+  active: string | null;
+  onSelect: (tag: string) => void;
+}) {
+  const names = Object.keys(tags).sort();
+  if (names.length === 0) return null;
+  return (
+    <>
+      <SectionLabel>Tags</SectionLabel>
+      <div className="flex flex-wrap gap-1.5 px-3 py-1">
+        {names.map((name) => {
+          const on = active === name;
+          return (
+            <button
+              key={name}
+              onClick={() => onSelect(name)}
+              title={`${tags[name].toLocaleString()} asset${tags[name] === 1 ? "" : "s"}`}
+              aria-pressed={on}
+              className="rounded-md border px-2 py-0.5 text-xs transition-colors coarse:min-h-11"
+              style={{
+                background: on ? "var(--color-accent-muted)" : "var(--color-surface-2)",
+                color: on ? "var(--color-accent)" : "var(--color-fg-muted)",
+                borderColor: on ? "var(--color-accent)" : "var(--color-border)",
+              }}
+            >
+              {name}
+            </button>
+          );
+        })}
+      </div>
+    </>
+  );
+}
+
 function SectionLabel({ children }: { children: React.ReactNode }) {
   return (
     <div className="px-3 pt-4 pb-1 text-[10px] font-semibold tracking-wider text-fg-dim uppercase">
@@ -179,6 +221,14 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
         </Row>
       ))}
 
+      {/* tags facet — the most-used confirmed tags, from stats. Composes with the media/license/
+          source facets; clicking one toggles it (and exits any collection view). */}
+      <TagFacet
+        tags={stats.data?.tags ?? {}}
+        active={state.tag}
+        onSelect={(t) => go({ tag: state.tag === t ? null : t, collection: null })}
+      />
+
       {/* sources */}
       <div className="flex items-center justify-between px-3 pt-4 pb-1">
         <span className="text-[10px] font-semibold tracking-wider text-fg-dim uppercase">
@@ -235,7 +285,7 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
       <Collections
         activeId={state.collection}
         onSelect={(id) =>
-          go({ collection: id, media: null, source: null, license: null, q: "" })
+          go({ collection: id, media: null, source: null, license: null, tag: null, q: "" })
         }
       />
 

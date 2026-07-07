@@ -515,6 +515,14 @@ impl LibraryService for ApiClient {
         Ok(reply.job_id)
     }
 
+    async fn regenerate_thumbnails(
+        &self,
+        _ctx: &AuthContext,
+        req: ThumbnailRegenRequest,
+    ) -> Result<ThumbnailRegenReport, LibError> {
+        self.post("/api/v1/thumbnails/regenerate", &req).await
+    }
+
     async fn find_similar(
         &self,
         _ctx: &AuthContext,

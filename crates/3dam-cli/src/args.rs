@@ -50,6 +50,10 @@ pub(crate) enum Cmd {
         format: Option<String>,
         #[arg(long, default_value_t = 50)]
         limit: u32,
+        /// Match strategy (semantic-search M5): `lexical` (FTS + synonyms), `hybrid` (also pulls in
+        /// embedding neighbours of the matches), or `semantic` (rank by that neighbourhood).
+        #[arg(long, value_enum, default_value_t = SearchModeArg::Lexical)]
+        mode: SearchModeArg,
     },
     /// Manage sources.
     Sources {
@@ -350,4 +354,23 @@ pub(crate) enum CollectionCmd {
     Add { id: String, assets: Vec<String> },
     /// Remove assets from a manual collection.
     Remove { id: String, assets: Vec<String> },
+}
+
+/// CLI spelling of `dam_api::dto::SearchMode` (semantic-search M5). Kept local so the clap layer
+/// owns its own `ValueEnum` without `dam-api` taking a clap dependency.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub(crate) enum SearchModeArg {
+    Lexical,
+    Hybrid,
+    Semantic,
+}
+
+impl From<SearchModeArg> for SearchMode {
+    fn from(m: SearchModeArg) -> Self {
+        match m {
+            SearchModeArg::Lexical => SearchMode::Lexical,
+            SearchModeArg::Hybrid => SearchMode::Hybrid,
+            SearchModeArg::Semantic => SearchMode::Semantic,
+        }
+    }
 }

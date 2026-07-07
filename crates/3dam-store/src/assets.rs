@@ -19,7 +19,7 @@ impl Store {
             .map_err(internal)?;
         let hash_blob = a.content_hash.map(|h| h.as_bytes().to_vec());
         let now = now_ms();
-        if let Some(id_blob) = existing {
+        let (id, is_new) = if let Some(id_blob) = existing {
             conn.execute(
                 "UPDATE asset SET content_hash = ?2, filename = ?3, size_bytes = ?4,
                     source_modified_at = ?5, scanned_at = ?6, media_type = ?7, format = ?8,
@@ -37,7 +37,7 @@ impl Store {
                 ],
             )
             .map_err(internal)?;
-            Ok((blob_to_asset_id(&id_blob), false))
+            (blob_to_asset_id(&id_blob), false)
         } else {
             let id = AssetId::new();
             conn.execute(
@@ -59,8 +59,18 @@ impl Store {
                 ],
             )
             .map_err(internal)?;
-            Ok((id, true))
-        }
+            (id, true)
+        };
+        // Enrich the FTS row with filename-derived tokens (M2) so an embedded term like the `ak47`
+        // in `ak47_lowpoly.fbx` is searchable immediately at scan — the `asset_fts` row itself was
+        // created by the insert trigger with the raw filename. Best-effort: a token failure never
+        // sinks the ingest.
+        let tokens = crate::search::tokenize_name(&a.filename).join(" ");
+        let _ = conn.execute(
+            "UPDATE asset_fts SET tokens = ?2 WHERE rowid = (SELECT rowid FROM asset WHERE id = ?1)",
+            params![id.as_bytes().to_vec(), tokens],
+        );
+        Ok((id, is_new))
     }
 
     /// Persist the cheap-tier media attributes into the per-type attr table (tech-spec 02 §3.2,

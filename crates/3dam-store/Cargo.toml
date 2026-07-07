@@ -15,3 +15,11 @@ rusqlite.workspace = true
 uuid.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
+# Optional HNSW ANN index (semantic-search M6). Off by default: the brute-force cosine scan is exact
+# and adequate at v1 scale. The `ann` feature swaps in an approximate index for large embedding
+# spaces (100k+), keeping brute-force as the fallback.
+instant-distance = { version = "0.6.1", optional = true }
+
+[features]
+# HNSW nearest-neighbour acceleration for similarity/hybrid search (M6). See src/ann.rs.
+ann = ["dep:instant-distance"]

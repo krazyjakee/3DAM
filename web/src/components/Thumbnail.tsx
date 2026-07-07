@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Loader2 } from "lucide-react";
 import type { AssetSummary } from "@/api/types";
 import { api } from "@/api/client";
+import { useThumbnailVersion } from "@/lib/thumbnail-cache";
 import { MediaIcon } from "./MediaIcon";
 
 // Images get a real server-rendered PNG thumbnail (tech-spec 04 §6.4); 3D models get a server-side
@@ -42,10 +43,12 @@ function TypedTile({ asset, size }: { asset: AssetSummary; size: number }) {
 
 export function Thumbnail({ asset, size = 28 }: { asset: AssetSummary; size?: number }) {
   const [status, setStatus] = useState<"loading" | "loaded" | "failed">("loading");
+  // Regeneration epoch: bumped when the user forces a rebuild, so the <img> re-fetches past the cache.
+  const version = useThumbnailVersion(asset.id);
 
   // A virtualised cell may be reused for a different asset without remounting — reset when the id
-  // changes so the placeholder/spinner tracks the new image rather than the previous one.
-  useEffect(() => setStatus("loading"), [asset.id]);
+  // (or regeneration epoch) changes so the placeholder/spinner tracks the new image.
+  useEffect(() => setStatus("loading"), [asset.id, version]);
 
   // Media with no server thumbnail (audio), or a preview that failed to load, shows the typed tile.
   if (!hasServerThumbnail(asset.media) || status === "failed") {
@@ -65,7 +68,7 @@ export function Thumbnail({ asset, size = 28 }: { asset: AssetSummary; size?: nu
         </div>
       )}
       <img
-        src={api.assetThumbnailUrl(asset.id, edge)}
+        src={api.assetThumbnailUrl(asset.id, edge, version)}
         alt={asset.name}
         loading="lazy"
         decoding="async"

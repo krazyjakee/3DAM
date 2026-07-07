@@ -2,6 +2,13 @@
 //!
 //! The GUI follows the web client (web-first phasing, PRODUCT_SPEC §9), reusing the same `LibraryService` seam. Until
 //! then `run` is a friendly stub so the `3dam` binary's no-verb GUI role dispatches somewhere real.
+//!
+//! ## UI-parity backlog (build these when the egui shell is real — golden rule 1)
+//! Features already live in the web client that the native GUI still owes, so it reaches parity
+//! rather than silently trailing:
+//! - **Search mode selector** (semantic-search M5): a Keywords / Keywords+similar / Most-similar
+//!   toggle beside the search box, setting `QueryRequest.mode` (`SearchMode`). The engine already
+//!   honours it via `LibraryService::query`, so the GUI only owns the control + wiring.
 
 /// Entry point for the GUI role (bare `3dam`). Returns a process exit code.
 pub fn run() -> u8 {

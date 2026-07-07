@@ -25,11 +25,37 @@ directories.workspace = true
 # watch/auto-rescan (local FS change notification) + CSV manifest export (phase 4 Reach).
 notify.workspace = true
 csv.workspace = true
+# Semantic-embedding stack (semantic-search M4), all optional and pulled in only by the `semantic`
+# feature: SigLIP runs on candle (ADR 0006 §runtime), text is tokenized with `tokenizers`, and
+# `image` decodes + resizes to the vision tower's 224px input.
+candle-transformers = { version = "0.11", optional = true }
+candle-core = { version = "0.11", optional = true }
+candle-nn = { version = "0.11", optional = true }
+tokenizers = { version = "0.23", optional = true }
+image = { workspace = true, optional = true }
+# CLAP audio tower runs on ONNX Runtime via `ort` (the audio analogue of candle-SigLIP). `load-dynamic`
+# links libonnxruntime at runtime (dlopen) rather than at build, so enabling `semantic` never triggers
+# a build-time binary download and the default build stays offline/model-free (ADR 0006). The mel
+# front-end it consumes is pure `dam-media` DSP.
+ort = { version = "=2.0.0-rc.10", default-features = false, features = ["load-dynamic"], optional = true }
 
 [features]
 # 3D model thumbnails via the wgpu renderer. Pulls wgpu in transitively — enabled by `serve`, kept
 # off for lean CLI/GUI builds where the honest typed tile is the intended 3D grid affordance.
 render = ["dep:dam-render"]
+# Model-backed semantic embeddings behind the EmbeddingSpace seam (semantic-search M4, ADR 0006).
+# Off by default: the model-free `*-stats-v1` descriptors stand in. Enabling it compiles the real
+# candle SigLIP encoder (image + text towers); it activates at runtime only when model weights are
+# present under the data dir (see crates/3dam-core/src/semantic.rs), else it logs and returns None.
+# Audio is CLAP via `ort` (this feature); 3D (multi-view render → SigLIP) is the remaining M4 sub-path.
+semantic = [
+    "dep:candle-transformers",
+    "dep:candle-core",
+    "dep:candle-nn",
+    "dep:tokenizers",
+    "dep:image",
+    "dep:ort",
+]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread"] }

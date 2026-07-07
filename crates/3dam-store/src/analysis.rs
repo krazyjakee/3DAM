@@ -128,6 +128,9 @@ impl Store {
             ],
         )
         .map_err(internal)?;
+        // Invalidate any cached ANN index (M6): the space's vectors just changed.
+        self.embed_gen
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -258,30 +261,40 @@ impl Store {
             return Ok(Vec::new()); // not embedded yet (§1.3)
         };
         let qvec = bytes_to_f32(&qbytes);
-
-        // Score every other vector in the same space.
-        let mut stmt = conn
-            .prepare("SELECT asset_id, vec FROM embedding WHERE space_id = ?1")
-            .map_err(internal)?;
-        let self_blob = id.as_bytes().to_vec();
-        let rows = stmt
-            .query_map(params![space_id], |r| {
-                Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?))
-            })
-            .map_err(internal)?;
-        let mut scored: Vec<(AssetId, f32)> = Vec::new();
-        for r in rows {
-            let (id_blob, vbytes) = r.map_err(internal)?;
-            if id_blob == self_blob {
-                continue;
-            }
-            let score = cosine(&qvec, &bytes_to_f32(&vbytes));
-            scored.push((blob_to_asset_id(&id_blob), score));
-        }
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        // Over-fetch, then post-filter against the facet predicate and fetch summaries (§3.3).
+        // Over-fetch nearest neighbours (self excluded) so the facet post-filter still leaves ≥ k.
         let overfetch = (k as usize * 4).max(k as usize + 16);
+
+        // Nearest neighbours in the space, descending cosine. The `ann` feature (M6) serves this from
+        // a cached HNSW index; the default build does the exact brute-force scan (correct and the
+        // ground truth the ANN parity test checks against).
+        #[cfg(feature = "ann")]
+        let scored: Vec<(AssetId, f32)> =
+            self.ann_scored(&conn, &space_id, &qvec, id, overfetch)?;
+        #[cfg(not(feature = "ann"))]
+        let scored: Vec<(AssetId, f32)> = {
+            let mut stmt = conn
+                .prepare("SELECT asset_id, vec FROM embedding WHERE space_id = ?1")
+                .map_err(internal)?;
+            let self_blob = id.as_bytes().to_vec();
+            let rows = stmt
+                .query_map(params![space_id], |r| {
+                    Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?))
+                })
+                .map_err(internal)?;
+            let mut scored: Vec<(AssetId, f32)> = Vec::new();
+            for r in rows {
+                let (id_blob, vbytes) = r.map_err(internal)?;
+                if id_blob == self_blob {
+                    continue;
+                }
+                let score = cosine(&qvec, &bytes_to_f32(&vbytes));
+                scored.push((blob_to_asset_id(&id_blob), score));
+            }
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            scored
+        };
+
+        // Post-filter against the facet predicate and fetch summaries (§3.3).
         let candidate_ids: Vec<AssetId> = scored.iter().take(overfetch).map(|(a, _)| *a).collect();
         let summaries = Self::summaries_for_ids(&conn, &candidate_ids, filters)?;
         let mut out = Vec::new();
@@ -294,6 +307,105 @@ impl Store {
             }
         }
         Ok(out)
+    }
+
+    /// Nearest neighbours of an arbitrary query vector in `space_id`, `(id, cosine)` desc, capped at
+    /// `k`. This is the text→asset entry point (semantic-search M4/M5): the engine encodes a query
+    /// string into the model's shared space, then this finds the closest assets — no reference asset
+    /// needed. Uses the ANN index under the `ann` feature, else an exact scan. Empty space → empty.
+    pub(crate) fn nearest_in_space(
+        &self,
+        conn: &Connection,
+        space_id: &str,
+        qvec: &[f32],
+        k: usize,
+    ) -> Result<Vec<(AssetId, f32)>, LibError> {
+        #[cfg(feature = "ann")]
+        {
+            match self.ann_for_space(conn, space_id) {
+                Ok(index) => Ok(index.nearest(qvec, k)),
+                Err(_) => Ok(Vec::new()), // empty/absent space
+            }
+        }
+        #[cfg(not(feature = "ann"))]
+        {
+            let mut stmt = conn
+                .prepare("SELECT asset_id, vec FROM embedding WHERE space_id = ?1")
+                .map_err(internal)?;
+            let rows = stmt
+                .query_map(params![space_id], |r| {
+                    Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?))
+                })
+                .map_err(internal)?;
+            let mut scored: Vec<(AssetId, f32)> = Vec::new();
+            for r in rows {
+                let (idb, vb) = r.map_err(internal)?;
+                scored.push((blob_to_asset_id(&idb), cosine(qvec, &bytes_to_f32(&vb))));
+            }
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            scored.truncate(k);
+            Ok(scored)
+        }
+    }
+
+    /// ANN nearest neighbours of `qvec` in `space_id` (M6), self excluded, `(id, cosine)` desc.
+    #[cfg(feature = "ann")]
+    fn ann_scored(
+        &self,
+        conn: &Connection,
+        space_id: &str,
+        qvec: &[f32],
+        self_id: &AssetId,
+        k: usize,
+    ) -> Result<Vec<(AssetId, f32)>, LibError> {
+        let index = self.ann_for_space(conn, space_id)?;
+        let mut out: Vec<(AssetId, f32)> = index
+            .nearest(qvec, k + 1)
+            .into_iter()
+            .filter(|(id, _)| id != self_id)
+            .collect();
+        out.truncate(k);
+        Ok(out)
+    }
+
+    /// Get (or lazily build + cache) the HNSW index for a space (M6). Rebuilt when an embedding
+    /// write has bumped `embed_gen` since the cached copy. `conn` is the already-held lock.
+    #[cfg(feature = "ann")]
+    fn ann_for_space(
+        &self,
+        conn: &Connection,
+        space_id: &str,
+    ) -> Result<std::sync::Arc<crate::ann::AnnIndex>, LibError> {
+        use std::sync::atomic::Ordering;
+        let generation = self.embed_gen.load(Ordering::Relaxed);
+        if let Some((g, idx)) = self.ann_cache.lock().unwrap().get(space_id) {
+            if *g == generation {
+                return Ok(idx.clone());
+            }
+        }
+        // (Re)build from the space's current vectors.
+        let mut stmt = conn
+            .prepare("SELECT asset_id, vec FROM embedding WHERE space_id = ?1")
+            .map_err(internal)?;
+        let rows = stmt
+            .query_map(params![space_id], |r| {
+                Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(internal)?;
+        let mut items: Vec<(AssetId, Vec<f32>)> = Vec::new();
+        for r in rows {
+            let (idb, vb) = r.map_err(internal)?;
+            items.push((blob_to_asset_id(&idb), bytes_to_f32(&vb)));
+        }
+        let idx = std::sync::Arc::new(
+            crate::ann::AnnIndex::build(items)
+                .ok_or_else(|| LibError::Internal("empty embedding space".into()))?,
+        );
+        self.ann_cache
+            .lock()
+            .unwrap()
+            .insert(space_id.to_string(), (generation, idx.clone()));
+        Ok(idx)
     }
 
     /// Duplicate groups for the review view (§4). `Exact` groups by content hash; `Near` groups by
@@ -412,7 +524,7 @@ impl Store {
 
     /// Fetch summaries for a set of ids, applying the same faceted filters as text search (§3.3).
     /// Returns a map so callers can preserve their own ordering (similarity score / dup grouping).
-    fn summaries_for_ids(
+    pub(crate) fn summaries_for_ids(
         conn: &Connection,
         ids: &[AssetId],
         filters: &[Filter],
@@ -445,7 +557,7 @@ impl Store {
 }
 
 /// Decode a little-endian f32 blob (an embedding row's `vec`).
-fn bytes_to_f32(b: &[u8]) -> Vec<f32> {
+pub(crate) fn bytes_to_f32(b: &[u8]) -> Vec<f32> {
     b.chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
@@ -453,7 +565,7 @@ fn bytes_to_f32(b: &[u8]) -> Vec<f32> {
 
 /// Cosine similarity. Vectors are stored L2-normalised, so this is a dot product; we still divide by
 /// the norms defensively in case a legacy/zero vector slips in.
-fn cosine(a: &[f32], b: &[f32]) -> f32 {
+pub(crate) fn cosine(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() || a.is_empty() {
         return 0.0;
     }

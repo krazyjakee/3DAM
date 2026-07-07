@@ -5,12 +5,22 @@
 // asset, or the multi-selection when the clicked item is part of it — #22).
 
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { FileCog, FolderPlus, Search, Sparkles, ClipboardCopy, Trash2, Ban } from "lucide-react";
+import {
+  FileCog,
+  FolderPlus,
+  Search,
+  Sparkles,
+  RefreshCw,
+  ClipboardCopy,
+  Trash2,
+  Ban,
+} from "lucide-react";
 import { api } from "@/api/client";
 import {
   useAnalyze,
   useCollections,
   useCollectionMembers,
+  useRegenerateThumbnail,
   useRemoveAsset,
 } from "@/api/queries";
 import type { AssetSummary } from "@/api/types";
@@ -63,6 +73,7 @@ export function ContextMenu({
   const [pos, setPos] = useState({ x: 0, y: 0 });
   const { patch } = useViewState();
   const analyze = useAnalyze();
+  const regenerateThumbnail = useRegenerateThumbnail();
   const collections = useCollections();
   const members = useCollectionMembers();
   const remove = useRemoveAsset();
@@ -107,6 +118,11 @@ export function ContextMenu({
   const ids = assets.map((a) => a.id);
   const single = assets.length === 1;
   const heading = single ? assets[0].name : `${assets.length} items`;
+  // Only image + 3D assets have a server thumbnail to rebuild (audio uses the honest typed tile);
+  // hide "Regenerate thumbnail" when nothing in the target set can produce one.
+  const thumbableIds = assets
+    .filter((a) => a.media === "image" || a.media === "model")
+    .map((a) => a.id);
 
   const run = (fn: () => void) => {
     fn();
@@ -145,11 +161,22 @@ export function ContextMenu({
       {single && (
         <Item icon={<Search size={13} />} label="Open" onClick={() => run(() => patch({ selected: ids[0] }))} />
       )}
+      {/* Reanalyze forces a re-run (`force: true`) so a deliberate per-asset click is never a silent
+          no-op on an already-up-to-date asset; it still analyses never-analysed targets too. */}
       <Item
         icon={<Sparkles size={13} />}
-        label={single ? "Analyze" : `Analyze ${assets.length}`}
-        onClick={() => run(() => analyze.mutate({ assets: ids }))}
+        label={single ? "Reanalyze" : `Reanalyze ${assets.length}`}
+        onClick={() => run(() => analyze.mutate({ assets: ids, force: true }))}
       />
+      {thumbableIds.length > 0 && (
+        <Item
+          icon={<RefreshCw size={13} />}
+          label={
+            thumbableIds.length === 1 ? "Regenerate thumbnail" : `Regenerate ${thumbableIds.length} thumbnails`
+          }
+          onClick={() => run(() => regenerateThumbnail.mutate(thumbableIds))}
+        />
+      )}
       <Item
         icon={<FileCog size={13} />}
         label={single ? "Convert…" : `Convert ${assets.length}…`}

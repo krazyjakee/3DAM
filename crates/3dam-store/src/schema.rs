@@ -199,4 +199,34 @@ pub const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE model_attr ADD COLUMN dependency_bytes INTEGER;
     "#,
+    // ── V6: FTS5 full-text index over the searchable text of an asset (semantic-search M1) ────────
+    // v1 text search was `filename LIKE '%term%'` — an unindexed full scan with no word matching or
+    // ranking (§13). This adds an FTS5 index so text search becomes an inverted-index lookup with
+    // bm25 relevance, real token matching, and prefix queries. Two columns: `filename` (the raw
+    // name) and `tokens` (filename-derived terms the analyse pass writes — M2 — so "ak47_lowpoly.fbx"
+    // is findable as `ak47`). A standalone (not contentless) FTS table keyed by `asset.rowid`, kept
+    // in sync by triggers; the initial backfill seeds rows for an already-populated catalog. Search
+    // still degrades to LIKE for partial in-word substrings the tokenizer can't reach.
+    r#"
+    CREATE VIRTUAL TABLE asset_fts USING fts5(
+        filename,
+        tokens,
+        tokenize = "unicode61 remove_diacritics 2"
+    );
+
+    -- Seed existing rows (triggers only fire on future writes).
+    INSERT INTO asset_fts(rowid, filename, tokens)
+        SELECT rowid, filename, '' FROM asset;
+
+    -- Keep the index in lockstep with the asset table. rowid is the join key back to asset.
+    CREATE TRIGGER asset_fts_ai AFTER INSERT ON asset BEGIN
+        INSERT INTO asset_fts(rowid, filename, tokens) VALUES (new.rowid, new.filename, '');
+    END;
+    CREATE TRIGGER asset_fts_ad AFTER DELETE ON asset BEGIN
+        DELETE FROM asset_fts WHERE rowid = old.rowid;
+    END;
+    CREATE TRIGGER asset_fts_au AFTER UPDATE OF filename ON asset BEGIN
+        UPDATE asset_fts SET filename = new.filename WHERE rowid = new.rowid;
+    END;
+    "#,
 ];

@@ -290,6 +290,12 @@ pub(crate) fn print_stats(s: &LibraryStats) {
             println!("  {k:<20} {v}");
         }
     }
+    if !s.tags.is_empty() {
+        println!("top tags:");
+        for (k, v) in &s.tags {
+            println!("  {k:<20} {v}");
+        }
+    }
 }
 
 pub(crate) fn print_asset(a: &Asset) {
