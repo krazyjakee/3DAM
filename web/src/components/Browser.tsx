@@ -10,6 +10,7 @@ import {
   Rows3,
   Search,
   Sparkles,
+  Star,
   X,
 } from "lucide-react";
 import {
@@ -18,6 +19,7 @@ import {
   useCollectionMembers,
   useCollections,
   useDuplicates,
+  useSetFavorite,
 } from "@/api/queries";
 import type { AssetSummary, DupGroup, SearchMode, SortField } from "@/api/types";
 import { useViewState } from "@/lib/view-state";
@@ -777,7 +779,7 @@ function GridCell({
         onContext(asset, e.clientX, e.clientY);
       }}
       {...longPress}
-      className="flex flex-col overflow-hidden rounded border text-left transition-colors"
+      className="group flex flex-col overflow-hidden rounded border text-left transition-colors"
       style={{
         height: CELL_H - 8,
         borderColor: active ? "var(--color-accent)" : "var(--color-border)",
@@ -797,6 +799,7 @@ function GridCell({
         <span className="truncate text-[11px] text-fg" title={asset.name}>
           {asset.name}
         </span>
+        <FavoriteStar asset={asset} />
       </div>
       <div className="flex items-center justify-between px-1.5 pb-1">
         <LicenseBadge badge={asset.license} />
@@ -922,7 +925,7 @@ function TableRow({
         onContext(asset, e.clientX, e.clientY);
       }}
       {...longPress}
-      className="absolute top-0 left-0 grid w-full grid-cols-[1fr_64px_104px_112px_84px] items-center gap-2 px-3 text-left text-xs"
+      className="group absolute top-0 left-0 grid w-full grid-cols-[1fr_64px_104px_112px_84px] items-center gap-2 px-3 text-left text-xs"
       style={{
         height: ROW_H,
         transform: `translateY(${top}px)`,
@@ -937,6 +940,7 @@ function TableRow({
         </span>
         {/* collapsed-duplicate count — a row has no "top right", so the red badge sits by the name */}
         {dupCount != null && dupCount > 0 && <DupBadge count={dupCount} className="shrink-0" />}
+        <FavoriteStar asset={asset} />
       </span>
       <span className="truncate uppercase">{asset.format}</span>
       <LicenseBadge badge={asset.license} />
@@ -949,6 +953,36 @@ function TableRow({
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
+
+/** Favourite toggle for a grid tile / table row (issue #63). The cell itself is a `<button>`, so this
+ *  is a `role="button"` span — never a nested `<button>` — and it stops propagation so starring never
+ *  selects/opens the asset. Hidden until hover/focus (always shown once starred, or on touch), so the
+ *  dense grid stays low-chrome. Active state uses the one accent (warn/danger are exposure-risk only). */
+function FavoriteStar({ asset }: { asset: AssetSummary }) {
+  const setFavorite = useSetFavorite();
+  const on = asset.favorite;
+  return (
+    <span
+      role="button"
+      tabIndex={-1}
+      aria-label={on ? "Remove from favourites" : "Add to favourites"}
+      aria-pressed={on}
+      title={on ? "Remove from favourites" : "Add to favourites"}
+      onClick={(e) => {
+        e.stopPropagation();
+        if (!setFavorite.isPending) setFavorite.mutate({ asset: asset.id, favorite: !on });
+      }}
+      className={`flex shrink-0 cursor-pointer items-center justify-center rounded transition-opacity coarse:min-h-11 coarse:min-w-11 ${
+        on
+          ? "opacity-100"
+          : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 coarse:opacity-100"
+      }`}
+      style={{ color: on ? "var(--color-accent)" : "var(--color-fg-dim)" }}
+    >
+      <Star size={12} className={on ? "fill-current" : ""} />
+    </span>
+  );
+}
 
 /** Responsive column count from the container width (re-measured on resize). */
 function useColumns(ref: React.RefObject<HTMLDivElement | null>, target: number) {
