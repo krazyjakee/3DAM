@@ -1,6 +1,15 @@
 import type React from "react";
 import { useEffect, useState } from "react";
-import { Check, Grid3x3, RefreshCw, Sparkles, Star, X } from "lucide-react";
+import {
+  Check,
+  Grid3x3,
+  PanelRightClose,
+  PanelRightOpen,
+  RefreshCw,
+  Sparkles,
+  Star,
+  X,
+} from "lucide-react";
 import {
   useAnalyze,
   useAsset,
@@ -40,31 +49,53 @@ import { Drawer } from "./Drawer";
  *
  *  Below `lg` the drawer is opt-in (issue #33): selecting an asset highlights it in place — it no longer
  *  hijacks the screen — and the drawer opens only when the caller flips `open` (via the explicit
- *  "Inspect" affordance in the Workspace selection bar). Dismissing the drawer keeps the selection. */
+ *  "Inspect" affordance in the Workspace selection bar). Dismissing the drawer keeps the selection.
+ *
+ *  On `lg` the rail's close button collapses the whole rail (issue #65) — reclaiming the space for the
+ *  Browser — rather than just emptying it; a slim strip with a reopen button remains. */
 export function Inspector({
   width,
   open,
   onClose,
+  collapsed,
+  onCollapse,
+  onExpand,
 }: {
   width?: number;
   open: boolean;
   onClose: () => void;
+  collapsed: boolean;
+  onCollapse: () => void;
+  onExpand: () => void;
 }) {
-  const { state, patch } = useViewState();
-  const deselect = () => patch({ selected: null });
+  const { state } = useViewState();
 
   return (
     <>
-      <aside
-        className="hidden shrink-0 flex-col border-l border-border bg-surface lg:flex"
-        style={{ width }}
-      >
-        {/* The persistent rail's close clears the selection (there is nothing to "dismiss"). */}
-        <InspectorPanel selected={state.selected} onClose={deselect} />
-      </aside>
+      {collapsed ? (
+        // Collapsed rail (issue #65): a slim edge strip whose only control reopens the inspector.
+        <aside className="hidden w-9 shrink-0 flex-col items-center border-l border-border bg-surface py-2 lg:flex">
+          <button
+            onClick={onExpand}
+            title="Show inspector"
+            aria-label="Show inspector"
+            className="flex items-center justify-center text-fg-dim hover:text-fg coarse:min-h-11 coarse:min-w-11"
+          >
+            <PanelRightOpen size={15} />
+          </button>
+        </aside>
+      ) : (
+        <aside
+          className="hidden shrink-0 flex-col border-l border-border bg-surface lg:flex"
+          style={{ width }}
+        >
+          {/* The rail's close collapses the panel (reclaims space); reopen via the strip above. */}
+          <InspectorPanel selected={state.selected} onClose={onCollapse} mode="rail" />
+        </aside>
+      )}
       {/* The drawer's close only dismisses the overlay — the selection (and its grid highlight) stays. */}
       <Drawer open={open && !!state.selected} onClose={onClose} side="right" label="Inspector">
-        <InspectorPanel selected={state.selected} onClose={onClose} />
+        <InspectorPanel selected={state.selected} onClose={onClose} mode="drawer" />
       </Drawer>
     </>
   );
@@ -73,26 +104,28 @@ export function Inspector({
 function InspectorPanel({
   selected,
   onClose,
+  mode,
 }: {
   selected: string | null;
   onClose: () => void;
+  /** `rail` → the close control collapses the `lg` rail; `drawer` → it dismisses the overlay. */
+  mode: "rail" | "drawer";
 }) {
   const asset = useAsset(selected);
+  const { patch } = useViewState();
+  const collapse = mode === "rail";
 
   // If the selected asset no longer exists — its source was removed, or it was removed + blocked
   // (#21) — clear the dangling selection instead of leaving the inspector stuck on an error (#29).
+  // This is independent of the close button, which on the rail collapses rather than deselects (#65).
   useEffect(() => {
-    if (asset.isError && asset.error instanceof ApiError && asset.error.status === 404) onClose();
-  }, [asset.isError, asset.error, onClose]);
+    if (asset.isError && asset.error instanceof ApiError && asset.error.status === 404) {
+      patch({ selected: null });
+    }
+  }, [asset.isError, asset.error, patch]);
 
-  if (!selected) {
-    return (
-      <div className="flex h-full items-center justify-center px-6 text-center text-xs text-fg-dim">
-        Select an asset to inspect it.
-      </div>
-    );
-  }
-
+  // The header — and its collapse/close control — is always present, so the rail can be collapsed
+  // even with nothing selected (issue #65). The body below swaps placeholder / skeleton / content.
   return (
     <div className="flex h-full flex-col overflow-y-auto">
       <div className="flex items-center justify-between border-b border-border px-3 py-2">
@@ -101,16 +134,21 @@ function InspectorPanel({
         </span>
         <button
           className="flex items-center justify-center text-fg-dim hover:text-fg coarse:min-h-11 coarse:min-w-11"
-          title="Close"
-          aria-label="Close inspector"
+          title={collapse ? "Collapse" : "Close"}
+          aria-label={collapse ? "Collapse inspector" : "Close inspector"}
           onClick={onClose}
         >
-          {/* One dismiss glyph across the app: the same X the modal/dialog uses (issue #33 item 4). */}
-          <X size={15} />
+          {/* The rail collapses (panel-close glyph, issue #65); the drawer dismisses (the X the
+              modal/dialog uses, issue #33 item 4). */}
+          {collapse ? <PanelRightClose size={15} /> : <X size={15} />}
         </button>
       </div>
 
-      {asset.isLoading ? (
+      {!selected ? (
+        <div className="flex flex-1 items-center justify-center px-6 text-center text-xs text-fg-dim">
+          Select an asset to inspect it.
+        </div>
+      ) : asset.isLoading ? (
         <InspectorSkeleton />
       ) : asset.isError || !asset.data ? (
         <div className="p-4 text-xs text-danger">Could not load this asset.</div>

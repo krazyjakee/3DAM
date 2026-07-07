@@ -24,8 +24,22 @@ export function Workspace() {
   // Below `lg` the inspector is an opt-in overlay: selecting highlights in place, and this flag —
   // toggled by the selection bar — controls whether the detail drawer is up (issue #33 item 3).
   const [inspectOpen, setInspectOpen] = useState(false);
+  // On `lg` the inspector rail can be collapsed to reclaim space for the Browser (issue #65);
+  // persisted so the choice survives a reload.
+  const [collapsed, setCollapsed] = useState(
+    () => typeof window !== "undefined" && localStorage.getItem("dam.inspectorCollapsed") === "1",
+  );
+  const collapse = (v: boolean) => {
+    setCollapsed(v);
+    if (typeof window !== "undefined")
+      localStorage.setItem("dam.inspectorCollapsed", v ? "1" : "0");
+  };
   const nav = useResizableWidth("dam.navWidth", 220, 160, 480);
-  const inspector = useResizableWidth("dam.inspectorWidth", 300, 220, 560);
+  // The inspector holds a 3D preview / full-res image + dense metadata, so let it drag meaningfully
+  // wide — up to ~55% of the viewport (issue #65), with a generous floor for small screens.
+  const inspectorMax =
+    typeof window !== "undefined" ? Math.max(560, Math.floor(window.innerWidth * 0.55)) : 560;
+  const inspector = useResizableWidth("dam.inspectorWidth", 300, 220, inspectorMax);
 
   return (
     <div className="flex h-dvh flex-col">
@@ -46,12 +60,16 @@ export function Workspace() {
 
         <Browser onOpenNav={() => setNavOpen(true)} />
 
-        {/* Inspector — persistent rail on lg; on narrow it's an opt-in drawer (see SelectionBar). */}
-        <ResizeHandle resizable={inspector} grow="left" label="Resize inspector" />
+        {/* Inspector — persistent rail on lg (collapsible, issue #65); on narrow an opt-in drawer.
+            The splitter is hidden when the rail is collapsed — there's nothing to resize. */}
+        {!collapsed && <ResizeHandle resizable={inspector} grow="left" label="Resize inspector" />}
         <Inspector
           width={inspector.width}
           open={inspectOpen}
           onClose={() => setInspectOpen(false)}
+          collapsed={collapsed}
+          onCollapse={() => collapse(true)}
+          onExpand={() => collapse(false)}
         />
       </div>
       {/* Narrow-screen selection bar: a tapped asset stays highlighted in the grid; "Inspect" raises
