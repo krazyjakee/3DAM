@@ -8,13 +8,15 @@ use dam_api::admin::{
     AdminStatus, AuditEntry, FlagInfo, NewToken, NewTokenReply, SetFlag, TokenInfo,
 };
 use dam_api::dto::*;
-use dam_api::event::{LibraryEvent, SubscribeRequest};
+use dam_api::event::{EventTopic, LibraryEvent, SubscribeRequest};
 use dam_api::id::{AssetId, CollectionId, ContentHash, JobId, SourceId};
 use dam_api::page::{Page, PageParams};
 use dam_api::service::{AuthContext, EventStream, LibraryService};
 use dam_api::{ErrorBody, LibError};
+use futures::StreamExt;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use std::time::Duration;
 use url::Url;
 
 #[derive(serde::Deserialize)]
@@ -33,6 +35,9 @@ struct JobIdReply {
 pub struct ApiClient {
     base: Url,
     http: reqwest::Client,
+    /// Bearer token, kept alongside the reqwest default header so the WebSocket handshake
+    /// (`subscribe`, tech-spec 09 §A.3) can present the same credential (issue #36).
+    token: Option<String>,
 }
 
 /// Recover `(media, format)` from a `Content-Type` — the inverse of `dam_api::dto::content_type_for`.
@@ -56,6 +61,49 @@ fn media_from_content_type(ct: &str) -> (MediaType, String) {
         m if m.starts_with("audio/") => (MediaType::Audio, String::new()),
         _ => (MediaType::Model, String::new()),
     }
+}
+
+/// Open the WebSocket, presenting the bearer token on the handshake when the peer is token-gated.
+async fn connect_ws(
+    url: &Url,
+    token: Option<&str>,
+) -> Result<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    LibError,
+> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut request = url
+        .as_str()
+        .into_client_request()
+        .map_err(|e| LibError::BadRequest(format!("bad ws url: {e}")))?;
+    if let Some(t) = token {
+        let value = format!("Bearer {t}")
+            .parse()
+            .map_err(|e| LibError::BadRequest(format!("invalid token: {e}")))?;
+        request
+            .headers_mut()
+            .insert(reqwest::header::AUTHORIZATION.as_str(), value);
+    }
+    let (ws, _resp) = tokio_tungstenite::connect_async(request)
+        .await
+        .map_err(|e| LibError::SourceUnavailable(e.to_string()))?;
+    Ok(ws)
+}
+
+/// Whether an event passes the subscription's topic filter. An empty topic list means "everything"
+/// (matches the embedded engine, which streams the whole firehose).
+fn topic_matches(topics: &[EventTopic], ev: &LibraryEvent) -> bool {
+    if topics.is_empty() {
+        return true;
+    }
+    let topic = match ev {
+        LibraryEvent::AssetAdded(_)
+        | LibraryEvent::AssetChanged { .. }
+        | LibraryEvent::AssetRemoved(_) => EventTopic::Assets,
+        LibraryEvent::SourceState { .. } => EventTopic::Sources,
+        LibraryEvent::JobProgress(_) => EventTopic::Jobs,
+    };
+    topics.contains(&topic)
 }
 
 impl ApiClient {
@@ -84,6 +132,7 @@ impl ApiClient {
         Ok(ApiClient {
             base: endpoint,
             http,
+            token,
         })
     }
 
@@ -91,6 +140,15 @@ impl ApiClient {
         self.base
             .join(path)
             .map_err(|e| LibError::BadRequest(e.to_string()))
+    }
+
+    /// The `ws://` / `wss://` URL for the live-event endpoint, derived from the http(s) base.
+    fn ws_url(&self) -> Result<Url, LibError> {
+        let mut u = self.url("/api/v1/ws")?;
+        let ws_scheme = if u.scheme() == "https" { "wss" } else { "ws" };
+        u.set_scheme(ws_scheme)
+            .map_err(|_| LibError::Internal("cannot derive ws scheme".into()))?;
+        Ok(u)
     }
 
     async fn decode<T: DeserializeOwned>(resp: reqwest::Response) -> Result<T, LibError> {
@@ -560,11 +618,52 @@ impl LibraryService for ApiClient {
     async fn subscribe(
         &self,
         _ctx: &AuthContext,
-        _req: SubscribeRequest,
+        req: SubscribeRequest,
     ) -> Result<EventStream<LibraryEvent>, LibError> {
-        // The WS live-update transport lands with the server WS endpoint; not yet wired client-side.
-        Err(LibError::Unsupported(
-            "live subscribe over the API client is not implemented yet".into(),
-        ))
+        // Connect to the server WS firehose (`/api/v1/ws`, tech-spec 09 §A.3) and pump the
+        // `LibraryEvent` stream into a channel, reconnecting with backoff so a connected frontend's
+        // live updates survive a transient drop (mirrors the web client's ws.ts — issue #36, #25).
+        let ws_url = self.ws_url()?;
+        let token = self.token.clone();
+        let topics = req.topics;
+        let (tx, rx) = futures::channel::mpsc::unbounded::<LibraryEvent>();
+
+        tokio::spawn(async move {
+            let mut backoff = Duration::from_millis(500);
+            loop {
+                match connect_ws(&ws_url, token.as_deref()).await {
+                    Ok(mut ws) => {
+                        backoff = Duration::from_millis(500); // reset once connected
+                        while let Some(msg) = ws.next().await {
+                            match msg {
+                                Ok(tokio_tungstenite::tungstenite::Message::Text(txt)) => {
+                                    match serde_json::from_str::<LibraryEvent>(txt.as_str()) {
+                                        Ok(ev) if topic_matches(&topics, &ev) => {
+                                            if tx.unbounded_send(ev).is_err() {
+                                                return;
+                                            }
+                                        }
+                                        Ok(_) => {}
+                                        Err(e) => tracing::debug!(error = %e, "bad ws event frame"),
+                                    }
+                                }
+                                Ok(tokio_tungstenite::tungstenite::Message::Close(_)) | Err(_) => {
+                                    break
+                                }
+                                Ok(_) => {}
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!(error = %e, "ws subscribe connect failed"),
+                }
+                if tx.is_closed() {
+                    return;
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(15));
+            }
+        });
+
+        Ok(Box::pin(rx))
     }
 }

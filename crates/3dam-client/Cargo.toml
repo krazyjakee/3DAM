@@ -15,3 +15,6 @@ async-trait.workspace = true
 futures.workspace = true
 url.workspace = true
 tracing.workspace = true
+# WS client for the live-event transport (`subscribe`, issue #36). Version matches the tree's
+# existing transitive resolve (via axum's WS support); ws:// only in v1, so no TLS feature needed.
+tokio-tungstenite = "0.29"
