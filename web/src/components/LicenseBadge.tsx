@@ -13,6 +13,18 @@ export function LicenseBadge({
   const color = licenseColorVar[badge.status];
   const text = badge.id ?? licenseLabel[badge.status];
 
+  // An unknown, unidentified license conveys nothing — the common case for local game assets (#54).
+  // Don't spend a prime grid/table slot on it: compact contexts drop it entirely, and the inspector
+  // keeps only a muted one-liner. License stays prominent when it's actually meaningful.
+  if (badge.status === "unknown" && !badge.id) {
+    if (!prominent) return null;
+    return (
+      <span className="text-[11px] text-fg-dim" title="No license information recorded">
+        No license info
+      </span>
+    );
+  }
+
   if (prominent) {
     return (
       <span
