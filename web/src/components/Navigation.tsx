@@ -103,7 +103,9 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
         <Library size={16} className="text-accent" />
         <div className="min-w-0">
           <div className="text-sm font-semibold text-fg">3DAM</div>
-          <div className="text-[10px] text-fg-dim">{total.toLocaleString()} assets</div>
+          <div className="text-[10px] text-fg-dim">
+            {stats.isLoading ? "…" : total.toLocaleString()} assets
+          </div>
         </div>
         <button
           className="btn ml-auto px-1.5 py-1 coarse:min-h-11 coarse:min-w-11 coarse:justify-center"
@@ -140,7 +142,7 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
       <Row
         active={!state.media && !state.collection}
         onClick={() => go({ media: null, collection: null })}
-        right={<Count n={total} />}
+        right={<Count n={total} loading={stats.isLoading} />}
       >
         <Layers size={14} /> All assets
       </Row>
@@ -149,7 +151,7 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
           key={key}
           active={state.media === key && !state.collection}
           onClick={() => go({ media: state.media === key ? null : key, collection: null })}
-          right={<Count n={byMedia[key] ?? 0} />}
+          right={<Count n={byMedia[key] ?? 0} loading={stats.isLoading} />}
         >
           <Icon size={14} /> {label}
         </Row>
@@ -247,8 +249,13 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
   );
 }
 
-function Count({ n }: { n: number }) {
-  return <span className="text-[10px] text-fg-dim tabular-nums">{n.toLocaleString()}</span>;
+function Count({ n, loading = false }: { n: number; loading?: boolean }) {
+  // While stats load, show a muted placeholder rather than a misleading "0" (issue #30).
+  return (
+    <span className="text-[10px] text-fg-dim tabular-nums">
+      {loading ? "·" : n.toLocaleString()}
+    </span>
+  );
 }
 
 /** Collections & smart folders (issue #3). Lists them, filters the grid on click, and offers

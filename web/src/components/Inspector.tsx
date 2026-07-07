@@ -86,12 +86,34 @@ function InspectorPanel({
       </div>
 
       {asset.isLoading ? (
-        <div className="p-4 text-xs text-fg-dim">Loading…</div>
+        <InspectorSkeleton />
       ) : asset.isError || !asset.data ? (
         <div className="p-4 text-xs text-danger">Could not load this asset.</div>
       ) : (
         <Body asset={asset.data} />
       )}
+    </div>
+  );
+}
+
+/** Loading placeholder mirroring the inspector body (issue #30): a square preview block, a title,
+ *  and a few metadata rows as pulsing skeletons — so the panel doesn't pop from "Loading…" to full. */
+function InspectorSkeleton() {
+  return (
+    <div className="flex flex-col">
+      <div className="aspect-square animate-pulse border-b border-border bg-surface-2" />
+      <div className="flex flex-col gap-3 p-3">
+        <div className="h-4 w-2/3 animate-pulse rounded bg-surface-2" />
+        <div className="h-6 w-24 animate-pulse rounded bg-surface-2" />
+        <div className="mt-1 flex flex-col gap-2">
+          {Array.from({ length: 5 }).map((_, i) => (
+            <div key={i} className="flex items-center justify-between gap-3">
+              <div className="h-2.5 w-16 animate-pulse rounded bg-surface-2" />
+              <div className="h-2.5 w-24 animate-pulse rounded bg-surface-2" />
+            </div>
+          ))}
+        </div>
+      </div>
     </div>
   );
 }

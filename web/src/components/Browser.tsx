@@ -144,7 +144,11 @@ export function Browser({ onOpenNav }: { onOpenNav?: () => void }) {
       )}
       <div className="min-h-0 flex-1">
         {assets.isLoading ? (
-          <Centered>Loading…</Centered>
+          state.view === "grid" ? (
+            <GridSkeleton />
+          ) : (
+            <TableSkeleton />
+          )
         ) : assets.isError ? (
           <Centered tone="danger">Failed to load — is `3dam serve` running?</Centered>
         ) : items.length === 0 ? (
@@ -433,6 +437,64 @@ function Grid({
           );
         })}
       </div>
+      {loading && <div className="py-2 text-center text-[11px] text-fg-dim">Loading more…</div>}
+    </div>
+  );
+}
+
+/** Skeleton placeholders while the first page loads — lightweight pulsing blocks that mirror the
+ *  grid/table layout so regions don't pop from blank to content (issue #30). */
+function GridSkeleton() {
+  return (
+    <div className="h-full overflow-hidden p-3">
+      <div
+        className="grid gap-2"
+        style={{ gridTemplateColumns: `repeat(auto-fill, minmax(${CELL_W}px, 1fr))` }}
+      >
+        {Array.from({ length: 18 }).map((_, i) => (
+          <div
+            key={i}
+            className="flex flex-col overflow-hidden rounded border border-border"
+            style={{ height: CELL_H - 8 }}
+          >
+            <div className="min-h-0 flex-1 animate-pulse bg-surface-2" />
+            <div className="flex flex-col gap-1 p-1.5">
+              <div className="h-2.5 w-3/4 animate-pulse rounded bg-surface-2" />
+              <div className="h-2 w-1/2 animate-pulse rounded bg-surface-2" />
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function TableSkeleton() {
+  return (
+    <div className="h-full overflow-hidden">
+      <div className="grid grid-cols-[1fr_64px_104px_112px_84px] gap-2 border-b border-border bg-surface px-3 py-1.5 text-[10px] font-semibold tracking-wider text-fg-dim uppercase">
+        <span>Name</span>
+        <span>Format</span>
+        <span>License</span>
+        <span>Detail</span>
+        <span className="text-right">Size</span>
+      </div>
+      {Array.from({ length: 16 }).map((_, i) => (
+        <div
+          key={i}
+          className="grid grid-cols-[1fr_64px_104px_112px_84px] items-center gap-2 px-3"
+          style={{ height: ROW_H }}
+        >
+          <div className="flex items-center gap-2">
+            <div className="h-3.5 w-8 shrink-0 animate-pulse rounded bg-surface-2" />
+            <div className="h-2.5 w-40 animate-pulse rounded bg-surface-2" />
+          </div>
+          <div className="h-2.5 w-8 animate-pulse rounded bg-surface-2" />
+          <div className="h-2.5 w-14 animate-pulse rounded bg-surface-2" />
+          <div className="h-2.5 w-16 animate-pulse rounded bg-surface-2" />
+          <div className="ml-auto h-2.5 w-10 animate-pulse rounded bg-surface-2" />
+        </div>
+      ))}
     </div>
   );
 }
