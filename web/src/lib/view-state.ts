@@ -25,6 +25,8 @@ export interface ViewState {
   /** When set, the Browser shows this collection's assets instead of the faceted search. Mutually
    *  exclusive with the facet filters — selecting one clears the other (see Navigation). */
   collection: string | null;
+  /** Favorites-only (issue #63) — a boolean facet that composes with media/source/license/tag. */
+  fav: boolean;
   sort: SortField;
   dir: SortDir;
   /** Text-search strategy (semantic-search M5). `lexical` is the default FTS+synonym path;
@@ -45,6 +47,7 @@ export function useViewState() {
       license: params.get("license"),
       tag: params.get("tag"),
       collection: params.get("col"),
+      fav: params.get("fav") === "1",
       sort: (params.get("sort") as SortField | null) ?? "name",
       dir: (params.get("dir") as SortDir | null) ?? "asc",
       mode: (params.get("mode") as SearchMode | null) ?? "lexical",
@@ -69,6 +72,7 @@ export function useViewState() {
           if ("license" in next) set("license", next.license);
           if ("tag" in next) set("tag", next.tag);
           if ("collection" in next) set("col", next.collection);
+          if ("fav" in next) set("fav", next.fav ? "1" : null);
           if ("sort" in next) set("sort", next.sort);
           if ("dir" in next) set("dir", next.dir);
           if ("mode" in next) set("mode", next.mode === "lexical" ? null : next.mode);
@@ -89,6 +93,7 @@ export function useViewState() {
     if (state.license)
       filters.push({ field: "license", op: "eq", value: { str: state.license } });
     if (state.tag) filters.push({ field: "tag", op: "eq", value: { str: state.tag } });
+    if (state.fav) filters.push({ field: "favorite", op: "eq", value: { bool: true } });
     return {
       text: state.q || null,
       filters,

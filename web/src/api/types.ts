@@ -41,6 +41,8 @@ export interface AssetSummary {
   top_tags: string[];
   origin: Origin;
   key_attrs: Record<string, string>;
+  /** User-flagged favourite (issue #63); persisted in the asset `flags` bitset server-side. */
+  favorite: boolean;
 }
 
 export interface AssetTimes {
@@ -113,6 +115,12 @@ export interface SuggestionReview {
   action: ReviewAction;
 }
 
+/** Flag/unflag an asset as a favourite (issue #63). Backend route: POST /api/v1/assets/favorite. */
+export interface FavoriteRequest {
+  asset: AssetId;
+  favorite: boolean;
+}
+
 export interface Asset {
   summary: AssetSummary;
   hash: ContentHash | null;
@@ -138,7 +146,8 @@ export type FacetField =
   | "width"
   | "height"
   | "bpm"
-  | "tri_count";
+  | "tri_count"
+  | "favorite";
 
 export type FilterOp =
   | "eq"

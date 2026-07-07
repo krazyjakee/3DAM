@@ -554,6 +554,17 @@ impl LibraryService for ApiClient {
         Self::expect_no_content(resp).await
     }
 
+    async fn set_favorite(&self, _ctx: &AuthContext, req: FavoriteRequest) -> Result<(), LibError> {
+        let resp = self
+            .http
+            .post(self.url("/api/v1/assets/favorite")?)
+            .json(&req)
+            .send()
+            .await
+            .map_err(|e| LibError::SourceUnavailable(e.to_string()))?;
+        Self::expect_no_content(resp).await
+    }
+
     async fn list_collections(&self, _ctx: &AuthContext) -> Result<Vec<Collection>, LibError> {
         self.get("/api/v1/collections").await
     }

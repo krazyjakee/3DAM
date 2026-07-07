@@ -8,12 +8,12 @@ pub(crate) fn parse_connection(blob: &str) -> Result<SourceConnection, LibError>
         .map_err(|e| LibError::Internal(format!("corrupt source connection: {e}")))
 }
 
-/// The SELECT column list every grid/summary query shares — twelve columns in the exact order
+/// The SELECT column list every grid/summary query shares — thirteen columns in the exact order
 /// `row_to_summary` reads them. Callers append their own `FROM …`, `{ATTR_JOINS}`, WHERE and ORDER.
 pub(crate) const GRID_SELECT: &str = "SELECT asset.id, filename, media_type, format,
         size_bytes + COALESCE(model_attr.dependency_bytes, 0), license_id, license_status,
         image_attr.width, image_attr.height, audio_attr.duration_ms, model_attr.triangle_count,
-        audio_attr.class";
+        audio_attr.class, asset.flags";
 
 /// The per-media attribute LEFT JOINs the grid select depends on (dimensions / duration / tris).
 pub(crate) const ATTR_JOINS: &str = "LEFT JOIN image_attr ON image_attr.asset_id = asset.id
@@ -30,6 +30,8 @@ pub(crate) fn row_to_summary(r: &rusqlite::Row) -> rusqlite::Result<AssetSummary
     let duration_ms: Option<i64> = r.get(9)?;
     let tri_count: Option<i64> = r.get(10)?;
     let audio_class: Option<String> = r.get(11)?;
+    // Favourite is bit 1 of the asset `flags` bitset (bit 0 is the scan-derived "missing" mark).
+    let flags: i64 = r.get(12)?;
     Ok(AssetSummary {
         id,
         name: r.get(1)?,
@@ -50,8 +52,14 @@ pub(crate) fn row_to_summary(r: &rusqlite::Row) -> rusqlite::Result<AssetSummary
             tri_count,
             audio_class.as_deref(),
         ),
+        favorite: flags & FAVORITE_FLAG != 0,
     })
 }
+
+/// Asset `flags` bit reserved for the user favourite mark (issue #63). Bit 0 (`1`) is the
+/// scan-derived "missing" mark; this is bit 1 so the two never collide, and the favourite survives
+/// the re-scan upserts that clear/set bit 0.
+pub(crate) const FAVORITE_FLAG: i64 = 2;
 
 /// The couple of cheap per-media attributes shown on a grid tile / table row: dimensions for
 /// images, duration (+ a `loop` marker when the analysis classed it so) for audio, triangle count
@@ -255,6 +263,13 @@ pub(crate) fn apply_filter(
         Height => attr_num_filter(f, "image_attr", "height", where_sql, binds)?,
         Bpm => attr_num_filter(f, "audio_attr", "bpm", where_sql, binds)?,
         TriCount => attr_num_filter(f, "model_attr", "triangle_count", where_sql, binds)?,
+        // A boolean flag on the asset row itself — presence of the filter means "favourites only".
+        // `Eq false` inverts it (everything not favourited), which keeps the op meaningful.
+        Favorite => {
+            let want = !matches!(f.value, FilterValue::Bool(false));
+            let test = if want { "!= 0" } else { "= 0" };
+            where_sql.push_str(&format!(" AND (flags & {FAVORITE_FLAG}) {test}"));
+        }
     }
     Ok(())
 }
@@ -367,6 +382,7 @@ mod tests {
             Height => (FilterOp::Lte, FilterValue::Num(512.0)),
             Bpm => (FilterOp::Range, FilterValue::Range(90.0, 130.0)),
             TriCount => (FilterOp::Lt, FilterValue::Num(50_000.0)),
+            Favorite => (FilterOp::Eq, FilterValue::Bool(true)),
         };
         Filter { field, op, value }
     }
@@ -387,6 +403,7 @@ mod tests {
             FacetField::Height,
             FacetField::Bpm,
             FacetField::TriCount,
+            FacetField::Favorite,
         ];
 
         // The schema the store runs against — enough for SQLite to plan each filter's subquery.

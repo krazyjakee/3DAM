@@ -20,6 +20,7 @@ import type {
   ConvertRequest,
   DupRequest,
   ExportRequest,
+  FavoriteRequest,
   JobListRequest,
   NewCollection,
   QueryRequest,
@@ -159,6 +160,20 @@ export function useReviewSuggestion() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (req: SuggestionReview) => api.reviewSuggestion(req),
+    onSuccess: (_data, req) => {
+      qc.invalidateQueries({ queryKey: qk.asset(req.asset) });
+      qc.invalidateQueries({ queryKey: qk.assets });
+    },
+  });
+}
+
+/** Flag/unflag an asset as a favourite (issue #63); refresh the inspected asset + grid (so the
+ *  Favorites filter and any star affordance re-render) on success. */
+export function useSetFavorite() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (req: FavoriteRequest) => api.setFavorite(req),
+    meta: { errorPrefix: "Couldn’t update favourite" },
     onSuccess: (_data, req) => {
       qc.invalidateQueries({ queryKey: qk.asset(req.asset) });
       qc.invalidateQueries({ queryKey: qk.assets });

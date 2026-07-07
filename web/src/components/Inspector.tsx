@@ -1,6 +1,6 @@
 import type React from "react";
 import { useEffect, useState } from "react";
-import { Check, Grid3x3, RefreshCw, Sparkles, X } from "lucide-react";
+import { Check, Grid3x3, RefreshCw, Sparkles, Star, X } from "lucide-react";
 import {
   useAnalyze,
   useAsset,
@@ -9,6 +9,7 @@ import {
   useDuplicates,
   useRegenerateThumbnail,
   useReviewSuggestion,
+  useSetFavorite,
   useSimilar,
   useSources,
 } from "@/api/queries";
@@ -213,6 +214,7 @@ function Body({ asset }: { asset: Asset }) {
           <h1 className="min-w-0 flex-1 text-sm font-semibold break-words text-fg">
             {summary.name}
           </h1>
+          <FavoriteButton asset={asset} />
         </div>
 
         {/* per-asset actions — reanalyze + rebuild the preview thumbnail (mirrors the context menu) */}
@@ -271,6 +273,28 @@ function Body({ asset }: { asset: Asset }) {
         <SimilarSection asset={asset} />
       </div>
     </div>
+  );
+}
+
+/** Favourite toggle (issue #63) — a star in the inspector title row. Active state uses the one accent
+ *  (warn/danger are reserved for exposure risk, DESIGN_GUIDELINES §4), and mirrors the nav Favorites
+ *  facet: starring here makes the asset appear under that filter. */
+function FavoriteButton({ asset }: { asset: Asset }) {
+  const setFavorite = useSetFavorite();
+  const on = asset.summary.favorite;
+  return (
+    <button
+      type="button"
+      className="flex shrink-0 items-center justify-center transition-colors disabled:opacity-40 coarse:min-h-11 coarse:min-w-11"
+      style={{ color: on ? "var(--color-accent)" : "var(--color-fg-dim)" }}
+      title={on ? "Remove from favourites" : "Add to favourites"}
+      aria-label={on ? "Remove from favourites" : "Add to favourites"}
+      aria-pressed={on}
+      disabled={setFavorite.isPending}
+      onClick={() => setFavorite.mutate({ asset: asset.summary.id, favorite: !on })}
+    >
+      <Star size={16} className={on ? "fill-current" : ""} />
+    </button>
   );
 }
 

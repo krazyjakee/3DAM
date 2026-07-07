@@ -27,6 +27,7 @@ import type {
   Page,
   PageParams,
   AssetSummary,
+  FavoriteRequest,
   QueryRequest,
   RemoveAsset,
   RemoveSource,
@@ -112,6 +113,9 @@ export const api = {
   // auto-tag suggestion lifecycle — accept/reject one suggested tag (tech-spec 05 §1.4)
   reviewSuggestion: (req: SuggestionReview) =>
     send<void>("POST", `${API}/suggestions/review`, req),
+
+  /** Flag/unflag an asset as a favourite (issue #63). */
+  setFavorite: (req: FavoriteRequest) => send<void>("POST", `${API}/assets/favorite`, req),
 
   /** "More like this" — cosine over embeddings, ranked in the asset's media space (tech-spec 05 §3). */
   findSimilar: (req: SimilarRequest) => send<Page<SimilarHit>>("POST", `${API}/similar`, req),

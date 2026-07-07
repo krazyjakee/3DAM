@@ -1010,6 +1010,17 @@ impl LibraryService for EmbeddedLibrary {
         Ok(())
     }
 
+    async fn set_favorite(&self, _ctx: &AuthContext, req: FavoriteRequest) -> Result<(), LibError> {
+        let id = req.asset;
+        let on = req.favorite;
+        self.db(move |s| s.set_favorite(&id, on)).await?;
+        let _ = self.events.send(LibraryEvent::AssetChanged {
+            id: req.asset,
+            kind: ChangeKind::Metadata,
+        });
+        Ok(())
+    }
+
     async fn get_job(&self, _ctx: &AuthContext, id: &JobId) -> Result<JobStatus, LibError> {
         let id = *id;
         self.db(move |s| s.get_job(&id)).await

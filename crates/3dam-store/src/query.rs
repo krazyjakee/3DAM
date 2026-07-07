@@ -448,6 +448,65 @@ mod tests {
         store
     }
 
+    /// Favourites (issue #63): the flag round-trips through the `flags` bitset, the `favorite` facet
+    /// filters to just the starred assets, and un-starring clears it — all without a schema change.
+    #[test]
+    fn favorite_flag_round_trips_and_filters() {
+        use dam_api::dto::{FacetField, Filter, FilterOp, FilterValue};
+        let store = Store::open_in_memory().unwrap();
+        let src = store
+            .add_source(
+                &SourceConnection::LocalFs {
+                    root: "/tmp".into(),
+                },
+                "t",
+                false,
+            )
+            .unwrap();
+        let mk = |name: &str| {
+            store
+                .upsert_asset(&NewAsset {
+                    source_id: src,
+                    path: name.to_string(),
+                    filename: name.to_string(),
+                    content_hash: None,
+                    size_bytes: Some(1),
+                    source_modified_at: None,
+                    scanned_at: now_ms(),
+                    media_type: MediaType::Image,
+                    format: "png".into(),
+                })
+                .unwrap()
+                .0
+        };
+        let a = mk("keep.png");
+        let _b = mk("other.png");
+
+        // Fresh assets are not favourites.
+        let all = store.query_assets(&QueryRequest::default()).unwrap().items;
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().all(|s| !s.favorite));
+
+        // Star one; the favourites-only filter returns exactly it, marked favourite.
+        store.set_favorite(&a, true).unwrap();
+        let fav_req = QueryRequest {
+            filters: vec![Filter {
+                field: FacetField::Favorite,
+                op: FilterOp::Eq,
+                value: FilterValue::Bool(true),
+            }],
+            ..Default::default()
+        };
+        let favs = store.query_assets(&fav_req).unwrap().items;
+        assert_eq!(favs.len(), 1);
+        assert_eq!(favs[0].name, "keep.png");
+        assert!(favs[0].favorite);
+
+        // Un-star; the filter is empty again.
+        store.set_favorite(&a, false).unwrap();
+        assert!(store.query_assets(&fav_req).unwrap().items.is_empty());
+    }
+
     fn search(store: &Store, text: &str) -> Vec<String> {
         search_mode(store, text, SearchMode::Lexical)
     }

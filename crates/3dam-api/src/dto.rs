@@ -169,6 +169,10 @@ pub struct AssetSummary {
     pub origin: Origin,
     #[serde(default)]
     pub key_attrs: SmallMap,
+    /// User-flagged favourite (issue #63) — persisted in the asset `flags` bitset. `#[serde(default)]`
+    /// so pre-favourite payloads deserialize to `false`.
+    #[serde(default)]
+    pub favorite: bool,
 }
 
 /// Full inspector record.
@@ -341,6 +345,8 @@ pub enum FacetField {
     Height,
     Bpm,
     TriCount,
+    /// User-flagged favourite (issue #63). Presence of the filter means "favourites only".
+    Favorite,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -838,6 +844,14 @@ pub struct SuggestionReview {
 pub enum ReviewAction {
     Accept,
     Reject,
+}
+
+/// Flag or unflag one asset as a favourite (issue #63). Reversible; the state lives in the asset
+/// `flags` bitset, so it survives re-scans and analysis.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct FavoriteRequest {
+    pub asset: AssetId,
+    pub favorite: bool,
 }
 
 // ── collections / smart folders (phase 4 Reach; PRODUCT_SPEC §3, §6.4) ────────────────────────

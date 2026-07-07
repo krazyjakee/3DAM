@@ -289,6 +289,10 @@ pub trait LibraryService: Send + Sync {
         req: SuggestionReview,
     ) -> Result<(), LibError>;
 
+    /// Flag or unflag an asset as a favourite (issue #63). Reversible; persisted in the asset
+    /// `flags` bitset so it survives re-scans.
+    async fn set_favorite(&self, ctx: &AuthContext, req: FavoriteRequest) -> Result<(), LibError>;
+
     // ── collections / smart folders (phase 4) ────────────────────────────────
     /// All collections and smart folders. Manual folders carry an exact member count; a smart
     /// folder's live count is left `None` here (computed on demand).

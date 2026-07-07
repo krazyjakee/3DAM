@@ -176,6 +176,8 @@ pub(crate) fn run_scan(
                                     top_tags: Vec::new(),
                                     origin: Origin::Local,
                                     key_attrs: key_attrs_of(&attrs),
+                                    // A freshly-scanned asset is never a favourite yet.
+                                    favorite: false,
                                 };
                                 let _ = events.send(LibraryEvent::AssetAdded(summary));
                             }

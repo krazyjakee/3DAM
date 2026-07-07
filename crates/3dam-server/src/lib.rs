@@ -117,6 +117,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/api/v1/similar", post(find_similar))
         .route("/api/v1/duplicates", post(list_duplicates))
         .route("/api/v1/suggestions/review", post(review_suggestion))
+        .route("/api/v1/assets/favorite", post(set_favorite))
         .route("/api/v1/jobs/analyze", post(submit_analyze))
         .route("/api/v1/thumbnails/regenerate", post(regenerate_thumbnails))
         .route("/api/v1/sources", get(list_sources).post(add_source))
@@ -522,6 +523,15 @@ async fn review_suggestion(
     Json(req): Json<SuggestionReview>,
 ) -> Result<StatusCode, ApiError> {
     st.lib.review_suggestion(&ctx, req).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn set_favorite(
+    Writer(ctx): Writer,
+    State(st): State<AppState>,
+    Json(req): Json<FavoriteRequest>,
+) -> Result<StatusCode, ApiError> {
+    st.lib.set_favorite(&ctx, req).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

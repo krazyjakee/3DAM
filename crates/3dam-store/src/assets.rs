@@ -75,6 +75,22 @@ impl Store {
 
     /// Persist the cheap-tier media attributes into the per-type attr table (tech-spec 02 §3.2,
     /// 04 §5). Idempotent upsert keyed by `asset_id`; called after each `upsert_asset` during a scan.
+    /// Set or clear an asset's favourite mark (issue #63) — bit 1 of the `flags` bitset, left
+    /// untouched by scan upserts (which only ever touch bit 0). A no-op on a missing id.
+    pub fn set_favorite(&self, id: &AssetId, on: bool) -> Result<(), LibError> {
+        let conn = self.conn.lock().unwrap();
+        let flag = crate::helpers::FAVORITE_FLAG;
+        // `flags | flag` sets the bit; `flags & ~flag` clears just that bit, preserving the rest.
+        let sql = if on {
+            format!("UPDATE asset SET flags = flags | {flag}, updated_at = ?2 WHERE id = ?1")
+        } else {
+            format!("UPDATE asset SET flags = flags & ~{flag}, updated_at = ?2 WHERE id = ?1")
+        };
+        conn.execute(&sql, params![id.as_bytes().to_vec(), now_ms()])
+            .map_err(internal)?;
+        Ok(())
+    }
+
     pub fn set_media_attrs(&self, id: &AssetId, attrs: &MediaAttributes) -> Result<(), LibError> {
         let conn = self.conn.lock().unwrap();
         let key = id.as_bytes().to_vec();
@@ -234,7 +250,7 @@ impl Store {
                         source_created_at, source_modified_at, scanned_at, analysed_at,
                         media_type, format, license_id, license_status, license_provenance,
                         rights_commercial, rights_modify, rights_redistribute, rights_attribution,
-                        attribution_holder, attribution_credit, license_url, created_at
+                        attribution_holder, attribution_credit, license_url, created_at, flags
                  FROM asset WHERE id = ?1",
                 params![id.as_bytes().to_vec()],
                 Self::row_to_asset,
@@ -285,6 +301,7 @@ impl Store {
         let holder: Option<String> = r.get(19)?;
         let credit: Option<String> = r.get(20)?;
         let url: Option<String> = r.get(21)?;
+        let flags: i64 = r.get(23)?;
 
         let media = MediaType::parse(&media_s).unwrap_or(MediaType::Image);
         let status = LicenseStatus::parse(&license_status);
@@ -301,6 +318,7 @@ impl Store {
             top_tags: Vec::new(),
             origin: Origin::Local,
             key_attrs: SmallMap::new(),
+            favorite: flags & crate::helpers::FAVORITE_FLAG != 0,
         };
         Ok(Asset {
             summary,

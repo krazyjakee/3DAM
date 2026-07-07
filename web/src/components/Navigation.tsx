@@ -18,6 +18,7 @@ import {
   RefreshCw,
   Settings as SettingsIcon,
   Sparkles,
+  Star,
   Sun,
   Trash2,
   WifiOff,
@@ -197,6 +198,11 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
         right={<Count n={total} loading={stats.isLoading} />}
       >
         <Layers size={14} /> All assets
+      </Row>
+      {/* Favorites (issue #63): a boolean facet — star an asset from the Inspector — that composes
+          with the media/source facets. Toggling it on clears any active collection view. */}
+      <Row active={state.fav} onClick={() => go({ fav: !state.fav, collection: null })}>
+        <Star size={14} className={state.fav ? "fill-current" : ""} /> Favorites
       </Row>
       {/* Recently added (issue #63): a saved-sort shortcut — newest-scanned first — that composes with
           the media/source facets (so "recently added images" works). No schema change; `Scanned` sort
