@@ -106,7 +106,7 @@ export function Settings() {
               promptToken();
               void refresh();
             }}
-            className="text-neutral-400 hover:underline"
+            className="text-fg-muted hover:underline"
           >
             Set admin token…
           </button>
@@ -117,7 +117,7 @@ export function Settings() {
       </header>
 
       {error && (
-        <div className="rounded border border-red-500/40 bg-red-500/10 px-3 py-2 text-red-300">
+        <div className="rounded border border-danger/40 bg-danger/10 px-3 py-2 text-danger">
           {error}
         </div>
       )}
@@ -125,7 +125,7 @@ export function Settings() {
       {status && <StatusCard status={status} />}
 
       <section className="flex flex-col gap-3">
-        <h2 className="font-medium text-neutral-400">Feature flags</h2>
+        <h2 className="font-medium text-fg-muted">Feature flags</h2>
 
         <FlagCard
           title="Authentication"
@@ -178,17 +178,17 @@ export function Settings() {
       <TokensSection tokens={tokens} onChange={refresh} />
 
       <section className="flex flex-col gap-2">
-        <h2 className="font-medium text-neutral-400">Audit log</h2>
-        <div className="rounded border border-neutral-800">
-          {audit.length === 0 && <div className="px-3 py-2 text-neutral-500">(no entries)</div>}
+        <h2 className="font-medium text-fg-muted">Audit log</h2>
+        <div className="rounded border border-border">
+          {audit.length === 0 && <div className="px-3 py-2 text-fg-dim">(no entries)</div>}
           {audit.map((e, i) => (
-            <div key={i} className="flex gap-3 border-b border-neutral-800 px-3 py-1.5 last:border-0">
-              <span className="w-40 shrink-0 text-neutral-500">
+            <div key={i} className="flex gap-3 border-b border-border px-3 py-1.5 last:border-0">
+              <span className="w-40 shrink-0 text-fg-dim">
                 {new Date(e.at).toLocaleString()}
               </span>
-              <span className="w-24 shrink-0 text-neutral-400">{e.actor}</span>
+              <span className="w-24 shrink-0 text-fg-muted">{e.actor}</span>
               <span className="font-mono text-xs">{e.action}</span>
-              <span className="truncate text-neutral-500">{e.target ?? ""}</span>
+              <span className="truncate text-fg-dim">{e.target ?? ""}</span>
             </div>
           ))}
         </div>
@@ -201,7 +201,7 @@ function StatusCard({ status }: { status: AdminStatus }) {
   return (
     <section
       className={`rounded border p-3 ${
-        status.exposed_without_auth ? "border-amber-500/50 bg-amber-500/10" : "border-neutral-800"
+        status.exposed_without_auth ? "border-warn/50 bg-warn/10" : "border-border"
       }`}
     >
       <div className="grid grid-cols-2 gap-x-6 gap-y-1 sm:grid-cols-3">
@@ -214,7 +214,7 @@ function StatusCard({ status }: { status: AdminStatus }) {
         <Field label="Tokens" value={String(status.token_count)} />
       </div>
       {status.exposed_without_auth && (
-        <p className="mt-2 text-amber-300">
+        <p className="mt-2 text-warn">
           ⚠ Exposed beyond localhost with no authentication and no TLS. Set the authentication flag.
         </p>
       )}
@@ -225,7 +225,7 @@ function StatusCard({ status }: { status: AdminStatus }) {
 function Field({ label, value }: { label: string; value: string }) {
   return (
     <div className="flex flex-col">
-      <span className="text-xs text-neutral-500">{label}</span>
+      <span className="text-xs text-fg-dim">{label}</span>
       <span className="font-mono">{value}</span>
     </div>
   );
@@ -243,17 +243,17 @@ function FlagCard({
   children: ReactNode;
 }) {
   return (
-    <div className="flex items-center justify-between gap-4 rounded border border-neutral-800 p-3">
+    <div className="flex items-center justify-between gap-4 rounded border border-border p-3">
       <div className="min-w-0">
         <div className="flex items-center gap-2">
           <span className="font-medium">{title}</span>
           {flag && (
-            <span className="text-xs text-neutral-600">
+            <span className="text-xs text-fg-dim">
               {flag.live ? "live" : "restart"} · v{flag.version}
             </span>
           )}
         </div>
-        <p className="text-xs text-neutral-500">{hint}</p>
+        <p className="text-xs text-fg-dim">{hint}</p>
       </div>
       <div className="shrink-0">{children}</div>
     </div>
@@ -273,7 +273,7 @@ function Choice({
 }) {
   return (
     <select
-      className="rounded border border-neutral-700 bg-neutral-900 px-2 py-1 disabled:opacity-50"
+      className="field w-auto disabled:opacity-50"
       value={value}
       disabled={disabled}
       onChange={(e) => onChange(e.target.value)}
@@ -304,11 +304,11 @@ function Toggle({
       disabled={disabled}
       onClick={() => onChange(!checked)}
       className={`h-6 w-11 rounded-full transition disabled:opacity-50 ${
-        checked ? "bg-accent" : "bg-neutral-700"
+        checked ? "bg-accent" : "bg-surface-2"
       }`}
     >
       <span
-        className={`block h-5 w-5 rounded-full bg-white transition ${
+        className={`block h-5 w-5 rounded-full bg-fg transition ${
           checked ? "translate-x-5" : "translate-x-0.5"
         }`}
       />
@@ -358,12 +358,12 @@ function TokensSection({ tokens, onChange }: { tokens: TokenInfo[]; onChange: ()
 
   return (
     <section className="flex flex-col gap-2">
-      <h2 className="font-medium text-neutral-400">API tokens</h2>
+      <h2 className="font-medium text-fg-muted">API tokens</h2>
 
-      <div className="flex flex-col gap-2 rounded border border-neutral-800 p-3">
+      <div className="flex flex-col gap-2 rounded border border-border p-3">
         <div className="flex flex-wrap items-center gap-2">
           <input
-            className="min-w-40 flex-1 rounded border border-neutral-700 bg-neutral-900 px-2 py-1"
+            className="field min-w-40 flex-1"
             placeholder="Label (e.g. ci-reader)"
             value={label}
             onChange={(e) => setLabel(e.target.value)}
@@ -372,7 +372,7 @@ function TokensSection({ tokens, onChange }: { tokens: TokenInfo[]; onChange: ()
             type="button"
             disabled={!label.trim() || creating}
             onClick={() => void create()}
-            className="rounded bg-accent px-3 py-1 text-black disabled:opacity-40"
+            className="btn btn-accent disabled:opacity-40"
           >
             {creating ? "Issuing…" : "Issue token"}
           </button>
@@ -393,10 +393,10 @@ function TokensSection({ tokens, onChange }: { tokens: TokenInfo[]; onChange: ()
             </label>
           ))}
         </div>
-        {err && <p className="text-red-300">{err}</p>}
+        {err && <p className="text-danger">{err}</p>}
         {created && (
-          <div className="rounded border border-emerald-500/40 bg-emerald-500/10 p-2">
-            <p className="text-emerald-300">
+          <div className="rounded border border-lic-permissive/40 bg-lic-permissive/10 p-2">
+            <p className="text-lic-permissive">
               Token “{created.label}” created. Copy the secret now — it is shown once:
             </p>
             <code className="mt-1 block break-all font-mono text-xs">{created.secret}</code>
@@ -404,23 +404,23 @@ function TokensSection({ tokens, onChange }: { tokens: TokenInfo[]; onChange: ()
         )}
       </div>
 
-      <div className="rounded border border-neutral-800">
-        {tokens.length === 0 && <div className="px-3 py-2 text-neutral-500">(no tokens)</div>}
+      <div className="rounded border border-border">
+        {tokens.length === 0 && <div className="px-3 py-2 text-fg-dim">(no tokens)</div>}
         {tokens.map((t) => (
           <div
             key={t.token_id}
-            className="flex items-center gap-3 border-b border-neutral-800 px-3 py-1.5 last:border-0"
+            className="flex items-center gap-3 border-b border-border px-3 py-1.5 last:border-0"
           >
             <span className="w-40 truncate font-medium">{t.label}</span>
-            <span className="flex-1 truncate text-xs text-neutral-500">{t.scopes.join(", ")}</span>
-            <span className="text-xs text-neutral-600">
+            <span className="flex-1 truncate text-xs text-fg-dim">{t.scopes.join(", ")}</span>
+            <span className="text-xs text-fg-dim">
               {t.last_used ? `used ${new Date(t.last_used).toLocaleDateString()}` : "unused"}
             </span>
             <button
               type="button"
               disabled={revoking === t.token_id}
               onClick={() => void revoke(t.token_id)}
-              className="text-red-400 hover:underline disabled:opacity-40"
+              className="text-danger hover:underline disabled:opacity-40"
             >
               {revoking === t.token_id ? "revoking…" : "revoke"}
             </button>
