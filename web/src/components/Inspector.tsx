@@ -1,5 +1,5 @@
 import type React from "react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Check, Grid3x3, PanelRightClose, Sparkles, X } from "lucide-react";
 import {
   useAnalyze,
@@ -10,7 +10,7 @@ import {
   useSimilar,
   useSources,
 } from "@/api/queries";
-import { api } from "@/api/client";
+import { api, ApiError } from "@/api/client";
 import type {
   Asset,
   AssetId,
@@ -60,6 +60,12 @@ function InspectorPanel({
   onClose: () => void;
 }) {
   const asset = useAsset(selected);
+
+  // If the selected asset no longer exists — its source was removed, or it was removed + blocked
+  // (#21) — clear the dangling selection instead of leaving the inspector stuck on an error (#29).
+  useEffect(() => {
+    if (asset.isError && asset.error instanceof ApiError && asset.error.status === 404) onClose();
+  }, [asset.isError, asset.error, onClose]);
 
   if (!selected) {
     return (

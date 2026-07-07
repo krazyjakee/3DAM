@@ -33,6 +33,7 @@ import { useConnection } from "@/api/connection";
 import type { Collection, LicenseStatus, MediaType, SourceInfo } from "@/api/types";
 import { licenseColorVar, licenseLabel, sourceStateLabel } from "@/lib/format";
 import { useViewState } from "@/lib/view-state";
+import { useDialogs } from "@/lib/dialogs";
 import { AddSourceDialog } from "./AddSourceDialog";
 
 const MEDIA: { key: MediaType; label: string; Icon: typeof AudioLines }[] = [
@@ -91,6 +92,7 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
   const analyze = useAnalyze();
   const removeSource = useRemoveSource();
   const conn = useConnection();
+  const { confirm } = useDialogs();
   const [showAdd, setShowAdd] = useState(false);
 
   const total = stats.data?.total ?? 0;
@@ -204,9 +206,23 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
           removing={removeSource.isPending && removeSource.variables === s.id}
           onSelect={() => go({ source: state.source === s.id ? null : s.id, collection: null })}
           onRescan={() => scan.mutate({ sources: [s.id], mode: "full" })}
-          onRemove={() => {
-            if (confirm(`Remove source "${s.name}"? Its catalogued rows are dropped.`))
-              removeSource.mutate(s.id);
+          onRemove={async () => {
+            const n = s.stats.asset_count;
+            if (
+              await confirm({
+                title: `Remove source “${s.name}”?`,
+                message: `Its ${n.toLocaleString()} catalogued row${n === 1 ? "" : "s"} will be dropped from the library. The files on disk are not touched.`,
+                danger: true,
+                confirmLabel: "Remove source",
+              })
+            ) {
+              removeSource.mutate(s.id, {
+                onSuccess: () => {
+                  // Don't leave the browser filtered on a source that no longer exists (issue #29).
+                  if (state.source === s.id) patch({ source: null });
+                },
+              });
+            }
           }}
         />
       ))}
@@ -273,10 +289,11 @@ function Collections({
   const create = useCreateCollection();
   const rename = useRenameCollection();
   const del = useDeleteCollection();
+  const { confirm, prompt } = useDialogs();
   const items = collections.data ?? [];
 
-  const onCreate = () => {
-    const name = prompt("New collection name")?.trim();
+  const onCreate = async () => {
+    const name = (await prompt({ title: "New collection", placeholder: "Name", confirmLabel: "Create" }))?.trim();
     if (name) create.mutate({ name, kind: "manual" });
   };
 
@@ -310,12 +327,21 @@ function Collections({
           collection={c}
           active={activeId === c.id}
           onSelect={() => onSelect(activeId === c.id ? null : c.id)}
-          onRename={() => {
-            const name = prompt("Rename collection", c.name)?.trim();
+          onRename={async () => {
+            const name = (
+              await prompt({ title: "Rename collection", initial: c.name, confirmLabel: "Rename" })
+            )?.trim();
             if (name && name !== c.name) rename.mutate({ id: c.id, name });
           }}
-          onDelete={() => {
-            if (confirm(`Delete collection "${c.name}"? The assets themselves are untouched.`)) {
+          onDelete={async () => {
+            if (
+              await confirm({
+                title: `Delete collection “${c.name}”?`,
+                message: "The assets themselves are untouched.",
+                danger: true,
+                confirmLabel: "Delete",
+              })
+            ) {
               if (activeId === c.id) onSelect(null);
               del.mutate(c.id);
             }

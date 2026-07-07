@@ -19,6 +19,7 @@ import {
 } from "@/api/admin";
 import { ApiError } from "@/api/client";
 import { errorMessage, toast } from "@/lib/toast";
+import { useDialogs } from "@/lib/dialogs";
 
 const ALL_SCOPES: Scope[] = ["read", "write", "admin", "mcp_use", "federate"];
 
@@ -31,6 +32,7 @@ export function Settings() {
   // Which flag write is in flight — disables the flag controls so a slow admin round-trip can't be
   // double-submitted into two conflicting writes (issue #23).
   const [busyFlag, setBusyFlag] = useState<string | null>(null);
+  const { confirm } = useDialogs();
   const promptToken = useAdminTokenPrompt();
 
   const refresh = useCallback(async () => {
@@ -65,7 +67,14 @@ export function Settings() {
         toast.success("Setting updated");
       } catch (e) {
         if (e instanceof ApiError && e.status === 400 && /exposure/i.test(e.message)) {
-          if (window.confirm(`This increases exposure:\n\n${e.message}\n\nApply anyway?`)) {
+          if (
+            await confirm({
+              title: "Increase exposure?",
+              message: e.message,
+              danger: true,
+              confirmLabel: "Apply anyway",
+            })
+          ) {
             try {
               await admin.setFlag(key, { value, expected_version: version, confirm: true });
               await refresh();
@@ -81,7 +90,7 @@ export function Settings() {
         setBusyFlag(null);
       }
     },
-    [refresh],
+    [refresh, confirm],
   );
 
   const flag = (key: string) => flags.find((f) => f.key === key);
@@ -422,11 +431,20 @@ function TokensSection({ tokens, onChange }: { tokens: TokenInfo[]; onChange: ()
   );
 }
 
-/** A small helper for the toolbar link, kept here so the admin-token prompt lives with the surface. */
+/** A small helper for the toolbar link, kept here so the admin-token prompt lives with the surface.
+ *  Uses the in-app prompt with a masked input rather than `window.prompt` (issue #29). */
 export function useAdminTokenPrompt() {
-  return () => {
+  const { prompt } = useDialogs();
+  return async () => {
     const cur = getAdminToken() ?? "";
-    const next = window.prompt("Admin bearer token (blank to clear):", cur);
+    const next = await prompt({
+      title: "Admin bearer token",
+      message: "Presented on admin API calls. Leave blank to clear.",
+      initial: cur,
+      password: true,
+      allowEmpty: true,
+      confirmLabel: "Save",
+    });
     if (next !== null) setAdminToken(next.trim() || null);
   };
 }

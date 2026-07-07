@@ -5,6 +5,7 @@ import { Settings } from "./components/Settings";
 import { Duplicates } from "./components/Duplicates";
 import { Blocklist } from "./components/Blocklist";
 import { Toaster } from "./components/Toaster";
+import { DialogProvider } from "./lib/dialogs";
 import { errorMessage, toast } from "./lib/toast";
 
 // Every mutation reports through one place (issue #23): a failure always raises an error toast, so
@@ -33,6 +34,7 @@ const queryClient = new QueryClient({
 export function App() {
   return (
     <QueryClientProvider client={queryClient}>
+      <DialogProvider>
       <BrowserRouter>
         <Routes>
           {/* The admin / Settings surface (tech-spec 09 §B.4, 10). */}
@@ -47,6 +49,7 @@ export function App() {
       </BrowserRouter>
       {/* Global toast viewport — feedback for every mutation, on top of every route. */}
       <Toaster />
+      </DialogProvider>
     </QueryClientProvider>
   );
 }
