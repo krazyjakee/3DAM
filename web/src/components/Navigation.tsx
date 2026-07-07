@@ -5,6 +5,7 @@ import {
   AudioLines,
   Ban,
   Box,
+  Clock,
   Copy,
   Folder,
   FolderPlus,
@@ -143,6 +144,9 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
 
   const total = stats.data?.total ?? 0;
   const byMedia = stats.data?.by_media ?? {};
+  // The "Recently added" shortcut is a sort overlay (newest-scanned first), not a filter — so it reads
+  // as active whenever that ordering is in effect, regardless of the media/source facet layered on it.
+  const recentlyAdded = state.sort === "scanned" && state.dir === "desc";
 
   return (
     <nav className="flex h-full flex-col overflow-y-auto border-r border-border bg-surface">
@@ -193,6 +197,21 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
         right={<Count n={total} loading={stats.isLoading} />}
       >
         <Layers size={14} /> All assets
+      </Row>
+      {/* Recently added (issue #63): a saved-sort shortcut — newest-scanned first — that composes with
+          the media/source facets (so "recently added images" works). No schema change; `Scanned` sort
+          already exists. Clicking it again reverts to the default name/ascending order. */}
+      <Row
+        active={recentlyAdded}
+        onClick={() =>
+          go(
+            recentlyAdded
+              ? { sort: "name", dir: "asc" }
+              : { sort: "scanned", dir: "desc", collection: null },
+          )
+        }
+      >
+        <Clock size={14} /> Recently added
       </Row>
       {MEDIA.map(({ key, label, Icon }) => (
         <Row
