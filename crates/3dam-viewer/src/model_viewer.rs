@@ -99,6 +99,39 @@ impl ModelViewer {
         Ok(())
     }
 
+    /// Load a loose glTF whose buffers are external files (issue #56): `json` is the `.gltf` text and
+    /// `buffers` is a JS array of `Uint8Array`, one per glTF buffer in index order, already resolved
+    /// by the DOM (data-URIs decoded, external files fetched via `/assets/{id}/related`). Same upload +
+    /// re-fit as `loadModel`.
+    #[wasm_bindgen(js_name = loadGltfExternal)]
+    pub fn load_gltf_external(&self, json: &[u8], buffers: js_sys::Array) -> Result<(), JsValue> {
+        use wasm_bindgen::JsCast;
+        let mut bufs: Vec<Vec<u8>> = Vec::with_capacity(buffers.length() as usize);
+        for v in buffers.iter() {
+            let arr: js_sys::Uint8Array = v
+                .dyn_into()
+                .map_err(|_| js_err("buffers must be Uint8Array".to_string()))?;
+            bufs.push(arr.to_vec());
+        }
+        let cpu = gltf_load::load_external(json, bufs).map_err(js_err)?;
+        log::info!(
+            "dam-viewer: loaded loose glTF — {} verts, {} indices",
+            cpu.vertices.len(),
+            cpu.indices.len()
+        );
+        let mut inner = self.inner.borrow_mut();
+        let Inner {
+            ctx,
+            renderer,
+            camera,
+            dirty,
+        } = &mut *inner;
+        renderer.upload(ctx, &cpu);
+        camera.set_bounds(cpu.bounds);
+        *dirty = true;
+        Ok(())
+    }
+
     /// DOM-driven orbit + zoom. `yaw`/`pitch` in radians; `zoom` multiplies the bounds-fit distance.
     #[wasm_bindgen(js_name = setCamera)]
     pub fn set_camera(&self, yaw: f32, pitch: f32, zoom: f32) {

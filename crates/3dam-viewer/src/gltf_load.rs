@@ -22,12 +22,46 @@ pub struct CpuMesh {
     pub bounds: Aabb,
 }
 
-/// Decode glTF or GLB bytes. Walks the default scene (or scene 0), applies each node's world
-/// transform, and concatenates every primitive into one indexed mesh.
+/// Decode self-contained glTF or GLB bytes (embedded / data-URI buffers). Walks the default scene
+/// (or scene 0), applies each node's world transform, and concatenates every primitive into one
+/// indexed mesh. Loose glTF with *external* buffers goes through [`load_external`] instead.
 pub fn load(bytes: &[u8]) -> Result<CpuMesh, String> {
     let (doc, buffers, _images) =
         gltf::import_slice(bytes).map_err(|e| format!("glTF decode failed: {e}"))?;
+    build_mesh(&doc, &buffers)
+}
 
+/// Decode a loose glTF whose buffers live in *external* files (issue #56). The DOM does the
+/// networking: it parses the glTF JSON, resolves each buffer's URI against the asset's directory
+/// (data-URIs decoded client-side, external files fetched via `/assets/{id}/related`), and passes the
+/// resolved bytes here in **buffer-index order**. This crate never touches the network.
+pub fn load_external(json: &[u8], mut external: Vec<Vec<u8>>) -> Result<CpuMesh, String> {
+    let gltf = gltf::Gltf::from_slice(json).map_err(|e| format!("glTF parse failed: {e}"))?;
+    let blob = gltf.blob.clone();
+    let doc = gltf.document;
+
+    let mut buffers: Vec<gltf::buffer::Data> = Vec::with_capacity(doc.buffers().count());
+    for buffer in doc.buffers() {
+        let data = match buffer.source() {
+            // A GLB binary chunk (unusual for loose glTF, but handle it): use the parsed blob.
+            gltf::buffer::Source::Bin => blob.clone().ok_or_else(|| {
+                "glTF references a binary chunk but none was supplied".to_string()
+            })?,
+            // Every URI buffer (external file *or* data-URI) was resolved to bytes by the DOM.
+            gltf::buffer::Source::Uri(uri) => external
+                .get_mut(buffer.index())
+                .map(std::mem::take)
+                .filter(|b| !b.is_empty())
+                .ok_or_else(|| format!("missing external buffer #{} ({uri})", buffer.index()))?,
+        };
+        buffers.push(gltf::buffer::Data(data));
+    }
+
+    build_mesh(&doc, &buffers)
+}
+
+/// Shared mesh assembly: walk the default scene and flatten every primitive into one indexed mesh.
+fn build_mesh(doc: &gltf::Document, buffers: &[gltf::buffer::Data]) -> Result<CpuMesh, String> {
     let mut vertices: Vec<Vertex> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
     let mut bounds = Aabb::empty();
@@ -41,7 +75,7 @@ pub fn load(bytes: &[u8]) -> Result<CpuMesh, String> {
         walk(
             &node,
             Mat4::IDENTITY,
-            &buffers,
+            buffers,
             &mut vertices,
             &mut indices,
             &mut bounds,

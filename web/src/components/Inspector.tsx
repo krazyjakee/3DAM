@@ -105,7 +105,7 @@ function Preview({ asset }: { asset: Asset }) {
   if (summary.media === "model") {
     return (
       <div className="aspect-square border-b border-border">
-        <ModelViewerIsland src={src} />
+        <ModelViewerIsland src={src} assetId={summary.id} format={summary.format} />
       </div>
     );
   }

@@ -64,7 +64,8 @@ fn gen_thumbnail(
         media: asset.summary.media,
         format: asset.summary.format.clone(),
     };
-    let thumb = dam_media::render_thumbnail(fetched.path(), &det, max_edge).map_err(map_handler_err)?;
+    let thumb =
+        dam_media::render_thumbnail(fetched.path(), &det, max_edge).map_err(map_handler_err)?;
 
     // Best-effort cache write (a cold cache is a slow path, not an error).
     if std::fs::create_dir_all(&cache_dir).is_ok() {
@@ -135,6 +136,66 @@ fn read_asset_content(store: &Store, asset: &Asset) -> Result<AssetContent, LibE
     })
 }
 
+/// Resolve `rel` against the *directory* of `base` (a source-relative path), normalising `.`/`..`
+/// and rejecting anything absolute or that escapes the source root. Returns a clean source-relative
+/// path. This is the loose-glTF sibling resolver (#56); the source's own `fetch` is separately
+/// traversal-guarded as defence-in-depth.
+fn resolve_sibling(base: &str, rel: &str) -> Result<String, LibError> {
+    let rel = rel.trim();
+    if rel.is_empty() {
+        return Err(LibError::BadRequest("empty related path".into()));
+    }
+    // Absolute paths (POSIX or Windows-drive) and URLs are never source-relative siblings.
+    if rel.starts_with('/') || rel.starts_with('\\') || rel.contains("://") {
+        return Err(LibError::BadRequest(
+            "related path must be source-relative".into(),
+        ));
+    }
+    // Start from the base file's directory (drop its final component).
+    let mut parts: Vec<&str> = base.split('/').collect();
+    parts.pop();
+    for seg in rel.split(['/', '\\']) {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                if parts.pop().is_none() {
+                    return Err(LibError::BadRequest(
+                        "related path escapes the source".into(),
+                    ));
+                }
+            }
+            s => parts.push(s),
+        }
+    }
+    Ok(parts.join("/"))
+}
+
+/// Read a file relative to `asset`'s directory within the same source, bounded by the content cap.
+/// Pure/blocking — called inside a `spawn_blocking` closure. Powers loose-glTF external buffers (#56).
+fn read_related_content(store: &Store, asset: &Asset, rel: &str) -> Result<AssetContent, LibError> {
+    let target = resolve_sibling(&asset.path, rel)?;
+    let conn = store.get_source_connection(&asset.source_id)?;
+    let fs = dam_sources::open_source(&conn)?;
+    let fetched = fs.fetch(&target)?;
+    let abs = fetched.path();
+    let meta = std::fs::metadata(abs)
+        .map_err(|e| LibError::NotFound(format!("related file {target}: {e}")))?;
+    if meta.len() > MAX_CONTENT_BYTES {
+        return Err(LibError::Unsupported(format!(
+            "related file is {} bytes; preview content is capped at {MAX_CONTENT_BYTES} bytes",
+            meta.len()
+        )));
+    }
+    let bytes = std::fs::read(abs)
+        .map_err(|e| LibError::Internal(format!("read {}: {e}", abs.display())))?;
+    Ok(AssetContent {
+        bytes,
+        content_type: "application/octet-stream".to_string(),
+        format: String::new(),
+        media: asset.summary.media,
+    })
+}
+
 /// The in-process engine. Cheap to clone the handle by wrapping in `Arc`.
 pub struct EmbeddedLibrary {
     store: Arc<Store>,
@@ -154,8 +215,11 @@ impl EmbeddedLibrary {
             .map_err(|e| LibError::Internal(e.to_string()))??;
         let store = Arc::new(store);
         let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
-        let watchers =
-            watch::WatchManager::new(store.clone(), events.clone(), tokio::runtime::Handle::current());
+        let watchers = watch::WatchManager::new(
+            store.clone(),
+            events.clone(),
+            tokio::runtime::Handle::current(),
+        );
         // NB: watchers are *not* started here. Auto-rescan only makes sense for long-running roles
         // (serve/mcp), which call `start_watchers()` explicitly. A run-and-exit CLI command must not
         // register OS watches — they add nothing to a one-shot and their setup would outlive the
@@ -219,6 +283,21 @@ impl LibraryService for EmbeddedLibrary {
         self.db(move |s| {
             let asset = s.get_asset(&id)?;
             read_asset_content(s, &asset)
+        })
+        .await
+    }
+
+    async fn read_related_content(
+        &self,
+        _ctx: &AuthContext,
+        id: &AssetId,
+        rel: &str,
+    ) -> Result<AssetContent, LibError> {
+        let id = *id;
+        let rel = rel.to_string();
+        self.db(move |s| {
+            let asset = s.get_asset(&id)?;
+            read_related_content(s, &asset, &rel)
         })
         .await
     }
@@ -298,9 +377,7 @@ impl LibraryService for EmbeddedLibrary {
 
         let name = req.name.clone().unwrap_or(default_name);
         let watch = req.options.watch;
-        let id = self
-            .db(move |s| s.add_source(&conn, &name, watch))
-            .await?;
+        let id = self.db(move |s| s.add_source(&conn, &name, watch)).await?;
         // Start watching immediately if requested (tech-spec 07 §3.1).
         if watch {
             self.watchers.ensure(id);
@@ -442,7 +519,11 @@ impl LibraryService for EmbeddedLibrary {
         .await
     }
 
-    async fn export(&self, _ctx: &AuthContext, req: ExportRequest) -> Result<ExportReport, LibError> {
+    async fn export(
+        &self,
+        _ctx: &AuthContext,
+        req: ExportRequest,
+    ) -> Result<ExportReport, LibError> {
         self.db(move |s| export::run_export(s, req)).await
     }
 
@@ -602,5 +683,49 @@ impl LibraryService for EmbeddedLibrary {
         let stream =
             tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(|r| async move { r.ok() });
         Ok(Box::pin(stream))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_sibling;
+
+    #[test]
+    fn resolve_sibling_confines_to_source() {
+        // Same-directory sibling (the common loose-glTF `.bin` case).
+        assert_eq!(
+            resolve_sibling("models/scene.gltf", "scene.bin").unwrap(),
+            "models/scene.bin"
+        );
+        // Sub-directory (e.g. textures/).
+        assert_eq!(
+            resolve_sibling("models/scene.gltf", "textures/wall.png").unwrap(),
+            "models/textures/wall.png"
+        );
+        // A `..` that stays within the source root.
+        assert_eq!(
+            resolve_sibling("a/b/scene.gltf", "../shared.bin").unwrap(),
+            "a/shared.bin"
+        );
+        // A glTF at the source root.
+        assert_eq!(
+            resolve_sibling("scene.gltf", "scene.bin").unwrap(),
+            "scene.bin"
+        );
+        // `.`/`..` segments normalise.
+        assert_eq!(
+            resolve_sibling("m/s.gltf", "./x/../y.bin").unwrap(),
+            "m/y.bin"
+        );
+
+        // Traversal that escapes the source root is rejected.
+        assert!(resolve_sibling("models/s.gltf", "../../etc/passwd").is_err());
+        assert!(resolve_sibling("s.gltf", "../secret").is_err());
+        // Absolute paths and URLs are never source-relative siblings.
+        assert!(resolve_sibling("m/s.gltf", "/etc/passwd").is_err());
+        assert!(resolve_sibling("m/s.gltf", "\\windows\\system32").is_err());
+        assert!(resolve_sibling("m/s.gltf", "http://evil/x").is_err());
+        // Empty is rejected.
+        assert!(resolve_sibling("m/s.gltf", "  ").is_err());
     }
 }

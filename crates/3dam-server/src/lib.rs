@@ -109,6 +109,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/api/v1/query", post(query))
         .route("/api/v1/assets/{id}", get(get_asset).delete(remove_asset))
         .route("/api/v1/assets/{id}/content", get(asset_content))
+        .route("/api/v1/assets/{id}/related", get(asset_related))
         .route("/api/v1/assets/{id}/thumbnail", get(asset_thumbnail))
         .route("/api/v1/stats", get(stats))
         .route("/api/v1/convert", post(convert))
@@ -117,7 +118,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/api/v1/suggestions/review", post(review_suggestion))
         .route("/api/v1/jobs/analyze", post(submit_analyze))
         .route("/api/v1/sources", get(list_sources).post(add_source))
-        .route("/api/v1/sources/{id}", get(get_source).delete(remove_source))
+        .route(
+            "/api/v1/sources/{id}",
+            get(get_source).delete(remove_source),
+        )
         .route(
             "/api/v1/collections",
             get(list_collections).post(create_collection),
@@ -182,7 +186,10 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
         None => ServeFile::default(),
     };
     let default_addr: SocketAddr = "127.0.0.1:7878".parse().unwrap();
-    let addr = cfg.addr.or_else(|| file.socket_addr()).unwrap_or(default_addr);
+    let addr = cfg
+        .addr
+        .or_else(|| file.socket_addr())
+        .unwrap_or(default_addr);
     let localhost_only = addr.ip().is_loopback();
     let tls = false; // static rustls cert/key is a phase-6 follow-up (ADR 0009 §4).
 
@@ -230,7 +237,9 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
         cfg.data_dir.display()
     );
     if s.exposed_without_auth {
-        eprintln!("  ⚠ exposed beyond localhost with no auth and no TLS — set the authentication flag");
+        eprintln!(
+            "  ⚠ exposed beyond localhost with no auth and no TLS — set the authentication flag"
+        );
     }
     // Graceful shutdown, in three moves:
     //   1. `wait_for_signal()` resolves on Ctrl-C / SIGTERM,
@@ -403,6 +412,30 @@ async fn asset_content(
         Body::from(content.bytes),
     )
         .into_response())
+}
+
+async fn asset_related(
+    Reader(ctx): Reader,
+    State(st): State<AppState>,
+    AxPath(id): AxPath<String>,
+    Query(q): Query<RelatedQuery>,
+) -> Result<Response, ApiError> {
+    let id: AssetId = parse_id(&id, "asset")?;
+    let content = st.lib.read_related_content(&ctx, &id, &q.path).await?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, content.content_type),
+            (header::CACHE_CONTROL, "private, max-age=60".to_string()),
+        ],
+        Body::from(content.bytes),
+    )
+        .into_response())
+}
+
+#[derive(serde::Deserialize)]
+struct RelatedQuery {
+    /// The glTF-relative URI of the sibling file (`.bin` / texture), resolved against the asset dir.
+    path: String,
 }
 
 async fn asset_thumbnail(

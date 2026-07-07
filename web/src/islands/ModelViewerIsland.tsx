@@ -7,6 +7,38 @@
 import { useEffect, useRef, useState } from "react";
 import { createModelViewer } from "./index";
 import type { ModelViewerHandle } from "./index";
+import { api } from "@/api/client";
+
+/** Resolve every buffer of a loose `.gltf` to bytes (issue #56): data-URIs are decoded here, and
+ *  external files are fetched relative to the asset via the `related` endpoint. Returned in glTF
+ *  buffer-index order, as the WASM loader expects. */
+async function resolveGltfBuffers(gltfBytes: Uint8Array, assetId: string): Promise<Uint8Array[]> {
+  const doc = JSON.parse(new TextDecoder().decode(gltfBytes)) as { buffers?: { uri?: string }[] };
+  const buffers = doc.buffers ?? [];
+  return Promise.all(
+    buffers.map(async (b) => {
+      if (!b.uri) return new Uint8Array(0); // a GLB bin chunk — not expected in a loose .gltf
+      if (b.uri.startsWith("data:")) return decodeDataUri(b.uri);
+      const rel = decodeURI(b.uri); // glTF URIs are percent-encoded per spec
+      const r = await fetch(api.assetRelatedUrl(assetId, rel));
+      if (!r.ok) throw new Error(`buffer ${rel} ${r.status}`);
+      return new Uint8Array(await r.arrayBuffer());
+    }),
+  );
+}
+
+function decodeDataUri(uri: string): Uint8Array {
+  const comma = uri.indexOf(",");
+  const meta = uri.slice(5, comma);
+  const data = uri.slice(comma + 1);
+  if (meta.includes("base64")) {
+    const bin = atob(data);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+  return new TextEncoder().encode(decodeURIComponent(data));
+}
 
 // Match the island's default framing so the first `setCamera` doesn't jump (tech-spec 06 §5).
 const DEFAULT_YAW = Math.PI / 4;
@@ -28,7 +60,17 @@ function fitCanvas(canvas: HTMLCanvasElement, container: HTMLElement) {
   return { w, h, changed };
 }
 
-export function ModelViewerIsland({ src }: { src: string }) {
+export function ModelViewerIsland({
+  src,
+  assetId,
+  format,
+}: {
+  src: string;
+  /** The asset id — used to resolve a loose `.gltf`'s external buffers via the related endpoint. */
+  assetId: string;
+  /** The detected model format (`glb` | `gltf` | …); a loose `gltf` takes the external-buffer path. */
+  format: string;
+}) {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [status, setStatus] = useState<Status>("loading");
@@ -87,17 +129,23 @@ export function ModelViewerIsland({ src }: { src: string }) {
         handle = h;
         const res = await fetch(src);
         if (!res.ok) throw new Error(`content ${res.status}`);
-        const buf = await res.arrayBuffer();
+        const bytes = new Uint8Array(await res.arrayBuffer());
         if (disposed) return;
-        handle.loadModel(new Uint8Array(buf));
+        if (format === "gltf") {
+          // Loose glTF: resolve its external/data-URI buffers DOM-side, then hand them across (#56).
+          const buffers = await resolveGltfBuffers(bytes, assetId);
+          if (disposed) return;
+          handle.loadGltfExternal(bytes, buffers);
+        } else {
+          handle.loadModel(bytes);
+        }
         setStatus("ready");
       } catch (err) {
         if (disposed) return;
         const msg = String(err);
-        // Loose glTF (external .bin/textures) can't be resolved from bytes alone yet.
         setMessage(
-          msg.includes("glTF decode")
-            ? "Preview needs a self-contained .glb (loose glTF isn't supported yet)."
+          msg.includes("glTF") || msg.includes("buffer")
+            ? "Couldn’t load this glTF (missing or unreadable buffers)."
             : "3D preview unavailable in this browser.",
         );
         setStatus("error");
@@ -119,7 +167,7 @@ export function ModelViewerIsland({ src }: { src: string }) {
       canvas.removeEventListener("wheel", onWheel);
       handle?.free();
     };
-  }, [src]);
+  }, [src, assetId, format]);
 
   return (
     <div ref={containerRef} className="relative h-full w-full bg-bg">

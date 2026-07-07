@@ -170,6 +170,17 @@ pub trait LibraryService: Send + Sync {
     async fn read_content(&self, ctx: &AuthContext, id: &AssetId)
         -> Result<AssetContent, LibError>;
 
+    /// Read a file referenced *by relative path* from an asset's own directory within the same
+    /// source — the loose-glTF case where a `.gltf` points at sibling `.bin`/texture files by
+    /// relative URI (issue #56). `rel` is resolved against the asset's directory and confined to the
+    /// source root (traversal rejected). Read-only, bounded to preview-sized reads.
+    async fn read_related_content(
+        &self,
+        ctx: &AuthContext,
+        id: &AssetId,
+        rel: &str,
+    ) -> Result<AssetContent, LibError>;
+
     /// Read (generating + caching on miss) a downscaled PNG thumbnail for an asset preview
     /// (tech-spec 04 §6.4). `max_edge` bounds the long side. Only raster images produce one;
     /// audio/3D return `Unsupported` (their previews are WASM islands) and the UI falls back to
@@ -229,8 +240,11 @@ pub trait LibraryService: Send + Sync {
     /// derivation, auto-tag/-category suggestions, and dedup grouping. Background job; incremental and
     /// versioned (§1.2, §7). Analysis only ever produces *suggestions* + derived data — it never
     /// mutates confirmed catalog state (DESIGN_GUIDELINES §1.2).
-    async fn submit_analyze(&self, ctx: &AuthContext, req: AnalyzeRequest)
-        -> Result<JobId, LibError>;
+    async fn submit_analyze(
+        &self,
+        ctx: &AuthContext,
+        req: AnalyzeRequest,
+    ) -> Result<JobId, LibError>;
 
     /// "More like this": nearest neighbours of an asset in its media's embedding space, cosine-ranked
     /// and facet-filterable (§3). Returns empty if the asset has no embedding yet (§1.3).
@@ -282,7 +296,8 @@ pub trait LibraryService: Send + Sync {
         req: UpdateCollection,
     ) -> Result<(), LibError>;
 
-    async fn delete_collection(&self, ctx: &AuthContext, id: &CollectionId) -> Result<(), LibError>;
+    async fn delete_collection(&self, ctx: &AuthContext, id: &CollectionId)
+        -> Result<(), LibError>;
 
     /// Add/remove members of a manual collection (rejects smart folders — their set is query-driven).
     async fn modify_collection_members(
@@ -304,7 +319,8 @@ pub trait LibraryService: Send + Sync {
     // ── export / manifests (phase 4) ─────────────────────────────────────────
     /// Export a manifest (JSON/CSV/sidecar) over a selector (ids / collection / query / whole
     /// library) — metadata, license, attribution, and tags for use in engines and pipelines.
-    async fn export(&self, ctx: &AuthContext, req: ExportRequest) -> Result<ExportReport, LibError>;
+    async fn export(&self, ctx: &AuthContext, req: ExportRequest)
+        -> Result<ExportReport, LibError>;
 
     // ── jobs: scan ───────────────────────────────────────────────────────────
     async fn submit_scan(&self, ctx: &AuthContext, req: ScanRequest) -> Result<JobId, LibError>;

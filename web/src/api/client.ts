@@ -127,8 +127,14 @@ export const api = {
    *  fetches this and hands it across the wasm-bindgen boundary; the island does no networking. */
   assetContentUrl: (id: AssetId) => `${API}/assets/${id}/content`,
 
-  /** URL for a server-rendered PNG thumbnail (tech-spec 04 §6.4). Only images produce one; other
-   *  media return an error and the caller falls back to the honest typed tile. `edge` bounds the long side. */
+  /** URL for a file referenced *relative to* an asset — a loose `.gltf`'s external `.bin`/textures
+   *  (issue #56). `rel` is the glTF URI, resolved server-side against the asset's directory. */
+  assetRelatedUrl: (id: AssetId, rel: string) =>
+    `${API}/assets/${id}/related?path=${encodeURIComponent(rel)}`,
+
+  /** URL for a server-rendered PNG thumbnail (tech-spec 04 §6.4): a raster downscale for images, a
+   *  wgpu turntable render for 3D models. Audio (and any render that fails) returns an error and the
+   *  caller falls back to the honest typed tile. `edge` bounds the long side. */
   assetThumbnailUrl: (id: AssetId, edge = 256) => `${API}/assets/${id}/thumbnail?edge=${edge}`,
 
   // collections / smart folders (tech-spec: phase 4 Reach)
