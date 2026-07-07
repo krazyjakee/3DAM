@@ -68,10 +68,9 @@ impl Store {
                 row_to_summary,
             )
             .map_err(internal)?;
-        let mut items = Vec::new();
-        for r in rows {
-            items.push(r.map_err(internal)?);
-        }
+        let items = rows
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(internal)?;
 
         let next = if (offset + items.len()) < total as usize {
             Some(Cursor((offset + items.len()).to_string()))
@@ -99,11 +98,7 @@ impl Store {
                 Ok(blob_to_asset_id(&r.get::<_, Vec<u8>>(0)?))
             })
             .map_err(internal)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(internal)?);
-        }
-        Ok(out)
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(internal)
     }
 
     /// All member ids of a collection (unbounded), newest-added first.
@@ -119,11 +114,7 @@ impl Store {
                 Ok(blob_to_asset_id(&r.get::<_, Vec<u8>>(0)?))
             })
             .map_err(internal)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(internal)?);
-        }
-        Ok(out)
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(internal)
     }
 
     pub fn stats(&self) -> Result<LibraryStats, LibError> {

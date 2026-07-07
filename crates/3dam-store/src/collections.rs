@@ -35,11 +35,7 @@ impl Store {
         let rows = stmt
             .query_map([], |r| Self::row_to_collection(r, true))
             .map_err(internal)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(internal)?);
-        }
-        Ok(out)
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(internal)
     }
 
     pub fn get_collection(&self, id: &CollectionId) -> Result<Collection, LibError> {
@@ -191,11 +187,7 @@ impl Store {
                 row_to_summary,
             )
             .map_err(internal)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(internal)?);
-        }
-        Ok(out)
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(internal)
     }
 
     /// Collections that contain an asset (manual membership) — surfaced on the inspector record.
@@ -211,10 +203,6 @@ impl Store {
                 ))
             })
             .map_err(internal)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(internal)?);
-        }
-        Ok(out)
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(internal)
     }
 }

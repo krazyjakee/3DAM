@@ -56,11 +56,7 @@ impl Store {
                 })
             })
             .map_err(internal)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(internal)?);
-        }
-        Ok(out)
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(internal)
     }
 
     /// Persist the derived image signals (§5, §6) into the existing `image_attr` row. The row is created

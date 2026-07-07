@@ -60,11 +60,7 @@ impl Store {
         let rows = stmt
             .query_map([], |r| Self::row_to_source(r, &conn))
             .map_err(internal)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r.map_err(internal)?);
-        }
-        Ok(out)
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(internal)
     }
 
     pub fn get_source(&self, id: &SourceId) -> Result<Option<SourceInfo>, LibError> {
