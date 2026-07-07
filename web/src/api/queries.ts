@@ -100,6 +100,7 @@ export function useAddSource() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (req: AddSource) => api.addSource(req),
+    meta: { success: "Source added", errorPrefix: "Couldn’t add source" },
     onSuccess: () => qc.invalidateQueries({ queryKey: qk.sources }),
   });
 }
@@ -108,6 +109,7 @@ export function useRemoveSource() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (id: SourceId) => api.removeSource(id, { keep_metadata: false }),
+    meta: { success: "Source removed", errorPrefix: "Couldn’t remove source" },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: qk.sources });
       qc.invalidateQueries({ queryKey: qk.assets });
@@ -120,6 +122,7 @@ export function useScan() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (req: ScanRequest) => api.submitScan(req),
+    meta: { success: "Rescan started", errorPrefix: "Couldn’t start scan" },
     onSuccess: () => qc.invalidateQueries({ queryKey: qk.jobs }),
   });
 }
@@ -130,6 +133,7 @@ export function useAnalyze() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (req: AnalyzeRequest) => api.submitAnalyze(req),
+    meta: { success: "Analysis started", errorPrefix: "Couldn’t start analysis" },
     onSuccess: () => qc.invalidateQueries({ queryKey: qk.jobs }),
   });
 }
@@ -165,6 +169,7 @@ export function useCreateCollection() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (req: NewCollection) => api.createCollection(req),
+    meta: { success: "Collection created", errorPrefix: "Couldn’t create collection" },
     onSuccess: () => qc.invalidateQueries({ queryKey: qk.collections }),
   });
 }
@@ -176,6 +181,7 @@ export function useRenameCollection() {
   return useMutation({
     mutationFn: ({ id, name }: { id: CollectionId; name: string }) =>
       api.updateCollection(id, { name }),
+    meta: { errorPrefix: "Couldn’t rename collection" },
     onSuccess: () => qc.invalidateQueries({ queryKey: qk.collections }),
   });
 }
@@ -184,6 +190,7 @@ export function useDeleteCollection() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (id: CollectionId) => api.deleteCollection(id),
+    meta: { success: "Collection deleted", errorPrefix: "Couldn’t delete collection" },
     onSuccess: () => qc.invalidateQueries({ queryKey: qk.collections }),
   });
 }
@@ -195,6 +202,7 @@ export function useCollectionMembers() {
   return useMutation({
     mutationFn: ({ id, members }: { id: CollectionId; members: CollectionMembers }) =>
       api.modifyCollectionMembers(id, members),
+    meta: { errorPrefix: "Couldn’t update collection" },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: qk.collections });
       qc.invalidateQueries({ queryKey: qk.assets });
@@ -206,13 +214,19 @@ export function useCollectionMembers() {
 /** Export a manifest (json/csv/sidecar). Read-only w.r.t. the catalog, so no cache invalidation;
  *  the caller shows the returned report (path + counts). */
 export function useExport() {
-  return useMutation({ mutationFn: (req: ExportRequest) => api.exportAssets(req) });
+  return useMutation({
+    mutationFn: (req: ExportRequest) => api.exportAssets(req),
+    meta: { errorPrefix: "Export failed" },
+  });
 }
 
 /** Convert assets to a target format. Writes to an output dir outside any source, so the catalog is
  *  unchanged — no invalidation; the caller shows the per-item report. */
 export function useConvert() {
-  return useMutation({ mutationFn: (req: ConvertRequest) => api.convert(req) });
+  return useMutation({
+    mutationFn: (req: ConvertRequest) => api.convert(req),
+    meta: { errorPrefix: "Convert failed" },
+  });
 }
 
 export function useCancelJob() {

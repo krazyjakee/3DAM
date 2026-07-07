@@ -1,5 +1,6 @@
 import type React from "react";
 import { useEffect } from "react";
+import { useFocusTrap } from "@/lib/use-focus-trap";
 
 /** A narrow-screen overlay drawer (responsive + touch pass).
  *
@@ -27,6 +28,9 @@ export function Drawer({
     return () => window.removeEventListener("keydown", onKey);
   }, [open, onClose]);
 
+  // Trap focus inside the panel while open; restore it to the trigger on close (issue #26).
+  const panelRef = useFocusTrap<HTMLDivElement>(open);
+
   const closedShift = side === "left" ? "-translate-x-full" : "translate-x-full";
 
   return (
@@ -41,6 +45,7 @@ export function Drawer({
         onClick={onClose}
       />
       <div
+        ref={panelRef}
         role="dialog"
         aria-modal="true"
         aria-label={label}

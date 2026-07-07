@@ -4,10 +4,11 @@
 // dialog defaults the target to the media most of the selection is. Non-destructive by construction:
 // outputs go under the chosen dir, never a source (the backend enforces §5.1).
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { FileCog, X } from "lucide-react";
 import { useConvert } from "@/api/queries";
 import { ApiError } from "@/api/client";
+import { useFocusTrap } from "@/lib/use-focus-trap";
 import type {
   AssetSummary,
   CollisionRule,
@@ -67,6 +68,14 @@ export function ConvertDialog({
     setFormat(m === "audio" ? "wav" : "png");
   };
 
+  // Modal focus trap + Escape-to-close (issue #26).
+  const dialogRef = useFocusTrap<HTMLDivElement>(true);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
   // How many inputs match the chosen target media (the rest will report `unsupported`).
   const matching = assets.filter((a) => a.media === media).length;
 
@@ -100,11 +109,15 @@ export function ConvertDialog({
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={onClose}>
       <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="convert-dialog-title"
         className="max-h-[90vh] w-full max-w-[420px] overflow-y-auto rounded-lg border border-border bg-surface p-4 shadow-xl"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="mb-3 flex items-center justify-between">
-          <h2 className="flex items-center gap-2 text-sm font-semibold">
+          <h2 id="convert-dialog-title" className="flex items-center gap-2 text-sm font-semibold">
             <FileCog size={15} /> Convert {assets.length} asset{assets.length === 1 ? "" : "s"}
           </h2>
           <button

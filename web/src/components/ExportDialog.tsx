@@ -3,10 +3,11 @@
 // server-side paths — for a local-first server that is the user's own disk, so this is "write a
 // manifest to <path>", not a browser download. Shows the returned report (files written + count).
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { FileDown, X } from "lucide-react";
 import { useExport } from "@/api/queries";
 import { ApiError } from "@/api/client";
+import { useFocusTrap } from "@/lib/use-focus-trap";
 import type { ExportFormat, ExportReport, QueryRequest } from "@/api/types";
 
 /** What the export is scoped to: an explicit multi-selection, a collection, or the faceted query. */
@@ -28,6 +29,14 @@ export function ExportDialog({ scope, onClose }: { scope: ExportScope; onClose: 
   const [attributionOnly, setAttributionOnly] = useState(false);
   const [report, setReport] = useState<ExportReport | null>(null);
   const [err, setErr] = useState<string | null>(null);
+
+  // Modal focus trap + Escape-to-close (issue #26).
+  const dialogRef = useFocusTrap<HTMLDivElement>(true);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
 
   const isDir = FORMATS.find((f) => f.value === format)?.dir;
   const scopeLabel =
@@ -52,11 +61,15 @@ export function ExportDialog({ scope, onClose }: { scope: ExportScope; onClose: 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={onClose}>
       <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="export-dialog-title"
         className="w-full max-w-[380px] rounded-lg border border-border bg-surface p-4 shadow-xl"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="mb-3 flex items-center justify-between">
-          <h2 className="flex items-center gap-2 text-sm font-semibold">
+          <h2 id="export-dialog-title" className="flex items-center gap-2 text-sm font-semibold">
             <FileDown size={15} /> Export manifest
           </h2>
           <button
