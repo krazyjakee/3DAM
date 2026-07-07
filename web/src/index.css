@@ -91,6 +91,14 @@
   ::-webkit-scrollbar-thumb:hover {
     background: var(--color-fg-dim);
   }
+  /* Global keyboard-focus indicator (issue #27): a single accent outline for every interactive
+     element, shown only for keyboard/AT navigation (:focus-visible), never on a mouse click — so
+     buttons, grid cells, table rows, nav rows, and toggles all become keyboard-navigable at a glance
+     without adding chrome for pointer users. */
+  :focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 1px;
+  }
 }
 
 @layer components {
