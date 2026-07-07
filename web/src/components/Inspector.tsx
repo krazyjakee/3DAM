@@ -1,6 +1,6 @@
 import type React from "react";
 import { useEffect, useState } from "react";
-import { Check, Grid3x3, PanelRightClose, RefreshCw, Sparkles, X } from "lucide-react";
+import { Check, Grid3x3, RefreshCw, Sparkles, X } from "lucide-react";
 import {
   useAnalyze,
   useAsset,
@@ -35,10 +35,22 @@ import { MediaIcon } from "./MediaIcon";
 import { Drawer } from "./Drawer";
 
 /** Inspector — a persistent right rail on `lg`, an overlay drawer below it (responsive + touch pass). Both
- *  render the same {@link InspectorPanel}, so a 360px phone and a wide desktop show identical detail. */
-export function Inspector({ width }: { width?: number }) {
+ *  render the same {@link InspectorPanel}, so a 360px phone and a wide desktop show identical detail.
+ *
+ *  Below `lg` the drawer is opt-in (issue #33): selecting an asset highlights it in place — it no longer
+ *  hijacks the screen — and the drawer opens only when the caller flips `open` (via the explicit
+ *  "Inspect" affordance in the Workspace selection bar). Dismissing the drawer keeps the selection. */
+export function Inspector({
+  width,
+  open,
+  onClose,
+}: {
+  width?: number;
+  open: boolean;
+  onClose: () => void;
+}) {
   const { state, patch } = useViewState();
-  const close = () => patch({ selected: null });
+  const deselect = () => patch({ selected: null });
 
   return (
     <>
@@ -46,10 +58,12 @@ export function Inspector({ width }: { width?: number }) {
         className="hidden shrink-0 flex-col border-l border-border bg-surface lg:flex"
         style={{ width }}
       >
-        <InspectorPanel selected={state.selected} onClose={close} />
+        {/* The persistent rail's close clears the selection (there is nothing to "dismiss"). */}
+        <InspectorPanel selected={state.selected} onClose={deselect} />
       </aside>
-      <Drawer open={!!state.selected} onClose={close} side="right" label="Inspector">
-        <InspectorPanel selected={state.selected} onClose={close} />
+      {/* The drawer's close only dismisses the overlay — the selection (and its grid highlight) stays. */}
+      <Drawer open={open && !!state.selected} onClose={onClose} side="right" label="Inspector">
+        <InspectorPanel selected={state.selected} onClose={onClose} />
       </Drawer>
     </>
   );
@@ -90,7 +104,8 @@ function InspectorPanel({
           aria-label="Close inspector"
           onClick={onClose}
         >
-          <PanelRightClose size={15} />
+          {/* One dismiss glyph across the app: the same X the modal/dialog uses (issue #33 item 4). */}
+          <X size={15} />
         </button>
       </div>
 
