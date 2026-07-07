@@ -1,17 +1,20 @@
 // Duplicate / dedupe review surface (issue #8; tech-spec 05 §4). A read-only review of the groups
 // the analysis pass linked — exact (byte-identical content hash) or near (pHash / embedding). 3DAM
 // only *groups*; it never auto-deletes. Each group suggests a "keep"; disposing of the rest
-// (remove + block from re-scan, issue #21) is a separate, deliberate step — open a member and use
-// its context menu's "Remove + block". Blocked hashes are managed on the /blocklist surface.
+// (remove + block from re-scan, issue #21) is a separate, deliberate step — right-click / long-press
+// any member for the same per-item context menu as the Browser tiles/rows (analyze, convert, add to
+// collection, copy path, remove / remove + block). Blocked hashes are managed on the /blocklist surface.
 
-import { useState } from "react";
+import { useCallback, useState } from "react";
 import { Link } from "react-router-dom";
 import { Copy } from "lucide-react";
 import { useDuplicates } from "@/api/queries";
-import type { DupGroup, DupKind, MediaType } from "@/api/types";
+import type { AssetSummary, DupGroup, DupKind, MediaType } from "@/api/types";
 import { bytes, mediaLabel } from "@/lib/format";
 import { Thumbnail } from "./Thumbnail";
 import { LicenseBadge } from "./LicenseBadge";
+import { ContextMenu, useLongPress, type MenuState } from "./ContextMenu";
+import { ConvertDialog } from "./ConvertDialog";
 
 const KINDS: { key: DupKind; label: string; hint: string }[] = [
   { key: "exact", label: "Exact", hint: "Byte-identical (content hash)" },
@@ -30,6 +33,15 @@ export function Duplicates() {
   const groups = useDuplicates({ kind, media: media || undefined });
   const data = groups.data ?? [];
 
+  // Same per-item context menu as the Browser tiles/rows (issue #20). The Duplicates page has no
+  // multi-selection, so the target is always the single right-clicked / long-pressed member.
+  const [menu, setMenu] = useState<MenuState | null>(null);
+  const [convertTargets, setConvertTargets] = useState<AssetSummary[] | null>(null);
+  const openMenu = useCallback(
+    (asset: AssetSummary, x: number, y: number) => setMenu({ assets: [asset], x, y }),
+    [],
+  );
+
   return (
     <div className="mx-auto flex min-h-dvh max-w-4xl flex-col gap-5 p-6 text-sm">
       <header className="flex flex-wrap items-center justify-between gap-3">
@@ -44,7 +56,8 @@ export function Duplicates() {
 
       <p className="text-xs text-fg-dim">
         Groups the analysis pass linked. 3DAM only groups — nothing is deleted. Each group marks a
-        suggested <span className="text-accent">Keep</span>; open a member to inspect it.
+        suggested <span className="text-accent">Keep</span>; open a member to inspect it, or
+        right-click for actions.
       </p>
 
       {/* controls: tier + media filter */}
@@ -93,15 +106,30 @@ export function Duplicates() {
       ) : (
         <div className="flex flex-col gap-4">
           {data.map((g, i) => (
-            <GroupCard key={i} group={g} />
+            <GroupCard key={i} group={g} onContext={openMenu} />
           ))}
         </div>
+      )}
+
+      <ContextMenu
+        menu={menu}
+        onClose={() => setMenu(null)}
+        onConvert={(assets) => setConvertTargets(assets)}
+      />
+      {convertTargets && (
+        <ConvertDialog assets={convertTargets} onClose={() => setConvertTargets(null)} />
       )}
     </div>
   );
 }
 
-function GroupCard({ group }: { group: DupGroup }) {
+function GroupCard({
+  group,
+  onContext,
+}: {
+  group: DupGroup;
+  onContext: (asset: AssetSummary, x: number, y: number) => void;
+}) {
   return (
     <section className="rounded border border-border bg-surface p-3">
       <div className="mb-2 flex items-center justify-between gap-2">
@@ -114,40 +142,61 @@ function GroupCard({ group }: { group: DupGroup }) {
         </span>
       </div>
       <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-        {group.members.map((m) => {
-          const keep = m.id === group.suggested_keep;
-          return (
-            <Link
-              key={m.id}
-              to={`/?sel=${m.id}`}
-              className="group flex flex-col overflow-hidden rounded border text-left transition-colors"
-              style={{
-                borderColor: keep ? "var(--color-accent)" : "var(--color-border)",
-              }}
-              title={`${m.name} · ${bytes(m.size)}`}
-            >
-              <div className="relative aspect-square">
-                <Thumbnail asset={m} size={48} />
-                {keep && (
-                  <span className="absolute top-1 left-1 rounded bg-accent px-1 py-0.5 text-[9px] font-semibold text-accent-fg">
-                    Keep
-                  </span>
-                )}
-              </div>
-              <div className="flex items-center justify-between gap-1 border-t border-border px-1.5 py-1">
-                <span className="truncate text-[11px] text-fg" title={m.name}>
-                  {m.name}
-                </span>
-              </div>
-              <div className="flex items-center justify-between px-1.5 pb-1">
-                <LicenseBadge badge={m.license} />
-                <span className="text-[10px] text-fg-dim tabular-nums">{bytes(m.size)}</span>
-              </div>
-            </Link>
-          );
-        })}
+        {group.members.map((m) => (
+          <MemberTile
+            key={m.id}
+            asset={m}
+            keep={m.id === group.suggested_keep}
+            onContext={onContext}
+          />
+        ))}
       </div>
     </section>
+  );
+}
+
+function MemberTile({
+  asset,
+  keep,
+  onContext,
+}: {
+  asset: AssetSummary;
+  keep: boolean;
+  onContext: (asset: AssetSummary, x: number, y: number) => void;
+}) {
+  const longPress = useLongPress((x, y) => onContext(asset, x, y));
+  return (
+    <Link
+      to={`/?sel=${asset.id}`}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        onContext(asset, e.clientX, e.clientY);
+      }}
+      {...longPress}
+      className="group flex flex-col overflow-hidden rounded border text-left transition-colors"
+      style={{
+        borderColor: keep ? "var(--color-accent)" : "var(--color-border)",
+      }}
+      title={`${asset.name} · ${bytes(asset.size)}`}
+    >
+      <div className="relative aspect-square">
+        <Thumbnail asset={asset} size={48} />
+        {keep && (
+          <span className="absolute top-1 left-1 rounded bg-accent px-1 py-0.5 text-[9px] font-semibold text-accent-fg">
+            Keep
+          </span>
+        )}
+      </div>
+      <div className="flex items-center justify-between gap-1 border-t border-border px-1.5 py-1">
+        <span className="truncate text-[11px] text-fg" title={asset.name}>
+          {asset.name}
+        </span>
+      </div>
+      <div className="flex items-center justify-between px-1.5 pb-1">
+        <LicenseBadge badge={asset.license} />
+        <span className="text-[10px] text-fg-dim tabular-nums">{bytes(asset.size)}</span>
+      </div>
+    </Link>
   );
 }
 

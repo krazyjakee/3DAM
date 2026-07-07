@@ -10,11 +10,16 @@ use futures::StreamExt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn unique_tmp() -> std::path::PathBuf {
+    // Per-process atomic counter as well as a timestamp: tests run in parallel within one process,
+    // and `as_nanos()` can coincide for two tests that start in the same clock tick — which would
+    // silently share a data dir (schema "already exists", cross-contaminated asset counts).
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    std::env::temp_dir().join(format!("3dam-test-{}-{}", std::process::id(), nanos))
+    std::env::temp_dir().join(format!("3dam-test-{}-{}-{}", std::process::id(), nanos, n))
 }
 
 #[tokio::test]
@@ -219,6 +224,110 @@ async fn remove_and_block_survives_rescan() {
         2,
         "unblocked content is re-imported"
     );
+
+    std::fs::remove_dir_all(&tmp).ok();
+}
+
+/// Remove + block is content-addressed dedup disposal: blocking one member of an exact-duplicate
+/// group (byte-identical copies sharing a content hash) purges the *whole* group, not just the
+/// clicked copy. A distinct asset is untouched, and the block still gates a rescan.
+#[tokio::test]
+async fn remove_and_block_purges_all_identical_copies() {
+    let tmp = unique_tmp();
+    let assets = tmp.join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    // Three byte-identical copies (one exact-dup group) + one distinct file.
+    let dup = b"\x89PNG\r\nDUP-BYTES";
+    std::fs::write(assets.join("a.png"), dup).unwrap();
+    std::fs::write(assets.join("b.png"), dup).unwrap();
+    std::fs::write(assets.join("c.png"), dup).unwrap();
+    std::fs::write(assets.join("other.png"), b"\x89PNG\r\nOTHER").unwrap();
+
+    let lib = EmbeddedLibrary::open(&tmp.join("data")).await.unwrap();
+    let ctx = AuthContext::embedded();
+    let sid = lib
+        .add_source(
+            &ctx,
+            AddSource {
+                kind: SourceKind::LocalFs,
+                uri: assets.to_string_lossy().into_owned(),
+                name: Some("t".into()),
+                options: SourceOptions::default(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let job = lib
+        .submit_scan(
+            &ctx,
+            ScanRequest {
+                sources: vec![sid],
+                mode: ScanMode::Full,
+            },
+        )
+        .await
+        .unwrap();
+    loop {
+        let j = lib.get_job(&ctx, &job).await.unwrap();
+        if matches!(j.state, JobState::Done | JobState::Failed) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let page = lib
+        .query(
+            &ctx,
+            QueryRequest {
+                page: PageParams {
+                    after: None,
+                    limit: 50,
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), 4, "all four files import");
+    // Pick any one of the three identical copies to remove + block.
+    let one_copy = page
+        .items
+        .iter()
+        .find(|a| a.name == "b.png")
+        .expect("b.png present")
+        .id;
+
+    lib.remove_asset(&ctx, &one_copy, RemoveAsset { block: true })
+        .await
+        .unwrap();
+
+    // All three byte-identical copies are gone; the distinct file remains.
+    assert_eq!(
+        lib.library_stats(&ctx).await.unwrap().total,
+        1,
+        "the whole exact-duplicate group is purged, not just the clicked copy"
+    );
+    let remaining = lib
+        .query(
+            &ctx,
+            QueryRequest {
+                page: PageParams {
+                    after: None,
+                    limit: 50,
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(remaining.items.len(), 1);
+    assert_eq!(
+        remaining.items[0].name, "other.png",
+        "distinct asset untouched"
+    );
+    // One hash blocked (the group's), and a rescan does not re-import the identical bytes.
+    assert_eq!(lib.list_blocklist(&ctx).await.unwrap().len(), 1);
 
     std::fs::remove_dir_all(&tmp).ok();
 }

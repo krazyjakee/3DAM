@@ -4,14 +4,20 @@ import type { AssetSummary } from "@/api/types";
 import { api } from "@/api/client";
 import { MediaIcon } from "./MediaIcon";
 
-// Capability phase 2 (Media depth): images get a real server-rendered PNG thumbnail (tech-spec
-// 04 §6.4), lazily loaded via <img>. Audio/3D previews are interactive WASM islands, not server
-// thumbnails, so they keep the honest typed tile here (DESIGN_GUIDELINES §4 — "no decorative
-// placeholders masquerading as content").
+// Images get a real server-rendered PNG thumbnail (tech-spec 04 §6.4); 3D models get a server-side
+// wgpu turntable render (ADR 0002), both lazily loaded via <img>. Audio previews are interactive
+// WASM islands with no server thumbnail, so audio keeps the honest typed tile here
+// (DESIGN_GUIDELINES §4 — "no decorative placeholders masquerading as content").
 //
-// While an image thumbnail is still fetching/generating we show a neutral placeholder (the typed
-// tile glyph) with a loading spinner overlay rather than raw alt text (issue #53); on load we swap
-// to the image, and on a decode/unsupported error we fall back to the same typed tile.
+// While a thumbnail is still fetching/generating we show a neutral placeholder (the typed tile
+// glyph) with a loading spinner overlay rather than raw alt text (issue #53); on load we swap to the
+// image, and on a decode/unsupported/no-GPU error we fall back to the same typed tile — so a model
+// on a GPU-less host, or a format the renderer can't decode yet, degrades gracefully.
+
+/** Media whose preview the server can render to a PNG the grid shows via <img>. */
+function hasServerThumbnail(media: AssetSummary["media"]): boolean {
+  return media === "image" || media === "model";
+}
 
 const TINT: Record<AssetSummary["media"], string> = {
   audio: "var(--color-lic-attribution)",
@@ -41,8 +47,8 @@ export function Thumbnail({ asset, size = 28 }: { asset: AssetSummary; size?: nu
   // changes so the placeholder/spinner tracks the new image rather than the previous one.
   useEffect(() => setStatus("loading"), [asset.id]);
 
-  // Non-image media, or an image that failed to decode, always shows the honest typed tile.
-  if (asset.media !== "image" || status === "failed") {
+  // Media with no server thumbnail (audio), or a preview that failed to load, shows the typed tile.
+  if (!hasServerThumbnail(asset.media) || status === "failed") {
     return <TypedTile asset={asset} size={size} />;
   }
 
@@ -52,8 +58,8 @@ export function Thumbnail({ asset, size = 28 }: { asset: AssetSummary; size?: nu
     <div className="relative h-full w-full" style={{ background: "var(--color-bg)" }}>
       {status === "loading" && (
         <div className="absolute inset-0 flex items-center justify-center" aria-hidden>
-          <span className="opacity-20" style={{ color: TINT.image }}>
-            <MediaIcon media="image" size={size} />
+          <span className="opacity-20" style={{ color: TINT[asset.media] }}>
+            <MediaIcon media={asset.media} size={size} />
           </span>
           <Loader2 className="absolute animate-spin text-fg-dim" size={Math.max(14, size / 2)} />
         </div>

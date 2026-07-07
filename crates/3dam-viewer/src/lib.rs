@@ -4,12 +4,13 @@
 //! shipped as focused `wgpu` components embedded *in* the React layout — **not** a full-page
 //! canvas ([tech-spec 09] §B.3, [ADR 0009] §9). Two islands live here:
 //!
-//! - [`ModelViewer`] — the interactive 3D viewer (glTF/GLB → PBR-lite orbit view).
+//! - [`ModelViewer`] — the interactive 3D viewer (server-decoded `DMSH` mesh → textured PBR orbit
+//!   view; every Assimp format, with materials).
 //! - [`WaveformView`] — the audio waveform (a "hot render path", also a WASM island per ADR 0009 §9;
 //!   thumbnails stay *server-rendered* previews and are deliberately **not** here).
 //!
 //! **The wasm-bindgen contract** ratified in ADR 0009 §9 / tech-spec 09 §B.3 is:
-//! `init(canvas) · load_model(bytes) / set_waveform(samples) · set_camera(..) · resize(w,h) · drop()`.
+//! `init(canvas) · load_preview_mesh(bytes) / set_waveform(samples) · set_camera(..) · resize(w,h) · drop()`.
 //! Each island maps that onto an exported struct: `create()` (async init), a data-in method,
 //! `set_camera`/`set_progress`, `resize`, and `free()` (wasm-bindgen's generated destructor = `drop`).
 //!
@@ -46,17 +47,22 @@ pub use native_stub::NOT_ON_NATIVE;
 #[cfg(target_arch = "wasm32")]
 mod camera;
 #[cfg(target_arch = "wasm32")]
-mod gltf_load;
-#[cfg(target_arch = "wasm32")]
 mod gpu;
 #[cfg(target_arch = "wasm32")]
 mod model_viewer;
+#[cfg(target_arch = "wasm32")]
+mod preview_mesh;
 #[cfg(target_arch = "wasm32")]
 mod raf;
 #[cfg(target_arch = "wasm32")]
 mod scene;
 #[cfg(target_arch = "wasm32")]
 mod waveform;
+
+/// Magic prefix of the server's `DMSH` preview blob (see `dam-render`'s `preview` module). Shared by
+/// the parser; kept crate-level so it stays in lockstep with the serializer's constant.
+#[cfg(target_arch = "wasm32")]
+pub(crate) const DMSH_MAGIC: &[u8; 4] = b"DMSH";
 
 #[cfg(target_arch = "wasm32")]
 pub use model_viewer::ModelViewer;

@@ -9,6 +9,9 @@ description = "The pure engine: EmbeddedLibrary over the store + handlers + sour
 dam-api.workspace = true
 dam-store.workspace = true
 dam-media.workspace = true
+# Optional GPU renderer for server-side 3D turntable thumbnails (ADR 0002). Off by default so the
+# native/CLI build stays GPU-free (crate-map invariant); `serve` opts in via the `render` feature.
+dam-render = { workspace = true, optional = true }
 dam-sources = { workspace = true, features = ["sftp", "smb"] }
 tokio.workspace = true
 tokio-stream.workspace = true
@@ -22,6 +25,11 @@ directories.workspace = true
 # watch/auto-rescan (local FS change notification) + CSV manifest export (phase 4 Reach).
 notify.workspace = true
 csv.workspace = true
+
+[features]
+# 3D model thumbnails via the wgpu renderer. Pulls wgpu in transitively — enabled by `serve`, kept
+# off for lean CLI/GUI builds where the honest typed tile is the intended 3D grid affordance.
+render = ["dep:dam-render"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread"] }

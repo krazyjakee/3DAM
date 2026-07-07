@@ -25,7 +25,7 @@ with current status. The spec is authoritative; this table just adds where we ar
 <thead><tr><th>#</th><th>Phase (spec §9)</th><th>Status</th></tr></thead>
 <tbody>
 <tr><td>1</td><td><strong>Foundation</strong> — schema, local scan, SQLite store, grid/table browse + text search, CLI <code>scan</code>/<code>search</code> <span class="sub">Embedded engine, <code>3dam serve</code> API, and CLI parity landed.</span></td><td><span class="pill done">Shipped</span></td></tr>
-<tr><td>2</td><td><strong>Media depth</strong> — per-type decode + preview (waveform, image, 3D), thumbnail cache, convert pipeline (CLI-first) <span class="sub">Cheap per-type metadata, server image thumbnails + cache, interactive audio/3D islands, and the CLI convert pipeline all landed; deeper codec/format coverage staged.</span></td><td><span class="pill done">Shipped</span></td></tr>
+<tr><td>2</td><td><strong>Media depth</strong> — per-type decode + preview (waveform, image, 3D), thumbnail cache, convert pipeline (CLI-first) <span class="sub">Cheap per-type metadata, server image thumbnails + cache, interactive audio/3D islands, and the CLI convert pipeline all landed; deeper codec/format coverage staged. The interactive 3D island now shares the server's Assimp decode (a self-contained textured `DMSH` preview mesh), so every format — FBX/OBJ/DAE/glTF/… — previews in-browser with materials.</span></td><td><span class="pill done">Shipped</span></td></tr>
 <tr><td>3</td><td><strong>Automation</strong> — feature extraction + embeddings, similarity search, auto-tag/categorise, dedup, review UX <span class="sub">The differentiator. Analyze pass (embeddings + tileability/pHash + auto-tag/-category suggestions), embedding-cosine <code>find_similar</code>, exact + near dedup grouping, and the accept/reject suggestion lifecycle all landed CLI-first over the same seam (embedded + <code>--connect</code>). Model-free v1 behind the <code>EmbeddingSpace</code> seam (ADR 0006): SigLIP/CLAP weights are a later feature-gated bump; the web review surface and HNSW-at-scale follow.</span></td><td><span class="pill done">Shipped</span></td></tr>
 <tr><td>4</td><td><strong>Reach</strong> — SFTP + SMB sources, watch/auto-rescan, smart folders, export/manifests, CLI/GUI parity <span class="sub">The <code>FileSource</code> seam now spans local FS, <strong>SFTP</strong> (<code>russh</code>) and <strong>SMB2/3</strong> (pure-Rust <code>smb</code>) behind one <code>open_source</code>/<code>fetch</code> path; delta re-scan skips unchanged files and marks vanished ones absent; <strong>watch/auto-rescan</strong> (local FS events + remote polling) drives delta scans; <strong>smart folders</strong> (live saved queries) and manual collections; and <strong>export/manifests</strong> (JSON/CSV/sidecar, incl. attribution-only). All CLI-first over the same seam, embedded + <code>--connect</code>. Desktop GUI stays phase 5.</span></td><td><span class="pill done">Shipped</span></td></tr>
 <tr><td>5</td><td><strong>Server &amp; web</strong> — <code>LibraryService</code> boundary, <code>3dam serve</code>, <code>3dam mcp</code>, <code>--connect</code>, web client, feature flags + Settings, basic auth <span class="sub">Complete for v1: the runtime feature-flag store + audited <code>/admin/api</code> + web Settings surface, basic access control (anonymous + token auth), and the MCP server (<code>3dam mcp</code> stdio + flag-gated <code>POST /mcp</code>) all landed on the one auth surface. Opt-in <strong>user accounts + OIDC</strong> layer on the same seam in phase 6.</span></td><td><span class="pill done">Shipped</span></td></tr>
@@ -120,10 +120,14 @@ depth, duration, codec — no PCM decode), images via header dimensions + a PNG 
 and 3D by hand-walking the <strong>GLB JSON chunk</strong> / glTF / OBJ / STL / PLY for vertex, triangle,
 mesh, material, texture, and rig/anim/UV counts — <strong>never decoding geometry or the BIN chunk</strong>
 (the cheap contract, §4). These persist to the per-type attribute tables and surface on the grid rows
-(<code>key_attrs</code>) and the Inspector. <strong>Server-rendered image thumbnails</strong> (downscaled PNG,
-content-hash-keyed on-disk cache) serve at <code>GET /api/v1/assets/{id}/thumbnail</code>, with audio
-waveforms and 3D turntables kept as the interactive WASM islands; the web grid/inspector render real
-previews with a graceful fall-back to the honest typed tile. The <strong>convert pipeline</strong> (CLI-first,
+(<code>key_attrs</code>) and the Inspector. <strong>Server-rendered thumbnails</strong> (downscaled PNG,
+content-hash-keyed on-disk cache) serve at <code>GET /api/v1/assets/{id}/thumbnail</code>: a raster
+downscale for images and a headless, <strong>textured PBR turntable render for 3D models</strong> across the professional
+format range (FBX, OBJ/MTL, DAE, 3DS, glTF/GLB, PLY, STL, <code>.blend</code>, … via Assimp —
+<a href="adr/0011-assimp-import-backend.md">ADR 0011</a>; USD family excepted), with a software-raster
+fallback on GPU-less hosts per <a href="adr/0001-3d-render-backend.md">ADR 0001</a>. Audio waveforms
+stay interactive WASM islands; the web grid/inspector render real previews with a graceful fall-back
+to the honest typed tile whenever a render is unavailable. The <strong>convert pipeline</strong> (CLI-first,
 <code>3dam convert</code>) decodes via the same handlers and re-encodes non-destructively — image
 transcode/resize and audio→WAV — with dry-run planning, the <strong>source-safety invariant</strong> (never
 writes into a registered source), atomic temp-write-then-rename, and collision policy. Deeper codec and
@@ -192,8 +196,12 @@ surface (API, admin, MCP); <code>Off</code> grants the localhost owner full trus
 and read/write/admin scopes gate handlers (writes further gated by the network ceiling beyond localhost). Bearer
 <strong>API tokens</strong> are issued through the audited admin API (secret shown once, blake3-hashed at rest). The
 <strong>admin API</strong> (<code>/admin/api/*</code>) is the single source of truth driven by both the CLI (<code>3dam admin
-flags|flag|token|status|audit</code>, embedded or <code>--connect</code>) and the web <strong>Settings / Administration</strong>
-surface (grouped flag cards, warn-and-confirm, token management, audit trail). The <strong>MCP server</strong> (ADR 0003,
+flags|flag|token|status|audit|maintenance</code>, embedded or <code>--connect</code>) and the web <strong>Settings / Administration</strong>
+surface (grouped flag cards, warn-and-confirm, token management, audit trail, and a <strong>Storage &amp; maintenance</strong>
+section — usage overview, clear thumbnail/3D-preview caches, clear analysis, VACUUM, reset-catalog, and factory-reset,
+all audited and non-destructive to source files). <em>(These maintenance controls are web + CLI today; the native egui
+Settings surface inherits them when the desktop GUI is built — it is still a stub, so the whole Settings area is
+web-only for now.)</em> The <strong>MCP server</strong> (ADR 0003,
 hand-rolled JSON-RPC over <code>dyn LibraryService</code> — no subprocess) serves tools/resources/prompts over both
 <code>3dam mcp</code> stdio (locally trusted) and <code>POST /mcp</code> on the shared port; the <code>mcp_server</code>
 flag mounts/unmounts it (<code>Off ⇒ 404</code>) and a <code>WriteGate</code> (bind + flag + caller scope) filters the write

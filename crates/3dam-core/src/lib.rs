@@ -12,6 +12,10 @@ mod watch;
 pub use paths::default_data_dir;
 
 use async_trait::async_trait;
+use dam_api::admin::{
+    CacheTarget, CacheUsage, ClearAnalysisReport, ClearCacheReport, StorageUsage, VacuumReport,
+    WipeReport,
+};
 use dam_api::dto::*;
 use dam_api::event::{ChangeKind, LibraryEvent, SubscribeRequest};
 use dam_api::id::{AssetId, CollectionId, ContentHash, JobId, SourceId};
@@ -38,9 +42,11 @@ const MAX_CONTENT_BYTES: u64 = 256 * 1024 * 1024;
 const THUMB_MIN_EDGE: u32 = 16;
 const THUMB_MAX_EDGE: u32 = 1024;
 
-/// Render (or read from cache) a downscaled PNG thumbnail for an image asset. Pure/blocking — runs
-/// inside `spawn_blocking`. The cache lives under `<data_dir>/cache/thumbnails/<key>-<edge>.png`,
-/// keyed by content hash (falling back to the asset id) so identical bytes share one derivative.
+/// Render (or read from cache) a downscaled PNG thumbnail for an asset — a raster downscale for
+/// images, a wgpu turntable render for 3D models (when the `render` feature is on). Pure/blocking —
+/// runs inside `spawn_blocking`. The cache lives under
+/// `<data_dir>/cache/thumbnails/<key>-<edge>[<variant>].png`, keyed by content hash (falling back to
+/// the asset id) so identical bytes share one derivative.
 fn gen_thumbnail(
     data_dir: &Path,
     store: &Store,
@@ -52,7 +58,10 @@ fn gen_thumbnail(
         .map(|h| h.to_hex())
         .unwrap_or_else(|| asset.summary.id.to_string());
     let cache_dir = data_dir.join("cache").join("thumbnails");
-    let cache_path = cache_dir.join(format!("{key}-{max_edge}.png"));
+    // Model thumbnails carry a renderer-version suffix so a shader/framing bump invalidates only
+    // that slice; images keep the bare `{key}-{edge}` name.
+    let variant = thumbnail_variant(asset.summary.media);
+    let cache_path = cache_dir.join(format!("{key}-{max_edge}{variant}.png"));
     if let Ok(bytes) = std::fs::read(&cache_path) {
         return Ok(png_content(bytes)); // cache hit → no source access at all
     }
@@ -64,17 +73,154 @@ fn gen_thumbnail(
         media: asset.summary.media,
         format: asset.summary.format.clone(),
     };
-    let thumb =
-        dam_media::render_thumbnail(fetched.path(), &det, max_edge).map_err(map_handler_err)?;
+    let bytes = render_thumbnail_bytes(fetched.path(), &det, max_edge)?;
 
     // Best-effort cache write (a cold cache is a slow path, not an error).
     if std::fs::create_dir_all(&cache_dir).is_ok() {
-        let tmp = cache_dir.join(format!(".{key}-{max_edge}.png.tmp"));
-        if std::fs::write(&tmp, &thumb.bytes).is_ok() {
+        let tmp = cache_dir.join(format!(".{key}-{max_edge}{variant}.png.tmp"));
+        if std::fs::write(&tmp, &bytes).is_ok() {
             let _ = std::fs::rename(&tmp, &cache_path);
         }
     }
-    Ok(png_content(thumb.bytes))
+    Ok(png_content(bytes))
+}
+
+/// Produce PNG thumbnail bytes for an asset. Images (and any raster derivative) go through the
+/// `dam-media` handler; 3D models go through the wgpu renderer when the `render` feature is on,
+/// and otherwise return `Unsupported` so the UI falls back to the honest typed tile.
+fn render_thumbnail_bytes(
+    path: &Path,
+    det: &dam_media::Detected,
+    max_edge: u32,
+) -> Result<Vec<u8>, LibError> {
+    match det.media {
+        MediaType::Model => render_model_thumbnail(path, det, max_edge),
+        _ => dam_media::render_thumbnail(path, det, max_edge)
+            .map(|t| t.bytes)
+            .map_err(map_handler_err),
+    }
+}
+
+/// Cache-key suffix distinguishing thumbnail variants that can change independently of the source
+/// bytes. Only 3D renders carry one (keyed to the renderer version); images return an empty suffix.
+#[cfg_attr(not(feature = "render"), allow(unused_variables))]
+fn thumbnail_variant(media: MediaType) -> String {
+    #[cfg(feature = "render")]
+    if media == MediaType::Model {
+        return format!("-r{}", dam_render::RENDER_VERSION);
+    }
+    String::new()
+}
+
+/// Render a 3D model to a PNG turntable thumbnail. Fail-soft: every failure — no GPU/software
+/// adapter, an unsupported model format, empty geometry, a decode fault — maps to `Unsupported`
+/// (a 415), which the web/GUI grid renders as the honest typed tile rather than an error.
+#[cfg(feature = "render")]
+fn render_model_thumbnail(
+    path: &Path,
+    det: &dam_media::Detected,
+    max_edge: u32,
+) -> Result<Vec<u8>, LibError> {
+    dam_render::render_model_thumbnail_png(path, &det.format, max_edge).map_err(|e| {
+        // Environmental faults (no adapter, readback) are worth a log line; per-asset faults aren't.
+        if matches!(
+            e,
+            dam_render::RenderError::NoAdapter
+                | dam_render::RenderError::Device(_)
+                | dam_render::RenderError::Readback(_)
+        ) {
+            tracing::warn!("3D thumbnail render unavailable: {e}");
+        }
+        LibError::Unsupported(e.to_string())
+    })
+}
+
+#[cfg(not(feature = "render"))]
+fn render_model_thumbnail(
+    _path: &Path,
+    det: &dam_media::Detected,
+    _max_edge: u32,
+) -> Result<Vec<u8>, LibError> {
+    Err(LibError::Unsupported(format!(
+        "{} previews render client-side (WASM island); server 3D thumbnails need the `render` feature",
+        det.media.as_str()
+    )))
+}
+
+/// Read (generating + caching on miss) the interactive 3D preview blob for a **model** asset — the
+/// self-contained `DMSH` mesh (geometry + PBR materials + downscaled textures) the browser island
+/// uploads directly (tech-spec 09 §B.3). Mirrors [`gen_thumbnail`]'s content-keyed cache, but the
+/// blob is CPU-decoded (no GPU), so it works on GPU-less hosts. Fail-soft: non-models and (in a
+/// build without the `render` feature) every model map to `Unsupported`, a 415 the UI degrades on.
+fn gen_model_preview(
+    data_dir: &Path,
+    store: &Store,
+    asset: &Asset,
+) -> Result<AssetContent, LibError> {
+    if asset.summary.media != MediaType::Model {
+        return Err(LibError::Unsupported(
+            "3D preview is only available for model assets".to_string(),
+        ));
+    }
+    gen_model_preview_impl(data_dir, store, asset)
+}
+
+#[cfg(feature = "render")]
+fn preview_content(bytes: Vec<u8>) -> AssetContent {
+    AssetContent {
+        bytes,
+        content_type: "model/x-dam-preview".to_string(),
+        format: "dmsh".to_string(),
+        media: MediaType::Model,
+    }
+}
+
+/// Decode + cache the `DMSH` blob. Split out so the `render`-off build can short-circuit *before*
+/// any (possibly remote) fetch instead of downloading only to fail the decode.
+#[cfg(feature = "render")]
+fn gen_model_preview_impl(
+    data_dir: &Path,
+    store: &Store,
+    asset: &Asset,
+) -> Result<AssetContent, LibError> {
+    let key = asset
+        .hash
+        .map(|h| h.to_hex())
+        .unwrap_or_else(|| asset.summary.id.to_string());
+    let cache_dir = data_dir.join("cache").join("previews");
+    // Suffix carries the blob-format version so a serializer bump invalidates only this slice.
+    let cache_path = cache_dir.join(format!("{key}-p{}.dmsh", dam_render::PREVIEW_VERSION));
+    if let Ok(bytes) = std::fs::read(&cache_path) {
+        return Ok(preview_content(bytes)); // cache hit → no source access at all
+    }
+
+    let fetched = fetch_asset(store, asset)?;
+    let bytes =
+        dam_render::model_preview_blob(fetched.path(), &asset.summary.format).map_err(|e| {
+            if matches!(e, dam_render::RenderError::Decode(_)) {
+                tracing::warn!("3D preview decode failed: {e}");
+            }
+            LibError::Unsupported(e.to_string())
+        })?;
+
+    if std::fs::create_dir_all(&cache_dir).is_ok() {
+        let tmp = cache_dir.join(format!(".{key}-p{}.dmsh.tmp", dam_render::PREVIEW_VERSION));
+        if std::fs::write(&tmp, &bytes).is_ok() {
+            let _ = std::fs::rename(&tmp, &cache_path);
+        }
+    }
+    Ok(preview_content(bytes))
+}
+
+#[cfg(not(feature = "render"))]
+fn gen_model_preview_impl(
+    _data_dir: &Path,
+    _store: &Store,
+    _asset: &Asset,
+) -> Result<AssetContent, LibError> {
+    Err(LibError::Unsupported(
+        "interactive 3D preview needs the server `render` feature".to_string(),
+    ))
 }
 
 /// Serialise an optional saved query to JSON for the `collection.query` column.
@@ -257,6 +403,124 @@ impl EmbeddedLibrary {
             .await
             .map_err(|e| LibError::Internal(e.to_string()))?
     }
+
+    // ── storage & maintenance (Settings §Storage, tech-spec 10 §5) ────────────
+    //
+    // Operator-plane methods the server's `/admin/api/maintenance/*` routes delegate to. Inherent
+    // (not on the `LibraryService` seam) because maintenance is admin-plane — the CLI reaches these
+    // through the audited admin surface, not the generic frontend trait.
+
+    /// Report on-disk usage: `library.db` + `server.db` sizes, both cache tiers, and catalog counts.
+    /// Read-only. File sizing runs off the async runtime.
+    pub async fn storage_usage(&self) -> Result<StorageUsage, LibError> {
+        let stats = self.db(|s| s.stats()).await?;
+        let data_dir = self.data_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let file_len = |p: PathBuf| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+            Ok(StorageUsage {
+                data_dir: data_dir.display().to_string(),
+                library_db_bytes: file_len(data_dir.join("library.db")),
+                server_db_bytes: file_len(data_dir.join("server.db")),
+                thumbnails: dir_usage(&data_dir.join("cache").join("thumbnails")),
+                previews: dir_usage(&data_dir.join("cache").join("previews")),
+                asset_count: stats.total,
+                source_count: stats.sources,
+            })
+        })
+        .await
+        .map_err(|e| LibError::Internal(e.to_string()))?
+    }
+
+    /// Delete the selected regenerable cache tier(s) under `<data_dir>/cache/`. Non-destructive:
+    /// every file is content-keyed and re-generated on the next thumbnail/preview read, so this
+    /// emits no event.
+    pub async fn clear_caches(&self, target: CacheTarget) -> Result<ClearCacheReport, LibError> {
+        let data_dir = self.data_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let cache = data_dir.join("cache");
+            let mut freed = CacheUsage { bytes: 0, files: 0 };
+            if matches!(target, CacheTarget::Thumbnails | CacheTarget::All) {
+                let u = clear_dir(&cache.join("thumbnails"));
+                freed.bytes += u.bytes;
+                freed.files += u.files;
+            }
+            if matches!(target, CacheTarget::Previews | CacheTarget::All) {
+                let u = clear_dir(&cache.join("previews"));
+                freed.bytes += u.bytes;
+                freed.files += u.files;
+            }
+            Ok(ClearCacheReport {
+                bytes_freed: freed.bytes,
+                files_deleted: freed.files,
+            })
+        })
+        .await
+        .map_err(|e| LibError::Internal(e.to_string()))?
+    }
+
+    /// Drop the analysis layer (suggestions + embeddings + derived attrs) and mark every asset due
+    /// for re-analysis, keeping user-confirmed tags. Emits `CatalogReset` so open grids refresh.
+    pub async fn clear_analysis(&self) -> Result<ClearAnalysisReport, LibError> {
+        let report = self.db(|s| s.clear_analysis()).await?;
+        let _ = self.events.send(LibraryEvent::CatalogReset);
+        Ok(report)
+    }
+
+    /// Compact `library.db` (`VACUUM`), returning the before/after size and bytes reclaimed.
+    pub async fn vacuum(&self) -> Result<VacuumReport, LibError> {
+        let db_path = self.data_dir.join("library.db");
+        let before = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+        self.db(|s| s.vacuum()).await?;
+        let after = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+        Ok(VacuumReport {
+            before_bytes: before,
+            after_bytes: after,
+            reclaimed_bytes: before.saturating_sub(after),
+        })
+    }
+
+    /// Reset the catalog to empty — assets/sources/collections/tags/embeddings/suggestions/jobs/
+    /// blocklist — without touching files in sources or `server.db`. Emits `CatalogReset` so live
+    /// clients empty their grids.
+    pub async fn wipe_catalog(&self) -> Result<WipeReport, LibError> {
+        let report = self.db(|s| s.wipe_catalog()).await?;
+        let _ = self.events.send(LibraryEvent::CatalogReset);
+        Ok(report)
+    }
+}
+
+/// Sum the size + count of the regular files directly under `dir` (the cache tiers are flat). A
+/// missing/unreadable dir reads as empty — a cold cache is zero usage, not an error.
+fn dir_usage(dir: &Path) -> CacheUsage {
+    let mut usage = CacheUsage { bytes: 0, files: 0 };
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for entry in rd.flatten() {
+            if let Ok(m) = entry.metadata() {
+                if m.is_file() {
+                    usage.bytes += m.len();
+                    usage.files += 1;
+                }
+            }
+        }
+    }
+    usage
+}
+
+/// Best-effort delete of every regular file directly under `dir`, returning what was freed. Leaves
+/// the directory itself (it is recreated lazily on the next cache write). A file that fails to
+/// delete is skipped, not counted — fail-soft (DESIGN_GUIDELINES §2).
+fn clear_dir(dir: &Path) -> CacheUsage {
+    let mut freed = CacheUsage { bytes: 0, files: 0 };
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for entry in rd.flatten() {
+            let Ok(m) = entry.metadata() else { continue };
+            if m.is_file() && std::fs::remove_file(entry.path()).is_ok() {
+                freed.bytes += m.len();
+                freed.files += 1;
+            }
+        }
+    }
+    freed
 }
 
 #[async_trait]
@@ -314,6 +578,20 @@ impl LibraryService for EmbeddedLibrary {
         self.db(move |s| {
             let asset = s.get_asset(&id)?;
             gen_thumbnail(&data_dir, s, &asset, edge)
+        })
+        .await
+    }
+
+    async fn read_model_preview(
+        &self,
+        _ctx: &AuthContext,
+        id: &AssetId,
+    ) -> Result<AssetContent, LibError> {
+        let id = *id;
+        let data_dir = self.data_dir.clone();
+        self.db(move |s| {
+            let asset = s.get_asset(&id)?;
+            gen_model_preview(&data_dir, s, &asset)
         })
         .await
     }

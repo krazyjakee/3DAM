@@ -33,7 +33,10 @@ fn png(path: &std::path::Path, seed: u8) {
 async fn wait_job(lib: &EmbeddedLibrary, ctx: &AuthContext, job: &JobId) -> JobStatus {
     loop {
         let j = lib.get_job(ctx, job).await.unwrap();
-        if matches!(j.state, JobState::Done | JobState::Failed | JobState::Cancelled) {
+        if matches!(
+            j.state,
+            JobState::Done | JobState::Failed | JobState::Cancelled
+        ) {
             return j;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -42,7 +45,13 @@ async fn wait_job(lib: &EmbeddedLibrary, ctx: &AuthContext, job: &JobId) -> JobS
 
 async fn scan(lib: &EmbeddedLibrary, ctx: &AuthContext, mode: ScanMode) -> JobStatus {
     let job = lib
-        .submit_scan(ctx, ScanRequest { sources: Vec::new(), mode })
+        .submit_scan(
+            ctx,
+            ScanRequest {
+                sources: Vec::new(),
+                mode,
+            },
+        )
         .await
         .unwrap();
     wait_job(lib, ctx, &job).await
@@ -53,7 +62,10 @@ async fn all_names(lib: &EmbeddedLibrary, ctx: &AuthContext) -> Vec<String> {
         .query(
             ctx,
             QueryRequest {
-                page: PageParams { after: None, limit: 200 },
+                page: PageParams {
+                    after: None,
+                    limit: 200,
+                },
                 ..Default::default()
             },
         )
@@ -64,7 +76,10 @@ async fn all_names(lib: &EmbeddedLibrary, ctx: &AuthContext) -> Vec<String> {
     names
 }
 
-async fn open_with_source(tmp: &std::path::Path, watch: bool) -> (EmbeddedLibrary, AuthContext, PathBuf) {
+async fn open_with_source(
+    tmp: &std::path::Path,
+    watch: bool,
+) -> (EmbeddedLibrary, AuthContext, PathBuf) {
     let src = tmp.join("src");
     std::fs::create_dir_all(&src).unwrap();
     let lib = EmbeddedLibrary::open(&tmp.join("data")).await.unwrap();
@@ -75,7 +90,10 @@ async fn open_with_source(tmp: &std::path::Path, watch: bool) -> (EmbeddedLibrar
             kind: SourceKind::LocalFs,
             uri: src.to_string_lossy().into_owned(),
             name: Some("fixtures".into()),
-            options: SourceOptions { watch, ..Default::default() },
+            options: SourceOptions {
+                watch,
+                ..Default::default()
+            },
         },
     )
     .await
@@ -128,13 +146,19 @@ async fn local_watch_auto_rescans_on_change() {
     let mut found = false;
     for _ in 0..80 {
         // up to ~8s
-        if all_names(&lib, &ctx).await.contains(&"watched.png".to_string()) {
+        if all_names(&lib, &ctx)
+            .await
+            .contains(&"watched.png".to_string())
+        {
             found = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(found, "watcher should auto-scan the new file within the timeout");
+    assert!(
+        found,
+        "watcher should auto-scan the new file within the timeout"
+    );
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
@@ -154,37 +178,69 @@ async fn manual_and_smart_collections() {
     let manual = lib
         .create_collection(
             &ctx,
-            NewCollection { name: "hero".into(), kind: CollectionKind::Manual, query: None },
+            NewCollection {
+                name: "hero".into(),
+                kind: CollectionKind::Manual,
+                query: None,
+            },
         )
         .await
         .unwrap();
     lib.modify_collection_members(
         &ctx,
         &manual,
-        CollectionMembers { add: vec![a, b], remove: Vec::new() },
+        CollectionMembers {
+            add: vec![a, b],
+            remove: Vec::new(),
+        },
     )
     .await
     .unwrap();
     let page = lib
-        .collection_assets(&ctx, &manual, PageParams { after: None, limit: 50 })
+        .collection_assets(
+            &ctx,
+            &manual,
+            PageParams {
+                after: None,
+                limit: 50,
+            },
+        )
         .await
         .unwrap();
     assert_eq!(page.items.len(), 2, "manual collection has both members");
     // Membership surfaces on the inspector record.
-    assert!(lib.get_asset(&ctx, &a).await.unwrap().collections.contains(&manual));
+    assert!(lib
+        .get_asset(&ctx, &a)
+        .await
+        .unwrap()
+        .collections
+        .contains(&manual));
     // Exact member count on the record.
-    assert_eq!(lib.get_collection(&ctx, &manual).await.unwrap().count, Some(2));
+    assert_eq!(
+        lib.get_collection(&ctx, &manual).await.unwrap().count,
+        Some(2)
+    );
 
     // Removing a member is reflected live.
     lib.modify_collection_members(
         &ctx,
         &manual,
-        CollectionMembers { add: Vec::new(), remove: vec![a] },
+        CollectionMembers {
+            add: Vec::new(),
+            remove: vec![a],
+        },
     )
     .await
     .unwrap();
     let page = lib
-        .collection_assets(&ctx, &manual, PageParams { after: None, limit: 50 })
+        .collection_assets(
+            &ctx,
+            &manual,
+            PageParams {
+                after: None,
+                limit: 50,
+            },
+        )
         .await
         .unwrap();
     assert_eq!(page.items.len(), 1, "member removed");
@@ -201,15 +257,30 @@ async fn manual_and_smart_collections() {
     let smart = lib
         .create_collection(
             &ctx,
-            NewCollection { name: "all-images".into(), kind: CollectionKind::Smart, query: Some(query) },
+            NewCollection {
+                name: "all-images".into(),
+                kind: CollectionKind::Smart,
+                query: Some(query),
+            },
         )
         .await
         .unwrap();
     let page = lib
-        .collection_assets(&ctx, &smart, PageParams { after: None, limit: 50 })
+        .collection_assets(
+            &ctx,
+            &smart,
+            PageParams {
+                after: None,
+                limit: 50,
+            },
+        )
         .await
         .unwrap();
-    assert_eq!(page.items.len(), 3, "smart folder resolves live to all three images");
+    assert_eq!(
+        page.items.len(),
+        3,
+        "smart folder resolves live to all three images"
+    );
     assert_eq!(
         lib.get_collection(&ctx, &smart).await.unwrap().count,
         Some(3),
@@ -220,7 +291,10 @@ async fn manual_and_smart_collections() {
         .modify_collection_members(
             &ctx,
             &smart,
-            CollectionMembers { add: vec![a], remove: Vec::new() },
+            CollectionMembers {
+                add: vec![a],
+                remove: Vec::new()
+            },
         )
         .await
         .is_err());
@@ -253,8 +327,15 @@ async fn export_manifests_json_csv_sidecar() {
     assert_eq!(rep.files_written, 1);
     let doc: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&json_out).unwrap()).unwrap();
-    assert_eq!(doc["assets"].as_array().unwrap().len(), 2, "json manifest lists both assets");
-    assert!(doc["assets"][0]["hash"].is_string(), "manifest row carries the content hash");
+    assert_eq!(
+        doc["assets"].as_array().unwrap().len(),
+        2,
+        "json manifest lists both assets"
+    );
+    assert!(
+        doc["assets"][0]["hash"].is_string(),
+        "manifest row carries the content hash"
+    );
 
     // CSV manifest — one header line + one row per asset.
     let csv_out = tmp.join("manifest.csv");
@@ -295,7 +376,10 @@ async fn id_of(lib: &EmbeddedLibrary, ctx: &AuthContext, name: &str) -> AssetId 
     lib.query(
         ctx,
         QueryRequest {
-            page: PageParams { after: None, limit: 200 },
+            page: PageParams {
+                after: None,
+                limit: 200,
+            },
             ..Default::default()
         },
     )

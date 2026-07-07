@@ -8,7 +8,8 @@ with `wasm-pack`. This folder is the **DOM-side boundary** the React chrome buil
 ## What's here
 
 - [`index.ts`](index.ts) — framework-agnostic loaders and typed handles:
-  - `createModelViewer(canvas) → ModelViewerHandle` — interactive 3D (glTF/GLB).
+  - `createModelViewer(canvas) → ModelViewerHandle` — interactive 3D (server-decoded `DMSH` preview
+    mesh; every Assimp format, textured).
   - `createWaveform(canvas) → WaveformHandle` — audio waveform (a "hot render path").
   - The `.wasm` is fetched **lazily** on first use, so the thumbnail grid pays nothing for it.
 

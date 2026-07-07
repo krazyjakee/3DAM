@@ -29,8 +29,24 @@ pub(crate) fn run_scan(
     mode: ScanMode,
     cancel: Arc<AtomicBool>,
 ) {
-    let _ = store.update_job_progress(&job, JobState::Running, 0, None, None);
+    // Establish the progress denominator up front so the job shows a real percentage + ETA rather
+    // than an indeterminate bar. A **full** scan re-reads every file (and new files matter), so we
+    // do a cheap metadata-only pre-walk to count exactly. A **delta** scan only opens bytes for
+    // files whose size/mtime changed, so re-walking the whole tree just to count would double the
+    // traversal — a second full network listing for SFTP/SMB — for no benefit. Instead we estimate
+    // the total from the catalog's existing row count (already computed when the sources were
+    // listed): off only by files added/removed since the last scan, and the bar clamps at 100%.
+    // `None` ⇒ nothing countable ⇒ indeterminate bar, which still works.
+    let total = match mode {
+        ScanMode::Full => count_total(&store, &sources, &cancel),
+        ScanMode::Delta => {
+            let n: u64 = sources.iter().map(|s| s.stats.asset_count).sum();
+            (n > 0).then_some(n)
+        }
+    };
+    let _ = store.update_job_progress(&job, JobState::Running, 0, total, None);
     let mut done: u64 = 0;
+    let mut examined: u64 = 0;
     let mut skipped: u64 = 0;
     let mut warnings: u64 = 0;
     let mut removed_total: u64 = 0;
@@ -77,6 +93,20 @@ pub(crate) fn run_scan(
                     let Some(det) = dam_media::detect(Path::new(&fe.rel_path)) else {
                         return true; // unhandled type: skip (fail-soft, DG §6)
                     };
+                    // Progress tracks every detectable file we examine — not just new/changed
+                    // upserts — so a delta re-scan (mostly unchanged) advances the bar instead of
+                    // sitting at 0 the whole time, and the % is against the pre-counted total.
+                    examined += 1;
+                    if examined.is_multiple_of(PROGRESS_EVERY) {
+                        let _ = store.update_job_progress(
+                            &job,
+                            JobState::Running,
+                            examined,
+                            total,
+                            Some(&fe.rel_path),
+                        );
+                        emit_progress(&store, &events, &job);
+                    }
                     // Delta: unchanged (same size + mtime) → never open bytes (§2.2).
                     if mode == ScanMode::Delta && unchanged(&index, &fe) {
                         skipped += 1;
@@ -127,28 +157,26 @@ pub(crate) fn run_scan(
                                 tracing::warn!(path = %fe.rel_path, error = %e, "attr persist failed");
                             }
                             if inserted {
+                                // Whole-asset size: the file itself plus a model's external
+                                // companion files (textures/buffers), matching the catalog read path.
+                                let dep = match &attrs {
+                                    dam_api::dto::MediaAttributes::Model(m) => {
+                                        m.dependency_bytes.unwrap_or(0).max(0) as u64
+                                    }
+                                    _ => 0,
+                                };
                                 let summary = AssetSummary {
                                     id,
                                     name: na.filename.clone(),
                                     media: det.media,
                                     format: det.format.clone(),
-                                    size: fe.size,
+                                    size: fe.size + dep,
                                     license: LicenseBadge::default(),
                                     top_tags: Vec::new(),
                                     origin: Origin::Local,
                                     key_attrs: key_attrs_of(&attrs),
                                 };
                                 let _ = events.send(LibraryEvent::AssetAdded(summary));
-                            }
-                            if done.is_multiple_of(PROGRESS_EVERY) {
-                                let _ = store.update_job_progress(
-                                    &job,
-                                    JobState::Running,
-                                    done,
-                                    None,
-                                    Some(&fe.rel_path),
-                                );
-                                emit_progress(&store, &events, &job);
                             }
                         }
                         Err(e) => {
@@ -169,8 +197,11 @@ pub(crate) fn run_scan(
             Ok(()) => {
                 // Rows we didn't see this pass have vanished from the source → mark absent (§2.2).
                 if !cancel.load(Ordering::Relaxed) {
-                    let removed: Vec<String> =
-                        index.keys().filter(|p| !seen.contains(*p)).cloned().collect();
+                    let removed: Vec<String> = index
+                        .keys()
+                        .filter(|p| !seen.contains(*p))
+                        .cloned()
+                        .collect();
                     match store.mark_paths_missing(&sid, &removed) {
                         Ok(n) => removed_total += n,
                         Err(e) => tracing::warn!(source = %sid, error = %e, "mark-missing failed"),
@@ -188,7 +219,13 @@ pub(crate) fn run_scan(
     if cancel.load(Ordering::Relaxed) {
         let _ = store.set_job_state(&job, JobState::Cancelled, None);
     } else {
-        let _ = store.update_job_progress(&job, JobState::Done, done, Some(done), None);
+        let _ = store.update_job_progress(
+            &job,
+            JobState::Done,
+            examined,
+            total.or(Some(examined)),
+            None,
+        );
         let mut notes = Vec::new();
         if skipped > 0 {
             notes.push(format!("{skipped} unchanged"));
@@ -246,6 +283,47 @@ fn key_attrs_of(attrs: &MediaAttributes) -> SmallMap {
         MediaAttributes::None => {}
     }
     m
+}
+
+/// Cheap metadata-only pre-pass: count detectable files across all scannable sources so the scan
+/// job can show a real percentage + ETA. Best-effort — a source that can't be opened or walked here
+/// is simply left out of the estimate (the main pass reports its actual error); if nothing can be
+/// counted we return `None` and the job falls back to an indeterminate bar. Walks only list metadata
+/// (no byte fetch/hash), so this is far cheaper than the main pass it precedes.
+fn count_total(store: &Store, sources: &[SourceInfo], cancel: &AtomicBool) -> Option<u64> {
+    let mut total: u64 = 0;
+    let mut counted_any = false;
+    for src in sources {
+        if src.kind == SourceKind::Federated {
+            continue; // federated peers yield catalog rows, not bytes — not scanned here (phase 6)
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        let Ok(conn) = store.get_source_connection(&src.id) else {
+            continue;
+        };
+        let Ok(fs) = open_source(&conn) else {
+            continue;
+        };
+        let mut n: u64 = 0;
+        let walked = fs.walk(&mut |entry| {
+            if cancel.load(Ordering::Relaxed) {
+                return false;
+            }
+            if let Ok(fe) = entry {
+                if dam_media::detect(Path::new(&fe.rel_path)).is_some() {
+                    n += 1;
+                }
+            }
+            true
+        });
+        if walked.is_ok() {
+            total += n;
+            counted_any = true;
+        }
+    }
+    (counted_any && total > 0).then_some(total)
 }
 
 fn emit_progress(store: &Store, events: &broadcast::Sender<LibraryEvent>, job: &JobId) {

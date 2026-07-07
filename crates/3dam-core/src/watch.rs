@@ -10,12 +10,13 @@
 //! no back-reference to the full engine. Overlapping scans of one source are suppressed.
 
 use crate::scan;
+use dam_api::dto::SourceKind;
 use dam_api::dto::{JobKind, ScanMode};
 use dam_api::event::LibraryEvent;
 use dam_api::id::SourceId;
-use dam_api::dto::SourceKind;
 use dam_store::Store;
-use notify::{RecursiveMode, Watcher};
+use notify::event::ModifyKind;
+use notify::{EventKind, RecursiveMode, Watcher};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
@@ -115,8 +116,14 @@ impl WatchManager {
             let (tx, mut rx) = mpsc::unbounded_channel::<()>();
             let mut watcher =
                 match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-                    if res.is_ok() {
-                        let _ = tx.send(());
+                    // Only a genuine content mutation may trigger a re-scan. The inotify backend also
+                    // reports opens/reads/atime bumps (`OPEN`, `CLOSE_NOWRITE`, `ATTRIB`), and the scan
+                    // opens+reads every file — so firing on those would make the scan re-trigger the
+                    // very scan that produced them: an endless rescan-from-zero loop. Filter it out.
+                    if let Ok(ev) = res {
+                        if is_content_change(&ev.kind) {
+                            let _ = tx.send(());
+                        }
                     }
                 }) {
                     Ok(w) => w,
@@ -162,6 +169,25 @@ impl WatchManager {
     }
 }
 
+/// Does this filesystem event represent an actual content change worth a delta re-scan?
+///
+/// Deny-list, not allow-list, so it stays correct across backends (inotify/FSEvents/ReadDirectoryW):
+/// anything that could be a real create/write/rename/remove passes; only the read-side noise is
+/// dropped. That noise is exactly what would otherwise loop — the scan `open()`s and reads every file
+/// (bumping atime), which the inotify backend surfaces as `Access(_)` and `Modify(Metadata)` events.
+/// Treating those as changes made each scan trigger the next one endlessly (the "counts to N, done,
+/// starts from zero again, forever" symptom). Real writes always arrive as `Modify(Data)`/`Create`/
+/// rename regardless, so ignoring reads and metadata-only bumps loses no genuine change.
+fn is_content_change(kind: &EventKind) -> bool {
+    !matches!(
+        kind,
+        EventKind::Access(_)             // opens, reads, close-nowrite — includes the scan's own reads
+            | EventKind::Modify(ModifyKind::Metadata(_)) // atime/permission bumps (a read touches atime)
+            | EventKind::Any
+            | EventKind::Other
+    )
+}
+
 /// Submit a background delta scan for one source, unless one is already running for it.
 fn trigger_delta(
     store: &Arc<Store>,
@@ -201,4 +227,46 @@ fn trigger_delta(
         scan::run_scan(store, events, job, vec![info], ScanMode::Delta, cancel);
         in_flight.lock().unwrap().remove(&id);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_content_change;
+    use notify::event::{
+        AccessKind, AccessMode, CreateKind, DataChange, MetadataKind, ModifyKind, RemoveKind,
+        RenameMode,
+    };
+    use notify::EventKind;
+
+    #[test]
+    fn reads_never_trigger_a_rescan() {
+        // These are exactly what the scan's own file opens/reads produce; if any triggered a
+        // re-scan the watcher would loop the scan forever (regression guard).
+        for kind in [
+            EventKind::Access(AccessKind::Open(AccessMode::Any)),
+            EventKind::Access(AccessKind::Read),
+            EventKind::Access(AccessKind::Close(AccessMode::Read)),
+            EventKind::Access(AccessKind::Any),
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any)), // atime bump from a read
+            EventKind::Any,
+            EventKind::Other,
+        ] {
+            assert!(
+                !is_content_change(&kind),
+                "read-side event triggered: {kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn real_changes_trigger_a_rescan() {
+        for kind in [
+            EventKind::Create(CreateKind::File),
+            EventKind::Remove(RemoveKind::File),
+            EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+            EventKind::Modify(ModifyKind::Name(RenameMode::Any)),
+        ] {
+            assert!(is_content_change(&kind), "real change ignored: {kind:?}");
+        }
+    }
 }

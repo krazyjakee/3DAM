@@ -99,7 +99,13 @@ csv = "1"
 wgpu = "=30.0.0"
 glam = "0.30"
 bytemuck = { version = "1", features = ["derive"] }
+# block_on the wgpu adapter/device init from the synchronous render path (dam-render runs inside
+# spawn_blocking, no async runtime of its own). Same executor the headless-render spike validated.
+pollster = "0.4"
 gltf = { version = "1", default-features = false, features = ["import", "utils", "names"] }
+# Assimp bindings (maintained -ng fork) — the import backend for the full 3D format range with
+# materials/textures. `static-link` builds assimp from source and links it statically (ADR 0011).
+russimp-ng = { version = "3.2", default-features = false }
 
 # wasm viewer islands (browser-only; see crates/3dam-viewer). Kept out of the native build via
 # per-target deps so `cargo build --workspace` stays a stub on non-wasm hosts.

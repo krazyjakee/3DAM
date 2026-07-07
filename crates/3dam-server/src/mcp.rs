@@ -15,9 +15,9 @@
 
 use dam_api::admin::McpMode;
 use dam_api::dto::*;
-use dam_api::service::{AuthContext, LibraryService, Scope};
 use dam_api::id::AssetId;
 use dam_api::page::PageParams;
+use dam_api::service::{AuthContext, LibraryService, Scope};
 use dam_api::LibError;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -60,75 +60,151 @@ struct ToolDef {
 
 fn tool_defs() -> Vec<ToolDef> {
     vec![
-        ToolDef { name: "search", description: "Search the library by text and facets (media, tags, source).", write: false, schema: || json!({
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Free text over filename."},
-                "media": {"type": "string", "enum": ["audio","image","model"]},
-                "tags": {"type": "array", "items": {"type": "string"}},
-                "source": {"type": "string", "description": "Source id (UUID)."},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50}
-            }
-        }) },
-        ToolDef { name: "find_similar", description: "Nearest neighbours of an asset by embedding cosine (\"more like this\").", write: false, schema: || json!({
-            "type": "object",
-            "required": ["id"],
-            "properties": {
-                "id": {"type": "string", "description": "The query asset id (UUID)."},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 12}
-            }
-        }) },
-        ToolDef { name: "get_asset", description: "Full metadata for one asset, including its license block.", write: false, schema: || json!({
-            "type": "object", "required": ["id"],
-            "properties": {"id": {"type": "string", "description": "Asset id (UUID)."}}
-        }) },
-        ToolDef { name: "list_sources", description: "List configured sources (file + federated).", write: false, schema: || json!({"type": "object", "properties": {}}) },
-        ToolDef { name: "library_stats", description: "Library counts, media mix, and unanalysed backlog.", write: false, schema: || json!({"type": "object", "properties": {}}) },
-        ToolDef { name: "find_duplicates", description: "Duplicate groups for review (exact or near). Grouping only — never deletes.", write: false, schema: || json!({
-            "type": "object",
-            "properties": {
-                "near": {"type": "boolean", "default": false},
-                "media": {"type": "string", "enum": ["audio","image","model"]},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50}
-            }
-        }) },
+        ToolDef {
+            name: "search",
+            description: "Search the library by text and facets (media, tags, source).",
+            write: false,
+            schema: || {
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Free text over filename."},
+                        "media": {"type": "string", "enum": ["audio","image","model"]},
+                        "tags": {"type": "array", "items": {"type": "string"}},
+                        "source": {"type": "string", "description": "Source id (UUID)."},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50}
+                    }
+                })
+            },
+        },
+        ToolDef {
+            name: "find_similar",
+            description: "Nearest neighbours of an asset by embedding cosine (\"more like this\").",
+            write: false,
+            schema: || {
+                json!({
+                    "type": "object",
+                    "required": ["id"],
+                    "properties": {
+                        "id": {"type": "string", "description": "The query asset id (UUID)."},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 12}
+                    }
+                })
+            },
+        },
+        ToolDef {
+            name: "get_asset",
+            description: "Full metadata for one asset, including its license block.",
+            write: false,
+            schema: || {
+                json!({
+                    "type": "object", "required": ["id"],
+                    "properties": {"id": {"type": "string", "description": "Asset id (UUID)."}}
+                })
+            },
+        },
+        ToolDef {
+            name: "list_sources",
+            description: "List configured sources (file + federated).",
+            write: false,
+            schema: || json!({"type": "object", "properties": {}}),
+        },
+        ToolDef {
+            name: "library_stats",
+            description: "Library counts, media mix, and unanalysed backlog.",
+            write: false,
+            schema: || json!({"type": "object", "properties": {}}),
+        },
+        ToolDef {
+            name: "find_duplicates",
+            description:
+                "Duplicate groups for review (exact or near). Grouping only — never deletes.",
+            write: false,
+            schema: || {
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "near": {"type": "boolean", "default": false},
+                        "media": {"type": "string", "enum": ["audio","image","model"]},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50}
+                    }
+                })
+            },
+        },
         // ── write tools (gated, §6) ──────────────────────────────────────────
-        ToolDef { name: "tag", description: "Accept (or --reject) an auto-suggested tag on an asset. Reversible.", write: true, schema: || json!({
-            "type": "object", "required": ["id","tag"],
-            "properties": {
-                "id": {"type": "string"}, "tag": {"type": "string"},
-                "reject": {"type": "boolean", "default": false}
-            }
-        }) },
-        ToolDef { name: "add_source", description: "Register a source (local path or network peer).", write: true, schema: || json!({
-            "type": "object", "required": ["kind","uri"],
-            "properties": {
-                "kind": {"type": "string", "enum": ["local_fs","sftp","smb","federated"]},
-                "uri": {"type": "string"}, "name": {"type": "string"}
-            }
-        }) },
-        ToolDef { name: "scan", description: "Scan sources for new/changed assets. Returns a job id.", write: true, schema: || json!({
-            "type": "object",
-            "properties": {"sources": {"type": "array", "items": {"type": "string"}}}
-        }) },
-        ToolDef { name: "convert", description: "Non-destructively convert assets into an output directory. Supports dry_run.", write: true, schema: || json!({
-            "type": "object", "required": ["inputs","target","output_dir"],
-            "properties": {
-                "inputs": {"type": "array", "items": {"type": "string"}},
-                "target": {"type": "object"},
-                "output_dir": {"type": "string"},
-                "dry_run": {"type": "boolean", "default": true}
-            }
-        }) },
-        ToolDef { name: "export", description: "Export a manifest (json/csv/sidecar) of assets, a collection, or a search.", write: true, schema: || json!({
-            "type": "object", "required": ["format","output"],
-            "properties": {
-                "assets": {"type": "array", "items": {"type": "string"}},
-                "format": {"type": "string", "enum": ["json","csv","sidecar"]},
-                "output": {"type": "string"},
-                "attribution_only": {"type": "boolean", "default": false}
-            }
-        }) },
+        ToolDef {
+            name: "tag",
+            description: "Accept (or --reject) an auto-suggested tag on an asset. Reversible.",
+            write: true,
+            schema: || {
+                json!({
+                    "type": "object", "required": ["id","tag"],
+                    "properties": {
+                        "id": {"type": "string"}, "tag": {"type": "string"},
+                        "reject": {"type": "boolean", "default": false}
+                    }
+                })
+            },
+        },
+        ToolDef {
+            name: "add_source",
+            description: "Register a source (local path or network peer).",
+            write: true,
+            schema: || {
+                json!({
+                    "type": "object", "required": ["kind","uri"],
+                    "properties": {
+                        "kind": {"type": "string", "enum": ["local_fs","sftp","smb","federated"]},
+                        "uri": {"type": "string"}, "name": {"type": "string"}
+                    }
+                })
+            },
+        },
+        ToolDef {
+            name: "scan",
+            description: "Scan sources for new/changed assets. Returns a job id.",
+            write: true,
+            schema: || {
+                json!({
+                    "type": "object",
+                    "properties": {"sources": {"type": "array", "items": {"type": "string"}}}
+                })
+            },
+        },
+        ToolDef {
+            name: "convert",
+            description:
+                "Non-destructively convert assets into an output directory. Supports dry_run.",
+            write: true,
+            schema: || {
+                json!({
+                    "type": "object", "required": ["inputs","target","output_dir"],
+                    "properties": {
+                        "inputs": {"type": "array", "items": {"type": "string"}},
+                        "target": {"type": "object"},
+                        "output_dir": {"type": "string"},
+                        "dry_run": {"type": "boolean", "default": true}
+                    }
+                })
+            },
+        },
+        ToolDef {
+            name: "export",
+            description:
+                "Export a manifest (json/csv/sidecar) of assets, a collection, or a search.",
+            write: true,
+            schema: || {
+                json!({
+                    "type": "object", "required": ["format","output"],
+                    "properties": {
+                        "assets": {"type": "array", "items": {"type": "string"}},
+                        "format": {"type": "string", "enum": ["json","csv","sidecar"]},
+                        "output": {"type": "string"},
+                        "attribution_only": {"type": "boolean", "default": false}
+                    }
+                })
+            },
+        },
     ]
 }
 
@@ -309,7 +385,11 @@ impl McpAdapter {
                     None => None,
                 };
                 let req = DupRequest {
-                    kind: if a.near { DupKind::Near } else { DupKind::Exact },
+                    kind: if a.near {
+                        DupKind::Near
+                    } else {
+                        DupKind::Exact
+                    },
                     media,
                     limit: a.limit.unwrap_or(50),
                 };
@@ -340,10 +420,19 @@ impl McpAdapter {
                     .sources
                     .unwrap_or_default()
                     .iter()
-                    .map(|s| s.parse().map_err(|_| LibError::BadRequest(format!("bad source id: {s}"))))
+                    .map(|s| {
+                        s.parse()
+                            .map_err(|_| LibError::BadRequest(format!("bad source id: {s}")))
+                    })
                     .collect::<Result<Vec<_>, _>>()?;
                 let job = lib
-                    .submit_scan(ctx, ScanRequest { sources, mode: ScanMode::Full })
+                    .submit_scan(
+                        ctx,
+                        ScanRequest {
+                            sources,
+                            mode: ScanMode::Full,
+                        },
+                    )
                     .await?;
                 Ok(json!({"job_id": job}))
             }
@@ -363,11 +452,17 @@ impl McpAdapter {
         let uri = params
             .get("uri")
             .and_then(|u| u.as_str())
-            .ok_or_else(|| RpcError { code: -32602, message: "missing uri".into() })?
+            .ok_or_else(|| RpcError {
+                code: -32602,
+                message: "missing uri".into(),
+            })?
             .to_string();
         match self.resolve_resource(ctx, &uri).await {
             Ok(contents) => Ok(json!({ "contents": [contents] })),
-            Err(e) => Err(RpcError { code: -32002, message: e.to_string() }),
+            Err(e) => Err(RpcError {
+                code: -32002,
+                message: e.to_string(),
+            }),
         }
     }
 
@@ -378,7 +473,10 @@ impl McpAdapter {
         let parts: Vec<&str> = rest.split('/').collect();
         match parts.as_slice() {
             ["asset", id, "preview"] => {
-                let thumb = self.library.read_thumbnail(ctx, &parse_asset(id)?, 256).await?;
+                let thumb = self
+                    .library
+                    .read_thumbnail(ctx, &parse_asset(id)?, 256)
+                    .await?;
                 Ok(json!({
                     "uri": uri,
                     "mimeType": thumb.content_type,
@@ -387,17 +485,33 @@ impl McpAdapter {
             }
             ["asset", id] => {
                 let asset = self.library.get_asset(ctx, &parse_asset(id)?).await?;
-                Ok(text_resource(uri, "application/json", &serde_json::to_string(&asset).unwrap()))
+                Ok(text_resource(
+                    uri,
+                    "application/json",
+                    &serde_json::to_string(&asset).unwrap(),
+                ))
             }
             ["source", id] => {
-                let sid = id.parse().map_err(|_| LibError::BadRequest("bad source id".into()))?;
+                let sid = id
+                    .parse()
+                    .map_err(|_| LibError::BadRequest("bad source id".into()))?;
                 let src = self.library.get_source(ctx, &sid).await?;
-                Ok(text_resource(uri, "application/json", &serde_json::to_string(&src).unwrap()))
+                Ok(text_resource(
+                    uri,
+                    "application/json",
+                    &serde_json::to_string(&src).unwrap(),
+                ))
             }
             ["collection", id] => {
-                let cid = id.parse().map_err(|_| LibError::BadRequest("bad collection id".into()))?;
+                let cid = id
+                    .parse()
+                    .map_err(|_| LibError::BadRequest("bad collection id".into()))?;
                 let col = self.library.get_collection(ctx, &cid).await?;
-                Ok(text_resource(uri, "application/json", &serde_json::to_string(&col).unwrap()))
+                Ok(text_resource(
+                    uri,
+                    "application/json",
+                    &serde_json::to_string(&col).unwrap(),
+                ))
             }
             _ => Err(LibError::NotFound(format!("no resource: {uri}"))),
         }
@@ -446,10 +560,15 @@ fn parse_args<T: serde::de::DeserializeOwned>(v: Value) -> Result<T, LibError> {
     serde_json::from_value(v).map_err(|e| LibError::BadRequest(format!("bad tool arguments: {e}")))
 }
 fn parse_asset(s: &str) -> Result<AssetId, LibError> {
-    s.parse().map_err(|_| LibError::BadRequest(format!("bad asset id: {s}")))
+    s.parse()
+        .map_err(|_| LibError::BadRequest(format!("bad asset id: {s}")))
 }
 fn eq_filter(field: FacetField, value: String) -> Filter {
-    Filter { field, op: FilterOp::Eq, value: FilterValue::Str(value) }
+    Filter {
+        field,
+        op: FilterOp::Eq,
+        value: FilterValue::Str(value),
+    }
 }
 fn to_value<T: serde::Serialize>(v: &T) -> Result<Value, LibError> {
     serde_json::to_value(v).map_err(|e| LibError::Internal(e.to_string()))
@@ -541,8 +660,16 @@ fn base64_encode(data: &[u8]) -> String {
         let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | (b[2] as u32);
         out.push(A[((n >> 18) & 63) as usize] as char);
         out.push(A[((n >> 12) & 63) as usize] as char);
-        out.push(if chunk.len() > 1 { A[((n >> 6) & 63) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { A[(n & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            A[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            A[(n & 63) as usize] as char
+        } else {
+            '='
+        });
     }
     out
 }

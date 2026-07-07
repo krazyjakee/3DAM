@@ -128,5 +128,6 @@ mod blocklist;
 mod collections;
 mod helpers;
 mod jobs;
+mod maintenance;
 mod query;
 mod sources;

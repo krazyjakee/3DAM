@@ -9,10 +9,19 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LibraryEvent {
     AssetAdded(AssetSummary),
-    AssetChanged { id: AssetId, kind: ChangeKind },
+    AssetChanged {
+        id: AssetId,
+        kind: ChangeKind,
+    },
     AssetRemoved(AssetId),
-    SourceState { id: SourceId, state: SourceState },
+    SourceState {
+        id: SourceId,
+        state: SourceState,
+    },
     JobProgress(JobStatus),
+    /// The whole catalog was reset by a maintenance wipe/factory-reset. Carries no ids — clients
+    /// drop their caches and refetch everything rather than diffing thousands of removals.
+    CatalogReset,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

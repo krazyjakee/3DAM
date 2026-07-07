@@ -374,6 +374,30 @@ impl ServerStore {
         Ok(Some((label, scopes)))
     }
 
+    // ── factory reset (Settings §Storage → Factory reset) ────────────────────
+
+    /// Erase the server config — every token, feature flag, and audit entry — and drop the in-memory
+    /// flag state back to the safe-by-default floor (tech-spec 10 §2). Returns the number of tokens
+    /// removed. This revokes the caller's own admin token and returns `authentication` to `Off`
+    /// (localhost implicit trust); it is the `server.db` half of a first-run factory reset and the
+    /// UI warns before invoking it. The catalog + caches are wiped separately by the engine.
+    pub fn factory_reset(&self) -> Result<u64, LibError> {
+        let removed = {
+            let conn = self.conn.lock().unwrap();
+            let removed: i64 = conn
+                .query_row("SELECT COUNT(*) FROM token", [], |r| r.get(0))
+                .map_err(internal)?;
+            conn.execute("DELETE FROM token", []).map_err(internal)?;
+            conn.execute("DELETE FROM feature_flag", [])
+                .map_err(internal)?;
+            conn.execute("DELETE FROM audit_log", [])
+                .map_err(internal)?;
+            removed as u64
+        };
+        *self.flags.write().unwrap() = FlagState::defaults();
+        Ok(removed)
+    }
+
     // ── audit (tech-spec 10 §4.5) ────────────────────────────────────────────
 
     pub fn audit(

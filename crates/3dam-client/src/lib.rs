@@ -5,10 +5,13 @@
 
 use async_trait::async_trait;
 use dam_api::admin::{
-    AdminStatus, AuditEntry, FlagInfo, NewToken, NewTokenReply, SetFlag, TokenInfo,
+    AdminStatus, AuditEntry, CacheTarget, ClearAnalysisReport, ClearCacheReport, ClearCacheRequest,
+    ConfirmRequest, FactoryResetReport, FlagInfo, NewToken, NewTokenReply, SetFlag, StorageUsage,
+    TokenInfo, VacuumReport, WipeReport,
 };
 use dam_api::dto::*;
-use dam_api::event::{EventTopic, LibraryEvent, SubscribeRequest};
+use dam_api::event::EventTopic;
+use dam_api::event::{LibraryEvent, SubscribeRequest};
 use dam_api::id::{AssetId, CollectionId, ContentHash, JobId, SourceId};
 use dam_api::page::{Page, PageParams};
 use dam_api::service::{AuthContext, EventStream, LibraryService};
@@ -99,7 +102,10 @@ fn topic_matches(topics: &[EventTopic], ev: &LibraryEvent) -> bool {
     let topic = match ev {
         LibraryEvent::AssetAdded(_)
         | LibraryEvent::AssetChanged { .. }
-        | LibraryEvent::AssetRemoved(_) => EventTopic::Assets,
+        | LibraryEvent::AssetRemoved(_)
+        // A catalog-wide reset is an asset-topic event: subscribers watching assets must drop
+        // their caches and refetch (the whole catalog just changed underneath them).
+        | LibraryEvent::CatalogReset => EventTopic::Assets,
         LibraryEvent::SourceState { .. } => EventTopic::Sources,
         LibraryEvent::JobProgress(_) => EventTopic::Jobs,
     };
@@ -255,6 +261,46 @@ impl ApiClient {
     pub async fn admin_audit(&self, limit: u32) -> Result<Vec<AuditEntry>, LibError> {
         self.get(&format!("/admin/api/audit?limit={limit}")).await
     }
+
+    // ── storage & maintenance (tech-spec 10 §5) ──────────────────────────────
+
+    /// `GET /admin/api/maintenance/usage`.
+    pub async fn admin_storage_usage(&self) -> Result<StorageUsage, LibError> {
+        self.get("/admin/api/maintenance/usage").await
+    }
+    /// `POST /admin/api/maintenance/clear-cache`.
+    pub async fn admin_clear_cache(
+        &self,
+        target: CacheTarget,
+    ) -> Result<ClearCacheReport, LibError> {
+        self.post(
+            "/admin/api/maintenance/clear-cache",
+            &ClearCacheRequest { target },
+        )
+        .await
+    }
+    /// `POST /admin/api/maintenance/clear-analysis`.
+    pub async fn admin_clear_analysis(&self) -> Result<ClearAnalysisReport, LibError> {
+        self.post("/admin/api/maintenance/clear-analysis", &())
+            .await
+    }
+    /// `POST /admin/api/maintenance/vacuum`.
+    pub async fn admin_vacuum(&self) -> Result<VacuumReport, LibError> {
+        self.post("/admin/api/maintenance/vacuum", &()).await
+    }
+    /// `POST /admin/api/maintenance/wipe` — reset the catalog (requires `confirm`).
+    pub async fn admin_wipe(&self, confirm: bool) -> Result<WipeReport, LibError> {
+        self.post("/admin/api/maintenance/wipe", &ConfirmRequest { confirm })
+            .await
+    }
+    /// `POST /admin/api/maintenance/factory-reset` — erase everything (requires `confirm`).
+    pub async fn admin_factory_reset(&self, confirm: bool) -> Result<FactoryResetReport, LibError> {
+        self.post(
+            "/admin/api/maintenance/factory-reset",
+            &ConfirmRequest { confirm },
+        )
+        .await
+    }
 }
 
 #[async_trait]
@@ -389,6 +435,45 @@ impl LibraryService for ApiClient {
             content_type,
             format: "png".to_string(),
             media: MediaType::Image,
+        })
+    }
+
+    async fn read_model_preview(
+        &self,
+        _ctx: &AuthContext,
+        id: &AssetId,
+    ) -> Result<AssetContent, LibError> {
+        // Raw `DMSH` bytes, not JSON — reconstruct `AssetContent` from the HTTP response.
+        let resp = self
+            .http
+            .get(self.url(&format!("/api/v1/assets/{id}/preview-mesh"))?)
+            .send()
+            .await
+            .map_err(|e| LibError::SourceUnavailable(e.to_string()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let bytes = resp.bytes().await.unwrap_or_default();
+            return match serde_json::from_slice::<ErrorBody>(&bytes) {
+                Ok(body) => Err(LibError::from_body(body)),
+                Err(_) => Err(LibError::Upstream(format!("HTTP {}", status.as_u16()))),
+            };
+        }
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("model/x-dam-preview")
+            .to_string();
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| LibError::Upstream(e.to_string()))?
+            .to_vec();
+        Ok(AssetContent {
+            bytes,
+            content_type,
+            format: "dmsh".to_string(),
+            media: MediaType::Model,
         })
     }
 
@@ -639,6 +724,7 @@ impl LibraryService for ApiClient {
                                 Ok(tokio_tungstenite::tungstenite::Message::Text(txt)) => {
                                     match serde_json::from_str::<LibraryEvent>(txt.as_str()) {
                                         Ok(ev) if topic_matches(&topics, &ev) => {
+                                            // Receiver dropped → the subscription is gone; stop.
                                             if tx.unbounded_send(ev).is_err() {
                                                 return;
                                             }
@@ -650,7 +736,7 @@ impl LibraryService for ApiClient {
                                 Ok(tokio_tungstenite::tungstenite::Message::Close(_)) | Err(_) => {
                                     break
                                 }
-                                Ok(_) => {}
+                                Ok(_) => {} // ping/pong/binary — ignore
                             }
                         }
                     }

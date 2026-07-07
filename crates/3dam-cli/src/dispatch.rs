@@ -278,7 +278,10 @@ pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 .map_err(|_| anyhow::anyhow!("invalid asset id"))?;
             lib.remove_asset(&ctx, &aid, RemoveAsset { block }).await?;
             if json {
-                println!("{}", serde_json::json!({ "removed": aid.to_string(), "blocked": block }));
+                println!(
+                    "{}",
+                    serde_json::json!({ "removed": aid.to_string(), "blocked": block })
+                );
             } else if block {
                 println!("removed and blocked asset {aid}");
             } else {

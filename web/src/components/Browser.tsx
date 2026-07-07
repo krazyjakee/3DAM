@@ -12,8 +12,14 @@ import {
   Sparkles,
   X,
 } from "lucide-react";
-import { useAnalyze, useAssets, useCollectionMembers, useCollections } from "@/api/queries";
-import type { AssetSummary, SortField } from "@/api/types";
+import {
+  useAnalyze,
+  useAssets,
+  useCollectionMembers,
+  useCollections,
+  useDuplicates,
+} from "@/api/queries";
+import type { AssetSummary, DupGroup, SortField } from "@/api/types";
 import { useViewState } from "@/lib/view-state";
 import { useDebounced } from "@/lib/use-debounced";
 import { bytes } from "@/lib/format";
@@ -38,6 +44,41 @@ const CELL_H = 132;
 const COARSE_POINTER =
   typeof window !== "undefined" && window.matchMedia("(pointer: coarse)").matches;
 const ROW_H = COARSE_POINTER ? 44 : 30;
+// Pull enough exact-duplicate groups to collapse the whole loaded library (default server cap is 100).
+const DUP_LIMIT = 10_000;
+
+/** Collapse byte-identical duplicates in the browse list (issue: dedup in grid/table). Each exact
+ *  group renders once — the first member that appears in the current sort/filter represents it, so a
+ *  group never vanishes and the visible order is preserved — carrying a badge count of the *other*
+ *  copies (library-wide). Near-duplicates are deliberately left expanded: they're merely similar
+ *  (surfaced via "Find similar" / the Duplicates page), so collapsing them would hide distinct assets. */
+function collapseExactDuplicates(
+  items: AssetSummary[],
+  groups: DupGroup[] | undefined,
+): { visible: AssetSummary[]; dupCounts: Map<string, number> } {
+  const memberToGroup = new Map<string, DupGroup>();
+  for (const g of groups ?? []) {
+    if (g.members.length < 2) continue;
+    for (const m of g.members) memberToGroup.set(m.id, g);
+  }
+  if (memberToGroup.size === 0) return { visible: items, dupCounts: new Map() };
+
+  const seen = new Set<DupGroup>();
+  const visible: AssetSummary[] = [];
+  const dupCounts = new Map<string, number>();
+  for (const a of items) {
+    const g = memberToGroup.get(a.id);
+    if (!g) {
+      visible.push(a);
+      continue;
+    }
+    if (seen.has(g)) continue; // an earlier member already represents this group
+    seen.add(g);
+    visible.push(a);
+    dupCounts.set(a.id, g.members.length - 1);
+  }
+  return { visible, dupCounts };
+}
 
 export function Browser({ onOpenNav }: { onOpenNav?: () => void }) {
   const { state, patch, request } = useViewState();
@@ -64,8 +105,17 @@ export function Browser({ onOpenNav }: { onOpenNav?: () => void }) {
   const total = assets.data?.pages[0]?.total ?? null;
   const byId = useMemo(() => new Map(items.map((a) => [a.id, a])), [items]);
 
+  // Collapse byte-identical duplicates into one row each, badged with the hidden-copy count; the
+  // full group is listed in the Inspector. Whole-library groups, cached + shared with the Inspector
+  // and the Duplicates page under `qk.duplicates`.
+  const dups = useDuplicates({ kind: "exact", limit: DUP_LIMIT });
+  const { visible, dupCounts } = useMemo(
+    () => collapseExactDuplicates(items, dups.data),
+    [items, dups.data],
+  );
+
   const clearSelection = useCallback(() => setSelection(new Set()), []);
-  const selectAll = useCallback(() => setSelection(new Set(items.map((a) => a.id))), [items]);
+  const selectAll = useCallback(() => setSelection(new Set(visible.map((a) => a.id))), [visible]);
   const selectedAssets = useMemo(
     () => [...selection].map((id) => byId.get(id)).filter((a): a is AssetSummary => !!a),
     [selection, byId],
@@ -80,7 +130,7 @@ export function Browser({ onOpenNav }: { onOpenNav?: () => void }) {
       const id = asset.id;
       patch({ selected: id });
       if (mods.shift && anchor) {
-        const ids = items.map((a) => a.id);
+        const ids = visible.map((a) => a.id);
         const a = ids.indexOf(anchor);
         const b = ids.indexOf(id);
         if (a >= 0 && b >= 0) {
@@ -100,7 +150,7 @@ export function Browser({ onOpenNav }: { onOpenNav?: () => void }) {
         setAnchor(id);
       }
     },
-    [anchor, items, patch],
+    [anchor, visible, patch],
   );
 
   // Double-click / double-tap = activate: focus the asset in the Inspector and, for audio, start
@@ -144,6 +194,7 @@ export function Browser({ onOpenNav }: { onOpenNav?: () => void }) {
 
   const listProps = {
     selection,
+    dupCounts,
     onItemClick,
     onItemActivate,
     onContext: openMenu,
@@ -154,7 +205,7 @@ export function Browser({ onOpenNav }: { onOpenNav?: () => void }) {
 
   return (
     <section className="flex h-full min-w-0 flex-1 flex-col bg-bg">
-      <Toolbar count={items.length} total={total} onOpenNav={onOpenNav} searching={searching} />
+      <Toolbar count={visible.length} total={total} onOpenNav={onOpenNav} searching={searching} />
       {selection.size > 1 && (
         <SelectionBar
           assets={selectedAssets}
@@ -176,9 +227,9 @@ export function Browser({ onOpenNav }: { onOpenNav?: () => void }) {
             No assets match. Add a source and scan, or clear the filters.
           </Centered>
         ) : state.view === "grid" ? (
-          <Grid items={items} {...listProps} />
+          <Grid items={visible} {...listProps} />
         ) : (
-          <Table items={items} {...listProps} />
+          <Table items={visible} {...listProps} />
         )}
       </div>
       <ContextMenu
@@ -402,6 +453,8 @@ function ViewBtn({
 interface ListProps {
   items: AssetSummary[];
   selection: Set<string>;
+  /** assetId → count of hidden byte-identical copies, for the red duplicate badge. */
+  dupCounts: Map<string, number>;
   onItemClick: (asset: AssetSummary, mods: ClickMods) => void;
   onItemActivate: (asset: AssetSummary) => void;
   onContext: (asset: AssetSummary, x: number, y: number) => void;
@@ -419,6 +472,7 @@ function mods(e: React.MouseEvent): ClickMods {
 function Grid({
   items,
   selection,
+  dupCounts,
   onItemClick,
   onItemActivate,
   onContext,
@@ -459,6 +513,7 @@ function Grid({
                   key={a.id}
                   asset={a}
                   active={selection.has(a.id)}
+                  dupCount={dupCounts.get(a.id)}
                   onClick={onItemClick}
                   onActivate={onItemActivate}
                   onContext={onContext}
@@ -542,15 +597,34 @@ function detailAttr(asset: AssetSummary): string | null {
   return null;
 }
 
+/** A red count badge for a collapsed duplicate group — the top-right circle showing how many
+ *  byte-identical copies are folded behind this card/row (the set is listed in the Inspector). Danger
+ *  tone flags the redundant storage; capped at 99+ so a large group can't blow out the layout. */
+function DupBadge({ count, className = "" }: { count: number; className?: string }) {
+  return (
+    <span
+      className={`flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[10px] font-semibold tabular-nums ${className}`}
+      style={{ background: "var(--color-danger)", color: "var(--color-bg)" }}
+      title={`${count} duplicate${count === 1 ? "" : "s"} — listed in the Inspector`}
+      aria-label={`${count} duplicate${count === 1 ? "" : "s"}`}
+    >
+      {count > 99 ? "99+" : count}
+    </span>
+  );
+}
+
 function GridCell({
   asset,
   active,
+  dupCount,
   onClick,
   onActivate,
   onContext,
 }: {
   asset: AssetSummary;
   active: boolean;
+  /** Count of hidden byte-identical copies; undefined ⇒ not a duplicate, no badge. */
+  dupCount?: number;
   onClick: (asset: AssetSummary, mods: ClickMods) => void;
   onActivate: (asset: AssetSummary) => void;
   onContext: (asset: AssetSummary, x: number, y: number) => void;
@@ -576,6 +650,10 @@ function GridCell({
         <Thumbnail asset={asset} />
         {/* media-type tag so a mixed grid reads at a glance (DESIGN_GUIDELINES — media badges) */}
         <MediaBadge media={asset.media} className="absolute top-1.5 left-1.5" />
+        {/* collapsed-duplicate count, top-right (the requested red circle) */}
+        {dupCount != null && dupCount > 0 && (
+          <DupBadge count={dupCount} className="absolute top-1.5 right-1.5" />
+        )}
       </div>
       <div className="flex items-center justify-between gap-1 border-t border-border px-1.5 py-1">
         <span className="truncate text-[11px] text-fg" title={asset.name}>
@@ -596,6 +674,7 @@ function GridCell({
 function Table({
   items,
   selection,
+  dupCounts,
   onItemClick,
   onItemActivate,
   onContext,
@@ -629,6 +708,7 @@ function Table({
               key={vr.key}
               asset={a}
               active={selection.has(a.id)}
+              dupCount={dupCounts.get(a.id)}
               top={vr.start}
               onClick={onItemClick}
               onActivate={onItemActivate}
@@ -645,6 +725,7 @@ function Table({
 function TableRow({
   asset,
   active,
+  dupCount,
   top,
   onClick,
   onActivate,
@@ -652,6 +733,8 @@ function TableRow({
 }: {
   asset: AssetSummary;
   active: boolean;
+  /** Count of hidden byte-identical copies; undefined ⇒ not a duplicate, no badge. */
+  dupCount?: number;
   top: number;
   onClick: (asset: AssetSummary, mods: ClickMods) => void;
   onActivate: (asset: AssetSummary) => void;
@@ -680,6 +763,8 @@ function TableRow({
         <span className="truncate text-fg" title={asset.name}>
           {asset.name}
         </span>
+        {/* collapsed-duplicate count — a row has no "top right", so the red badge sits by the name */}
+        {dupCount != null && dupCount > 0 && <DupBadge count={dupCount} className="shrink-0" />}
       </span>
       <span className="truncate uppercase">{asset.format}</span>
       <LicenseBadge badge={asset.license} />

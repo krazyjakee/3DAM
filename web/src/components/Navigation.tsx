@@ -205,7 +205,7 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
           active={state.source === s.id && !state.collection}
           removing={removeSource.isPending && removeSource.variables === s.id}
           onSelect={() => go({ source: state.source === s.id ? null : s.id, collection: null })}
-          onRescan={() => scan.mutate({ sources: [s.id], mode: "full" })}
+          onRescan={() => scan.mutate({ sources: [s.id], mode: "delta" })}
           onRemove={async () => {
             const n = s.stats.asset_count;
             if (
@@ -471,8 +471,8 @@ function SourceRow({
       <div className="hidden items-center gap-1 group-hover:flex coarse:flex">
         <button
           className="flex items-center justify-center text-fg-dim hover:text-accent coarse:min-h-11 coarse:min-w-11"
-          title="Full rescan — re-read every file in this source"
-          aria-label="Full rescan this source"
+          title="Quick rescan — changed files only (full re-scan lives in Settings)"
+          aria-label="Quick rescan this source (changed files only)"
           onClick={onRescan}
         >
           <RefreshCw size={12} className={scanning ? "animate-spin" : ""} />

@@ -213,6 +213,37 @@ pub(crate) enum AdminCmd {
         #[arg(long, default_value_t = 50)]
         limit: u32,
     },
+    /// Storage & maintenance: report usage, clear caches/analysis, compact, or reset the library.
+    Maintenance {
+        #[command(subcommand)]
+        cmd: MaintenanceCmd,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum MaintenanceCmd {
+    /// Report library.db/server.db sizes, cache sizes/counts, and catalog counts.
+    Usage,
+    /// Delete regenerable derivative caches (regenerated on next view).
+    ClearCache {
+        /// Which tier to clear: thumbnails | previews | all (default: all).
+        #[arg(long, default_value = "all")]
+        target: String,
+    },
+    /// Drop analysis suggestions + embeddings and mark assets for re-analysis (keeps confirmed tags).
+    ClearAnalysis,
+    /// Compact library.db (VACUUM), reclaiming space freed by deletes.
+    Vacuum,
+    /// Reset the catalog to empty. Files in sources are never touched. Requires `--confirm`.
+    Wipe {
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Factory reset: also erase caches, tokens, flags, and audit. Requires `--confirm`.
+    FactoryReset {
+        #[arg(long)]
+        confirm: bool,
+    },
 }
 
 #[derive(Subcommand)]

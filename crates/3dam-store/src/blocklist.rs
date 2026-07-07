@@ -3,12 +3,17 @@
 //! Removing an asset deletes its catalog row (cascading to attrs, tags, collection membership, and
 //! embeddings via `ON DELETE CASCADE`). Optionally the asset's content hash is recorded on the
 //! blocklist so a subsequent scan/watch/auto-rescan skips the same bytes rather than re-importing
-//! them (see [`crate::scan`]). Non-destructive: the file in the source is never touched.
+//! them (see [`crate::scan`]). Blocking is content-addressed, not per-row: it also purges every
+//! byte-identical copy already in the catalog (the whole exact-duplicate group), so "remove + block"
+//! is a one-shot dedup disposal rather than a per-copy chore. Non-destructive: source files are
+//! never touched.
 use super::*;
 
 impl Store {
-    /// Remove one asset. With `block`, also record its content hash on the blocklist (capturing the
-    /// filename as a display label) so future scans skip it. Returns `NotFound` if the id is unknown.
+    /// Remove an asset. Without `block`, deletes just this one row. With `block`, treats the bytes as
+    /// unwanted: purges **every** asset sharing the same content hash (the entire byte-identical
+    /// group) and records that hash on the blocklist — capturing the filename as a display label — so
+    /// future scans skip it. Returns `NotFound` if the id is unknown.
     pub fn remove_asset(&self, id: &AssetId, block: bool) -> Result<(), LibError> {
         let conn = self.conn.lock().unwrap();
         // Read the hash + filename before the row is gone — needed for a meaningful blocklist entry.
@@ -22,25 +27,30 @@ impl Store {
             .map_err(internal)?;
         let (hash_blob, filename) = row.ok_or_else(|| LibError::NotFound(format!("asset {id}")))?;
 
-        // Delete the asset (cascades to audio/image/model attrs, asset_tag, collection_member,
-        // embedding — all keyed ON DELETE CASCADE to asset.id).
-        conn.execute(
-            "DELETE FROM asset WHERE id = ?1",
-            params![id.as_bytes().to_vec()],
-        )
-        .map_err(internal)?;
-
+        // Blocking a content-addressable asset means the user never wants these bytes: delete every
+        // byte-identical copy at once so the whole exact-duplicate group clears, not just the clicked
+        // one, then record the hash. (A federated row carries no bytes to block — fall through to the
+        // single-row delete below.) Deletes cascade to audio/image/model attrs, asset_tag,
+        // collection_member, embedding — all keyed ON DELETE CASCADE to asset.id.
         if block {
-            // Only content-addressable assets can be blocked; a federated row without bytes can't.
             if let Some(hash) = hash_blob {
+                conn.execute("DELETE FROM asset WHERE content_hash = ?1", params![hash])
+                    .map_err(internal)?;
                 conn.execute(
                     "INSERT INTO blocklist (content_hash, label, blocked_at) VALUES (?1, ?2, ?3)
                      ON CONFLICT(content_hash) DO UPDATE SET label = excluded.label",
                     params![hash, filename, now_ms()],
                 )
                 .map_err(internal)?;
+                return Ok(());
             }
         }
+
+        conn.execute(
+            "DELETE FROM asset WHERE id = ?1",
+            params![id.as_bytes().to_vec()],
+        )
+        .map_err(internal)?;
         Ok(())
     }
 

@@ -171,3 +171,99 @@ pub struct AuditEntry {
     pub target: Option<String>,
     pub detail: Option<serde_json::Value>,
 }
+
+// ── storage & maintenance (Settings §Storage) ────────────────────────────────
+//
+// The operator-plane maintenance surface behind `/admin/api/maintenance/*`: report disk usage,
+// clear the regenerable caches, reset analysis, compact/vacuum, and the two destructive wipes
+// (catalog reset and full factory reset). All non-destructive to files inside registered sources —
+// only 3DAM's own SQLite DBs and its `<data_dir>/cache/` derivatives are ever touched.
+
+/// One cache tier's on-disk footprint (the image thumbnails or the 3D preview meshes).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct CacheUsage {
+    pub bytes: u64,
+    pub files: u64,
+}
+
+/// Storage report for the Settings surface: DB sizes, both cache tiers, and catalog counts.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StorageUsage {
+    /// The data directory the report is for (shown so the operator knows what they're clearing).
+    pub data_dir: String,
+    /// Size of `library.db` on disk (bytes; excludes the WAL/SHM sidecars).
+    pub library_db_bytes: u64,
+    /// Size of `server.db` on disk (bytes).
+    pub server_db_bytes: u64,
+    pub thumbnails: CacheUsage,
+    pub previews: CacheUsage,
+    pub asset_count: u64,
+    pub source_count: u64,
+}
+
+/// Which regenerable cache tier(s) to clear.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheTarget {
+    /// The image thumbnail cache (`<data_dir>/cache/thumbnails`).
+    Thumbnails,
+    /// The 3D preview-mesh cache (`<data_dir>/cache/previews`).
+    Previews,
+    /// Both tiers.
+    All,
+}
+
+/// Body of `POST /admin/api/maintenance/clear-cache`.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct ClearCacheRequest {
+    pub target: CacheTarget,
+}
+
+/// Result of clearing a cache tier — what was freed. Regenerated on next thumbnail/preview read.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct ClearCacheReport {
+    pub bytes_freed: u64,
+    pub files_deleted: u64,
+}
+
+/// Result of clearing analysis: dropped suggestions + embeddings (derived attrs are nulled and each
+/// asset is marked due for re-analysis; user-confirmed tags are kept).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct ClearAnalysisReport {
+    pub suggestions_removed: u64,
+    pub embeddings_removed: u64,
+}
+
+/// Result of a `VACUUM` — before/after `library.db` size and the bytes reclaimed.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct VacuumReport {
+    pub before_bytes: u64,
+    pub after_bytes: u64,
+    pub reclaimed_bytes: u64,
+}
+
+/// Body of the destructive maintenance ops (`wipe`, `factory-reset`) — the machine form of
+/// warn-and-confirm: the server rejects the call unless `confirm` is `true`.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct ConfirmRequest {
+    #[serde(default)]
+    pub confirm: bool,
+}
+
+/// Result of a catalog wipe / library reset — what was cleared (files in sources untouched).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct WipeReport {
+    pub assets_removed: u64,
+    pub sources_removed: u64,
+    pub collections_removed: u64,
+    pub tags_removed: u64,
+}
+
+/// Result of a factory reset: the catalog wipe + caches cleared + the server config erased
+/// (tokens/flags/audit). Returns the app to first-run state.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct FactoryResetReport {
+    pub catalog: WipeReport,
+    pub cache: ClearCacheReport,
+    pub tokens_removed: u64,
+}

@@ -127,6 +127,11 @@ export const api = {
    *  fetches this and hands it across the wasm-bindgen boundary; the island does no networking. */
   assetContentUrl: (id: AssetId) => `${API}/assets/${id}/content`,
 
+  /** URL for a model asset's interactive 3D preview: the server-decoded, self-contained `DMSH` mesh
+   *  blob (geometry + PBR materials + textures) the 3D island uploads directly. One Assimp decode
+   *  server-side covers every format with textures, so the DOM never resolves external buffers. */
+  assetPreviewMeshUrl: (id: AssetId) => `${API}/assets/${id}/preview-mesh`,
+
   /** URL for a file referenced *relative to* an asset — a loose `.gltf`'s external `.bin`/textures
    *  (issue #56). `rel` is the glTF URI, resolved server-side against the asset's directory. */
   assetRelatedUrl: (id: AssetId, rel: string) =>

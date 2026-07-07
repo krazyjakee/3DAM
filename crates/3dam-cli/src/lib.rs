@@ -4,8 +4,9 @@
 
 use clap::{Args, Parser, Subcommand};
 use dam_api::admin::{
-    AdminStatus, AuditEntry, AuthMode, FlagInfo, FlagKey, FlagValue, McpMode, NewToken,
-    NewTokenReply, SetFlag, TokenInfo,
+    AdminStatus, AuditEntry, AuthMode, CacheTarget, ClearAnalysisReport, ClearCacheReport,
+    FactoryResetReport, FlagInfo, FlagKey, FlagValue, McpMode, NewToken, NewTokenReply, SetFlag,
+    StorageUsage, TokenInfo, VacuumReport, WipeReport,
 };
 use dam_api::dto::*;
 use dam_api::id::{AssetId, CollectionId, JobId, SourceId};

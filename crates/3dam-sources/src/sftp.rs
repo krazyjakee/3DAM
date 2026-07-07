@@ -10,7 +10,7 @@
 //! (tech-spec 10 owns a real keyring later), and the server host key is trust-on-first-use
 //! (accepted) — a documented v1 limitation, revisited with the auth work.
 
-use crate::{guard_rel_path, temp_from_bytes, FileEntry, FileSource, Fetched, SftpConfig};
+use crate::{guard_rel_path, temp_from_bytes, Fetched, FileEntry, FileSource, SftpConfig};
 use dam_api::LibError;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
@@ -61,7 +61,13 @@ impl SftpSource {
 
 async fn connect_inner(
     cfg: &SftpConfig,
-) -> Result<(russh::client::Handle<Client>, russh_sftp::client::SftpSession), LibError> {
+) -> Result<
+    (
+        russh::client::Handle<Client>,
+        russh_sftp::client::SftpSession,
+    ),
+    LibError,
+> {
     let config = Arc::new(russh::client::Config::default());
     let mut handle = russh::client::connect(config, (cfg.host.as_str(), cfg.port), Client)
         .await
@@ -75,7 +81,9 @@ async fn connect_inner(
             .authenticate_publickey(cfg.username.clone(), key)
             .await
     } else if let Some(pw) = &cfg.password {
-        handle.authenticate_password(cfg.username.clone(), pw.clone()).await
+        handle
+            .authenticate_password(cfg.username.clone(), pw.clone())
+            .await
     } else {
         return Err(LibError::BadRequest(
             "sftp source needs a password or private key".into(),

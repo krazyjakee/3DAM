@@ -90,6 +90,8 @@ export interface ModelAttributes {
   mesh_count: number | null;
   material_count?: number | null;
   texture_count?: number | null;
+  /** On-disk bytes of external companion files (textures, glTF .bin). Folded into the asset size. */
+  dependency_bytes?: number | null;
   has_rig?: boolean | null;
   has_animation?: boolean | null;
   has_uvs?: boolean | null;
@@ -470,7 +472,8 @@ export type LibraryEvent =
   | { type: "asset_changed"; id: AssetId; kind: ChangeKind }
   | { type: "asset_removed"; 0: AssetId } // AssetRemoved(AssetId) — newtype variant
   | { type: "source_state"; id: SourceId; state: SourceState }
-  | ({ type: "job_progress" } & JobStatus);
+  | ({ type: "job_progress" } & JobStatus)
+  | { type: "catalog_reset" }; // whole catalog wiped (maintenance) — drop caches and refetch
 
 // ── error envelope ──────────────────────────────────────────────────────────
 

@@ -69,6 +69,54 @@ export interface AuditEntry {
   detail?: unknown;
 }
 
+// ── storage & maintenance (Settings §Storage) ────────────────────────────────
+
+export interface CacheUsage {
+  bytes: number;
+  files: number;
+}
+
+export interface StorageUsage {
+  data_dir: string;
+  library_db_bytes: number;
+  server_db_bytes: number;
+  thumbnails: CacheUsage;
+  previews: CacheUsage;
+  asset_count: number;
+  source_count: number;
+}
+
+export type CacheTarget = "thumbnails" | "previews" | "all";
+
+export interface ClearCacheReport {
+  bytes_freed: number;
+  files_deleted: number;
+}
+
+export interface ClearAnalysisReport {
+  suggestions_removed: number;
+  embeddings_removed: number;
+}
+
+export interface VacuumReport {
+  before_bytes: number;
+  after_bytes: number;
+  reclaimed_bytes: number;
+}
+
+export interface WipeReport {
+  assets_removed: number;
+  sources_removed: number;
+  collections_removed: number;
+  tags_removed: number;
+}
+
+export interface FactoryResetReport {
+  catalog: WipeReport;
+  cache: ClearCacheReport;
+  tokens_removed: number;
+}
+
 /** The admin bearer token an operator pasted in (Token-mode servers). Persisted locally only. */
 const TOKEN_KEY = "dam_admin_token";
 export function getAdminToken(): string | null {
@@ -129,4 +177,40 @@ export const admin = {
     ),
   audit: async (limit = 100) =>
     decode<AuditEntry[]>(await fetch(`${ADMIN}/audit?limit=${limit}`, { headers: headers(false) })),
+
+  // ── storage & maintenance ──────────────────────────────────────────────────
+  storageUsage: async () =>
+    decode<StorageUsage>(await fetch(`${ADMIN}/maintenance/usage`, { headers: headers(false) })),
+  clearCache: async (target: CacheTarget) =>
+    decode<ClearCacheReport>(
+      await fetch(`${ADMIN}/maintenance/clear-cache`, {
+        method: "POST",
+        headers: headers(true),
+        body: JSON.stringify({ target }),
+      }),
+    ),
+  clearAnalysis: async () =>
+    decode<ClearAnalysisReport>(
+      await fetch(`${ADMIN}/maintenance/clear-analysis`, { method: "POST", headers: headers(false) }),
+    ),
+  vacuum: async () =>
+    decode<VacuumReport>(
+      await fetch(`${ADMIN}/maintenance/vacuum`, { method: "POST", headers: headers(false) }),
+    ),
+  wipe: async (confirm: boolean) =>
+    decode<WipeReport>(
+      await fetch(`${ADMIN}/maintenance/wipe`, {
+        method: "POST",
+        headers: headers(true),
+        body: JSON.stringify({ confirm }),
+      }),
+    ),
+  factoryReset: async (confirm: boolean) =>
+    decode<FactoryResetReport>(
+      await fetch(`${ADMIN}/maintenance/factory-reset`, {
+        method: "POST",
+        headers: headers(true),
+        body: JSON.stringify({ confirm }),
+      }),
+    ),
 };

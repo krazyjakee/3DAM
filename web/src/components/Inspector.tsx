@@ -6,6 +6,7 @@ import {
   useAsset,
   useCollectionMembers,
   useCollections,
+  useDuplicates,
   useReviewSuggestion,
   useSimilar,
   useSources,
@@ -14,6 +15,7 @@ import { api, ApiError } from "@/api/client";
 import type {
   Asset,
   AssetId,
+  AssetSummary,
   CollectionId,
   MediaAttributes,
   ReviewAction,
@@ -128,15 +130,18 @@ function InspectorSkeleton() {
  *  file-03 content endpoint), or the server-rendered thumbnail for images and as the fallback. */
 function Preview({ asset }: { asset: Asset }) {
   const { summary } = asset;
-  const src = api.assetContentUrl(summary.id);
   const [tiling, setTiling] = useState(false);
-  if (summary.media === "model") {
+  // `.blend` has no interactive 3D: Assimp can't decode a modern .blend, and a full Blender render of
+  // a large file is unreasonable. It falls through to the server thumbnail below, which surfaces
+  // Blender's own embedded preview image when the file has one.
+  if (summary.media === "model" && summary.format !== "blend") {
     return (
       <div className="aspect-square border-b border-border">
-        <ModelViewerIsland src={src} assetId={summary.id} format={summary.format} />
+        <ModelViewerIsland src={api.assetPreviewMeshUrl(summary.id)} />
       </div>
     );
   }
+  const src = api.assetContentUrl(summary.id);
   if (summary.media === "audio") {
     // Playable inline: waveform + transport, with the playhead driven by real progress (issues
     // #16, #14). Keyed by id so switching assets resets playback + the decoded waveform.
@@ -205,6 +210,15 @@ function Body({ asset }: { asset: Asset }) {
           <Field label="Type" value={mediaLabel[summary.media]} />
           <Field label="Format" value={summary.format.toUpperCase()} />
           <Field label="Size" value={bytes(summary.size)} />
+          {asset.attributes?.media === "model" &&
+            (asset.attributes.dependency_bytes ?? 0) > 0 && (
+              <Field
+                label="↳ mesh + textures"
+                value={`${bytes(
+                  Math.max(0, summary.size - (asset.attributes.dependency_bytes ?? 0)),
+                )} + ${bytes(asset.attributes.dependency_bytes ?? 0)}`}
+              />
+            )}
           <Field label="Origin" value={originLabel(summary.origin)} />
           <Field label="Source" value={sourceName} />
           <Field label="Path" value={asset.path} mono />
@@ -229,6 +243,10 @@ function Body({ asset }: { asset: Asset }) {
 
         {/* collections — this asset's manual memberships, with per-asset add/remove (issue #3) */}
         <CollectionsGroup asset={asset} />
+
+        {/* duplicates — the byte-identical copies collapsed behind one card in the grid/table live
+            here (rendered only when this asset is part of an exact-duplicate group) */}
+        <DuplicatesSection asset={asset} />
 
         {/* find similar — cosine over embeddings, ranked in this asset's media space (phase 3) */}
         <SimilarSection asset={asset} />
@@ -300,6 +318,79 @@ function CollectionsGroup({ asset }: { asset: Asset }) {
         </select>
       )}
     </Group>
+  );
+}
+
+/** Pull enough exact-duplicate groups to cover the library; keyed identically to the Browser's fetch
+ *  so the two share one cached request under `qk.duplicates`. */
+const DUP_LIMIT = 10_000;
+
+/** The byte-identical copies of this asset. In the grid/table those copies collapse into one badged
+ *  card; this is where the full set is enumerated (the request in the golden rules: "duplicates listed
+ *  in the inspector"). Exact only — perceptual near-matches are the separate "Similar" surface. Absent
+ *  entirely when the asset has no identical twin, so the panel stays lean for the common case. */
+function DuplicatesSection({ asset }: { asset: Asset }) {
+  const { patch } = useViewState();
+  const id = asset.summary.id;
+  const dups = useDuplicates({ kind: "exact", limit: DUP_LIMIT });
+  const group = dups.data?.find(
+    (g) => g.members.length > 1 && g.members.some((m) => m.id === id),
+  );
+  if (!group) return null;
+
+  const others = group.members.length - 1;
+  return (
+    <Group title={`Duplicates (${others})`}>
+      <p className="mb-2 text-[11px] text-fg-dim">
+        {others} byte-identical {others === 1 ? "copy" : "copies"} (same content hash). 3DAM only
+        groups — dispose of a copy from its context menu.
+      </p>
+      <div className="grid grid-cols-3 gap-1.5">
+        {group.members.map((m) => (
+          <DuplicateTile
+            key={m.id}
+            member={m}
+            keep={m.id === group.suggested_keep}
+            current={m.id === id}
+            onOpen={() => patch({ selected: m.id })}
+          />
+        ))}
+      </div>
+    </Group>
+  );
+}
+
+function DuplicateTile({
+  member,
+  keep,
+  current,
+  onOpen,
+}: {
+  member: AssetSummary;
+  keep: boolean;
+  current: boolean;
+  onOpen: () => void;
+}) {
+  return (
+    <button
+      className="flex flex-col overflow-hidden rounded border text-left transition-colors hover:border-border-strong coarse:min-h-11"
+      style={{ borderColor: current ? "var(--color-accent)" : "var(--color-border)" }}
+      title={`${member.name} · ${bytes(member.size)}${keep ? " · suggested keep" : ""}${current ? " · this asset" : ""}`}
+      onClick={onOpen}
+    >
+      <span className="relative aspect-square w-full">
+        <Thumbnail asset={member} size={32} />
+        {keep && (
+          <span className="absolute top-1 left-1 rounded bg-accent px-1 py-0.5 text-[9px] font-semibold text-accent-fg">
+            Keep
+          </span>
+        )}
+      </span>
+      <span className="flex items-center justify-between gap-1 px-1 py-0.5">
+        <span className="min-w-0 truncate text-[10px] text-fg-muted">{member.name}</span>
+        <span className="shrink-0 text-[10px] text-fg-dim tabular-nums">{bytes(member.size)}</span>
+      </span>
+    </button>
   );
 }
 

@@ -16,7 +16,7 @@ pub(crate) async fn run_admin(global: &Global, cmd: AdminCmd) -> anyhow::Result<
         None => {
             let data_dir = global.data.clone().unwrap_or_else(default_data_dir);
             let store = dam_server::ServerStore::open(&data_dir.join("server.db"))?;
-            run_admin_embedded(&store, cmd, json)
+            run_admin_embedded(&store, &data_dir, cmd, json).await
         }
     }
 }
@@ -69,12 +69,34 @@ async fn run_admin_remote(
             }
         },
         AdminCmd::Audit { limit } => print_audit(&client.admin_audit(limit).await?, json)?,
+        AdminCmd::Maintenance { cmd } => match cmd {
+            MaintenanceCmd::Usage => print_usage(&client.admin_storage_usage().await?, json)?,
+            MaintenanceCmd::ClearCache { target } => print_clear_cache(
+                &client
+                    .admin_clear_cache(parse_cache_target(&target)?)
+                    .await?,
+                json,
+            )?,
+            MaintenanceCmd::ClearAnalysis => {
+                print_clear_analysis(&client.admin_clear_analysis().await?, json)?
+            }
+            MaintenanceCmd::Vacuum => print_vacuum(&client.admin_vacuum().await?, json)?,
+            MaintenanceCmd::Wipe { confirm } => {
+                confirm_or_bail(confirm, "reset the catalog")?;
+                print_wipe(&client.admin_wipe(true).await?, json)?;
+            }
+            MaintenanceCmd::FactoryReset { confirm } => {
+                confirm_or_bail(confirm, "factory reset")?;
+                print_factory_reset(&client.admin_factory_reset(true).await?, json)?;
+            }
+        },
     }
     Ok(())
 }
 
-fn run_admin_embedded(
+async fn run_admin_embedded(
     store: &dam_server::ServerStore,
+    data_dir: &std::path::Path,
     cmd: AdminCmd,
     json: bool,
 ) -> anyhow::Result<()> {
@@ -115,6 +137,74 @@ fn run_admin_embedded(
             }
         },
         AdminCmd::Audit { limit } => print_audit(&store.list_audit(limit)?, json)?,
+        AdminCmd::Maintenance { cmd } => {
+            // Maintenance touches library.db + caches, so the embedded path opens the engine
+            // (its inherent ops are off the LibraryService seam) and audits via the server store.
+            let lib = dam_core::EmbeddedLibrary::open(data_dir).await?;
+            match cmd {
+                MaintenanceCmd::Usage => print_usage(&lib.storage_usage().await?, json)?,
+                MaintenanceCmd::ClearCache { target } => {
+                    let t = parse_cache_target(&target)?;
+                    let report = lib.clear_caches(t).await?;
+                    store.audit(
+                        "cli",
+                        "maintenance.clear_cache",
+                        None,
+                        Some(serde_json::json!({ "files_deleted": report.files_deleted })),
+                    )?;
+                    print_clear_cache(&report, json)?;
+                }
+                MaintenanceCmd::ClearAnalysis => {
+                    let report = lib.clear_analysis().await?;
+                    store.audit("cli", "maintenance.clear_analysis", None, None)?;
+                    print_clear_analysis(&report, json)?;
+                }
+                MaintenanceCmd::Vacuum => {
+                    let report = lib.vacuum().await?;
+                    store.audit("cli", "maintenance.vacuum", None, None)?;
+                    print_vacuum(&report, json)?;
+                }
+                MaintenanceCmd::Wipe { confirm } => {
+                    confirm_or_bail(confirm, "reset the catalog")?;
+                    let report = lib.wipe_catalog().await?;
+                    store.audit("cli", "maintenance.wipe", None, None)?;
+                    print_wipe(&report, json)?;
+                }
+                MaintenanceCmd::FactoryReset { confirm } => {
+                    confirm_or_bail(confirm, "factory reset")?;
+                    let catalog = lib.wipe_catalog().await?;
+                    let cache = lib.clear_caches(CacheTarget::All).await?;
+                    let tokens_removed = store.factory_reset()?;
+                    store.audit("cli", "maintenance.factory_reset", None, None)?;
+                    print_factory_reset(
+                        &FactoryResetReport {
+                            catalog,
+                            cache,
+                            tokens_removed,
+                        },
+                        json,
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_cache_target(s: &str) -> anyhow::Result<CacheTarget> {
+    Ok(match s.trim().to_ascii_lowercase().as_str() {
+        "thumbnails" | "thumbs" | "thumb" => CacheTarget::Thumbnails,
+        "previews" | "preview" => CacheTarget::Previews,
+        "all" | "both" => CacheTarget::All,
+        _ => anyhow::bail!("cache target must be thumbnails|previews|all"),
+    })
+}
+
+/// Guard the destructive maintenance verbs: the CLI's own `--confirm` gate before the request even
+/// leaves (the server independently re-checks `confirm=true`).
+fn confirm_or_bail(confirm: bool, what: &str) -> anyhow::Result<()> {
+    if !confirm {
+        anyhow::bail!("{what} is destructive and irreversible — re-run with --confirm");
     }
     Ok(())
 }
@@ -249,6 +339,110 @@ fn print_audit(entries: &[AuditEntry], json: bool) -> anyhow::Result<()> {
             e.target.clone().unwrap_or_default()
         );
     }
+    Ok(())
+}
+
+fn human_bytes(n: u64) -> String {
+    const U: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = n as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < U.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{n} B")
+    } else {
+        format!("{v:.1} {}", U[i])
+    }
+}
+
+fn print_usage(u: &StorageUsage, json: bool) -> anyhow::Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(u)?);
+        return Ok(());
+    }
+    println!("data dir:      {}", u.data_dir);
+    println!("library.db:    {}", human_bytes(u.library_db_bytes));
+    println!("server.db:     {}", human_bytes(u.server_db_bytes));
+    println!(
+        "thumbnails:    {} ({} files)",
+        human_bytes(u.thumbnails.bytes),
+        u.thumbnails.files
+    );
+    println!(
+        "previews:      {} ({} files)",
+        human_bytes(u.previews.bytes),
+        u.previews.files
+    );
+    println!("assets:        {}", u.asset_count);
+    println!("sources:       {}", u.source_count);
+    Ok(())
+}
+
+fn print_clear_cache(r: &ClearCacheReport, json: bool) -> anyhow::Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(r)?);
+        return Ok(());
+    }
+    println!(
+        "cleared {} files, freed {}",
+        r.files_deleted,
+        human_bytes(r.bytes_freed)
+    );
+    Ok(())
+}
+
+fn print_clear_analysis(r: &ClearAnalysisReport, json: bool) -> anyhow::Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(r)?);
+        return Ok(());
+    }
+    println!(
+        "removed {} suggestions, {} embeddings; assets marked for re-analysis",
+        r.suggestions_removed, r.embeddings_removed
+    );
+    Ok(())
+}
+
+fn print_vacuum(r: &VacuumReport, json: bool) -> anyhow::Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(r)?);
+        return Ok(());
+    }
+    println!(
+        "compacted library.db: {} → {} (reclaimed {})",
+        human_bytes(r.before_bytes),
+        human_bytes(r.after_bytes),
+        human_bytes(r.reclaimed_bytes)
+    );
+    Ok(())
+}
+
+fn print_wipe(r: &WipeReport, json: bool) -> anyhow::Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(r)?);
+        return Ok(());
+    }
+    println!(
+        "catalog reset: {} assets, {} sources, {} collections, {} tags removed (files untouched)",
+        r.assets_removed, r.sources_removed, r.collections_removed, r.tags_removed
+    );
+    Ok(())
+}
+
+fn print_factory_reset(r: &FactoryResetReport, json: bool) -> anyhow::Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(r)?);
+        return Ok(());
+    }
+    println!(
+        "factory reset complete: {} assets removed, {} tokens revoked, {} freed from caches",
+        r.catalog.assets_removed,
+        r.tokens_removed,
+        human_bytes(r.cache.bytes_freed)
+    );
+    println!("flags reset to defaults; audit log cleared");
     Ok(())
 }
 

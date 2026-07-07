@@ -10,8 +10,10 @@ dam-api.workspace = true
 dam-frontend.workspace = true
 dam-server.workspace = true
 # The admin surface over `--connect` is driven through the API client (tech-spec 10 §5 parity);
-# the embedded admin path opens the server store from `dam-server` directly (ADR 0009 §2).
+# the embedded admin path opens the server store from `dam-server` directly (ADR 0009 §2), and the
+# embedded storage-maintenance ops open the engine (`EmbeddedLibrary`) for their inherent methods.
 dam-client.workspace = true
+dam-core.workspace = true
 clap.workspace = true
 tokio.workspace = true
 serde_json.workspace = true

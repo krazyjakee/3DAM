@@ -3,7 +3,20 @@ name = "dam-render"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "wgpu renderer: headless render-to-PNG + GUI viewer surface (tech-spec 06, ADR 0002). Stub until the render phase."
+description = "wgpu renderer: headless render-to-PNG thumbnails + GUI viewer surface (tech-spec 06, ADR 0002)."
 
 [dependencies]
-# wgpu/glam land with the render phase (ADR 0002: owns GPU, never windowing).
+# GPU + math (ADR 0002: owns GPU, never windowing). wgpu pinned exactly — see workspace Cargo.toml.
+wgpu.workspace = true
+glam.workspace = true
+bytemuck.workspace = true
+pollster.workspace = true
+# Assimp (via russimp-ng) is the import backend for the full professional format range — FBX, OBJ,
+# DAE, 3DS, glTF/GLB, PLY, STL, X, LWO, … — with materials and embedded/external textures. Built
+# from source and statically linked so the shipped binary carries no runtime libassimp (ADR 0011).
+russimp-ng = { workspace = true, features = ["static-link"] }
+# PNG encode of the rendered frame (the readback path).
+image.workspace = true
+thiserror.workspace = true
+# Temp GLB scratch for the Blender bridge (modern `.blend` → GLB → Assimp). Auto-cleaned on drop.
+tempfile.workspace = true

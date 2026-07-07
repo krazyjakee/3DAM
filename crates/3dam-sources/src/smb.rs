@@ -9,11 +9,13 @@
 //! Only the default SMB port is supported in v1 (share_connect resolves the server from the UNC);
 //! a non-default port is rejected up front rather than silently ignored.
 
-use crate::{guard_rel_path, temp_from_bytes, FileEntry, FileSource, Fetched, SmbConfig};
+use crate::{guard_rel_path, temp_from_bytes, Fetched, FileEntry, FileSource, SmbConfig};
 use dam_api::LibError;
 use futures::StreamExt;
 use smb::resource::{Directory, Resource};
-use smb::{Client, ClientConfig, FileAccessMask, FileCreateArgs, FileDirectoryInformation, UncPath};
+use smb::{
+    Client, ClientConfig, FileAccessMask, FileCreateArgs, FileDirectoryInformation, UncPath,
+};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -41,8 +43,9 @@ impl SmbSource {
             .build()
             .map_err(|e| LibError::Internal(format!("smb runtime: {e}")))?;
         let client = Client::new(ClientConfig::default());
-        let unc = UncPath::from_str(&format!(r"\\{}\{}", cfg.host, cfg.share))
-            .map_err(|e| LibError::BadRequest(format!("bad smb share //{}/{}: {e}", cfg.host, cfg.share)))?;
+        let unc = UncPath::from_str(&format!(r"\\{}\{}", cfg.host, cfg.share)).map_err(|e| {
+            LibError::BadRequest(format!("bad smb share //{}/{}: {e}", cfg.host, cfg.share))
+        })?;
 
         // sspi accepts `DOMAIN\user`; fold the domain into the username when supplied.
         let user = match &cfg.domain {
@@ -51,7 +54,12 @@ impl SmbSource {
         };
         let password = cfg.password.clone().unwrap_or_default();
         rt.block_on(client.share_connect(&unc, &user, password))
-            .map_err(|e| LibError::SourceUnavailable(format!("smb connect //{}/{}: {e}", cfg.host, cfg.share)))?;
+            .map_err(|e| {
+                LibError::SourceUnavailable(format!(
+                    "smb connect //{}/{}: {e}",
+                    cfg.host, cfg.share
+                ))
+            })?;
 
         Ok(SmbSource {
             cfg,
@@ -147,8 +155,7 @@ async fn list_dir(
         .map_err(|e| LibError::SourceUnavailable(format!("smb query dir: {e}")))?;
     let mut out = Vec::new();
     while let Some(item) = stream.next().await {
-        let info =
-            item.map_err(|e| LibError::SourceUnavailable(format!("smb dir entry: {e}")))?;
+        let info = item.map_err(|e| LibError::SourceUnavailable(format!("smb dir entry: {e}")))?;
         let name = info.file_name.to_string();
         let is_dir = info.file_attributes.directory();
         let mtime = if info.last_write_time.is_zero() {

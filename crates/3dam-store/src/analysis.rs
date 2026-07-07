@@ -436,7 +436,8 @@ impl Store {
             binds.push(Value::Blob(id.as_bytes().to_vec()));
         }
         let sql = format!(
-            "SELECT asset.id, filename, media_type, format, size_bytes, license_id, license_status,
+            "SELECT asset.id, filename, media_type, format,
+                    size_bytes + COALESCE(model_attr.dependency_bytes, 0), license_id, license_status,
                     image_attr.width, image_attr.height, audio_attr.duration_ms, model_attr.triangle_count,
                     audio_attr.class
              FROM asset

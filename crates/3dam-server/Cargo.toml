@@ -7,7 +7,10 @@ description = "axum server: HTTP/WS API mirroring LibraryService, web-asset host
 
 [dependencies]
 dam-api.workspace = true
-dam-core.workspace = true
+# `render` pulls the wgpu renderer so `serve` can produce 3D model turntable thumbnails (ADR 0002).
+# The whole `3dam` binary links dam-server, so this turns rendering on for every role by unification
+# while dam-core itself stays GPU-free by default for pure-library consumers.
+dam-core = { workspace = true, features = ["render"] }
 axum.workspace = true
 tower-http.workspace = true
 rust-embed.workspace = true

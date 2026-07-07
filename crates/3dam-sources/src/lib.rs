@@ -226,7 +226,9 @@ fn parse_sftp(uri: &str, opts: &ConnOptions) -> Result<SourceConnection, LibErro
     };
     let (host, uri_port) = split_host_port(hostport);
     if host.is_empty() {
-        return Err(LibError::BadRequest("sftp source uri is missing a host".into()));
+        return Err(LibError::BadRequest(
+            "sftp source uri is missing a host".into(),
+        ));
     }
     let username = opts
         .username
@@ -256,7 +258,9 @@ fn parse_smb(uri: &str, opts: &ConnOptions) -> Result<SourceConnection, LibError
     let (authority, path) = split_once_or(rest, '/', ("", ""));
     let (host, uri_port) = split_host_port(authority);
     if host.is_empty() {
-        return Err(LibError::BadRequest("smb source uri is missing a host".into()));
+        return Err(LibError::BadRequest(
+            "smb source uri is missing a host".into(),
+        ));
     }
     let (share, base) = split_once_or(path, '/', (path, ""));
     if share.is_empty() {
@@ -366,10 +370,7 @@ impl FileSource for LocalFsSource {
                         .to_string_lossy()
                         .replace('\\', "/");
                     let (size, modified_ms) = match de.metadata() {
-                        Ok(m) => (
-                            m.len(),
-                            m.modified().ok().and_then(system_time_ms),
-                        ),
+                        Ok(m) => (m.len(), m.modified().ok().and_then(system_time_ms)),
                         Err(_) => (0, None),
                     };
                     sink(Ok(FileEntry {
@@ -410,9 +411,15 @@ mod tests {
 
     #[test]
     fn parses_sftp_uri_with_userinfo_and_port() {
-        let c = SourceConnection::parse("sftp", "sftp://bob@host.example:2222/assets", &ConnOptions::default())
-            .unwrap();
-        let SourceConnection::Sftp(cfg) = &c else { panic!() };
+        let c = SourceConnection::parse(
+            "sftp",
+            "sftp://bob@host.example:2222/assets",
+            &ConnOptions::default(),
+        )
+        .unwrap();
+        let SourceConnection::Sftp(cfg) = &c else {
+            panic!()
+        };
         assert_eq!(cfg.host, "host.example");
         assert_eq!(cfg.port, 2222);
         assert_eq!(cfg.username, "bob");
@@ -429,17 +436,28 @@ mod tests {
             ..Default::default()
         };
         let c = SourceConnection::parse("sftp", "sftp://bob@host/dir", &opts).unwrap();
-        let SourceConnection::Sftp(cfg) = &c else { panic!() };
+        let SourceConnection::Sftp(cfg) = &c else {
+            panic!()
+        };
         assert_eq!(cfg.username, "alice");
         assert_eq!(cfg.password.as_deref(), Some("s3cret"));
-        assert!(!c.display_uri().contains("s3cret"), "secret must not appear in display uri");
+        assert!(
+            !c.display_uri().contains("s3cret"),
+            "secret must not appear in display uri"
+        );
     }
 
     #[test]
     fn parses_smb_uri() {
-        let c = SourceConnection::parse("smb", "smb://nas.local/textures/pbr", &ConnOptions::default())
-            .unwrap();
-        let SourceConnection::Smb(cfg) = &c else { panic!() };
+        let c = SourceConnection::parse(
+            "smb",
+            "smb://nas.local/textures/pbr",
+            &ConnOptions::default(),
+        )
+        .unwrap();
+        let SourceConnection::Smb(cfg) = &c else {
+            panic!()
+        };
         assert_eq!(cfg.host, "nas.local");
         assert_eq!(cfg.share, "textures");
         assert_eq!(cfg.base_path, "pbr");

@@ -110,6 +110,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/api/v1/assets/{id}", get(get_asset).delete(remove_asset))
         .route("/api/v1/assets/{id}/content", get(asset_content))
         .route("/api/v1/assets/{id}/related", get(asset_related))
+        .route("/api/v1/assets/{id}/preview-mesh", get(asset_preview_mesh))
         .route("/api/v1/assets/{id}/thumbnail", get(asset_thumbnail))
         .route("/api/v1/stats", get(stats))
         .route("/api/v1/convert", post(convert))
@@ -426,6 +427,26 @@ async fn asset_related(
         [
             (header::CONTENT_TYPE, content.content_type),
             (header::CACHE_CONTROL, "private, max-age=60".to_string()),
+        ],
+        Body::from(content.bytes),
+    )
+        .into_response())
+}
+
+/// Serve the interactive 3D preview mesh (`DMSH` blob) the WASM viewer island uploads directly.
+/// Generated + cached server-side from the same Assimp decode as the turntable thumbnail, so it
+/// covers the full professional format range with textures. `Unsupported` (415) for non-models.
+async fn asset_preview_mesh(
+    Reader(ctx): Reader,
+    State(st): State<AppState>,
+    AxPath(id): AxPath<String>,
+) -> Result<Response, ApiError> {
+    let id: AssetId = parse_id(&id, "asset")?;
+    let content = st.lib.read_model_preview(&ctx, &id).await?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, content.content_type),
+            (header::CACHE_CONTROL, "private, max-age=300".to_string()),
         ],
         Body::from(content.bytes),
     )

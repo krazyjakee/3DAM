@@ -1,0 +1,12 @@
+# The repo otherwise runs on Rust defaults (no config), but Assimp's Draco decoder is a build-time
+# CMake option and there is no other reproducible hook: `russimp-sys-ng`'s build script hardcodes its
+# cmake defines and runs *before* any `dam-*` build script, so the flag must reach cmake via the
+# environment. The `cmake` crate reads CMAKE_TOOLCHAIN_FILE, and a toolchain file is loaded early
+# enough to force Assimp's `ASSIMP_BUILD_DRACO` cache variable on. See
+# `crates/3dam-render/assimp-draco.cmake` and ADR 0011.
+#
+# Effect: `KHR_draco_mesh_compression` glTF/GLB (Unreal/Blender/gltfpack/asset-pack exports) now
+# decode + thumbnail instead of failing to the typed tile. Only `russimp-sys-ng` invokes cmake, so
+# this env var affects nothing else in the workspace.
+[env]
+CMAKE_TOOLCHAIN_FILE = { value = "crates/3dam-render/assimp-draco.cmake", relative = true, force = true }

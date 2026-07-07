@@ -200,7 +200,8 @@ export function ContextMenu({
         <div className="px-3 py-1.5">
           <p className="mb-2 text-[10px] text-fg-dim">
             Remove {single ? "this asset" : `${assets.length} assets`} from the catalog? The source
-            file{single ? "" : "s"} won’t be deleted.
+            file{single ? "" : "s"} won’t be deleted. <span className="text-fg-muted">Block</span>{" "}
+            also removes every byte-identical copy and skips those bytes on future scans.
           </p>
           <div className="flex flex-col gap-1">
             <button

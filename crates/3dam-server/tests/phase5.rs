@@ -7,15 +7,18 @@
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use dam_server::{router, ServerStore, WriteGate};
 use dam_core::EmbeddedLibrary;
+use dam_server::{router, ServerStore, WriteGate};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tower::ServiceExt;
 
 fn unique_tmp() -> std::path::PathBuf {
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     std::env::temp_dir().join(format!("3dam-phase5-{}-{}", std::process::id(), nanos))
 }
 
@@ -47,7 +50,9 @@ async fn call(
     };
     let resp = app.clone().oneshot(req).await.unwrap();
     let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let val = if bytes.is_empty() {
         Value::Null
     } else {
@@ -56,7 +61,12 @@ async fn call(
     (status, val)
 }
 
-async fn rpc(app: &axum::Router, token: Option<&str>, method: &str, params: Value) -> (StatusCode, Value) {
+async fn rpc(
+    app: &axum::Router,
+    token: Option<&str>,
+    method: &str,
+    params: Value,
+) -> (StatusCode, Value) {
     call(
         app,
         "POST",
@@ -199,7 +209,11 @@ async fn confirm_gate_and_concurrency_on_store() {
     let err = store
         .set_flag(
             FlagKey::McpServer,
-            SetFlag { value: FlagValue::Mcp(McpMode::ReadWrite), expected_version: None, confirm: false },
+            SetFlag {
+                value: FlagValue::Mcp(McpMode::ReadWrite),
+                expected_version: None,
+                confirm: false,
+            },
             "t",
         )
         .unwrap_err();
@@ -208,7 +222,11 @@ async fn confirm_gate_and_concurrency_on_store() {
     let info = store
         .set_flag(
             FlagKey::McpServer,
-            SetFlag { value: FlagValue::Mcp(McpMode::ReadWrite), expected_version: None, confirm: true },
+            SetFlag {
+                value: FlagValue::Mcp(McpMode::ReadWrite),
+                expected_version: None,
+                confirm: true,
+            },
             "t",
         )
         .unwrap();
@@ -218,7 +236,11 @@ async fn confirm_gate_and_concurrency_on_store() {
     let err = store
         .set_flag(
             FlagKey::Authentication,
-            SetFlag { value: FlagValue::Auth(AuthMode::Token), expected_version: Some(5), confirm: false },
+            SetFlag {
+                value: FlagValue::Auth(AuthMode::Token),
+                expected_version: Some(5),
+                confirm: false,
+            },
             "t",
         )
         .unwrap_err();
@@ -226,7 +248,107 @@ async fn confirm_gate_and_concurrency_on_store() {
 
     // The audit log recorded the applied change.
     let audit = store.list_audit(10).unwrap();
-    assert!(audit.iter().any(|e| e.action == "flag.set" && e.target.as_deref() == Some("mcp_server")));
+    assert!(audit
+        .iter()
+        .any(|e| e.action == "flag.set" && e.target.as_deref() == Some("mcp_server")));
+}
+
+// ── storage & maintenance routes (tech-spec 10 §5) ───────────────────────────
+
+#[tokio::test]
+async fn maintenance_usage_wipe_gate_and_audit() {
+    let (app, store, _lib) = harness(true).await;
+
+    // Usage is reachable and well-formed on an empty library.
+    let (st, usage) = call(&app, "GET", "/admin/api/maintenance/usage", None, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(usage["asset_count"], 0);
+    assert!(usage["thumbnails"]["files"].is_number());
+
+    // Clearing caches on a cold cache succeeds (nothing to free).
+    let (st, cache) = call(
+        &app,
+        "POST",
+        "/admin/api/maintenance/clear-cache",
+        None,
+        Some(json!({ "target": "all" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(cache["files_deleted"], 0);
+
+    // Wipe without confirm is rejected — the machine form of warn-and-confirm.
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/admin/api/maintenance/wipe",
+        None,
+        Some(json!({ "confirm": false })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    // With confirm it runs and reports (empty catalog → zero removed).
+    let (st, wipe) = call(
+        &app,
+        "POST",
+        "/admin/api/maintenance/wipe",
+        None,
+        Some(json!({ "confirm": true })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(wipe["assets_removed"], 0);
+
+    // Every mutating maintenance op left an audit trail.
+    let audit = store.list_audit(20).unwrap();
+    assert!(audit.iter().any(|e| e.action == "maintenance.clear_cache"));
+    assert!(audit.iter().any(|e| e.action == "maintenance.wipe"));
+}
+
+#[tokio::test]
+async fn factory_reset_requires_confirm_and_erases_tokens() {
+    let (app, store, _lib) = harness(true).await;
+
+    // A token exists before the reset.
+    store
+        .create_token(
+            dam_api::admin::NewToken {
+                label: "doomed".into(),
+                scopes: dam_api::service::Scopes::none().with(dam_api::service::Scope::Read),
+                expires: None,
+            },
+            "test",
+        )
+        .unwrap();
+    assert_eq!(store.list_tokens().unwrap().len(), 1);
+
+    // Without confirm → rejected.
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/admin/api/maintenance/factory-reset",
+        None,
+        Some(json!({ "confirm": false })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    // With confirm → tokens erased and the audit log holds just the reset entry.
+    let (st, report) = call(
+        &app,
+        "POST",
+        "/admin/api/maintenance/factory-reset",
+        None,
+        Some(json!({ "confirm": true })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(report["tokens_removed"], 1);
+    assert!(store.list_tokens().unwrap().is_empty());
+    let audit = store.list_audit(20).unwrap();
+    assert_eq!(audit.len(), 1);
+    assert_eq!(audit[0].action, "maintenance.factory_reset");
 }
 
 // ── MCP endpoint mount/unmount + write gating ────────────────────────────────
@@ -242,7 +364,15 @@ async fn mcp_off_is_404_then_mounts_and_gates_writes() {
 
     // ReadOnly ⇒ mounted; initialize works; tools/list has read tools but no write tools.
     store
-        .set_flag(FlagKey::McpServer, SetFlag { value: FlagValue::Mcp(McpMode::ReadOnly), expected_version: None, confirm: false }, "t")
+        .set_flag(
+            FlagKey::McpServer,
+            SetFlag {
+                value: FlagValue::Mcp(McpMode::ReadOnly),
+                expected_version: None,
+                confirm: false,
+            },
+            "t",
+        )
         .unwrap();
     let (st, body) = rpc(&app, None, "initialize", json!({})).await;
     assert_eq!(st, StatusCode::OK);
@@ -256,11 +386,22 @@ async fn mcp_off_is_404_then_mounts_and_gates_writes() {
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
     assert!(names.contains(&"search".to_string()));
-    assert!(!names.contains(&"convert".to_string()), "read-only must hide write tools");
+    assert!(
+        !names.contains(&"convert".to_string()),
+        "read-only must hide write tools"
+    );
 
     // ReadWrite ⇒ write tools appear (localhost owner holds Write; gate permits).
     store
-        .set_flag(FlagKey::McpServer, SetFlag { value: FlagValue::Mcp(McpMode::ReadWrite), expected_version: None, confirm: true }, "t")
+        .set_flag(
+            FlagKey::McpServer,
+            SetFlag {
+                value: FlagValue::Mcp(McpMode::ReadWrite),
+                expected_version: None,
+                confirm: true,
+            },
+            "t",
+        )
         .unwrap();
     let (_, body) = rpc(&app, None, "tools/list", json!({})).await;
     let names: Vec<String> = body["result"]["tools"]
@@ -269,7 +410,10 @@ async fn mcp_off_is_404_then_mounts_and_gates_writes() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert!(names.contains(&"convert".to_string()), "read-write must expose write tools");
+    assert!(
+        names.contains(&"convert".to_string()),
+        "read-write must expose write tools"
+    );
     assert!(names.contains(&"add_source".to_string()));
 }
 
@@ -284,13 +428,19 @@ async fn mcp_adapter_stdio_is_locally_trusted() {
 
     // A notification (no id) yields no reply.
     let none = adapter
-        .handle_message(&ctx, json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+        .handle_message(
+            &ctx,
+            json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        )
         .await;
     assert!(none.is_none());
 
     // stdio is locally trusted → write tools are present.
     let reply = adapter
-        .handle_message(&ctx, json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
+        .handle_message(
+            &ctx,
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+        )
         .await
         .unwrap();
     let names: Vec<String> = reply["result"]["tools"]
@@ -315,8 +465,17 @@ async fn mcp_adapter_stdio_is_locally_trusted() {
 
     // resource templates advertise the asset/source/collection addressing.
     let reply = adapter
-        .handle_message(&ctx, json!({"jsonrpc": "2.0", "id": 3, "method": "resources/templates/list"}))
+        .handle_message(
+            &ctx,
+            json!({"jsonrpc": "2.0", "id": 3, "method": "resources/templates/list"}),
+        )
         .await
         .unwrap();
-    assert!(reply["result"]["resourceTemplates"].as_array().unwrap().len() >= 3);
+    assert!(
+        reply["result"]["resourceTemplates"]
+            .as_array()
+            .unwrap()
+            .len()
+            >= 3
+    );
 }

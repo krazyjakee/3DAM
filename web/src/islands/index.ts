@@ -14,11 +14,10 @@
 export interface ModelViewerHandle {
   /** Backend actually chosen: `"webgpu"` or `"webgl2"`. */
   readonly backend: string;
-  /** Decode + display glTF/GLB bytes (self-contained GLB is the common preview case). */
-  loadModel(bytes: Uint8Array): void;
-  /** Loose glTF (#56): the `.gltf` JSON + one resolved buffer per glTF buffer, in index order
-   *  (the DOM fetches external `.bin`/data-URI buffers and passes their bytes here). */
-  loadGltfExternal(json: Uint8Array, buffers: Uint8Array[]): void;
+  /** Decode + display a server-produced `DMSH` preview blob (geometry + PBR materials + textures).
+   *  Decoded server-side from any Assimp format and self-contained, so the DOM hands it straight in
+   *  with no buffer/texture resolution. */
+  loadPreviewMesh(bytes: Uint8Array): void;
   /** Orbit + zoom. `yaw`/`pitch` in radians; `zoom` multiplies the bounds-fit distance. */
   setCamera(yaw: number, pitch: number, zoom: number): void;
   /** New canvas backing size in device pixels — call on container resize (CSS owns layout). */

@@ -1,12 +1,13 @@
 //! `ModelViewer` — the interactive 3D viewer island.
 //!
 //! Implements the ratified wasm-bindgen contract (ADR 0009 §9 / tech-spec 09 §B.3):
-//! `create(canvas)` (async init) · `load_model(bytes)` · `set_camera(yaw, pitch, zoom)` ·
+//! `create(canvas)` (async init) · `load_preview_mesh(bytes)` · `set_camera(yaw, pitch, zoom)` ·
 //! `resize(w, h)` · `free()` (wasm-bindgen's generated destructor = the contract's `drop`).
 //!
-//! The DOM owns data and chrome: it fetches GLB bytes over the file-03 API and hands them in; orbit
-//! controls are DOM and call `set_camera`. State changes just mark the view dirty — the island's own
-//! rAF loop ([`crate::raf`]) redraws only when needed, so a static model costs no GPU per frame.
+//! The DOM owns data and chrome: it fetches the server-decoded `DMSH` preview blob over the file-03
+//! API and hands it in; orbit controls are DOM and call `set_camera`. State changes just mark the
+//! view dirty — the island's own rAF loop ([`crate::raf`]) redraws only when needed, so a static
+//! model costs no GPU per frame.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -15,8 +16,8 @@ use wasm_bindgen::prelude::*;
 use web_sys::HtmlCanvasElement;
 
 use crate::camera::{Aabb, OrbitCamera};
-use crate::gltf_load;
 use crate::gpu::GpuContext;
+use crate::preview_mesh;
 use crate::raf::{self, RafHandle};
 use crate::scene::ModelRenderer;
 
@@ -76,15 +77,19 @@ impl ModelViewer {
         Ok(ModelViewer { inner, _raf: raf })
     }
 
-    /// Decode + upload glTF/GLB bytes, then re-fit the camera to the new bounds. `Err` (bad/loose
-    /// glTF) leaves any previously loaded model on screen.
-    #[wasm_bindgen(js_name = loadModel)]
-    pub fn load_model(&self, bytes: &[u8]) -> Result<(), JsValue> {
-        let cpu = gltf_load::load(bytes).map_err(js_err)?;
+    /// Decode + upload a server-produced `DMSH` preview blob (geometry + PBR materials + textures),
+    /// then re-fit the camera to the new bounds. The blob is decoded server-side from *any* Assimp
+    /// format (glTF/GLB, FBX, OBJ, DAE, …) and is self-contained, so the browser never resolves
+    /// external buffers/textures. `Err` (truncated/undecodable blob) leaves any current model on
+    /// screen.
+    #[wasm_bindgen(js_name = loadPreviewMesh)]
+    pub fn load_preview_mesh(&self, bytes: &[u8]) -> Result<(), JsValue> {
+        let model = preview_mesh::parse(bytes).map_err(js_err)?;
         log::info!(
-            "dam-viewer: loaded model — {} verts, {} indices",
-            cpu.vertices.len(),
-            cpu.indices.len()
+            "dam-viewer: loaded preview — {} submeshes, {} materials, {} textures",
+            model.submeshes.len(),
+            model.materials.len(),
+            model.textures.len()
         );
         let mut inner = self.inner.borrow_mut();
         let Inner {
@@ -93,41 +98,8 @@ impl ModelViewer {
             camera,
             dirty,
         } = &mut *inner;
-        renderer.upload(ctx, &cpu);
-        camera.set_bounds(cpu.bounds);
-        *dirty = true;
-        Ok(())
-    }
-
-    /// Load a loose glTF whose buffers are external files (issue #56): `json` is the `.gltf` text and
-    /// `buffers` is a JS array of `Uint8Array`, one per glTF buffer in index order, already resolved
-    /// by the DOM (data-URIs decoded, external files fetched via `/assets/{id}/related`). Same upload +
-    /// re-fit as `loadModel`.
-    #[wasm_bindgen(js_name = loadGltfExternal)]
-    pub fn load_gltf_external(&self, json: &[u8], buffers: js_sys::Array) -> Result<(), JsValue> {
-        use wasm_bindgen::JsCast;
-        let mut bufs: Vec<Vec<u8>> = Vec::with_capacity(buffers.length() as usize);
-        for v in buffers.iter() {
-            let arr: js_sys::Uint8Array = v
-                .dyn_into()
-                .map_err(|_| js_err("buffers must be Uint8Array".to_string()))?;
-            bufs.push(arr.to_vec());
-        }
-        let cpu = gltf_load::load_external(json, bufs).map_err(js_err)?;
-        log::info!(
-            "dam-viewer: loaded loose glTF — {} verts, {} indices",
-            cpu.vertices.len(),
-            cpu.indices.len()
-        );
-        let mut inner = self.inner.borrow_mut();
-        let Inner {
-            ctx,
-            renderer,
-            camera,
-            dirty,
-        } = &mut *inner;
-        renderer.upload(ctx, &cpu);
-        camera.set_bounds(cpu.bounds);
+        renderer.upload(ctx, &model);
+        camera.set_bounds(model.bounds);
         *dirty = true;
         Ok(())
     }

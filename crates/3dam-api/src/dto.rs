@@ -260,6 +260,11 @@ pub struct ModelAttributes {
     pub material_count: Option<i64>,
     #[serde(default)]
     pub texture_count: Option<i64>,
+    /// On-disk bytes of the model's external companion files — textures, glTF `.bin` buffers, an
+    /// OBJ's `.mtl` and its maps. The asset's reported `size` adds this to the mesh container so it
+    /// reflects the whole asset; `None`/absent for self-contained (embedded) models.
+    #[serde(default)]
+    pub dependency_bytes: Option<i64>,
     #[serde(default)]
     pub has_rig: Option<bool>,
     #[serde(default)]

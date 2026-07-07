@@ -192,6 +192,18 @@ pub trait LibraryService: Send + Sync {
         max_edge: u32,
     ) -> Result<AssetContent, LibError>;
 
+    /// Read (generating + caching on miss) the interactive 3D preview for a **model** asset: a
+    /// compact self-contained `DMSH` mesh blob (geometry + PBR materials + downscaled textures) that
+    /// the WASM viewer island uploads directly (tech-spec 09 §B.3). Decoded once server-side via the
+    /// same Assimp path as the turntable thumbnail, so it covers the full professional format range
+    /// with textures. Non-model assets — or a build without the server `render` feature — return
+    /// `Unsupported`. Returned as an `AssetContent` with `model/x-dam-preview`.
+    async fn read_model_preview(
+        &self,
+        ctx: &AuthContext,
+        id: &AssetId,
+    ) -> Result<AssetContent, LibError>;
+
     async fn library_stats(&self, ctx: &AuthContext) -> Result<LibraryStats, LibError>;
 
     // ── convert (tech-spec 08) ───────────────────────────────────────────────

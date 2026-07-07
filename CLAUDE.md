@@ -83,7 +83,7 @@ Packages are named `dam-*` (Cargo forbids leading digits); directories are brand
 
 ## Developer workflow
 
-MSRV **1.85**, edition 2021, resolver 2. No `.cargo/config.toml`, `rustfmt.toml`, `clippy.toml`, or `deny.toml` — Rust defaults apply.
+MSRV **1.85**, edition 2021, resolver 2. No `rustfmt.toml`, `clippy.toml`, or `deny.toml` — Rust defaults apply. The one `.cargo/config.toml` exists solely to force Assimp's Draco decoder on at build time via `CMAKE_TOOLCHAIN_FILE` (see [ADR 0011](docs/adr/0011-assimp-import-backend.md)); it affects only the `russimp-sys-ng` cmake build.
 
 ### Build & run
 

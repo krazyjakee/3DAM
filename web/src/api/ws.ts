@@ -52,18 +52,38 @@ export function useLiveUpdates(): void {
           qc.invalidateQueries({ queryKey: qk.assets });
           qc.invalidateQueries({ queryKey: qk.stats });
           qc.invalidateQueries({ queryKey: qk.duplicates });
+          // The open Inspector reads a single asset under ["asset", id] and its neighbours under
+          // ["similar", id] — distinct roots from the grid's ["assets"]. Invalidate them too so an
+          // analyze/convert that mutates the inspected asset refreshes the panel without a reload.
+          qc.invalidateQueries({ queryKey: ["asset"] });
+          qc.invalidateQueries({ queryKey: ["similar"] });
           break;
         case "source_state":
           qc.invalidateQueries({ queryKey: qk.sources });
           break;
+        case "catalog_reset":
+          // A maintenance wipe/factory-reset cleared the whole catalog — invalidate everything so
+          // open grids/inspectors empty live rather than showing stale rows.
+          qc.invalidateQueries({ queryKey: qk.assets });
+          qc.invalidateQueries({ queryKey: qk.stats });
+          qc.invalidateQueries({ queryKey: qk.sources });
+          qc.invalidateQueries({ queryKey: qk.duplicates });
+          qc.invalidateQueries({ queryKey: qk.jobs });
+          qc.invalidateQueries({ queryKey: ["asset"] });
+          qc.invalidateQueries({ queryKey: ["similar"] });
+          break;
         case "job_progress":
           qc.invalidateQueries({ queryKey: qk.jobs });
-          // A finished scan changes the catalogue — refresh the grid + counts.
+          // A finished job (scan, analyze, convert…) changes the catalogue — refresh the grid +
+          // counts, plus the inspected asset and its neighbours so an analyze run surfaces its new
+          // attributes / tags / similarity results in the open Inspector without a manual reload.
           if (ev.state === "done") {
             qc.invalidateQueries({ queryKey: qk.assets });
             qc.invalidateQueries({ queryKey: qk.stats });
             qc.invalidateQueries({ queryKey: qk.sources });
             qc.invalidateQueries({ queryKey: qk.duplicates });
+            qc.invalidateQueries({ queryKey: ["asset"] });
+            qc.invalidateQueries({ queryKey: ["similar"] });
           }
           break;
       }

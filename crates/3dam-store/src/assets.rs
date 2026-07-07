@@ -102,12 +102,13 @@ impl Store {
             MediaAttributes::Model(m) => {
                 conn.execute(
                     "INSERT INTO model_attr (asset_id, vertex_count, triangle_count, mesh_count,
-                        material_count, texture_count, has_rig, has_animation, has_uv)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                        material_count, texture_count, dependency_bytes, has_rig, has_animation, has_uv)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                      ON CONFLICT(asset_id) DO UPDATE SET
                         vertex_count=excluded.vertex_count, triangle_count=excluded.triangle_count,
                         mesh_count=excluded.mesh_count, material_count=excluded.material_count,
-                        texture_count=excluded.texture_count, has_rig=excluded.has_rig,
+                        texture_count=excluded.texture_count, dependency_bytes=excluded.dependency_bytes,
+                        has_rig=excluded.has_rig,
                         has_animation=excluded.has_animation, has_uv=excluded.has_uv",
                     params![
                         key,
@@ -116,6 +117,7 @@ impl Store {
                         m.mesh_count,
                         m.material_count,
                         m.texture_count,
+                        m.dependency_bytes,
                         m.has_rig.map(|b| b as i64),
                         m.has_animation.map(|b| b as i64),
                         m.has_uvs.map(|b| b as i64),
@@ -188,7 +190,8 @@ impl Store {
             MediaType::Model => conn
                 .query_row(
                     "SELECT vertex_count, triangle_count, mesh_count, material_count, texture_count,
-                            has_rig, has_animation, has_uv, class FROM model_attr WHERE asset_id = ?1",
+                            dependency_bytes, has_rig, has_animation, has_uv, class
+                     FROM model_attr WHERE asset_id = ?1",
                     params![id_blob],
                     |r| {
                         Ok(ModelAttributes {
@@ -197,10 +200,11 @@ impl Store {
                             mesh_count: r.get(2)?,
                             material_count: r.get(3)?,
                             texture_count: r.get(4)?,
-                            has_rig: r.get::<_, Option<i64>>(5)?.map(|v| v != 0),
-                            has_animation: r.get::<_, Option<i64>>(6)?.map(|v| v != 0),
-                            has_uvs: r.get::<_, Option<i64>>(7)?.map(|v| v != 0),
-                            class: r.get(8)?,
+                            dependency_bytes: r.get(5)?,
+                            has_rig: r.get::<_, Option<i64>>(6)?.map(|v| v != 0),
+                            has_animation: r.get::<_, Option<i64>>(7)?.map(|v| v != 0),
+                            has_uvs: r.get::<_, Option<i64>>(8)?.map(|v| v != 0),
+                            class: r.get(9)?,
                         })
                     },
                 )
@@ -230,6 +234,11 @@ impl Store {
         let mut asset = asset.ok_or_else(|| LibError::NotFound(format!("asset {id}")))?;
         // Attach the cheap-tier media attributes from the per-type table (tech-spec 04 §5).
         asset.attributes = Self::load_media_attrs(&conn, id.as_bytes(), asset.summary.media);
+        // `row_to_asset` sets `size` to the mesh container alone; fold in a model's external
+        // companion files so the inspector shows the whole-asset size the grid also reports.
+        if let MediaAttributes::Model(m) = &asset.attributes {
+            asset.summary.size += m.dependency_bytes.unwrap_or(0).max(0) as u64;
+        }
         // Attach tags (suggested + confirmed + rejected) and surface confirmed ones on the summary.
         asset.tags = Self::load_tags(&conn, id.as_bytes());
         asset.summary.top_tags = asset

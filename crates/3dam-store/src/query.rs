@@ -27,7 +27,14 @@ impl Store {
             SortField::Relevance | SortField::Name => {
                 (format!("filename {dir}, asset.id ASC"), Vec::new())
             }
-            SortField::Size => (format!("size_bytes {dir}, asset.id ASC"), Vec::new()),
+            SortField::Size => (
+                // Sort on the whole-asset size (mesh + external companion files), matching what the
+                // grid shows; COALESCE keeps non-models (no model_attr row) on their own size.
+                format!(
+                    "(size_bytes + COALESCE(model_attr.dependency_bytes, 0)) {dir}, asset.id ASC"
+                ),
+                Vec::new(),
+            ),
             SortField::Scanned => (format!("scanned_at {dir}, asset.id ASC"), Vec::new()),
         };
 
@@ -45,7 +52,8 @@ impl Store {
         // attributes (dimensions / duration / triangles) without an N+1 fetch. Column names stay
         // unambiguous across the joined tables, so the bare-name filters above keep working.
         let sql = format!(
-            "SELECT asset.id, filename, media_type, format, size_bytes, license_id, license_status,
+            "SELECT asset.id, filename, media_type, format,
+                    size_bytes + COALESCE(model_attr.dependency_bytes, 0), license_id, license_status,
                     image_attr.width, image_attr.height, audio_attr.duration_ms, model_attr.triangle_count,
                     audio_attr.class
              FROM asset

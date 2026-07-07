@@ -92,7 +92,13 @@ code (captured in [3d-handler-notes.md](../3d-handler-notes.md)):
   **✅ Passed (2026-07-06)** — `wgpu 30` renders headless (no surface) to a PNG with no per-OS
   branch, and Mesa **lavapipe** (Vulkan software raster, `device_type == Cpu`) produces a frame
   identical to the RTX 3090 output. See [`spikes/headless-render/`](../../spikes/headless-render/README.md).
-  Caveat: software was forced on a GPU-equipped box (VK_ICD/`force_fallback_adapter`); confirm on
-  genuinely GPU-less hardware before final sign-off.
+  The spike is now **productionised** in `dam-render` (device fallback ladder + offscreen readback →
+  PNG), which drives the 3D-model grid thumbnails served by `serve`. The renderer's own test
+  (`crates/3dam-render/tests/render.rs`) exercises the same fallback ladder headlessly and skips
+  fail-soft when no adapter exists. The software path is verified by running that test (and the
+  `dam-core` end-to-end `model_thumbnail` test) with the Vulkan ICD pinned to **lavapipe**
+  (`VK_ICD_FILENAMES=…/lvp_icd.json`): the render matches the discrete-GPU output, substantially
+  closing the earlier "confirm on genuinely GPU-less hardware" caveat. Wiring this pinned run into an
+  automated gate is a follow-up (there is no `ci.yml` yet; `cargo xtask ci` is the local gate).
 - Record the GUI toolkit choice (egui vs Iced) separately; both sit on wgpu, so this ADR is
   independent of that one.

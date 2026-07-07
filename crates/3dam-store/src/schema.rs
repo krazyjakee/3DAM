@@ -190,4 +190,13 @@ pub const MIGRATIONS: &[&str] = &[
         blocked_at   INTEGER NOT NULL
     ) STRICT;
     "#,
+    // ── V5: a model's external companion-file footprint (tech-spec 04 §4.1) ──────────────────────
+    // `asset.size_bytes` stays the mesh container's own size (it is the delta-scan change token, and
+    // must match the filesystem entry). This holds the summed on-disk bytes of the *referenced*
+    // files a model pulls in — external textures, glTF `.bin` buffers, an OBJ's `.mtl` + maps — so
+    // the reported asset size (`size_bytes + dependency_bytes`) reflects the whole asset. NULL for
+    // self-contained models (GLB/STL/PLY) and non-models.
+    r#"
+    ALTER TABLE model_attr ADD COLUMN dependency_bytes INTEGER;
+    "#,
 ];

@@ -182,7 +182,8 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT asset.id, filename, media_type, format, size_bytes, license_id, license_status,
+                "SELECT asset.id, filename, media_type, format,
+                        size_bytes + COALESCE(model_attr.dependency_bytes, 0), license_id, license_status,
                         image_attr.width, image_attr.height, audio_attr.duration_ms, model_attr.triangle_count,
                         audio_attr.class
                  FROM collection_member cm
