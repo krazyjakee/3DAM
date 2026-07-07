@@ -120,8 +120,8 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
         </button>
         <button
           className="btn px-1.5 py-1 coarse:min-h-11 coarse:min-w-11 coarse:justify-center"
-          title="Rescan all sources"
-          aria-label="Rescan all sources"
+          title="Quick rescan — changed files only (all sources)"
+          aria-label="Quick rescan all sources (changed files only)"
           onClick={() => scan.mutate({ mode: "delta" })}
           disabled={scan.isPending}
         >
@@ -195,7 +195,7 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
           className="mx-3 my-1 rounded border border-dashed border-border px-2 py-2 text-center text-[11px] text-fg-dim hover:border-accent hover:text-accent"
           onClick={() => setShowAdd(true)}
         >
-          + Add a folder to scan
+          + Add a source to scan
         </button>
       )}
       {sources.data?.map((s) => (
@@ -471,7 +471,8 @@ function SourceRow({
       <div className="hidden items-center gap-1 group-hover:flex coarse:flex">
         <button
           className="flex items-center justify-center text-fg-dim hover:text-accent coarse:min-h-11 coarse:min-w-11"
-          title="Rescan"
+          title="Full rescan — re-read every file in this source"
+          aria-label="Full rescan this source"
           onClick={onRescan}
         >
           <RefreshCw size={12} className={scanning ? "animate-spin" : ""} />

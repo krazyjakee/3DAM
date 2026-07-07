@@ -1,10 +1,21 @@
 import type React from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { FileCog, FileDown, LayoutGrid, Menu, Rows3, Search, Sparkles, X } from "lucide-react";
+import {
+  FileCog,
+  FileDown,
+  LayoutGrid,
+  Loader2,
+  Menu,
+  Rows3,
+  Search,
+  Sparkles,
+  X,
+} from "lucide-react";
 import { useAnalyze, useAssets, useCollectionMembers, useCollections } from "@/api/queries";
 import type { AssetSummary, SortField } from "@/api/types";
 import { useViewState } from "@/lib/view-state";
+import { useDebounced } from "@/lib/use-debounced";
 import { bytes } from "@/lib/format";
 import { requestAutoplay } from "@/lib/audio-intent";
 import { Thumbnail } from "./Thumbnail";
@@ -30,7 +41,16 @@ const ROW_H = COARSE_POINTER ? 44 : 30;
 
 export function Browser({ onOpenNav }: { onOpenNav?: () => void }) {
   const { state, patch, request } = useViewState();
-  const assets = useAssets(request, state.collection);
+  // Debounce the *derived* search text so the field stays instant but `/query` only refetches once
+  // typing settles (issue #33). The other facets apply immediately; only free-text is debounced.
+  const debouncedText = useDebounced(state.q, 300);
+  const searchReq = useMemo(
+    () => ({ ...request, text: debouncedText.trim() || null }),
+    [request, debouncedText],
+  );
+  const assets = useAssets(searchReq, state.collection);
+  // A search is pending while the field's text hasn't yet been applied to the query.
+  const searching = state.q.trim() !== debouncedText.trim();
   const [menu, setMenu] = useState<MenuState | null>(null);
   // Multi-selection lives here (Browser-local, not the URL): the ids to batch-act on. Distinct from
   // the single Inspector focus (`state.selected`). `anchor` is the pivot for shift-range.
@@ -134,7 +154,7 @@ export function Browser({ onOpenNav }: { onOpenNav?: () => void }) {
 
   return (
     <section className="flex h-full min-w-0 flex-1 flex-col bg-bg">
-      <Toolbar count={items.length} total={total} onOpenNav={onOpenNav} />
+      <Toolbar count={items.length} total={total} onOpenNav={onOpenNav} searching={searching} />
       {selection.size > 1 && (
         <SelectionBar
           assets={selectedAssets}
@@ -250,10 +270,12 @@ function Toolbar({
   count,
   total,
   onOpenNav,
+  searching,
 }: {
   count: number;
   total: number | null;
   onOpenNav?: () => void;
+  searching?: boolean;
 }) {
   const { state, patch, request } = useViewState();
   const [showExport, setShowExport] = useState(false);
@@ -278,13 +300,22 @@ function Toolbar({
           // exits collection mode (mirrors the sidebar's mutual-exclusion).
           onChange={(e) => patch({ q: e.target.value, collection: null })}
         />
-        {state.q && (
-          <button
-            className="absolute top-1/2 right-2 -translate-y-1/2 text-fg-dim hover:text-fg"
-            onClick={() => patch({ q: "" })}
-          >
-            <X size={13} />
-          </button>
+        {searching ? (
+          <Loader2
+            size={13}
+            className="absolute top-1/2 right-2 -translate-y-1/2 animate-spin text-fg-dim"
+            aria-label="Searching…"
+          />
+        ) : (
+          state.q && (
+            <button
+              className="absolute top-1/2 right-2 -translate-y-1/2 text-fg-dim hover:text-fg"
+              onClick={() => patch({ q: "" })}
+              aria-label="Clear search"
+            >
+              <X size={13} />
+            </button>
+          )
         )}
       </div>
 
