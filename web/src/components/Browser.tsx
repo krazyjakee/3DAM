@@ -437,13 +437,15 @@ function Grid({
   );
 }
 
-/** The one cheap media attribute worth showing on a grid row (from the store's `key_attrs`):
- *  image dimensions, audio duration, or model triangle count. */
-function primaryAttr(asset: AssetSummary): string | null {
+/** The media-specific "detail" from the store's `key_attrs` — image dimensions, audio duration
+ *  (with a loop marker when analysis classed it so), or model triangle count (issue #55). One value
+ *  per media type so a mixed grid/table has a single meaningful column. */
+function detailAttr(asset: AssetSummary): string | null {
   const k = asset.key_attrs;
-  if (k.dimensions) return k.dimensions;
-  if (k.duration) return k.duration;
-  if (k.tris) return `${k.tris} tris`;
+  if (asset.media === "image") return k.dimensions ?? null;
+  if (asset.media === "audio")
+    return k.duration ? (k.loop ? `${k.duration} · loop` : k.duration) : k.loop ? "loop" : null;
+  if (asset.media === "model") return k.tris ? `${k.tris} tris` : null;
   return null;
 }
 
@@ -490,7 +492,7 @@ function GridCell({
       <div className="flex items-center justify-between px-1.5 pb-1">
         <LicenseBadge badge={asset.license} />
         <span className="text-[10px] text-fg-dim tabular-nums">
-          {primaryAttr(asset) ? `${primaryAttr(asset)} · ${bytes(asset.size)}` : bytes(asset.size)}
+          {detailAttr(asset) ? `${detailAttr(asset)} · ${bytes(asset.size)}` : bytes(asset.size)}
         </span>
       </div>
     </button>
@@ -519,10 +521,11 @@ function Table({
 
   return (
     <div ref={parentRef} className="h-full overflow-y-auto">
-      <div className="sticky top-0 z-10 grid grid-cols-[1fr_90px_110px_90px] gap-2 border-b border-border bg-surface px-3 py-1.5 text-[10px] font-semibold tracking-wider text-fg-dim uppercase">
+      <div className="sticky top-0 z-10 grid grid-cols-[1fr_64px_104px_112px_84px] gap-2 border-b border-border bg-surface px-3 py-1.5 text-[10px] font-semibold tracking-wider text-fg-dim uppercase">
         <span>Name</span>
         <span>Format</span>
         <span>License</span>
+        <span>Detail</span>
         <span className="text-right">Size</span>
       </div>
       <div style={{ height: virt.getTotalSize(), position: "relative" }}>
@@ -571,7 +574,7 @@ function TableRow({
         onContext(asset, e.clientX, e.clientY);
       }}
       {...longPress}
-      className="absolute top-0 left-0 grid w-full grid-cols-[1fr_90px_110px_90px] items-center gap-2 px-3 text-left text-xs"
+      className="absolute top-0 left-0 grid w-full grid-cols-[1fr_64px_104px_112px_84px] items-center gap-2 px-3 text-left text-xs"
       style={{
         height: ROW_H,
         transform: `translateY(${top}px)`,
@@ -587,6 +590,9 @@ function TableRow({
       </span>
       <span className="truncate uppercase">{asset.format}</span>
       <LicenseBadge badge={asset.license} />
+      <span className="truncate tabular-nums text-fg-dim" title={detailAttr(asset) ?? undefined}>
+        {detailAttr(asset) ?? "—"}
+      </span>
       <span className="text-right tabular-nums">{bytes(asset.size)}</span>
     </button>
   );

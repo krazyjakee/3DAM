@@ -183,7 +183,8 @@ impl Store {
         let mut stmt = conn
             .prepare(
                 "SELECT asset.id, filename, media_type, format, size_bytes, license_id, license_status,
-                        image_attr.width, image_attr.height, audio_attr.duration_ms, model_attr.triangle_count
+                        image_attr.width, image_attr.height, audio_attr.duration_ms, model_attr.triangle_count,
+                        audio_attr.class
                  FROM collection_member cm
                  JOIN asset ON asset.id = cm.asset_id
                  LEFT JOIN image_attr ON image_attr.asset_id = asset.id
@@ -240,6 +241,7 @@ impl Store {
         let height: Option<i64> = r.get(8)?;
         let duration_ms: Option<i64> = r.get(9)?;
         let tri_count: Option<i64> = r.get(10)?;
+        let audio_class: Option<String> = r.get(11)?;
         Ok(AssetSummary {
             id,
             name,
@@ -252,7 +254,14 @@ impl Store {
             },
             top_tags: Vec::new(),
             origin: Origin::Local,
-            key_attrs: grid_key_attrs(media, width, height, duration_ms, tri_count),
+            key_attrs: grid_key_attrs(
+                media,
+                width,
+                height,
+                duration_ms,
+                tri_count,
+                audio_class.as_deref(),
+            ),
         })
     }
 }

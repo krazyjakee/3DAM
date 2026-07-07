@@ -8,13 +8,16 @@ pub(crate) fn parse_connection(blob: &str) -> Result<SourceConnection, LibError>
         .map_err(|e| LibError::Internal(format!("corrupt source connection: {e}")))
 }
 
-/// images, duration for audio, triangle count for models. Cheap and best-effort.
+/// The couple of cheap per-media attributes shown on a grid tile / table row: dimensions for
+/// images, duration (+ a `loop` marker when the analysis classed it so) for audio, triangle count
+/// for models. Cheap and best-effort.
 pub(crate) fn grid_key_attrs(
     media: MediaType,
     width: Option<i64>,
     height: Option<i64>,
     duration_ms: Option<i64>,
     tri_count: Option<i64>,
+    audio_class: Option<&str>,
 ) -> SmallMap {
     let mut m = SmallMap::new();
     match media {
@@ -30,6 +33,11 @@ pub(crate) fn grid_key_attrs(
                     "duration".into(),
                     format!("{:.0}:{:02}", (secs / 60.0).floor(), (secs % 60.0) as i64),
                 );
+            }
+            // The cheap onset/loop classifier (analysis §4.2) marks longer clips as loops — surface
+            // it so the table/grid can show "loop" alongside the duration.
+            if audio_class == Some("loop") {
+                m.insert("loop".into(), "loop".into());
             }
         }
         MediaType::Model => {
