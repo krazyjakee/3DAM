@@ -83,10 +83,6 @@ impl Scopes {
     pub fn has(self, s: Scope) -> bool {
         self.0 & s.bit() != 0
     }
-    /// Narrow to the intersection (a token issued below its ceiling, tech-spec 10 §4.2).
-    pub fn intersect(self, other: Scopes) -> Self {
-        Scopes(self.0 & other.0)
-    }
     pub fn to_vec(self) -> Vec<Scope> {
         Scope::ALL.into_iter().filter(|s| self.has(*s)).collect()
     }

@@ -163,7 +163,7 @@ export function TilePreview({
             {mode === "cube" && (
               <button
                 onClick={() => setSpin((s) => !s)}
-                className="btn flex items-center gap-1.5 coarse:min-h-11"
+                className="btn flex items-center gap-1.5"
                 title={spin ? "Pause rotation" : "Auto-rotate"}
               >
                 {spin ? <Pause size={13} /> : <Play size={13} />}

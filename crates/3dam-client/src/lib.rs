@@ -185,6 +185,38 @@ impl ApiClient {
         }
     }
 
+    /// Send a GET expecting raw bytes (not JSON): map a transport failure to `SourceUnavailable`, an
+    /// error body / non-2xx to the right `LibError`, and on success return the response
+    /// `Content-Type` (if present) with the body. Callers reconstruct the typed `AssetContent`.
+    async fn fetch_bytes(
+        &self,
+        req: reqwest::RequestBuilder,
+    ) -> Result<(Option<String>, Vec<u8>), LibError> {
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| LibError::SourceUnavailable(e.to_string()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let bytes = resp.bytes().await.unwrap_or_default();
+            return match serde_json::from_slice::<ErrorBody>(&bytes) {
+                Ok(body) => Err(LibError::from_body(body)),
+                Err(_) => Err(LibError::Upstream(format!("HTTP {}", status.as_u16()))),
+            };
+        }
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| LibError::Upstream(e.to_string()))?
+            .to_vec();
+        Ok((content_type, bytes))
+    }
+
     async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, LibError> {
         let resp = self
             .http
@@ -324,31 +356,13 @@ impl LibraryService for ApiClient {
     ) -> Result<AssetContent, LibError> {
         // Raw bytes, not JSON — reconstruct `AssetContent` from the HTTP response. Media/format are
         // recovered from the `Content-Type` header (the server sets it via `content_type_for`).
-        let resp = self
-            .http
-            .get(self.url(&format!("/api/v1/assets/{id}/content"))?)
-            .send()
-            .await
-            .map_err(|e| LibError::SourceUnavailable(e.to_string()))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let bytes = resp.bytes().await.unwrap_or_default();
-            return match serde_json::from_slice::<ErrorBody>(&bytes) {
-                Ok(body) => Err(LibError::from_body(body)),
-                Err(_) => Err(LibError::Upstream(format!("HTTP {}", status.as_u16()))),
-            };
-        }
-        let content_type = resp
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("application/octet-stream")
-            .to_string();
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| LibError::Upstream(e.to_string()))?
-            .to_vec();
+        let (ct, bytes) = self
+            .fetch_bytes(
+                self.http
+                    .get(self.url(&format!("/api/v1/assets/{id}/content"))?),
+            )
+            .await?;
+        let content_type = ct.unwrap_or_else(|| "application/octet-stream".to_string());
         let (media, format) = media_from_content_type(&content_type);
         Ok(AssetContent {
             bytes,
@@ -364,32 +378,14 @@ impl LibraryService for ApiClient {
         id: &AssetId,
         rel: &str,
     ) -> Result<AssetContent, LibError> {
-        let resp = self
-            .http
-            .get(self.url(&format!("/api/v1/assets/{id}/related"))?)
-            .query(&[("path", rel)])
-            .send()
-            .await
-            .map_err(|e| LibError::SourceUnavailable(e.to_string()))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let bytes = resp.bytes().await.unwrap_or_default();
-            return match serde_json::from_slice::<ErrorBody>(&bytes) {
-                Ok(body) => Err(LibError::from_body(body)),
-                Err(_) => Err(LibError::Upstream(format!("HTTP {}", status.as_u16()))),
-            };
-        }
-        let content_type = resp
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("application/octet-stream")
-            .to_string();
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| LibError::Upstream(e.to_string()))?
-            .to_vec();
+        let (ct, bytes) = self
+            .fetch_bytes(
+                self.http
+                    .get(self.url(&format!("/api/v1/assets/{id}/related"))?)
+                    .query(&[("path", rel)]),
+            )
+            .await?;
+        let content_type = ct.unwrap_or_else(|| "application/octet-stream".to_string());
         let (media, format) = media_from_content_type(&content_type);
         Ok(AssetContent {
             bytes,
@@ -405,34 +401,15 @@ impl LibraryService for ApiClient {
         id: &AssetId,
         max_edge: u32,
     ) -> Result<AssetContent, LibError> {
-        let resp = self
-            .http
-            .get(self.url(&format!("/api/v1/assets/{id}/thumbnail?edge={max_edge}"))?)
-            .send()
-            .await
-            .map_err(|e| LibError::SourceUnavailable(e.to_string()))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let bytes = resp.bytes().await.unwrap_or_default();
-            return match serde_json::from_slice::<ErrorBody>(&bytes) {
-                Ok(body) => Err(LibError::from_body(body)),
-                Err(_) => Err(LibError::Upstream(format!("HTTP {}", status.as_u16()))),
-            };
-        }
-        let content_type = resp
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("image/png")
-            .to_string();
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| LibError::Upstream(e.to_string()))?
-            .to_vec();
+        let (ct, bytes) = self
+            .fetch_bytes(
+                self.http
+                    .get(self.url(&format!("/api/v1/assets/{id}/thumbnail?edge={max_edge}"))?),
+            )
+            .await?;
         Ok(AssetContent {
             bytes,
-            content_type,
+            content_type: ct.unwrap_or_else(|| "image/png".to_string()),
             format: "png".to_string(),
             media: MediaType::Image,
         })
@@ -444,34 +421,15 @@ impl LibraryService for ApiClient {
         id: &AssetId,
     ) -> Result<AssetContent, LibError> {
         // Raw `DMSH` bytes, not JSON — reconstruct `AssetContent` from the HTTP response.
-        let resp = self
-            .http
-            .get(self.url(&format!("/api/v1/assets/{id}/preview-mesh"))?)
-            .send()
-            .await
-            .map_err(|e| LibError::SourceUnavailable(e.to_string()))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let bytes = resp.bytes().await.unwrap_or_default();
-            return match serde_json::from_slice::<ErrorBody>(&bytes) {
-                Ok(body) => Err(LibError::from_body(body)),
-                Err(_) => Err(LibError::Upstream(format!("HTTP {}", status.as_u16()))),
-            };
-        }
-        let content_type = resp
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("model/x-dam-preview")
-            .to_string();
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| LibError::Upstream(e.to_string()))?
-            .to_vec();
+        let (ct, bytes) = self
+            .fetch_bytes(
+                self.http
+                    .get(self.url(&format!("/api/v1/assets/{id}/preview-mesh"))?),
+            )
+            .await?;
         Ok(AssetContent {
             bytes,
-            content_type,
+            content_type: ct.unwrap_or_else(|| "model/x-dam-preview".to_string()),
             format: "dmsh".to_string(),
             media: MediaType::Model,
         })

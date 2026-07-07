@@ -6,6 +6,7 @@
 
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 import type React from "react";
+import { X } from "lucide-react";
 import { useFocusTrap } from "./use-focus-trap";
 
 export interface ConfirmOpts {
@@ -98,6 +99,62 @@ function useEscape(onEscape: () => void) {
   }, [onEscape]);
 }
 
+/**
+ * A titled modal panel: backdrop + centred surface, focus-trapped, Escape/backdrop to close, with a
+ * heading (optional icon) and a close button. Wraps the shared dialog boilerplate so feature dialogs
+ * only supply their body.
+ */
+export function Modal({
+  title,
+  icon,
+  labelledBy,
+  onClose,
+  wide,
+  scroll,
+  children,
+}: {
+  title: React.ReactNode;
+  icon?: React.ReactNode;
+  labelledBy: string;
+  onClose: () => void;
+  /** Widen from the default 380px to 420px (denser forms). */
+  wide?: boolean;
+  /** Cap height and scroll the body (long forms / reports). */
+  scroll?: boolean;
+  children: React.ReactNode;
+}) {
+  const ref = useFocusTrap<HTMLDivElement>(true);
+  useEscape(onClose);
+  return (
+    <Overlay onClose={onClose}>
+      <div
+        ref={ref}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={labelledBy}
+        className={`w-full ${wide ? "max-w-[420px]" : "max-w-[380px]"} rounded-lg border border-border bg-surface p-4 shadow-xl${
+          scroll ? " max-h-[90vh] overflow-y-auto" : ""
+        }`}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="mb-3 flex items-center justify-between">
+          <h2 id={labelledBy} className="flex items-center gap-2 text-sm font-semibold">
+            {icon} {title}
+          </h2>
+          <button
+            className="flex items-center justify-center text-fg-dim hover:text-fg coarse:min-h-11 coarse:min-w-11"
+            onClick={onClose}
+            aria-label="Close"
+          >
+            <X size={16} />
+          </button>
+        </div>
+        {children}
+      </div>
+    </Overlay>
+  );
+}
+
 function ConfirmModal({ opts, onResult }: { opts: ConfirmOpts; onResult: (b: boolean) => void }) {
   const ref = useFocusTrap<HTMLDivElement>(true);
   useEscape(() => onResult(false));
@@ -118,12 +175,12 @@ function ConfirmModal({ opts, onResult }: { opts: ConfirmOpts; onResult: (b: boo
           <div className="mt-2 text-xs whitespace-pre-line text-fg-muted">{opts.message}</div>
         )}
         <div className="mt-4 flex justify-end gap-2">
-          <button className="btn coarse:min-h-11" onClick={() => onResult(false)}>
+          <button className="btn" onClick={() => onResult(false)}>
             {opts.cancelLabel ?? "Cancel"}
           </button>
           <button
             autoFocus
-            className={`btn coarse:min-h-11 ${opts.danger ? "text-danger" : "btn-accent"}`}
+            className={`btn ${opts.danger ? "text-danger" : "btn-accent"}`}
             style={
               opts.danger
                 ? { borderColor: "color-mix(in srgb, var(--color-danger) 45%, transparent)" }
@@ -171,7 +228,7 @@ function PromptModal({ opts, onResult }: { opts: PromptOpts; onResult: (s: strin
         <input
           ref={inputRef}
           type={opts.password ? "password" : "text"}
-          className="field mt-3 coarse:min-h-11"
+          className="field mt-3"
           value={value}
           placeholder={opts.placeholder}
           spellCheck={false}
@@ -181,10 +238,10 @@ function PromptModal({ opts, onResult }: { opts: PromptOpts; onResult: (s: strin
           }}
         />
         <div className="mt-4 flex justify-end gap-2">
-          <button className="btn coarse:min-h-11" onClick={() => onResult(null)}>
+          <button className="btn" onClick={() => onResult(null)}>
             Cancel
           </button>
-          <button className="btn btn-accent coarse:min-h-11" onClick={submit} disabled={!canSubmit}>
+          <button className="btn btn-accent" onClick={submit} disabled={!canSubmit}>
             {opts.confirmLabel ?? "OK"}
           </button>
         </div>

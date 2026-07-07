@@ -30,6 +30,7 @@ import { MediaBadge } from "./MediaBadge";
 import { ContextMenu, useLongPress, type MenuState } from "./ContextMenu";
 import { ExportDialog } from "./ExportDialog";
 import { ConvertDialog } from "./ConvertDialog";
+import { Centered } from "@/lib/ui";
 
 /** Modifier keys that change what a click does to the multi-selection (issue #10/#22). */
 export interface ClickMods {
@@ -267,16 +268,16 @@ function SelectionBar({
     <div className="flex items-center gap-2 border-b border-border bg-surface px-3 py-1.5 text-xs">
       <span className="font-medium text-fg tabular-nums">{assets.length} selected</span>
       <button
-        className="btn coarse:min-h-11"
+        className="btn"
         onClick={() => analyze.mutate({ assets: ids })}
         disabled={analyze.isPending}
       >
         <Sparkles size={12} /> Analyze
       </button>
-      <button className="btn coarse:min-h-11" onClick={() => setShowConvert(true)}>
+      <button className="btn" onClick={() => setShowConvert(true)}>
         <FileCog size={12} /> Convert
       </button>
-      <button className="btn coarse:min-h-11" onClick={() => setShowExport(true)}>
+      <button className="btn" onClick={() => setShowExport(true)}>
         <FileDown size={12} /> Export
       </button>
       {showConvert && (
@@ -468,6 +469,89 @@ function mods(e: React.MouseEvent): ClickMods {
   return { meta: e.metaKey || e.ctrlKey, shift: e.shiftKey };
 }
 
+/** Screen-reader label for a cell/row — name, media, and any collapsed-duplicate count, so the
+ *  selected item is announced by more than colour (issue #27). */
+function itemAriaLabel(asset: AssetSummary, dupCount?: number): string {
+  const dup = dupCount != null && dupCount > 0 ? `, ${dupCount} duplicate${dupCount === 1 ? "" : "s"}` : "";
+  return `${asset.name}, ${asset.media}${dup}`;
+}
+
+/** Keyboard roving-focus for the virtualised grid/table (issue #27). Tabbing through a 100k-item
+ *  list is impractical, so exactly one cell is a tab stop (roving `tabindex`); arrow keys move it,
+ *  Home/End jump to the ends, and native `<button>` semantics turn Enter/Space into selection.
+ *  `cols` is the row stride — 1 for the table (horizontal arrows are ignored), the live column
+ *  count for the grid. `scrollToItem` pulls the target into the virtual window before we hand it
+ *  DOM focus. Returns the focused index, a setter (so a mouse click/focus can re-seat the tab stop),
+ *  and the container key handler. */
+function useRovingFocus(
+  itemCount: number,
+  cols: number,
+  parentRef: React.RefObject<HTMLDivElement | null>,
+  scrollToItem: (index: number) => void,
+) {
+  const [focusIndex, setFocusIndex] = useState(0);
+  const moveFocus = useRef(false);
+
+  // Keep the roving index in range as the list grows (infinite scroll) or shrinks (new query).
+  useEffect(() => {
+    if (itemCount > 0) setFocusIndex((i) => Math.min(i, itemCount - 1));
+  }, [itemCount]);
+
+  // Once a key moves the index, pull the target into the virtual window and give it real DOM focus.
+  // A large jump can render a frame late, so retry once on the next frame.
+  useEffect(() => {
+    if (!moveFocus.current) return;
+    moveFocus.current = false;
+    const focus = () =>
+      parentRef.current?.querySelector<HTMLElement>(`[data-index="${focusIndex}"]`)?.focus();
+    focus();
+    const raf = requestAnimationFrame(focus);
+    return () => cancelAnimationFrame(raf);
+  }, [focusIndex, parentRef]);
+
+  const onKeyDown = useCallback(
+    (e: React.KeyboardEvent) => {
+      let next: number | null = null;
+      switch (e.key) {
+        case "ArrowRight":
+          if (cols === 1) return;
+          next = focusIndex + 1;
+          break;
+        case "ArrowLeft":
+          if (cols === 1) return;
+          next = focusIndex - 1;
+          break;
+        case "ArrowDown":
+          next = focusIndex + cols;
+          break;
+        case "ArrowUp":
+          next = focusIndex - cols;
+          break;
+        case "Home":
+          next = 0;
+          break;
+        case "End":
+          next = itemCount - 1;
+          break;
+        default:
+          return;
+      }
+      // Out of range → swallow the key so the scroll container doesn't also pan, but don't move.
+      if (next < 0 || next >= itemCount) {
+        e.preventDefault();
+        return;
+      }
+      e.preventDefault();
+      moveFocus.current = true;
+      setFocusIndex(next);
+      scrollToItem(next);
+    },
+    [focusIndex, cols, itemCount, scrollToItem],
+  );
+
+  return { focusIndex, setFocusIndex, onKeyDown };
+}
+
 /** Windowed grid — a 100k+ library scrolls at 60fps (DESIGN_GUIDELINES §1.1, §3.1). */
 function Grid({
   items,
@@ -493,8 +577,25 @@ function Grid({
 
   useInfinite(virt.getVirtualItems(), rowCount, hasMore, loading, loadMore);
 
+  const scrollToItem = useCallback(
+    (index: number) => virt.scrollToIndex(Math.floor(index / cols)),
+    [virt, cols],
+  );
+  const { focusIndex, setFocusIndex, onKeyDown } = useRovingFocus(
+    items.length,
+    cols,
+    parentRef,
+    scrollToItem,
+  );
+
   return (
-    <div ref={parentRef} className="h-full overflow-y-auto">
+    <div
+      ref={parentRef}
+      className="h-full overflow-y-auto"
+      role="group"
+      aria-label="Assets"
+      onKeyDown={onKeyDown}
+    >
       <div style={{ height: virt.getTotalSize(), position: "relative" }}>
         {virt.getVirtualItems().map((vr) => {
           const start = vr.index * cols;
@@ -508,17 +609,23 @@ function Grid({
                 gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))`,
               }}
             >
-              {row.map((a) => (
-                <GridCell
-                  key={a.id}
-                  asset={a}
-                  active={selection.has(a.id)}
-                  dupCount={dupCounts.get(a.id)}
-                  onClick={onItemClick}
-                  onActivate={onItemActivate}
-                  onContext={onContext}
-                />
-              ))}
+              {row.map((a, ci) => {
+                const index = start + ci;
+                return (
+                  <GridCell
+                    key={a.id}
+                    asset={a}
+                    index={index}
+                    active={selection.has(a.id)}
+                    focusable={index === focusIndex}
+                    onFocusIndex={setFocusIndex}
+                    dupCount={dupCounts.get(a.id)}
+                    onClick={onItemClick}
+                    onActivate={onItemActivate}
+                    onContext={onContext}
+                  />
+                );
+              })}
             </div>
           );
         })}
@@ -615,14 +722,23 @@ function DupBadge({ count, className = "" }: { count: number; className?: string
 
 function GridCell({
   asset,
+  index,
   active,
+  focusable,
+  onFocusIndex,
   dupCount,
   onClick,
   onActivate,
   onContext,
 }: {
   asset: AssetSummary;
+  /** Flat index into the visible list — the roving-focus key and virtualiser scroll target. */
+  index: number;
   active: boolean;
+  /** True for the single cell that is the list's tab stop (roving tabindex, issue #27). */
+  focusable: boolean;
+  /** Re-seat the roving tab stop when this cell is focused by mouse/tab. */
+  onFocusIndex: (index: number) => void;
   /** Count of hidden byte-identical copies; undefined ⇒ not a duplicate, no badge. */
   dupCount?: number;
   onClick: (asset: AssetSummary, mods: ClickMods) => void;
@@ -632,6 +748,11 @@ function GridCell({
   const longPress = useLongPress((x, y) => onContext(asset, x, y));
   return (
     <button
+      data-index={index}
+      aria-pressed={active}
+      aria-label={itemAriaLabel(asset, dupCount)}
+      tabIndex={focusable ? 0 : -1}
+      onFocus={() => onFocusIndex(index)}
       onClick={(e) => onClick(asset, mods(e))}
       onDoubleClick={() => onActivate(asset)}
       onContextMenu={(e) => {
@@ -691,9 +812,26 @@ function Table({
   });
   useInfinite(virt.getVirtualItems(), items.length, hasMore, loading, loadMore);
 
+  const scrollToItem = useCallback((index: number) => virt.scrollToIndex(index), [virt]);
+  const { focusIndex, setFocusIndex, onKeyDown } = useRovingFocus(
+    items.length,
+    1,
+    parentRef,
+    scrollToItem,
+  );
+
   return (
-    <div ref={parentRef} className="h-full overflow-y-auto">
-      <div className="sticky top-0 z-10 grid grid-cols-[1fr_64px_104px_112px_84px] gap-2 border-b border-border bg-surface px-3 py-1.5 text-[10px] font-semibold tracking-wider text-fg-dim uppercase">
+    <div
+      ref={parentRef}
+      className="h-full overflow-y-auto"
+      role="group"
+      aria-label="Assets"
+      onKeyDown={onKeyDown}
+    >
+      <div
+        role="row"
+        className="sticky top-0 z-10 grid grid-cols-[1fr_64px_104px_112px_84px] gap-2 border-b border-border bg-surface px-3 py-1.5 text-[10px] font-semibold tracking-wider text-fg-dim uppercase"
+      >
         <span>Name</span>
         <span>Format</span>
         <span>License</span>
@@ -707,7 +845,10 @@ function Table({
             <TableRow
               key={vr.key}
               asset={a}
+              index={vr.index}
               active={selection.has(a.id)}
+              focusable={vr.index === focusIndex}
+              onFocusIndex={setFocusIndex}
               dupCount={dupCounts.get(a.id)}
               top={vr.start}
               onClick={onItemClick}
@@ -724,7 +865,10 @@ function Table({
 
 function TableRow({
   asset,
+  index,
   active,
+  focusable,
+  onFocusIndex,
   dupCount,
   top,
   onClick,
@@ -732,7 +876,13 @@ function TableRow({
   onContext,
 }: {
   asset: AssetSummary;
+  /** Flat index into the visible list — the roving-focus key and virtualiser scroll target. */
+  index: number;
   active: boolean;
+  /** True for the single row that is the list's tab stop (roving tabindex, issue #27). */
+  focusable: boolean;
+  /** Re-seat the roving tab stop when this row is focused by mouse/tab. */
+  onFocusIndex: (index: number) => void;
   /** Count of hidden byte-identical copies; undefined ⇒ not a duplicate, no badge. */
   dupCount?: number;
   top: number;
@@ -743,6 +893,11 @@ function TableRow({
   const longPress = useLongPress((x, y) => onContext(asset, x, y));
   return (
     <button
+      data-index={index}
+      aria-pressed={active}
+      aria-label={itemAriaLabel(asset, dupCount)}
+      tabIndex={focusable ? 0 : -1}
+      onFocus={() => onFocusIndex(index)}
       onClick={(e) => onClick(asset, mods(e))}
       onDoubleClick={() => onActivate(asset)}
       onContextMenu={(e) => {
@@ -777,17 +932,6 @@ function TableRow({
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
-
-function Centered({ children, tone }: { children: React.ReactNode; tone?: "danger" }) {
-  return (
-    <div
-      className="flex h-full items-center justify-center px-6 text-center text-xs"
-      style={{ color: tone === "danger" ? "var(--color-danger)" : "var(--color-fg-dim)" }}
-    >
-      {children}
-    </div>
-  );
-}
 
 /** Responsive column count from the container width (re-measured on resize). */
 function useColumns(ref: React.RefObject<HTMLDivElement | null>, target: number) {

@@ -398,6 +398,18 @@ async fn get_asset(
     Ok(Json(st.lib.get_asset(&ctx, &id).await?))
 }
 
+/// Build a binary asset response: `Content-Type` from the payload, plus a private cache directive.
+fn content_response(content: AssetContent, cache_control: &'static str) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, content.content_type),
+            (header::CACHE_CONTROL, cache_control.to_string()),
+        ],
+        Body::from(content.bytes),
+    )
+        .into_response()
+}
+
 async fn asset_content(
     Reader(ctx): Reader,
     State(st): State<AppState>,
@@ -405,14 +417,7 @@ async fn asset_content(
 ) -> Result<Response, ApiError> {
     let id: AssetId = parse_id(&id, "asset")?;
     let content = st.lib.read_content(&ctx, &id).await?;
-    Ok((
-        [
-            (header::CONTENT_TYPE, content.content_type),
-            (header::CACHE_CONTROL, "private, max-age=60".to_string()),
-        ],
-        Body::from(content.bytes),
-    )
-        .into_response())
+    Ok(content_response(content, "private, max-age=60"))
 }
 
 async fn asset_related(
@@ -423,14 +428,7 @@ async fn asset_related(
 ) -> Result<Response, ApiError> {
     let id: AssetId = parse_id(&id, "asset")?;
     let content = st.lib.read_related_content(&ctx, &id, &q.path).await?;
-    Ok((
-        [
-            (header::CONTENT_TYPE, content.content_type),
-            (header::CACHE_CONTROL, "private, max-age=60".to_string()),
-        ],
-        Body::from(content.bytes),
-    )
-        .into_response())
+    Ok(content_response(content, "private, max-age=60"))
 }
 
 /// Serve the interactive 3D preview mesh (`DMSH` blob) the WASM viewer island uploads directly.
@@ -443,14 +441,7 @@ async fn asset_preview_mesh(
 ) -> Result<Response, ApiError> {
     let id: AssetId = parse_id(&id, "asset")?;
     let content = st.lib.read_model_preview(&ctx, &id).await?;
-    Ok((
-        [
-            (header::CONTENT_TYPE, content.content_type),
-            (header::CACHE_CONTROL, "private, max-age=300".to_string()),
-        ],
-        Body::from(content.bytes),
-    )
-        .into_response())
+    Ok(content_response(content, "private, max-age=300"))
 }
 
 #[derive(serde::Deserialize)]
@@ -468,14 +459,7 @@ async fn asset_thumbnail(
     let id: AssetId = parse_id(&id, "asset")?;
     let edge = q.edge.unwrap_or(256);
     let content = st.lib.read_thumbnail(&ctx, &id, edge).await?;
-    Ok((
-        [
-            (header::CONTENT_TYPE, content.content_type),
-            (header::CACHE_CONTROL, "private, max-age=300".to_string()),
-        ],
-        Body::from(content.bytes),
-    )
-        .into_response())
+    Ok(content_response(content, "private, max-age=300"))
 }
 
 #[derive(serde::Deserialize)]

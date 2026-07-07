@@ -8,6 +8,7 @@
 //! cheap change token (size + mtime) to the stored row and only opens bytes for new/changed files;
 //! either way, files that vanished are marked absent (non-destructive), never deleted.
 
+use crate::emit_progress;
 use dam_api::dto::*;
 use dam_api::event::LibraryEvent;
 use dam_api::id::JobId;
@@ -324,12 +325,6 @@ fn count_total(store: &Store, sources: &[SourceInfo], cancel: &AtomicBool) -> Op
         }
     }
     (counted_any && total > 0).then_some(total)
-}
-
-fn emit_progress(store: &Store, events: &broadcast::Sender<LibraryEvent>, job: &JobId) {
-    if let Ok(js) = store.get_job(job) {
-        let _ = events.send(LibraryEvent::JobProgress(js));
-    }
 }
 
 fn hash_file(path: &Path) -> Option<dam_api::id::ContentHash> {

@@ -11,6 +11,7 @@ import { Copy } from "lucide-react";
 import { useDuplicates } from "@/api/queries";
 import type { AssetSummary, DupGroup, DupKind, MediaType } from "@/api/types";
 import { bytes, mediaLabel } from "@/lib/format";
+import { CenteredCard } from "@/lib/ui";
 import { Thumbnail } from "./Thumbnail";
 import { LicenseBadge } from "./LicenseBadge";
 import { ContextMenu, useLongPress, type MenuState } from "./ContextMenu";
@@ -95,14 +96,14 @@ export function Duplicates() {
       </div>
 
       {groups.isLoading ? (
-        <Centered>Scanning for duplicates…</Centered>
+        <CenteredCard>Scanning for duplicates…</CenteredCard>
       ) : groups.isError ? (
-        <Centered tone="danger">Failed to load — is `3dam serve` running?</Centered>
+        <CenteredCard tone="danger">Failed to load — is `3dam serve` running?</CenteredCard>
       ) : data.length === 0 ? (
-        <Centered>
+        <CenteredCard>
           No {kind} duplicates{media ? ` among ${mediaLabel[media]}` : ""}. Run the analysis pass to
           populate near-duplicate signals.
-        </Centered>
+        </CenteredCard>
       ) : (
         <div className="flex flex-col gap-4">
           {data.map((g, i) => (
@@ -200,13 +201,3 @@ function MemberTile({
   );
 }
 
-function Centered({ children, tone }: { children: React.ReactNode; tone?: "danger" }) {
-  return (
-    <div
-      className="flex flex-1 items-center justify-center rounded border border-border px-6 py-12 text-center text-xs"
-      style={{ color: tone === "danger" ? "var(--color-danger)" : "var(--color-fg-dim)" }}
-    >
-      {children}
-    </div>
-  );
-}

@@ -55,10 +55,6 @@ impl<T> Page<T> {
     pub fn empty() -> Self {
         Self::new(Vec::new(), None)
     }
-    pub fn with_total(mut self, total: u64) -> Self {
-        self.total = Some(total);
-        self
-    }
 }
 
 /// Soft, per-call degradation record — NOT an error (tech-spec 03 §4.1). A `complete: false`

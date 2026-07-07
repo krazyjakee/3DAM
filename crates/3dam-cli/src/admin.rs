@@ -1,6 +1,7 @@
 //! The `admin` subcommand: talks to `/admin/api` over `--connect` or the local server store.
 use super::*;
 use crate::args::*;
+use crate::support::human_size;
 
 /// Drive the admin API. Over `--connect` it calls the `/admin/api` routes; embedded it opens the
 /// local server store directly (seeding it on first use, ADR 0009 §2).
@@ -342,37 +343,22 @@ fn print_audit(entries: &[AuditEntry], json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn human_bytes(n: u64) -> String {
-    const U: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut v = n as f64;
-    let mut i = 0;
-    while v >= 1024.0 && i < U.len() - 1 {
-        v /= 1024.0;
-        i += 1;
-    }
-    if i == 0 {
-        format!("{n} B")
-    } else {
-        format!("{v:.1} {}", U[i])
-    }
-}
-
 fn print_usage(u: &StorageUsage, json: bool) -> anyhow::Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(u)?);
         return Ok(());
     }
     println!("data dir:      {}", u.data_dir);
-    println!("library.db:    {}", human_bytes(u.library_db_bytes));
-    println!("server.db:     {}", human_bytes(u.server_db_bytes));
+    println!("library.db:    {}", human_size(u.library_db_bytes));
+    println!("server.db:     {}", human_size(u.server_db_bytes));
     println!(
         "thumbnails:    {} ({} files)",
-        human_bytes(u.thumbnails.bytes),
+        human_size(u.thumbnails.bytes),
         u.thumbnails.files
     );
     println!(
         "previews:      {} ({} files)",
-        human_bytes(u.previews.bytes),
+        human_size(u.previews.bytes),
         u.previews.files
     );
     println!("assets:        {}", u.asset_count);
@@ -388,7 +374,7 @@ fn print_clear_cache(r: &ClearCacheReport, json: bool) -> anyhow::Result<()> {
     println!(
         "cleared {} files, freed {}",
         r.files_deleted,
-        human_bytes(r.bytes_freed)
+        human_size(r.bytes_freed)
     );
     Ok(())
 }
@@ -412,9 +398,9 @@ fn print_vacuum(r: &VacuumReport, json: bool) -> anyhow::Result<()> {
     }
     println!(
         "compacted library.db: {} → {} (reclaimed {})",
-        human_bytes(r.before_bytes),
-        human_bytes(r.after_bytes),
-        human_bytes(r.reclaimed_bytes)
+        human_size(r.before_bytes),
+        human_size(r.after_bytes),
+        human_size(r.reclaimed_bytes)
     );
     Ok(())
 }
@@ -440,7 +426,7 @@ fn print_factory_reset(r: &FactoryResetReport, json: bool) -> anyhow::Result<()>
         "factory reset complete: {} assets removed, {} tokens revoked, {} freed from caches",
         r.catalog.assets_removed,
         r.tokens_removed,
-        human_bytes(r.cache.bytes_freed)
+        human_size(r.cache.bytes_freed)
     );
     println!("flags reset to defaults; audit log cleared");
     Ok(())

@@ -52,15 +52,7 @@ impl Store {
         // attributes (dimensions / duration / triangles) without an N+1 fetch. Column names stay
         // unambiguous across the joined tables, so the bare-name filters above keep working.
         let sql = format!(
-            "SELECT asset.id, filename, media_type, format,
-                    size_bytes + COALESCE(model_attr.dependency_bytes, 0), license_id, license_status,
-                    image_attr.width, image_attr.height, audio_attr.duration_ms, model_attr.triangle_count,
-                    audio_attr.class
-             FROM asset
-             LEFT JOIN image_attr ON image_attr.asset_id = asset.id
-             LEFT JOIN audio_attr ON audio_attr.asset_id = asset.id
-             LEFT JOIN model_attr ON model_attr.asset_id = asset.id
-             {where_sql} ORDER BY {order_clause} LIMIT ? OFFSET ?"
+            "{GRID_SELECT} FROM asset {ATTR_JOINS} {where_sql} ORDER BY {order_clause} LIMIT ? OFFSET ?"
         );
         // Bind order is positional across the whole statement: WHERE binds, then the ORDER BY term,
         // then LIMIT/OFFSET.
@@ -71,42 +63,10 @@ impl Store {
 
         let mut stmt = conn.prepare(&sql).map_err(internal)?;
         let rows = stmt
-            .query_map(rusqlite::params_from_iter(page_binds.iter()), |r| {
-                let id = blob_to_asset_id(&r.get::<_, Vec<u8>>(0)?);
-                let name: String = r.get(1)?;
-                let media_s: String = r.get(2)?;
-                let format: String = r.get(3)?;
-                let size: Option<i64> = r.get(4)?;
-                let license_id: Option<String> = r.get(5)?;
-                let license_status: String = r.get(6)?;
-                let media = MediaType::parse(&media_s).unwrap_or(MediaType::Image);
-                let width: Option<i64> = r.get(7)?;
-                let height: Option<i64> = r.get(8)?;
-                let duration_ms: Option<i64> = r.get(9)?;
-                let tri_count: Option<i64> = r.get(10)?;
-                let audio_class: Option<String> = r.get(11)?;
-                Ok(AssetSummary {
-                    id,
-                    name,
-                    media,
-                    format,
-                    size: size.unwrap_or(0) as u64,
-                    license: LicenseBadge {
-                        id: license_id,
-                        status: LicenseStatus::parse(&license_status),
-                    },
-                    top_tags: Vec::new(),
-                    origin: Origin::Local,
-                    key_attrs: grid_key_attrs(
-                        media,
-                        width,
-                        height,
-                        duration_ms,
-                        tri_count,
-                        audio_class.as_deref(),
-                    ),
-                })
-            })
+            .query_map(
+                rusqlite::params_from_iter(page_binds.iter()),
+                row_to_summary,
+            )
             .map_err(internal)?;
         let mut items = Vec::new();
         for r in rows {
@@ -131,13 +91,8 @@ impl Store {
     pub fn query_asset_ids(&self, req: &QueryRequest) -> Result<Vec<AssetId>, LibError> {
         let (where_sql, binds) = build_where(req)?;
         let conn = self.conn.lock().unwrap();
-        let sql = format!(
-            "SELECT asset.id FROM asset
-             LEFT JOIN image_attr ON image_attr.asset_id = asset.id
-             LEFT JOIN audio_attr ON audio_attr.asset_id = asset.id
-             LEFT JOIN model_attr ON model_attr.asset_id = asset.id
-             {where_sql} ORDER BY filename ASC, asset.id ASC"
-        );
+        let sql =
+            format!("SELECT asset.id FROM asset {ATTR_JOINS} {where_sql} ORDER BY filename ASC, asset.id ASC");
         let mut stmt = conn.prepare(&sql).map_err(internal)?;
         let rows = stmt
             .query_map(rusqlite::params_from_iter(binds.iter()), |r| {

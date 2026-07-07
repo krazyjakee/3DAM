@@ -180,25 +180,15 @@ impl Store {
         limit: u32,
     ) -> Result<Vec<AssetSummary>, LibError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare(
-                "SELECT asset.id, filename, media_type, format,
-                        size_bytes + COALESCE(model_attr.dependency_bytes, 0), license_id, license_status,
-                        image_attr.width, image_attr.height, audio_attr.duration_ms, model_attr.triangle_count,
-                        audio_attr.class
-                 FROM collection_member cm
-                 JOIN asset ON asset.id = cm.asset_id
-                 LEFT JOIN image_attr ON image_attr.asset_id = asset.id
-                 LEFT JOIN audio_attr ON audio_attr.asset_id = asset.id
-                 LEFT JOIN model_attr ON model_attr.asset_id = asset.id
-                 WHERE cm.collection_id = ?1
-                 ORDER BY cm.added_at DESC, asset.id ASC LIMIT ?2",
-            )
-            .map_err(internal)?;
+        let sql = format!(
+            "{GRID_SELECT} FROM collection_member cm JOIN asset ON asset.id = cm.asset_id {ATTR_JOINS} \
+             WHERE cm.collection_id = ?1 ORDER BY cm.added_at DESC, asset.id ASC LIMIT ?2"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(internal)?;
         let rows = stmt
             .query_map(
                 params![id.as_bytes().to_vec(), limit.min(QUERY_MAX_LIMIT) as i64],
-                Self::row_to_summary,
+                row_to_summary,
             )
             .map_err(internal)?;
         let mut out = Vec::new();
@@ -226,43 +216,5 @@ impl Store {
             out.push(r.map_err(internal)?);
         }
         Ok(out)
-    }
-
-    /// Shared row → `AssetSummary` mapper for the grid SELECT shape.
-    fn row_to_summary(r: &rusqlite::Row) -> rusqlite::Result<AssetSummary> {
-        let id = blob_to_asset_id(&r.get::<_, Vec<u8>>(0)?);
-        let name: String = r.get(1)?;
-        let media_s: String = r.get(2)?;
-        let format: String = r.get(3)?;
-        let size: Option<i64> = r.get(4)?;
-        let license_id: Option<String> = r.get(5)?;
-        let license_status: String = r.get(6)?;
-        let media = MediaType::parse(&media_s).unwrap_or(MediaType::Image);
-        let width: Option<i64> = r.get(7)?;
-        let height: Option<i64> = r.get(8)?;
-        let duration_ms: Option<i64> = r.get(9)?;
-        let tri_count: Option<i64> = r.get(10)?;
-        let audio_class: Option<String> = r.get(11)?;
-        Ok(AssetSummary {
-            id,
-            name,
-            media,
-            format,
-            size: size.unwrap_or(0) as u64,
-            license: LicenseBadge {
-                id: license_id,
-                status: LicenseStatus::parse(&license_status),
-            },
-            top_tags: Vec::new(),
-            origin: Origin::Local,
-            key_attrs: grid_key_attrs(
-                media,
-                width,
-                height,
-                duration_ms,
-                tri_count,
-                audio_class.as_deref(),
-            ),
-        })
     }
 }

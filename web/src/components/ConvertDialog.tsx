@@ -4,11 +4,11 @@
 // dialog defaults the target to the media most of the selection is. Non-destructive by construction:
 // outputs go under the chosen dir, never a source (the backend enforces §5.1).
 
-import { useEffect, useMemo, useState } from "react";
-import { FileCog, X } from "lucide-react";
+import { useMemo, useState } from "react";
+import { FileCog } from "lucide-react";
 import { useConvert } from "@/api/queries";
 import { ApiError } from "@/api/client";
-import { useFocusTrap } from "@/lib/use-focus-trap";
+import { Modal } from "@/lib/dialogs";
 import type {
   AssetSummary,
   CollisionRule,
@@ -68,14 +68,6 @@ export function ConvertDialog({
     setFormat(m === "audio" ? "wav" : "png");
   };
 
-  // Modal focus trap + Escape-to-close (issue #26).
-  const dialogRef = useFocusTrap<HTMLDivElement>(true);
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
-
   // How many inputs match the chosen target media (the rest will report `unsupported`).
   const matching = assets.filter((a) => a.media === media).length;
 
@@ -107,29 +99,15 @@ export function ConvertDialog({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={onClose}>
-      <div
-        ref={dialogRef}
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="convert-dialog-title"
-        className="max-h-[90vh] w-full max-w-[420px] overflow-y-auto rounded-lg border border-border bg-surface p-4 shadow-xl"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="mb-3 flex items-center justify-between">
-          <h2 id="convert-dialog-title" className="flex items-center gap-2 text-sm font-semibold">
-            <FileCog size={15} /> Convert {assets.length} asset{assets.length === 1 ? "" : "s"}
-          </h2>
-          <button
-            className="flex items-center justify-center text-fg-dim hover:text-fg coarse:min-h-11 coarse:min-w-11"
-            onClick={onClose}
-            aria-label="Close"
-          >
-            <X size={16} />
-          </button>
-        </div>
-
-        {report ? (
+    <Modal
+      title={`Convert ${assets.length} asset${assets.length === 1 ? "" : "s"}`}
+      icon={<FileCog size={15} />}
+      labelledBy="convert-dialog-title"
+      onClose={onClose}
+      wide
+      scroll
+    >
+      {report ? (
           <ReportView report={report} onClose={onClose} onAgain={() => setReport(null)} />
         ) : (
           <div className="flex flex-col gap-3">
@@ -164,7 +142,7 @@ export function ConvertDialog({
               <div className="flex-1">
                 <label className="mb-1 block text-[11px] text-fg-muted">Format</label>
                 <select
-                  className="field coarse:min-h-11"
+                  className="field"
                   value={format}
                   onChange={(e) => setFormat(e.target.value)}
                 >
@@ -179,7 +157,7 @@ export function ConvertDialog({
                 <div className="w-24">
                   <label className="mb-1 block text-[11px] text-fg-muted">Max edge</label>
                   <input
-                    className="field coarse:min-h-11"
+                    className="field"
                     type="number"
                     min={1}
                     placeholder="—"
@@ -192,7 +170,7 @@ export function ConvertDialog({
                 <div className="w-20">
                   <label className="mb-1 block text-[11px] text-fg-muted">Quality</label>
                   <input
-                    className="field coarse:min-h-11"
+                    className="field"
                     type="number"
                     min={1}
                     max={100}
@@ -208,7 +186,7 @@ export function ConvertDialog({
             <div>
               <label className="mb-1 block text-[11px] text-fg-muted">Output directory</label>
               <input
-                className="field coarse:min-h-11"
+                className="field"
                 placeholder="/home/me/converted"
                 value={outputDir}
                 onChange={(e) => setOutputDir(e.target.value)}
@@ -224,7 +202,7 @@ export function ConvertDialog({
               <div className="flex-1">
                 <label className="mb-1 block text-[11px] text-fg-muted">On collision</label>
                 <select
-                  className="field coarse:min-h-11"
+                  className="field"
                   value={collision}
                   onChange={(e) => setCollision(e.target.value as CollisionRule)}
                 >
@@ -248,11 +226,11 @@ export function ConvertDialog({
             {err && <p className="text-[11px] text-danger">{err}</p>}
 
             <div className="flex justify-end gap-2">
-              <button className="btn coarse:min-h-11" onClick={onClose}>
+              <button className="btn" onClick={onClose}>
                 Cancel
               </button>
               <button
-                className="btn btn-accent coarse:min-h-11"
+                className="btn btn-accent"
                 onClick={submit}
                 disabled={run.isPending}
               >
@@ -261,8 +239,7 @@ export function ConvertDialog({
             </div>
           </div>
         )}
-      </div>
-    </div>
+    </Modal>
   );
 }
 
@@ -324,10 +301,10 @@ function ReportView({
       </div>
 
       <div className="flex justify-end gap-2">
-        <button className="btn coarse:min-h-11" onClick={onAgain}>
+        <button className="btn" onClick={onAgain}>
           Back
         </button>
-        <button className="btn btn-accent coarse:min-h-11" onClick={onClose}>
+        <button className="btn btn-accent" onClick={onClose}>
           Done
         </button>
       </div>

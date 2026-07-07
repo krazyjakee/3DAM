@@ -412,7 +412,7 @@ function SimilarSection({ asset }: { asset: Asset }) {
           Analyze this asset to find visually similar ones.
         </p>
         <button
-          className="btn mt-2 coarse:min-h-11"
+          className="btn mt-2"
           disabled={analyze.isPending}
           onClick={() => analyze.mutate({ assets: [asset.summary.id] })}
         >
@@ -426,7 +426,7 @@ function SimilarSection({ asset }: { asset: Asset }) {
   if (!open) {
     return (
       <Group title="Similar">
-        <button className="btn coarse:min-h-11" onClick={() => setOpen(true)}>
+        <button className="btn" onClick={() => setOpen(true)}>
           <Sparkles size={12} />
           Find similar
         </button>

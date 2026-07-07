@@ -19,9 +19,6 @@ macro_rules! uuid_id {
             pub fn new() -> Self {
                 Self(Uuid::now_v7())
             }
-            pub fn as_uuid(&self) -> Uuid {
-                self.0
-            }
             /// The 16 raw bytes, as stored in a `BLOB(16)` column.
             pub fn as_bytes(&self) -> &[u8; 16] {
                 self.0.as_bytes()

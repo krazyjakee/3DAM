@@ -10,6 +10,7 @@
 //! Every stage is fail-soft (DESIGN_GUIDELINES §2): a bad decode degrades that one asset to "no
 //! embedding" and the pass moves on — never an aborted job.
 
+use crate::emit_progress;
 use dam_api::dto::*;
 use dam_api::event::{ChangeKind, LibraryEvent};
 use dam_api::id::JobId;
@@ -248,10 +249,4 @@ fn resolve(source_uri: &str, rel_path: &str) -> Result<std::path::PathBuf, Strin
 fn normalise(mut v: Vec<f32>) -> Vec<f32> {
     dam_media::l2_normalise(&mut v);
     v
-}
-
-fn emit_progress(store: &Store, events: &broadcast::Sender<LibraryEvent>, job: &JobId) {
-    if let Ok(js) = store.get_job(job) {
-        let _ = events.send(LibraryEvent::JobProgress(js));
-    }
 }

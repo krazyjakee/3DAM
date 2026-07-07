@@ -75,13 +75,7 @@ fn gen_thumbnail(
     };
     let bytes = render_thumbnail_bytes(fetched.path(), &det, max_edge)?;
 
-    // Best-effort cache write (a cold cache is a slow path, not an error).
-    if std::fs::create_dir_all(&cache_dir).is_ok() {
-        let tmp = cache_dir.join(format!(".{key}-{max_edge}{variant}.png.tmp"));
-        if std::fs::write(&tmp, &bytes).is_ok() {
-            let _ = std::fs::rename(&tmp, &cache_path);
-        }
-    }
+    cache_write_atomic(&cache_path, &bytes);
     Ok(png_content(bytes))
 }
 
@@ -203,12 +197,7 @@ fn gen_model_preview_impl(
             LibError::Unsupported(e.to_string())
         })?;
 
-    if std::fs::create_dir_all(&cache_dir).is_ok() {
-        let tmp = cache_dir.join(format!(".{key}-p{}.dmsh.tmp", dam_render::PREVIEW_VERSION));
-        if std::fs::write(&tmp, &bytes).is_ok() {
-            let _ = std::fs::rename(&tmp, &cache_path);
-        }
-    }
+    cache_write_atomic(&cache_path, &bytes);
     Ok(preview_content(bytes))
 }
 
@@ -229,6 +218,32 @@ fn serialize_opt_query(q: &Option<QueryRequest>) -> Result<Option<String>, LibEr
         .map(serde_json::to_string)
         .transpose()
         .map_err(|e| LibError::Internal(e.to_string()))
+}
+
+/// Best-effort atomic cache write: create the parent dir, write to a sibling temp file, then rename
+/// into place. A cold cache is a slow path, not an error, so every failure is silently ignored. The
+/// temp name is derived from the final filename (`.{name}.tmp`), keeping it on the same filesystem.
+fn cache_write_atomic(cache_path: &Path, bytes: &[u8]) {
+    let (Some(dir), Some(name)) = (
+        cache_path.parent(),
+        cache_path.file_name().and_then(|n| n.to_str()),
+    ) else {
+        return;
+    };
+    if std::fs::create_dir_all(dir).is_ok() {
+        let tmp = dir.join(format!(".{name}.tmp"));
+        if std::fs::write(&tmp, bytes).is_ok() {
+            let _ = std::fs::rename(&tmp, cache_path);
+        }
+    }
+}
+
+/// Emit a job's current progress as a `JobProgress` event (best-effort; a dropped read is skipped).
+/// Shared by the scan and analyse job loops.
+pub(crate) fn emit_progress(store: &Store, events: &broadcast::Sender<LibraryEvent>, job: &JobId) {
+    if let Ok(js) = store.get_job(job) {
+        let _ = events.send(LibraryEvent::JobProgress(js));
+    }
 }
 
 fn png_content(bytes: Vec<u8>) -> AssetContent {

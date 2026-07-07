@@ -7,6 +7,7 @@ import { Link } from "react-router-dom";
 import { Ban, RotateCcw } from "lucide-react";
 import { useBlocklist, useUnblock } from "@/api/queries";
 import { relTime } from "@/lib/format";
+import { CenteredCard } from "@/lib/ui";
 import type { BlockEntry } from "@/api/types";
 
 export function Blocklist() {
@@ -37,14 +38,14 @@ export function Blocklist() {
       </div>
 
       {list.isLoading ? (
-        <Centered>Loading blocklist…</Centered>
+        <CenteredCard>Loading blocklist…</CenteredCard>
       ) : list.isError ? (
-        <Centered tone="danger">Failed to load — is `3dam serve` running?</Centered>
+        <CenteredCard tone="danger">Failed to load — is `3dam serve` running?</CenteredCard>
       ) : data.length === 0 ? (
-        <Centered>
+        <CenteredCard>
           Nothing blocked. Use <span className="text-fg-muted">Remove + block</span> from an asset’s
           context menu to keep specific content out of future scans.
-        </Centered>
+        </CenteredCard>
       ) : (
         <ul className="flex flex-col divide-y divide-border rounded border border-border">
           {data.map((e) => (
@@ -82,7 +83,7 @@ function Row({
         type="button"
         onClick={onUnblock}
         disabled={busy}
-        className="btn flex shrink-0 items-center gap-1.5 coarse:min-h-11"
+        className="btn flex shrink-0 items-center gap-1.5"
         title="Lift the block so a later scan can re-import this content"
       >
         <RotateCcw size={13} /> Unblock
@@ -91,13 +92,3 @@ function Row({
   );
 }
 
-function Centered({ children, tone }: { children: React.ReactNode; tone?: "danger" }) {
-  return (
-    <div
-      className="flex flex-1 items-center justify-center rounded border border-border px-6 py-12 text-center text-xs"
-      style={{ color: tone === "danger" ? "var(--color-danger)" : "var(--color-fg-dim)" }}
-    >
-      {children}
-    </div>
-  );
-}

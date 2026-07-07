@@ -8,6 +8,51 @@ pub(crate) fn parse_connection(blob: &str) -> Result<SourceConnection, LibError>
         .map_err(|e| LibError::Internal(format!("corrupt source connection: {e}")))
 }
 
+/// The SELECT column list every grid/summary query shares — twelve columns in the exact order
+/// `row_to_summary` reads them. Callers append their own `FROM …`, `{ATTR_JOINS}`, WHERE and ORDER.
+pub(crate) const GRID_SELECT: &str = "SELECT asset.id, filename, media_type, format,
+        size_bytes + COALESCE(model_attr.dependency_bytes, 0), license_id, license_status,
+        image_attr.width, image_attr.height, audio_attr.duration_ms, model_attr.triangle_count,
+        audio_attr.class";
+
+/// The per-media attribute LEFT JOINs the grid select depends on (dimensions / duration / tris).
+pub(crate) const ATTR_JOINS: &str = "LEFT JOIN image_attr ON image_attr.asset_id = asset.id
+         LEFT JOIN audio_attr ON audio_attr.asset_id = asset.id
+         LEFT JOIN model_attr ON model_attr.asset_id = asset.id";
+
+/// Row → `AssetSummary` mapper for the [`GRID_SELECT`] column shape. Shared by the paged query,
+/// collection listing, and similarity/dedup summary fetch so the column contract lives in one place.
+pub(crate) fn row_to_summary(r: &rusqlite::Row) -> rusqlite::Result<AssetSummary> {
+    let id = blob_to_asset_id(&r.get::<_, Vec<u8>>(0)?);
+    let media = MediaType::parse(&r.get::<_, String>(2)?).unwrap_or(MediaType::Image);
+    let width: Option<i64> = r.get(7)?;
+    let height: Option<i64> = r.get(8)?;
+    let duration_ms: Option<i64> = r.get(9)?;
+    let tri_count: Option<i64> = r.get(10)?;
+    let audio_class: Option<String> = r.get(11)?;
+    Ok(AssetSummary {
+        id,
+        name: r.get(1)?,
+        media,
+        format: r.get(3)?,
+        size: r.get::<_, Option<i64>>(4)?.unwrap_or(0) as u64,
+        license: LicenseBadge {
+            id: r.get(5)?,
+            status: LicenseStatus::parse(&r.get::<_, String>(6)?),
+        },
+        top_tags: Vec::new(),
+        origin: Origin::Local,
+        key_attrs: grid_key_attrs(
+            media,
+            width,
+            height,
+            duration_ms,
+            tri_count,
+            audio_class.as_deref(),
+        ),
+    })
+}
+
 /// The couple of cheap per-media attributes shown on a grid tile / table row: dimensions for
 /// images, duration (+ a `loop` marker when the analysis classed it so) for audio, triangle count
 /// for models. Cheap and best-effort.

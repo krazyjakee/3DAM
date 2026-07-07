@@ -134,9 +134,6 @@ impl ServerStore {
 
     // ── flag reads (cheap, in-memory) ────────────────────────────────────────
 
-    pub fn flag_state(&self) -> FlagState {
-        self.flags.read().unwrap().clone()
-    }
     pub fn auth_mode(&self) -> AuthMode {
         self.flags.read().unwrap().auth
     }

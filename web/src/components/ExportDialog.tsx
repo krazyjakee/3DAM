@@ -3,11 +3,11 @@
 // server-side paths — for a local-first server that is the user's own disk, so this is "write a
 // manifest to <path>", not a browser download. Shows the returned report (files written + count).
 
-import { useEffect, useState } from "react";
-import { FileDown, X } from "lucide-react";
+import { useState } from "react";
+import { FileDown } from "lucide-react";
 import { useExport } from "@/api/queries";
 import { ApiError } from "@/api/client";
-import { useFocusTrap } from "@/lib/use-focus-trap";
+import { Modal } from "@/lib/dialogs";
 import type { ExportFormat, ExportReport, QueryRequest } from "@/api/types";
 
 /** What the export is scoped to: an explicit multi-selection, a collection, or the faceted query. */
@@ -30,14 +30,6 @@ export function ExportDialog({ scope, onClose }: { scope: ExportScope; onClose: 
   const [report, setReport] = useState<ExportReport | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
-  // Modal focus trap + Escape-to-close (issue #26).
-  const dialogRef = useFocusTrap<HTMLDivElement>(true);
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
-
   const isDir = FORMATS.find((f) => f.value === format)?.dir;
   const scopeLabel =
     "assets" in scope
@@ -59,29 +51,13 @@ export function ExportDialog({ scope, onClose }: { scope: ExportScope; onClose: 
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={onClose}>
-      <div
-        ref={dialogRef}
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="export-dialog-title"
-        className="w-full max-w-[380px] rounded-lg border border-border bg-surface p-4 shadow-xl"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="mb-3 flex items-center justify-between">
-          <h2 id="export-dialog-title" className="flex items-center gap-2 text-sm font-semibold">
-            <FileDown size={15} /> Export manifest
-          </h2>
-          <button
-            className="flex items-center justify-center text-fg-dim hover:text-fg coarse:min-h-11 coarse:min-w-11"
-            onClick={onClose}
-            aria-label="Close"
-          >
-            <X size={16} />
-          </button>
-        </div>
-
-        {report ? (
+    <Modal
+      title="Export manifest"
+      icon={<FileDown size={15} />}
+      labelledBy="export-dialog-title"
+      onClose={onClose}
+    >
+      {report ? (
           <div className="flex flex-col gap-3">
             <div className="rounded border border-lic-permissive/40 bg-lic-permissive/10 p-3 text-xs">
               <p className="text-fg">
@@ -91,7 +67,7 @@ export function ExportDialog({ scope, onClose }: { scope: ExportScope; onClose: 
               </p>
               <p className="mt-1 font-mono text-[10px] break-all text-fg-muted">{report.output}</p>
             </div>
-            <button className="btn btn-accent self-end coarse:min-h-11" onClick={onClose}>
+            <button className="btn btn-accent self-end" onClick={onClose}>
               Done
             </button>
           </div>
@@ -104,7 +80,7 @@ export function ExportDialog({ scope, onClose }: { scope: ExportScope; onClose: 
             <div>
               <label className="mb-1 block text-[11px] text-fg-muted">Format</label>
               <select
-                className="field coarse:min-h-11"
+                className="field"
                 value={format}
                 onChange={(e) => setFormat(e.target.value as ExportFormat)}
               >
@@ -121,7 +97,7 @@ export function ExportDialog({ scope, onClose }: { scope: ExportScope; onClose: 
                 {isDir ? "Output directory" : "Output file"}
               </label>
               <input
-                className="field coarse:min-h-11"
+                className="field"
                 placeholder={isDir ? "/home/me/exports/manifest" : `/home/me/manifest.${format}`}
                 value={output}
                 onChange={(e) => setOutput(e.target.value)}
@@ -141,11 +117,11 @@ export function ExportDialog({ scope, onClose }: { scope: ExportScope; onClose: 
             {err && <p className="text-[11px] text-danger">{err}</p>}
 
             <div className="flex justify-end gap-2">
-              <button className="btn coarse:min-h-11" onClick={onClose}>
+              <button className="btn" onClick={onClose}>
                 Cancel
               </button>
               <button
-                className="btn btn-accent coarse:min-h-11"
+                className="btn btn-accent"
                 onClick={submit}
                 disabled={run.isPending}
               >
@@ -154,7 +130,6 @@ export function ExportDialog({ scope, onClose }: { scope: ExportScope; onClose: 
             </div>
           </div>
         )}
-      </div>
-    </div>
+    </Modal>
   );
 }

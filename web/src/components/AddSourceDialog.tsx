@@ -1,8 +1,8 @@
-import { useEffect, useState, type ReactNode } from "react";
-import { FolderPlus, X } from "lucide-react";
+import { useState, type ReactNode } from "react";
+import { FolderPlus } from "lucide-react";
 import { useAddSource, useScan } from "@/api/queries";
 import { ApiError } from "@/api/client";
-import { useFocusTrap } from "@/lib/use-focus-trap";
+import { Modal } from "@/lib/dialogs";
 import type { SourceKind, SourceOptions } from "@/api/types";
 
 // local_fs, sftp and smb are all backed by the phase-4 engine; federated peers are not built yet, so
@@ -41,15 +41,6 @@ export function AddSourceDialog({ onClose }: { onClose: () => void }) {
   const [port, setPort] = useState("");
 
   const remote = kind === "sftp" || kind === "smb";
-
-  // Modal focus management + Escape-to-close (issue #26): trap Tab within the dialog, return focus
-  // to the trigger on close, and close on Escape (mirroring the Drawer, which already did).
-  const dialogRef = useFocusTrap<HTMLDivElement>(true);
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
 
   const submit = async () => {
     setErr(null);
@@ -94,34 +85,16 @@ export function AddSourceDialog({ onClose }: { onClose: () => void }) {
   };
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
-      onClick={onClose}
+    <Modal
+      title="Add source"
+      icon={<FolderPlus size={15} />}
+      labelledBy="add-source-title"
+      onClose={onClose}
+      scroll
     >
-      <div
-        ref={dialogRef}
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="add-source-title"
-        className="max-h-[90vh] w-full max-w-[380px] overflow-y-auto rounded-lg border border-border bg-surface p-4 shadow-xl"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="mb-3 flex items-center justify-between">
-          <h2 id="add-source-title" className="flex items-center gap-2 text-sm font-semibold">
-            <FolderPlus size={15} /> Add source
-          </h2>
-          <button
-            className="flex items-center justify-center text-fg-dim hover:text-fg coarse:min-h-11 coarse:min-w-11"
-            onClick={onClose}
-            aria-label="Close"
-          >
-            <X size={16} />
-          </button>
-        </div>
-
         <label className="mb-1 block text-[11px] text-fg-muted">Kind</label>
         <select
-          className="field mb-3 coarse:min-h-11"
+          className="field mb-3"
           value={kind}
           onChange={(e) => setKind(e.target.value as SourceKind)}
         >
@@ -134,7 +107,7 @@ export function AddSourceDialog({ onClose }: { onClose: () => void }) {
 
         <label className="mb-1 block text-[11px] text-fg-muted">{URI_FIELD[kind].label}</label>
         <input
-          className="field mb-3 coarse:min-h-11"
+          className="field mb-3"
           placeholder={URI_FIELD[kind].placeholder}
           value={uri}
           onChange={(e) => setUri(e.target.value)}
@@ -146,7 +119,7 @@ export function AddSourceDialog({ onClose }: { onClose: () => void }) {
           <>
             <Field label="Username (optional)">
               <input
-                className="field coarse:min-h-11"
+                className="field"
                 placeholder="overrides user@ in the URI"
                 value={username}
                 onChange={(e) => setUsername(e.target.value)}
@@ -155,7 +128,7 @@ export function AddSourceDialog({ onClose }: { onClose: () => void }) {
             </Field>
             <Field label="Password (optional)">
               <input
-                className="field coarse:min-h-11"
+                className="field"
                 type="password"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
@@ -166,7 +139,7 @@ export function AddSourceDialog({ onClose }: { onClose: () => void }) {
               <>
                 <Field label="Private key path (optional)">
                   <input
-                    className="field coarse:min-h-11"
+                    className="field"
                     placeholder="~/.ssh/id_ed25519"
                     value={privateKey}
                     onChange={(e) => setPrivateKey(e.target.value)}
@@ -174,7 +147,7 @@ export function AddSourceDialog({ onClose }: { onClose: () => void }) {
                 </Field>
                 <Field label="Key passphrase (optional)">
                   <input
-                    className="field coarse:min-h-11"
+                    className="field"
                     type="password"
                     value={passphrase}
                     onChange={(e) => setPassphrase(e.target.value)}
@@ -186,7 +159,7 @@ export function AddSourceDialog({ onClose }: { onClose: () => void }) {
             {kind === "smb" && (
               <Field label="Domain / workgroup (optional)">
                 <input
-                  className="field coarse:min-h-11"
+                  className="field"
                   placeholder="WORKGROUP"
                   value={domain}
                   onChange={(e) => setDomain(e.target.value)}
@@ -195,7 +168,7 @@ export function AddSourceDialog({ onClose }: { onClose: () => void }) {
             )}
             <Field label={`Port (optional, default ${kind === "sftp" ? 22 : 445})`}>
               <input
-                className="field coarse:min-h-11"
+                className="field"
                 type="number"
                 inputMode="numeric"
                 min={1}
@@ -209,7 +182,7 @@ export function AddSourceDialog({ onClose }: { onClose: () => void }) {
 
         <label className="mb-1 block text-[11px] text-fg-muted">Name (optional)</label>
         <input
-          className="field mb-3 coarse:min-h-11"
+          className="field mb-3"
           placeholder="SFX library"
           value={name}
           onChange={(e) => setName(e.target.value)}
@@ -228,19 +201,18 @@ export function AddSourceDialog({ onClose }: { onClose: () => void }) {
         {err && <p className="mb-3 text-xs text-danger">{err}</p>}
 
         <div className="flex justify-end gap-2">
-          <button className="btn coarse:min-h-11" onClick={onClose}>
+          <button className="btn" onClick={onClose}>
             Cancel
           </button>
           <button
-            className="btn btn-accent coarse:min-h-11"
+            className="btn btn-accent"
             onClick={submit}
             disabled={add.isPending}
           >
             {add.isPending ? "Adding…" : "Add & scan"}
           </button>
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }
 

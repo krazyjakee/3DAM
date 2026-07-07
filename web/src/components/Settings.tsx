@@ -669,7 +669,7 @@ function TokensSection({ tokens, onChange }: { tokens: TokenInfo[]; onChange: ()
 
 /** A small helper for the toolbar link, kept here so the admin-token prompt lives with the surface.
  *  Uses the in-app prompt with a masked input rather than `window.prompt` (issue #29). */
-export function useAdminTokenPrompt() {
+function useAdminTokenPrompt() {
   const { prompt } = useDialogs();
   return async () => {
     const cur = getAdminToken() ?? "";
