@@ -99,6 +99,14 @@ pub(crate) fn run_scan(
                             return true;
                         }
                     };
+                    // Blocklist (issue #21): a hash the user removed-and-blocked is never
+                    // re-imported — skip it before the upsert so remove+block survives re-scans.
+                    if let Some(h) = &hash {
+                        if store.is_blocked(h).unwrap_or(false) {
+                            skipped += 1;
+                            return true;
+                        }
+                    }
                     let na = NewAsset {
                         source_id: sid,
                         path: fe.rel_path.clone(),

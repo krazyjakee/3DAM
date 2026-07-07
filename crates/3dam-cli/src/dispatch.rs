@@ -272,6 +272,41 @@ pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             }
         }
 
+        Cmd::Remove { id, block } => {
+            let aid: AssetId = id
+                .parse()
+                .map_err(|_| anyhow::anyhow!("invalid asset id"))?;
+            lib.remove_asset(&ctx, &aid, RemoveAsset { block }).await?;
+            if json {
+                println!("{}", serde_json::json!({ "removed": aid.to_string(), "blocked": block }));
+            } else if block {
+                println!("removed and blocked asset {aid}");
+            } else {
+                println!("removed asset {aid}");
+            }
+        }
+
+        Cmd::Blocklist { cmd } => match cmd {
+            BlocklistCmd::List => {
+                let entries = lib.list_blocklist(&ctx).await?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&entries)?);
+                } else if entries.is_empty() {
+                    println!("blocklist is empty");
+                } else {
+                    for e in &entries {
+                        println!("{}  {}", e.hash, e.label.as_deref().unwrap_or("—"));
+                    }
+                }
+            }
+            BlocklistCmd::Unblock { hash } => {
+                let h = dam_api::id::ContentHash::from_hex(&hash)
+                    .ok_or_else(|| anyhow::anyhow!("invalid content hash: {hash}"))?;
+                lib.unblock(&ctx, &h).await?;
+                println!("unblocked {h}");
+            }
+        },
+
         Cmd::Jobs => {
             let page = lib.list_jobs(&ctx, JobListRequest::default()).await?;
             if json {

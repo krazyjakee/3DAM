@@ -1,13 +1,18 @@
 // Per-item context menu for asset tiles/rows (issue #20). Opened by right-click or touch long-press
 // (see useLongPress) from the Browser, which owns the open state and passes the target asset here.
-// The action set lives in ONE place so future actions (convert #5, remove/block #21) slot in as
-// entries — today: open, analyze, add-to-collection (submenu), copy path. Actions honour the clicked
-// asset; batch-over-selection lands with multi-select (#22).
+// The action set lives in ONE place: open, analyze, convert (#5), add-to-collection (submenu),
+// copy path, and remove / remove + block (#21). Actions honour the whole target set (the clicked
+// asset, or the multi-selection when the clicked item is part of it — #22).
 
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { FileCog, FolderPlus, Search, Sparkles, ClipboardCopy } from "lucide-react";
+import { FileCog, FolderPlus, Search, Sparkles, ClipboardCopy, Trash2, Ban } from "lucide-react";
 import { api } from "@/api/client";
-import { useAnalyze, useCollections, useCollectionMembers } from "@/api/queries";
+import {
+  useAnalyze,
+  useCollections,
+  useCollectionMembers,
+  useRemoveAsset,
+} from "@/api/queries";
 import type { AssetSummary } from "@/api/types";
 import { useViewState } from "@/lib/view-state";
 
@@ -60,7 +65,10 @@ export function ContextMenu({
   const analyze = useAnalyze();
   const collections = useCollections();
   const members = useCollectionMembers();
+  const remove = useRemoveAsset();
   const [submenu, setSubmenu] = useState(false);
+  // Removal is a two-step, in-menu confirm (issue #21): the first click reveals Remove / Remove+block.
+  const [confirming, setConfirming] = useState(false);
 
   // Close on outside pointer, Escape, scroll, or resize.
   useEffect(() => {
@@ -91,6 +99,7 @@ export function ContextMenu({
       y: Math.min(menu.y, window.innerHeight - r.height - pad),
     });
     setSubmenu(false);
+    setConfirming(false);
   }, [menu]);
 
   if (!menu) return null;
@@ -114,6 +123,11 @@ export function ContextMenu({
       /* clipboard blocked / fetch failed — fail-soft, no crash */
     }
   };
+
+  // Remove the target set from the catalog; `block` also blocks each content hash from re-import.
+  // The source files are never touched — only catalog rows (issue #21).
+  const removeAll = (block: boolean) =>
+    run(() => ids.forEach((id) => remove.mutate({ id, block })));
 
   return (
     <div
@@ -172,14 +186,58 @@ export function ContextMenu({
       </div>
 
       {single && (
-        <>
-          <div className="my-1 border-t border-border" />
-          <Item
-            icon={<ClipboardCopy size={13} />}
-            label="Copy path"
-            onClick={() => run(() => void copyPath())}
-          />
-        </>
+        <Item
+          icon={<ClipboardCopy size={13} />}
+          label="Copy path"
+          onClick={() => run(() => void copyPath())}
+        />
+      )}
+
+      {/* Remove / remove + block (issue #21) — destructive to the catalog row (never the source
+          file), so it takes an explicit second click to reveal the confirm choices. */}
+      <div className="my-1 border-t border-border" />
+      {confirming ? (
+        <div className="px-3 py-1.5">
+          <p className="mb-2 text-[10px] text-fg-dim">
+            Remove {single ? "this asset" : `${assets.length} assets`} from the catalog? The source
+            file{single ? "" : "s"} won’t be deleted.
+          </p>
+          <div className="flex flex-col gap-1">
+            <button
+              type="button"
+              onClick={() => removeAll(false)}
+              className="flex items-center gap-2 rounded px-2 py-1.5 text-left text-danger hover:bg-danger/10 coarse:min-h-11"
+            >
+              <Trash2 size={13} /> Remove
+            </button>
+            <button
+              type="button"
+              onClick={() => removeAll(true)}
+              className="flex items-center gap-2 rounded px-2 py-1.5 text-left text-danger hover:bg-danger/10 coarse:min-h-11"
+            >
+              <Ban size={13} /> Remove + block from rescan
+            </button>
+            <button
+              type="button"
+              onClick={() => setConfirming(false)}
+              className="rounded px-2 py-1.5 text-left hover:bg-surface-2 hover:text-fg coarse:min-h-11"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      ) : (
+        <button
+          type="button"
+          role="menuitem"
+          onClick={() => setConfirming(true)}
+          className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-danger hover:bg-danger/10 coarse:min-h-11"
+        >
+          <span className="flex w-4 shrink-0 justify-center">
+            <Trash2 size={13} />
+          </span>
+          <span className="flex-1 truncate">{single ? "Remove…" : `Remove ${assets.length}…`}</span>
+        </button>
       )}
     </div>
   );

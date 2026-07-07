@@ -387,6 +387,21 @@ export interface RemoveSource {
   keep_metadata?: boolean;
 }
 
+// ── remove / blocklist (issue #21) ──────────────────────────────────────────
+
+/** Remove one asset; `block` also records its content hash so a later scan never re-imports it. */
+export interface RemoveAsset {
+  block?: boolean;
+}
+
+/** One blocked content hash — the "removed + blocked" management surface. `label` is the filename
+ *  captured at block time so the entry is recognisable after its asset row is gone. */
+export interface BlockEntry {
+  hash: ContentHash;
+  label?: string | null;
+  blocked_at: number;
+}
+
 // ── jobs ───────────────────────────────────────────────────────────────────
 
 export type ScanMode = "full" | "delta";

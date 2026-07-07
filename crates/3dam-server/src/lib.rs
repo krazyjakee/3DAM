@@ -20,11 +20,11 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as AxPath, Query, State};
 use axum::http::{header, HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use dam_api::dto::*;
 use dam_api::event::SubscribeRequest;
-use dam_api::id::{AssetId, CollectionId, JobId, SourceId};
+use dam_api::id::{AssetId, CollectionId, ContentHash, JobId, SourceId};
 use dam_api::service::LibraryService;
 use dam_api::LibError;
 use dam_core::EmbeddedLibrary;
@@ -107,7 +107,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/api/version", get(version))
         .route("/api/v1/query", post(query))
-        .route("/api/v1/assets/{id}", get(get_asset))
+        .route("/api/v1/assets/{id}", get(get_asset).delete(remove_asset))
         .route("/api/v1/assets/{id}/content", get(asset_content))
         .route("/api/v1/assets/{id}/thumbnail", get(asset_thumbnail))
         .route("/api/v1/stats", get(stats))
@@ -134,6 +134,8 @@ pub(crate) fn build_router(state: AppState) -> Router {
         )
         .route("/api/v1/collections/{id}/assets", post(collection_assets))
         .route("/api/v1/export", post(export))
+        .route("/api/v1/blocklist", get(list_blocklist))
+        .route("/api/v1/blocklist/{hash}", delete(unblock))
         .route("/api/v1/jobs/scan", post(submit_scan))
         .route("/api/v1/jobs/list", post(list_jobs))
         .route("/api/v1/jobs/{id}", get(get_job))
@@ -509,6 +511,35 @@ async fn remove_source(
 ) -> Result<StatusCode, ApiError> {
     let id: SourceId = parse_id(&id, "source")?;
     st.lib.remove_source(&ctx, &id, req).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn remove_asset(
+    Writer(ctx): Writer,
+    State(st): State<AppState>,
+    AxPath(id): AxPath<String>,
+    Json(req): Json<RemoveAsset>,
+) -> Result<StatusCode, ApiError> {
+    let id: AssetId = parse_id(&id, "asset")?;
+    st.lib.remove_asset(&ctx, &id, req).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_blocklist(
+    Reader(ctx): Reader,
+    State(st): State<AppState>,
+) -> Result<Json<Vec<BlockEntry>>, ApiError> {
+    Ok(Json(st.lib.list_blocklist(&ctx).await?))
+}
+
+async fn unblock(
+    Writer(ctx): Writer,
+    State(st): State<AppState>,
+    AxPath(hash): AxPath<String>,
+) -> Result<StatusCode, ApiError> {
+    let hash = ContentHash::from_hex(&hash)
+        .ok_or_else(|| ApiError(LibError::BadRequest("invalid content hash".into())))?;
+    st.lib.unblock(&ctx, &hash).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

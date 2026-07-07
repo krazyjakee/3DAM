@@ -124,6 +124,7 @@ impl Store {
 // `Store` type. Shared free helpers (SQL filter building, blob↔id conversions) live in `helpers`.
 mod analysis;
 mod assets;
+mod blocklist;
 mod collections;
 mod helpers;
 mod jobs;

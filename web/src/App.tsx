@@ -3,6 +3,7 @@ import { BrowserRouter, Route, Routes } from "react-router-dom";
 import { Workspace } from "./components/Workspace";
 import { Settings } from "./components/Settings";
 import { Duplicates } from "./components/Duplicates";
+import { Blocklist } from "./components/Blocklist";
 import { Toaster } from "./components/Toaster";
 import { errorMessage, toast } from "./lib/toast";
 
@@ -38,6 +39,8 @@ export function App() {
           <Route path="/settings" element={<Settings />} />
           {/* Duplicate / dedupe review (tech-spec 05 §4). */}
           <Route path="/duplicates" element={<Duplicates />} />
+          {/* Rescan blocklist management (issue #21). */}
+          <Route path="/blocklist" element={<Blocklist />} />
           {/* URL owns view state via ?query params (lib/view-state.ts); one workspace route. */}
           <Route path="*" element={<Workspace />} />
         </Routes>

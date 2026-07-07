@@ -178,4 +178,16 @@ pub const MIGRATIONS: &[&str] = &[
     ) STRICT;
     CREATE INDEX idx_embedding_space ON embedding(space_id, media_type);
     "#,
+    // ── V4: the rescan blocklist (issue #21) ────────────────────────────────────────────────────
+    // A content hash listed here is never re-imported by a scan/watch/auto-rescan — the "remove +
+    // block" outcome persists across re-scans (§2.2). Keyed by the BLAKE3 content hash so it matches
+    // regardless of path or source; `label` keeps the last-known filename so the management surface
+    // stays recognisable after the asset row it came from is deleted.
+    r#"
+    CREATE TABLE blocklist (
+        content_hash BLOB PRIMARY KEY,       -- BLAKE3 32 bytes, matches asset(content_hash)
+        label        TEXT,                    -- last-known filename at block time, for display
+        blocked_at   INTEGER NOT NULL
+    ) STRICT;
+    "#,
 ];

@@ -8,9 +8,11 @@ import type {
   AnalyzeRequest,
   Asset,
   AssetId,
+  BlockEntry,
   Collection,
   CollectionId,
   CollectionMembers,
+  ContentHash,
   ConvertReport,
   ConvertRequest,
   DupGroup,
@@ -26,6 +28,7 @@ import type {
   PageParams,
   AssetSummary,
   QueryRequest,
+  RemoveAsset,
   RemoveSource,
   ScanRequest,
   SimilarHit,
@@ -93,6 +96,16 @@ export const api = {
   query: (req: QueryRequest) => send<Page<AssetSummary>>("POST", `${API}/query`, req),
   getAsset: (id: AssetId) => get<Asset>(`${API}/assets/${id}`),
   stats: () => get<LibraryStats>(`${API}/stats`),
+
+  /** Remove an asset from the catalog (source file untouched); `block` also blocks its content hash
+   *  from any future scan (issue #21). */
+  removeAsset: (id: AssetId, req: RemoveAsset = {}) =>
+    send<void>("DELETE", `${API}/assets/${id}`, req),
+
+  /** The rescan blocklist — content hashes removed with `block: true`. */
+  listBlocklist: () => get<BlockEntry[]>(`${API}/blocklist`),
+  /** Lift a block so the content can be re-imported by a later scan. */
+  unblock: (hash: ContentHash) => send<void>("DELETE", `${API}/blocklist/${hash}`),
 
   // auto-tag suggestion lifecycle — accept/reject one suggested tag (tech-spec 05 §1.4)
   reviewSuggestion: (req: SuggestionReview) =>

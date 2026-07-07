@@ -3,6 +3,7 @@ import { useState } from "react";
 import { Link } from "react-router-dom";
 import {
   AudioLines,
+  Ban,
   Box,
   Copy,
   Folder,
@@ -224,6 +225,14 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
         className="flex items-center gap-2 border-t border-border px-3 py-2 text-xs text-fg-dim hover:text-accent coarse:min-h-11"
       >
         <Copy size={14} /> Duplicate review
+      </Link>
+      {/* Rescan blocklist management (issue #21). */}
+      <Link
+        to="/blocklist"
+        onClick={onNavigate}
+        className="flex items-center gap-2 border-t border-border px-3 py-2 text-xs text-fg-dim hover:text-accent coarse:min-h-11"
+      >
+        <Ban size={14} /> Rescan blocklist
       </Link>
       {/* Admin / Settings surface (tech-spec 09 §B.4). */}
       <Link

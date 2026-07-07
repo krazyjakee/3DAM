@@ -15,12 +15,14 @@ import type {
   AssetId,
   CollectionId,
   CollectionMembers,
+  ContentHash,
   ConvertRequest,
   DupRequest,
   ExportRequest,
   JobListRequest,
   NewCollection,
   QueryRequest,
+  RemoveAsset,
   ScanRequest,
   SourceId,
   SuggestionReview,
@@ -36,6 +38,7 @@ export const qk = {
   jobs: ["jobs"] as const,
   collections: ["collections"] as const,
   duplicates: ["duplicates"] as const,
+  blocklist: ["blocklist"] as const,
   similar: (id: AssetId) => ["similar", id] as const,
 };
 
@@ -156,6 +159,40 @@ export function useDuplicates(req: DupRequest) {
   return useQuery({
     queryKey: [...qk.duplicates, req],
     queryFn: () => api.listDuplicates(req),
+  });
+}
+
+// ── remove / blocklist (issue #21) ──────────────────────────────────────────
+
+/** Remove an asset; `block` also blocks its content hash from any future scan. Refreshes the grid,
+ *  counts, dedup groups, and (when blocking) the blocklist view. */
+export function useRemoveAsset() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, block }: { id: AssetId; block?: boolean } & RemoveAsset) =>
+      api.removeAsset(id, { block }),
+    meta: { errorPrefix: "Couldn’t remove asset" },
+    onSuccess: (_data, { block }) => {
+      qc.invalidateQueries({ queryKey: qk.assets });
+      qc.invalidateQueries({ queryKey: qk.stats });
+      qc.invalidateQueries({ queryKey: qk.duplicates });
+      if (block) qc.invalidateQueries({ queryKey: qk.blocklist });
+    },
+  });
+}
+
+/** The rescan blocklist — content hashes removed with "Remove + block". */
+export function useBlocklist() {
+  return useQuery({ queryKey: qk.blocklist, queryFn: api.listBlocklist });
+}
+
+/** Lift a block so the content can be re-imported by a later scan. */
+export function useUnblock() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (hash: ContentHash) => api.unblock(hash),
+    meta: { success: "Block lifted", errorPrefix: "Couldn’t unblock" },
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.blocklist }),
   });
 }
 

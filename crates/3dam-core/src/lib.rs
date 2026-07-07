@@ -14,7 +14,7 @@ pub use paths::default_data_dir;
 use async_trait::async_trait;
 use dam_api::dto::*;
 use dam_api::event::{ChangeKind, LibraryEvent, SubscribeRequest};
-use dam_api::id::{AssetId, CollectionId, JobId, SourceId};
+use dam_api::id::{AssetId, CollectionId, ContentHash, JobId, SourceId};
 use dam_api::page::{Page, PageParams};
 use dam_api::service::{AuthContext, EventStream, LibraryService};
 use dam_api::LibError;
@@ -317,6 +317,29 @@ impl LibraryService for EmbeddedLibrary {
         let id = *id;
         self.db(move |s| s.remove_source(&id, req.keep_metadata))
             .await
+    }
+
+    // ── remove / blocklist (issue #21) ───────────────────────────────────────
+    async fn remove_asset(
+        &self,
+        _ctx: &AuthContext,
+        id: &AssetId,
+        req: RemoveAsset,
+    ) -> Result<(), LibError> {
+        let id = *id;
+        self.db(move |s| s.remove_asset(&id, req.block)).await?;
+        // Live update: drop the row from every open grid/inspector (mirrors AssetAdded on scan).
+        let _ = self.events.send(LibraryEvent::AssetRemoved(id));
+        Ok(())
+    }
+
+    async fn list_blocklist(&self, _ctx: &AuthContext) -> Result<Vec<BlockEntry>, LibError> {
+        self.db(|s| s.list_blocklist()).await
+    }
+
+    async fn unblock(&self, _ctx: &AuthContext, hash: &ContentHash) -> Result<(), LibError> {
+        let hash = *hash;
+        self.db(move |s| s.unblock(&hash)).await
     }
 
     // ── collections / smart folders ──────────────────────────────────────────

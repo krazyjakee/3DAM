@@ -8,7 +8,7 @@
 use crate::dto::*;
 use crate::error::LibError;
 use crate::event::{LibraryEvent, SubscribeRequest};
-use crate::id::{AssetId, CollectionId, JobId, SourceId};
+use crate::id::{AssetId, CollectionId, ContentHash, JobId, SourceId};
 use crate::page::{Page, PageParams};
 use async_trait::async_trait;
 use futures::Stream;
@@ -206,6 +206,23 @@ pub trait LibraryService: Send + Sync {
         id: &SourceId,
         req: RemoveSource,
     ) -> Result<(), LibError>;
+
+    // ── remove / blocklist (issue #21) ───────────────────────────────────────
+    /// Remove one asset from the catalog. With `block`, also record its content hash on the
+    /// blocklist so no future scan/watch/auto-rescan re-imports the same bytes. Non-destructive:
+    /// only catalog rows are touched; the file in the source is never deleted (PRODUCT_SPEC §8).
+    async fn remove_asset(
+        &self,
+        ctx: &AuthContext,
+        id: &AssetId,
+        req: RemoveAsset,
+    ) -> Result<(), LibError>;
+
+    /// The blocked content hashes — the management surface for the "removed + blocked" set.
+    async fn list_blocklist(&self, ctx: &AuthContext) -> Result<Vec<BlockEntry>, LibError>;
+
+    /// Lift a block so the content can be re-imported by a subsequent scan.
+    async fn unblock(&self, ctx: &AuthContext, hash: &ContentHash) -> Result<(), LibError>;
 
     // ── analysis / automation (tech-spec 05, phase 3) ────────────────────────
     /// Submit an analysis pass over due (or the requested) assets: embeddings, perceptual/tileability

@@ -91,6 +91,20 @@ pub(crate) enum Cmd {
         /// Asset id (UUID).
         id: String,
     },
+    /// Remove an asset from the catalog. Non-destructive to the source file; optionally block its
+    /// content hash so a later scan/watch/auto-rescan never re-imports it (issue #21).
+    Remove {
+        /// Asset id (UUID).
+        id: String,
+        /// Also block the content hash from re-import by any future scan.
+        #[arg(long)]
+        block: bool,
+    },
+    /// Inspect or clear the rescan blocklist — content hashes removed with `remove --block`.
+    Blocklist {
+        #[command(subcommand)]
+        cmd: BlocklistCmd,
+    },
     /// List background jobs.
     Jobs,
     /// Show one job's status.
@@ -219,6 +233,17 @@ pub(crate) enum TokenCmd {
     List,
     /// Revoke a token by id.
     Revoke { id: String },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum BlocklistCmd {
+    /// List blocked content hashes (removed with `remove --block`), newest first.
+    List,
+    /// Lift a block by content hash so the content can be re-imported by a later scan.
+    Unblock {
+        /// The 64-char hex content hash (as shown by `blocklist list`).
+        hash: String,
+    },
 }
 
 #[derive(Subcommand)]

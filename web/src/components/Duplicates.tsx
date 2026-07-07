@@ -1,8 +1,8 @@
 // Duplicate / dedupe review surface (issue #8; tech-spec 05 §4). A read-only review of the groups
 // the analysis pass linked — exact (byte-identical content hash) or near (pHash / embedding). 3DAM
-// only *groups*; it never auto-deletes. Each group suggests a "keep"; disposing of the rest (delete
-// + block from re-scan) is a separate, deliberate step tracked by issue #21, so there is no remove
-// control here yet — showing a dead button would be fake chrome (DESIGN_GUIDELINES §4).
+// only *groups*; it never auto-deletes. Each group suggests a "keep"; disposing of the rest
+// (remove + block from re-scan, issue #21) is a separate, deliberate step — open a member and use
+// its context menu's "Remove + block". Blocked hashes are managed on the /blocklist surface.
 
 import { useState } from "react";
 import { Link } from "react-router-dom";

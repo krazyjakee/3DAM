@@ -9,7 +9,7 @@ use dam_api::admin::{
 };
 use dam_api::dto::*;
 use dam_api::event::{LibraryEvent, SubscribeRequest};
-use dam_api::id::{AssetId, CollectionId, JobId, SourceId};
+use dam_api::id::{AssetId, CollectionId, ContentHash, JobId, SourceId};
 use dam_api::page::{Page, PageParams};
 use dam_api::service::{AuthContext, EventStream, LibraryService};
 use dam_api::{ErrorBody, LibError};
@@ -328,6 +328,36 @@ impl LibraryService for ApiClient {
             .http
             .delete(self.url(&format!("/api/v1/sources/{id}"))?)
             .json(&req)
+            .send()
+            .await
+            .map_err(|e| LibError::SourceUnavailable(e.to_string()))?;
+        Self::expect_no_content(resp).await
+    }
+
+    async fn remove_asset(
+        &self,
+        _ctx: &AuthContext,
+        id: &AssetId,
+        req: RemoveAsset,
+    ) -> Result<(), LibError> {
+        let resp = self
+            .http
+            .delete(self.url(&format!("/api/v1/assets/{id}"))?)
+            .json(&req)
+            .send()
+            .await
+            .map_err(|e| LibError::SourceUnavailable(e.to_string()))?;
+        Self::expect_no_content(resp).await
+    }
+
+    async fn list_blocklist(&self, _ctx: &AuthContext) -> Result<Vec<BlockEntry>, LibError> {
+        self.get("/api/v1/blocklist").await
+    }
+
+    async fn unblock(&self, _ctx: &AuthContext, hash: &ContentHash) -> Result<(), LibError> {
+        let resp = self
+            .http
+            .delete(self.url(&format!("/api/v1/blocklist/{}", hash.to_hex()))?)
             .send()
             .await
             .map_err(|e| LibError::SourceUnavailable(e.to_string()))?;
