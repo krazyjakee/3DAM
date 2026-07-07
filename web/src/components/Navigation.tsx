@@ -11,10 +11,13 @@ import {
   Image as ImageIcon,
   Layers,
   Library,
+  Monitor,
+  Moon,
   Pencil,
   RefreshCw,
   Settings as SettingsIcon,
   Sparkles,
+  Sun,
   Trash2,
   WifiOff,
 } from "lucide-react";
@@ -34,6 +37,7 @@ import type { Collection, LicenseStatus, MediaType, SourceInfo } from "@/api/typ
 import { licenseColorVar, licenseLabel, sourceStateLabel } from "@/lib/format";
 import { useViewState } from "@/lib/view-state";
 import { useDialogs } from "@/lib/dialogs";
+import { useTheme, type ThemePref } from "@/lib/theme";
 import { AddSourceDialog } from "./AddSourceDialog";
 
 const MEDIA: { key: MediaType; label: string; Icon: typeof AudioLines }[] = [
@@ -236,6 +240,8 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
       />
 
       <div className="mt-auto" />
+      {/* Light/dark theme (issue #62) — cycles system → light → dark, persisted. */}
+      <ThemeToggle />
       {/* Duplicate / dedupe review (issue #8). */}
       <Link
         to="/duplicates"
@@ -262,6 +268,31 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
       </Link>
       {showAdd && <AddSourceDialog onClose={() => setShowAdd(false)} />}
     </nav>
+  );
+}
+
+/** Theme switch (issue #62): a single footer row that cycles the preference System → Light → Dark,
+ *  persisted and applied by the ThemeProvider. The icon/label reflect the current preference; the
+ *  title hints what a click does next. */
+const THEME_ORDER: ThemePref[] = ["system", "light", "dark"];
+const THEME_META: Record<ThemePref, { Icon: typeof Monitor; label: string }> = {
+  system: { Icon: Monitor, label: "System theme" },
+  light: { Icon: Sun, label: "Light theme" },
+  dark: { Icon: Moon, label: "Dark theme" },
+};
+
+function ThemeToggle() {
+  const { pref, setPref } = useTheme();
+  const { Icon, label } = THEME_META[pref];
+  const next = THEME_ORDER[(THEME_ORDER.indexOf(pref) + 1) % THEME_ORDER.length];
+  return (
+    <button
+      onClick={() => setPref(next)}
+      className="flex items-center gap-2 border-t border-border px-3 py-2 text-xs text-fg-dim hover:text-accent coarse:min-h-11"
+      title={`${label} — switch to ${THEME_META[next].label.toLowerCase()}`}
+    >
+      <Icon size={14} /> {label}
+    </button>
   );
 }
 

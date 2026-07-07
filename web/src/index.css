@@ -47,6 +47,41 @@
   --color-media-model: #7c8cff;
 }
 
+/* ── Light theme (DESIGN_GUIDELINES §3.5) ────────────────────────────────────
+   Dark stays the default (the @theme block above). The theme controller
+   (lib/theme.tsx) resolves system/light/dark to an explicit `data-theme` on
+   <html>, so light is the only case we override — every token below re-points
+   the same variable the Tailwind utilities already read. Accent, media, and
+   licence/warn/danger hues are darkened to hold ≥4.5:1 contrast on a light
+   surface; surfaces invert near-black → near-white. */
+:root[data-theme="light"] {
+  --color-bg: #f6f7f9;
+  --color-surface: #ffffff;
+  --color-surface-2: #eceef1;
+  --color-border: #dadfe6;
+  --color-border-strong: #c2c9d3;
+
+  --color-fg: #1a1d23;
+  --color-fg-muted: #55606e;
+  --color-fg-dim: #78828f;
+
+  --color-accent: #0284c7;
+  --color-accent-fg: #ffffff;
+  --color-accent-muted: #dceffb;
+
+  --color-warn: #b45309;
+  --color-danger: #dc2626;
+
+  --color-lic-permissive: #15803d;
+  --color-lic-attribution: #0284c7;
+  --color-lic-restricted: #dc2626;
+  --color-lic-unknown: #6b7280;
+
+  --color-media-audio: #0d9488;
+  --color-media-image: #c2410c;
+  --color-media-model: #4f46e5;
+}
+
 @layer base {
   html,
   body,

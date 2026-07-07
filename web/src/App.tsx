@@ -6,6 +6,7 @@ import { Duplicates } from "./components/Duplicates";
 import { Blocklist } from "./components/Blocklist";
 import { Toaster } from "./components/Toaster";
 import { DialogProvider } from "./lib/dialogs";
+import { ThemeProvider } from "./lib/theme";
 import { errorMessage, toast } from "./lib/toast";
 
 // Every mutation reports through one place (issue #23): a failure always raises an error toast, so
@@ -34,6 +35,7 @@ const queryClient = new QueryClient({
 export function App() {
   return (
     <QueryClientProvider client={queryClient}>
+      <ThemeProvider>
       <DialogProvider>
       <BrowserRouter>
         <Routes>
@@ -50,6 +52,7 @@ export function App() {
       {/* Global toast viewport — feedback for every mutation, on top of every route. */}
       <Toaster />
       </DialogProvider>
+      </ThemeProvider>
     </QueryClientProvider>
   );
 }

@@ -5,6 +5,25 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="dark" />
     <title>3DAM</title>
+    <!-- Apply the saved (or OS) theme before first paint so there's no dark→light flash. Kept in
+         sync with lib/theme.tsx (dark is the default; only `light` is an explicit token override). -->
+    <script>
+      (function () {
+        try {
+          var p = localStorage.getItem("3dam-theme");
+          var t =
+            p === "light" || p === "dark"
+              ? p
+              : matchMedia("(prefers-color-scheme: light)").matches
+                ? "light"
+                : "dark";
+          var r = document.documentElement;
+          r.dataset.theme = t;
+          r.classList.toggle("dark", t === "dark");
+          r.style.colorScheme = t;
+        } catch (e) {}
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>
