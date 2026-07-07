@@ -112,7 +112,7 @@ function Preview({ asset }: { asset: Asset }) {
     // #16, #14). Keyed by id so switching assets resets playback + the decoded waveform.
     return (
       <div className="border-b border-border">
-        <AudioPlayer key={summary.id} src={src} />
+        <AudioPlayer key={summary.id} src={src} assetId={summary.id} />
       </div>
     );
   }

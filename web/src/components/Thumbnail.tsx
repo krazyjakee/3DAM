@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { Loader2 } from "lucide-react";
 import type { AssetSummary } from "@/api/types";
 import { api } from "@/api/client";
 import { MediaIcon } from "./MediaIcon";
@@ -6,8 +7,11 @@ import { MediaIcon } from "./MediaIcon";
 // Capability phase 2 (Media depth): images get a real server-rendered PNG thumbnail (tech-spec
 // 04 §6.4), lazily loaded via <img>. Audio/3D previews are interactive WASM islands, not server
 // thumbnails, so they keep the honest typed tile here (DESIGN_GUIDELINES §4 — "no decorative
-// placeholders masquerading as content"). If a thumbnail fails to load (unsupported/decode error),
-// we fall back to that same tile rather than showing a broken image.
+// placeholders masquerading as content").
+//
+// While an image thumbnail is still fetching/generating we show a neutral placeholder (the typed
+// tile glyph) with a loading spinner overlay rather than raw alt text (issue #53); on load we swap
+// to the image, and on a decode/unsupported error we fall back to the same typed tile.
 
 const TINT: Record<AssetSummary["media"], string> = {
   audio: "var(--color-lic-attribution)",
@@ -31,22 +35,39 @@ function TypedTile({ asset, size }: { asset: AssetSummary; size: number }) {
 }
 
 export function Thumbnail({ asset, size = 28 }: { asset: AssetSummary; size?: number }) {
-  const [failed, setFailed] = useState(false);
+  const [status, setStatus] = useState<"loading" | "loaded" | "failed">("loading");
 
-  if (asset.media === "image" && !failed) {
-    // Request roughly 2× the render box (capped) so the thumbnail stays crisp on HiDPI grids.
-    const edge = Math.min(512, Math.max(64, size * 4));
-    return (
+  // A virtualised cell may be reused for a different asset without remounting — reset when the id
+  // changes so the placeholder/spinner tracks the new image rather than the previous one.
+  useEffect(() => setStatus("loading"), [asset.id]);
+
+  // Non-image media, or an image that failed to decode, always shows the honest typed tile.
+  if (asset.media !== "image" || status === "failed") {
+    return <TypedTile asset={asset} size={size} />;
+  }
+
+  // Request roughly 2× the render box (capped) so the thumbnail stays crisp on HiDPI grids.
+  const edge = Math.min(512, Math.max(64, size * 4));
+  return (
+    <div className="relative h-full w-full" style={{ background: "var(--color-bg)" }}>
+      {status === "loading" && (
+        <div className="absolute inset-0 flex items-center justify-center" aria-hidden>
+          <span className="opacity-20" style={{ color: TINT.image }}>
+            <MediaIcon media="image" size={size} />
+          </span>
+          <Loader2 className="absolute animate-spin text-fg-dim" size={Math.max(14, size / 2)} />
+        </div>
+      )}
       <img
         src={api.assetThumbnailUrl(asset.id, edge)}
         alt={asset.name}
         loading="lazy"
         decoding="async"
-        className="h-full w-full bg-bg object-contain"
-        onError={() => setFailed(true)}
+        className="h-full w-full object-contain transition-opacity"
+        style={{ opacity: status === "loaded" ? 1 : 0 }}
+        onLoad={() => setStatus("loaded")}
+        onError={() => setStatus("failed")}
       />
-    );
-  }
-
-  return <TypedTile asset={asset} size={size} />;
+    </div>
+  );
 }

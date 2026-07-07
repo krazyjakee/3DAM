@@ -39,6 +39,12 @@
   --color-lic-attribution: #38bdf8;
   --color-lic-restricted: #f0616d;
   --color-lic-unknown: #8b93a1;
+
+  /* Per-media-type identity colours (DESIGN_GUIDELINES visual language). One hue per media type so
+     a mixed grid/table reads at a glance — used by the MediaBadge and typed tiles, not the accent. */
+  --color-media-audio: #35d0ba;
+  --color-media-image: #f0883e;
+  --color-media-model: #7c8cff;
 }
 
 @layer base {

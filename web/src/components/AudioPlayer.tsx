@@ -4,9 +4,10 @@
 // call site passed no progress). Clicking the waveform seeks too. Decode/stream failures degrade to
 // a clear message rather than a dead control (fail-soft, DESIGN_GUIDELINES §2).
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Pause, Play } from "lucide-react";
 import { WaveformIsland } from "@/islands/WaveformIsland";
+import { clearAutoplay, useAutoplaySignal } from "@/lib/audio-intent";
 
 /** m:ss, guarding the NaN/Infinity that HTMLMediaElement reports before metadata loads. */
 function fmtTime(sec: number): string {
@@ -16,7 +17,7 @@ function fmtTime(sec: number): string {
   return `${m}:${String(s).padStart(2, "0")}`;
 }
 
-export function AudioPlayer({ src }: { src: string }) {
+export function AudioPlayer({ src, assetId }: { src: string; assetId?: string }) {
   const audioRef = useRef<HTMLAudioElement>(null);
   const [playing, setPlaying] = useState(false);
   const [time, setTime] = useState(0);
@@ -24,6 +25,16 @@ export function AudioPlayer({ src }: { src: string }) {
   const [error, setError] = useState(false);
 
   const progress = dur > 0 ? time / dur : 0;
+
+  // Double-click-to-play (issue #52): when the Browser requests autoplay for this asset, start
+  // playback and clear the request so single-click selecting it later never auto-starts.
+  const autoplaySignal = useAutoplaySignal(assetId);
+  useEffect(() => {
+    if (autoplaySignal > 0) {
+      audioRef.current?.play().catch(() => setError(true));
+      clearAutoplay();
+    }
+  }, [autoplaySignal]);
 
   const toggle = () => {
     const a = audioRef.current;

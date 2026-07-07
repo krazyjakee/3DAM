@@ -6,9 +6,10 @@ import { useAnalyze, useAssets, useCollectionMembers, useCollections } from "@/a
 import type { AssetSummary, SortField } from "@/api/types";
 import { useViewState } from "@/lib/view-state";
 import { bytes } from "@/lib/format";
+import { requestAutoplay } from "@/lib/audio-intent";
 import { Thumbnail } from "./Thumbnail";
 import { LicenseBadge } from "./LicenseBadge";
-import { MediaIcon } from "./MediaIcon";
+import { MediaBadge } from "./MediaBadge";
 import { ContextMenu, useLongPress, type MenuState } from "./ContextMenu";
 import { ExportDialog } from "./ExportDialog";
 import { ConvertDialog } from "./ConvertDialog";
@@ -82,6 +83,16 @@ export function Browser({ onOpenNav }: { onOpenNav?: () => void }) {
     [anchor, items, patch],
   );
 
+  // Double-click / double-tap = activate: focus the asset in the Inspector and, for audio, start
+  // playback immediately (issue #52). Non-audio just opens in the Inspector's viewer.
+  const onItemActivate = useCallback(
+    (asset: AssetSummary) => {
+      patch({ selected: asset.id });
+      if (asset.media === "audio") requestAutoplay(asset.id);
+    },
+    [patch],
+  );
+
   // Right-click / long-press targets the whole selection when the clicked item is part of a
   // multi-selection; otherwise just that item (issue #22).
   const openMenu = useCallback(
@@ -114,6 +125,7 @@ export function Browser({ onOpenNav }: { onOpenNav?: () => void }) {
   const listProps = {
     selection,
     onItemClick,
+    onItemActivate,
     onContext: openMenu,
     hasMore: assets.hasNextPage,
     loadMore: () => assets.fetchNextPage(),
@@ -356,6 +368,7 @@ interface ListProps {
   items: AssetSummary[];
   selection: Set<string>;
   onItemClick: (asset: AssetSummary, mods: ClickMods) => void;
+  onItemActivate: (asset: AssetSummary) => void;
   onContext: (asset: AssetSummary, x: number, y: number) => void;
   hasMore: boolean;
   loadMore: () => void;
@@ -368,7 +381,16 @@ function mods(e: React.MouseEvent): ClickMods {
 }
 
 /** Windowed grid — a 100k+ library scrolls at 60fps (DESIGN_GUIDELINES §1.1, §3.1). */
-function Grid({ items, selection, onItemClick, onContext, hasMore, loadMore, loading }: ListProps) {
+function Grid({
+  items,
+  selection,
+  onItemClick,
+  onItemActivate,
+  onContext,
+  hasMore,
+  loadMore,
+  loading,
+}: ListProps) {
   const parentRef = useRef<HTMLDivElement>(null);
   const cols = useColumns(parentRef, CELL_W);
   const rowCount = Math.ceil(items.length / cols);
@@ -403,6 +425,7 @@ function Grid({ items, selection, onItemClick, onContext, hasMore, loadMore, loa
                   asset={a}
                   active={selection.has(a.id)}
                   onClick={onItemClick}
+                  onActivate={onItemActivate}
                   onContext={onContext}
                 />
               ))}
@@ -428,17 +451,20 @@ function GridCell({
   asset,
   active,
   onClick,
+  onActivate,
   onContext,
 }: {
   asset: AssetSummary;
   active: boolean;
   onClick: (asset: AssetSummary, mods: ClickMods) => void;
+  onActivate: (asset: AssetSummary) => void;
   onContext: (asset: AssetSummary, x: number, y: number) => void;
 }) {
   const longPress = useLongPress((x, y) => onContext(asset, x, y));
   return (
     <button
       onClick={(e) => onClick(asset, mods(e))}
+      onDoubleClick={() => onActivate(asset)}
       onContextMenu={(e) => {
         e.preventDefault();
         onContext(asset, e.clientX, e.clientY);
@@ -451,8 +477,10 @@ function GridCell({
         background: "var(--color-surface)",
       }}
     >
-      <div className="min-h-0 flex-1 overflow-hidden">
+      <div className="relative min-h-0 flex-1 overflow-hidden">
         <Thumbnail asset={asset} />
+        {/* media-type tag so a mixed grid reads at a glance (DESIGN_GUIDELINES — media badges) */}
+        <MediaBadge media={asset.media} className="absolute top-1.5 left-1.5" />
       </div>
       <div className="flex items-center justify-between gap-1 border-t border-border px-1.5 py-1">
         <span className="truncate text-[11px] text-fg" title={asset.name}>
@@ -470,7 +498,16 @@ function GridCell({
 }
 
 /** Windowed table — same query, toggle preserves selection + filter (tech-spec 09 §B.1). */
-function Table({ items, selection, onItemClick, onContext, hasMore, loadMore, loading }: ListProps) {
+function Table({
+  items,
+  selection,
+  onItemClick,
+  onItemActivate,
+  onContext,
+  hasMore,
+  loadMore,
+  loading,
+}: ListProps) {
   const parentRef = useRef<HTMLDivElement>(null);
   const virt = useVirtualizer({
     count: items.length,
@@ -498,6 +535,7 @@ function Table({ items, selection, onItemClick, onContext, hasMore, loadMore, lo
               active={selection.has(a.id)}
               top={vr.start}
               onClick={onItemClick}
+              onActivate={onItemActivate}
               onContext={onContext}
             />
           );
@@ -513,18 +551,21 @@ function TableRow({
   active,
   top,
   onClick,
+  onActivate,
   onContext,
 }: {
   asset: AssetSummary;
   active: boolean;
   top: number;
   onClick: (asset: AssetSummary, mods: ClickMods) => void;
+  onActivate: (asset: AssetSummary) => void;
   onContext: (asset: AssetSummary, x: number, y: number) => void;
 }) {
   const longPress = useLongPress((x, y) => onContext(asset, x, y));
   return (
     <button
       onClick={(e) => onClick(asset, mods(e))}
+      onDoubleClick={() => onActivate(asset)}
       onContextMenu={(e) => {
         e.preventDefault();
         onContext(asset, e.clientX, e.clientY);
@@ -539,7 +580,7 @@ function TableRow({
       }}
     >
       <span className="flex min-w-0 items-center gap-2">
-        <MediaIcon media={asset.media} size={13} />
+        <MediaBadge media={asset.media} className="shrink-0" />
         <span className="truncate text-fg" title={asset.name}>
           {asset.name}
         </span>
