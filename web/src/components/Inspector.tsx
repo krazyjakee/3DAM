@@ -1,6 +1,6 @@
 import type React from "react";
 import { useState } from "react";
-import { Check, PanelRightClose, Sparkles, X } from "lucide-react";
+import { Check, Grid3x3, PanelRightClose, Sparkles, X } from "lucide-react";
 import {
   useAnalyze,
   useAsset,
@@ -26,6 +26,7 @@ import { ModelViewerIsland } from "@/islands/ModelViewerIsland";
 import { AudioPlayer } from "./AudioPlayer";
 import { LicenseBadge } from "./LicenseBadge";
 import { ImageViewer } from "./ImageViewer";
+import { TilePreview } from "./TilePreview";
 import { Thumbnail } from "./Thumbnail";
 import { MediaIcon } from "./MediaIcon";
 import { Drawer } from "./Drawer";
@@ -100,6 +101,7 @@ function InspectorPanel({
 function Preview({ asset }: { asset: Asset }) {
   const { summary } = asset;
   const src = api.assetContentUrl(summary.id);
+  const [tiling, setTiling] = useState(false);
   if (summary.media === "model") {
     return (
       <div className="aspect-square border-b border-border">
@@ -119,9 +121,20 @@ function Preview({ asset }: { asset: Asset }) {
   if (summary.media === "image") {
     // Full-resolution content image in a zoom/pan viewer — 1:1 is pixel-accurate for inspecting
     // texture detail / tileability (issue #17). Keyed by id so switching assets resets the view.
+    // A "Check tiling" affordance opens the interactive tile preview (cube / flat repeat, issue #58).
     return (
-      <div className="aspect-square border-b border-border">
+      <div className="relative aspect-square border-b border-border">
         <ImageViewer key={summary.id} src={src} alt={summary.name} />
+        <button
+          onClick={() => setTiling(true)}
+          className="absolute top-1.5 right-1.5 flex items-center gap-1 rounded border border-border bg-surface/85 px-1.5 py-1 text-[10px] text-fg-muted backdrop-blur hover:text-fg coarse:min-h-11"
+          title="Check tiling — wrap this texture on a cube / flat repeat"
+        >
+          <Grid3x3 size={12} /> Check tiling
+        </button>
+        {tiling && (
+          <TilePreview src={src} name={summary.name} onClose={() => setTiling(false)} />
+        )}
       </div>
     );
   }
