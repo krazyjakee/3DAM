@@ -494,7 +494,21 @@ function MediaFacts({ attrs }: { attrs: MediaAttributes }) {
     if (attrs.color_depth != null) rows.push(["Bit depth", `${attrs.color_depth}-bit`]);
     if (attrs.has_alpha != null) rows.push(["Alpha", attrs.has_alpha ? "yes" : "no"]);
     if (attrs.color_space) rows.push(["Color space", attrs.color_space]);
-  } else if (attrs.media === "model") {
+  }
+
+  // Seamlessness readout for images (issue #57) — the analysis pass's edge-continuity score +
+  // `seamless | tiled | non_tiling` class. Rendered as its own block (badge + score bar), separate
+  // from the plain key/value rows. Absent until `analyze` has run.
+  const seam =
+    attrs.media === "image" && (attrs.tileability != null || attrs.tile_class) ? (
+      <Seamlessness
+        tileability={attrs.tileability ?? null}
+        tileClass={attrs.tile_class ?? null}
+        repeatPeriod={attrs.repeat_period ?? null}
+      />
+    ) : null;
+
+  if (attrs.media === "model") {
     if (attrs.vertex_count != null) rows.push(["Vertices", attrs.vertex_count.toLocaleString()]);
     if (attrs.triangle_count != null)
       rows.push(["Triangles", attrs.triangle_count.toLocaleString()]);
@@ -505,13 +519,73 @@ function MediaFacts({ attrs }: { attrs: MediaAttributes }) {
     if (attrs.has_animation != null) rows.push(["Animation", attrs.has_animation ? "yes" : "no"]);
     if (attrs.has_uvs != null) rows.push(["UVs", attrs.has_uvs ? "yes" : "no"]);
   }
-  if (rows.length === 0) return null;
+  if (rows.length === 0 && !seam) return null;
   return (
     <Group title="Media">
       {rows.map(([label, value]) => (
         <Field key={label} label={label} value={value} />
       ))}
+      {seam}
     </Group>
+  );
+}
+
+/** Seamlessness readout for a texture (issue #57): the `seamless | tiled | non_tiling` class as a
+ *  coloured badge and the 0–1 edge-continuity score as a bar (raw value on hover). Only rendered once
+ *  the analysis pass has scored the image. */
+function Seamlessness({
+  tileability,
+  tileClass,
+  repeatPeriod,
+}: {
+  tileability: number | null;
+  tileClass: string | null;
+  repeatPeriod: number | null;
+}) {
+  const pct = tileability != null ? Math.round(tileability * 100) : null;
+  const label =
+    tileClass === "seamless"
+      ? "Seamless"
+      : tileClass === "tiled"
+        ? "Tiled"
+        : tileClass === "non_tiling"
+          ? "Non-tiling"
+          : null;
+  const tone =
+    tileClass === "seamless"
+      ? "var(--color-lic-permissive)"
+      : tileClass === "tiled"
+        ? "var(--color-accent)"
+        : "var(--color-fg-dim)";
+
+  return (
+    <div className="pt-1.5">
+      <div className="mb-1 flex items-center justify-between">
+        <span className="text-[11px] text-fg-dim">Seamlessness</span>
+        {label && (
+          <span
+            className="rounded px-1.5 py-0.5 text-[10px] font-medium"
+            style={{ color: tone, background: "color-mix(in srgb, currentColor 14%, transparent)" }}
+          >
+            {label}
+          </span>
+        )}
+      </div>
+      {pct != null && (
+        <div
+          className="flex items-center gap-2"
+          title={`Edge-continuity tileability: ${tileability!.toFixed(3)}`}
+        >
+          <div className="h-1.5 flex-1 overflow-hidden rounded bg-surface-2">
+            <div style={{ width: `${pct}%`, height: "100%", background: tone }} />
+          </div>
+          <span className="shrink-0 text-[10px] tabular-nums text-fg-muted">{pct}%</span>
+        </div>
+      )}
+      {repeatPeriod != null && (
+        <p className="mt-1 text-[10px] text-fg-dim">Repeat period ~{repeatPeriod}px</p>
+      )}
+    </div>
   );
 }
 

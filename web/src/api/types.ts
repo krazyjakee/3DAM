@@ -70,6 +70,19 @@ export interface ImageAttributes {
   color_depth?: number | null;
   has_alpha: boolean | null;
   color_space: string | null;
+  // ── derived by the analysis pass (null until `analyze` runs) ──
+  /** Perceptual (dHash) hash, hex-encoded. */
+  phash?: string | null;
+  /** Edge-continuity tileability score in [0,1]. */
+  tileability?: number | null;
+  /** Detected internal repeat period in source pixels, if the image already tiles. */
+  repeat_period?: number | null;
+  /** `seamless` | `tiled` | `non_tiling`. */
+  tile_class?: string | null;
+  /** Dominant colours as `#rrggbb`, most-prominent first. */
+  dominant_colors?: string[];
+  /** Auto-category guess (`texture` | `photo` | `sprite` | …). */
+  class?: string | null;
 }
 export interface ModelAttributes {
   vertex_count: number | null;
