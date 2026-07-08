@@ -33,7 +33,7 @@ Legend: ✅ done · 🟡 partial · ⬜ owed (not yet in egui)
 | Advanced Search (structured attr + tag filters) | ✅ | ✅ | toolbar "Filters" popover: media-contextual enum/numEnum/bool dropdowns + numeric ranges + free tag filter, AND-ed onto the query |
 | Quick class facet (audio/image/model class) | ✅ | ✅ | contextual chips in the left rail when a media type is active |
 | Favorites / Recently added | ✅ | 🟡 | favourites facet done; "recently added" = the Newest sort |
-| Collections & smart folders | ✅ | 🟡 | list + browse-by + inspector membership; create/rename/delete + member editing owed |
+| Collections & smart folders | ✅ | ✅ | list + browse-by + "+ New" create (manual / smart-from-search) + right-click rename/delete + inspector add/remove membership |
 | Grid ⇄ list view toggle | ✅ | 🟡 | grid + flat list; the web "table" (sortable columns) is richer |
 | Sort control | ✅ | ✅ | toolbar combo (name/size/scanned, both directions) |
 | Tag review (reject/restore) | ✅ | ✅ | reject-only lifecycle in the inspector, refreshes on review |

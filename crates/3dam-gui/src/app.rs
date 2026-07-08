@@ -17,13 +17,13 @@ use eframe::egui;
 use dam_api::service::{AuthContext, LibraryService};
 use dam_api::{
     AddSource, AnalyzeRequest, Asset, AssetId, AssetSummary, Collection, CollectionId,
-    CollectionKind, CollisionRule, ConvertReport, ConvertRequest, ConvertTarget, DupGroup, DupKind,
-    DupRequest, EventTopic, ExportFormat, ExportReport, ExportRequest, FacetField, Filter,
-    FilterOp, FilterValue, FolderEntry, FolderListing, JobState, LibraryEvent, LibraryStats,
-    LicenseStatus, MediaAttributes, MediaType, Page, PageParams, QueryRequest, RemoveSource,
-    ReviewAction, ScanMode, ScanRequest, SearchMode, SimilarHit, SimilarRequest, Sort, SortDir,
-    SortField, SourceId, SourceInfo, SourceKind, SubscribeRequest, SuggestionReview,
-    ThumbnailRegenRequest,
+    CollectionKind, CollectionMembers, CollisionRule, ConvertReport, ConvertRequest, ConvertTarget,
+    DupGroup, DupKind, DupRequest, EventTopic, ExportFormat, ExportReport, ExportRequest,
+    FacetField, Filter, FilterOp, FilterValue, FolderEntry, FolderListing, JobState, LibraryEvent,
+    LibraryStats, LicenseStatus, MediaAttributes, MediaType, NewCollection, Page, PageParams,
+    QueryRequest, RemoveSource, ReviewAction, ScanMode, ScanRequest, SearchMode, SimilarHit,
+    SimilarRequest, Sort, SortDir, SortField, SourceId, SourceInfo, SourceKind, SubscribeRequest,
+    SuggestionReview, ThumbnailRegenRequest, UpdateCollection,
 };
 use futures::StreamExt;
 
@@ -365,6 +365,17 @@ enum Msg {
     AudioBytes(AssetId, Result<Vec<u8>, String>),
     /// The DMSH preview-mesh blob for a model asset (interactive 3D viewer).
     ModelMesh(AssetId, Result<Vec<u8>, String>),
+    /// A collection create/rename/delete/membership mutation finished (reload on success).
+    CollectionMutated(Result<(), String>),
+}
+
+/// A collection CRUD / membership action gathered while rendering, applied after the panels.
+enum CollectionAction {
+    Create { name: String, smart: bool },
+    Rename { id: CollectionId, name: String },
+    Delete(CollectionId),
+    AddMember { id: CollectionId, asset: AssetId },
+    RemoveMember { id: CollectionId, asset: AssetId },
 }
 
 pub struct DamGui {
@@ -391,6 +402,13 @@ pub struct DamGui {
     /// faceted query (mutually exclusive with the facets, mirroring the web).
     collection: Option<CollectionId>,
     collections: Vec<Collection>,
+    // ── collection CRUD modals ──
+    /// The "new collection" modal: name buffer + whether to save the current search as a smart folder.
+    collection_new_open: bool,
+    collection_new_name: String,
+    collection_new_smart: bool,
+    /// When Some, the rename modal is open for this collection with the edited name buffer.
+    collection_rename: Option<(CollectionId, String)>,
     /// Exact (byte-identical) duplicate groups, cached for the inspector's per-asset dup section.
     duplicates: Vec<DupGroup>,
     sort: usize, // index into SORTS
@@ -494,6 +512,10 @@ impl DamGui {
             path: None,
             collection: None,
             collections: Vec::new(),
+            collection_new_open: false,
+            collection_new_name: String::new(),
+            collection_new_smart: false,
+            collection_rename: None,
             duplicates: Vec::new(),
             sort: 0,
             mode: SearchMode::Lexical,
@@ -1065,6 +1087,163 @@ impl DamGui {
         });
     }
 
+    /// Apply a collection CRUD / membership action off-thread; success posts `CollectionMutated(Ok)`
+    /// which triggers a reload of the list, the browse view, and the inspected asset's memberships.
+    fn collection_action(&self, action: CollectionAction) {
+        let (lib, auth, tx, egctx) = (
+            self.lib.clone(),
+            self.auth.clone(),
+            self.tx.clone(),
+            self.egui_ctx.clone(),
+        );
+        // A smart folder saves the current faceted browse as its live query.
+        let smart_query = self.build_query();
+        self.rt.spawn(async move {
+            let r: Result<(), String> = async {
+                match action {
+                    CollectionAction::Create { name, smart } => {
+                        let (kind, query) = if smart {
+                            (CollectionKind::Smart, Some(smart_query))
+                        } else {
+                            (CollectionKind::Manual, None)
+                        };
+                        lib.create_collection(&auth, NewCollection { name, kind, query })
+                            .await
+                            .map(|_| ())
+                    }
+                    CollectionAction::Rename { id, name } => {
+                        lib.update_collection(
+                            &auth,
+                            &id,
+                            UpdateCollection {
+                                name: Some(name),
+                                query: None,
+                            },
+                        )
+                        .await
+                    }
+                    CollectionAction::Delete(id) => lib.delete_collection(&auth, &id).await,
+                    CollectionAction::AddMember { id, asset } => {
+                        lib.modify_collection_members(
+                            &auth,
+                            &id,
+                            CollectionMembers {
+                                add: vec![asset],
+                                remove: vec![],
+                            },
+                        )
+                        .await
+                    }
+                    CollectionAction::RemoveMember { id, asset } => {
+                        lib.modify_collection_members(
+                            &auth,
+                            &id,
+                            CollectionMembers {
+                                add: vec![],
+                                remove: vec![asset],
+                            },
+                        )
+                        .await
+                    }
+                }
+                .map_err(|e| e.to_string())
+            }
+            .await;
+            let _ = tx.send(Msg::CollectionMutated(r));
+            egctx.request_repaint();
+        });
+    }
+
+    /// The create + rename collection modals. Kept together; each fires a `collection_action`
+    /// (create/rename) on confirm and closes.
+    fn collection_modals(&mut self, ctx: &egui::Context) {
+        // ── new collection ──
+        if self.collection_new_open {
+            let mut open = true;
+            let mut submit = false;
+            let mut cancel = false;
+            egui::Window::new("New collection")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.label("Name");
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.collection_new_name)
+                            .hint_text("Collection name")
+                            .desired_width(220.0),
+                    );
+                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        submit = true;
+                    }
+                    ui.checkbox(
+                        &mut self.collection_new_smart,
+                        "Smart folder (save current search)",
+                    );
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        let named = !self.collection_new_name.trim().is_empty();
+                        if ui.add_enabled(named, egui::Button::new("Create")).clicked() {
+                            submit = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            if submit && !self.collection_new_name.trim().is_empty() {
+                self.collection_action(CollectionAction::Create {
+                    name: self.collection_new_name.trim().to_string(),
+                    smart: self.collection_new_smart,
+                });
+                self.collection_new_open = false;
+            } else if cancel || !open {
+                self.collection_new_open = false;
+            }
+        }
+
+        // ── rename ── the name buffer is edited *in place* in `collection_rename` (like the create
+        // modal's persistent field) — reconstructing it each frame fought egui's text-cursor state.
+        let mut open = true;
+        let mut submit = false;
+        let mut cancel = false;
+        if let Some((_id, name)) = &mut self.collection_rename {
+            egui::Window::new("Rename collection")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(name)
+                            .hint_text("Collection name")
+                            .desired_width(220.0),
+                    );
+                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        submit = true;
+                    }
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        let named = !name.trim().is_empty();
+                        if ui.add_enabled(named, egui::Button::new("Save")).clicked() {
+                            submit = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+        }
+        if self.collection_rename.is_some() && (submit || cancel || !open) {
+            let (id, name) = self.collection_rename.take().unwrap();
+            if submit && !name.trim().is_empty() {
+                self.collection_action(CollectionAction::Rename {
+                    id,
+                    name: name.trim().to_string(),
+                });
+            }
+        }
+    }
+
     /// Load the exact (byte-identical) duplicate groups, cached for the inspector's dup section.
     fn load_duplicates(&self, egctx: &egui::Context) {
         let (lib, auth, tx, egctx) = (
@@ -1597,6 +1776,18 @@ impl DamGui {
             Msg::Collections(Err(e)) => {
                 self.error = Some(format!("Couldn't load collections: {e}"))
             }
+            Msg::CollectionMutated(Ok(())) => {
+                // Reload the list (names/counts), the browse view, and the inspected asset's chips.
+                let ctx = self.egui_ctx.clone();
+                self.load_collections(&ctx);
+                self.load_assets(&ctx);
+                if let Some(id) = self.selected {
+                    self.reload_detail(id);
+                }
+            }
+            Msg::CollectionMutated(Err(e)) => {
+                self.error = Some(format!("Collection update failed: {e}"))
+            }
             Msg::Export(Ok(rep)) => {
                 self.export_status = Some(Ok(format!(
                     "Exported {} asset(s) → {} ({} file(s))",
@@ -1773,6 +1964,10 @@ impl eframe::App for DamGui {
         let mut open_similar: Option<AssetId> = None;
         // Some(Some(id)) selects a collection; Some(None) clears collection mode.
         let mut pick_collection: Option<Option<CollectionId>> = None;
+        // A collection CRUD / membership action (create/rename/delete/add/remove), applied post-panel.
+        let mut collection_action: Option<CollectionAction> = None;
+        // Rename-modal open request (collected here to avoid a &mut self under the collections borrow).
+        let mut open_rename: Option<(CollectionId, String)> = None;
         let mut audio_play: Option<AssetId> = None;
         let mut audio_stop = false;
         let mut orbit_drag = egui::Vec2::ZERO;
@@ -2079,26 +2274,52 @@ impl eframe::App for DamGui {
                 }
 
                 // Collections & smart folders — clicking one browses its members (mutually exclusive
-                // with the facets). Create/rename/delete + membership editing stay owed (the web
-                // creates manual collections here; the GUI lists + filters for now).
-                if !self.collections.is_empty() {
-                    ui.separator();
+                // with the facets); the header "+ New" creates one, and right-click renames/deletes
+                // (mirrors the web Collections section). Membership editing lives in the inspector.
+                ui.separator();
+                ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("COLLECTIONS").small().weak());
-                    for c in &self.collections {
-                        let on = self.collection == Some(c.id);
-                        let smart = if matches!(c.kind, CollectionKind::Smart) {
-                            " ~smart"
-                        } else {
-                            ""
-                        };
-                        let label = match c.count {
-                            Some(n) => format!("{} ({n}){smart}", c.name),
-                            None => format!("{}{smart}", c.name),
-                        };
-                        if ui.selectable_label(on, label).clicked() {
-                            pick_collection = Some(if on { None } else { Some(c.id) });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .small_button("+ New")
+                            .on_hover_text("Create a collection")
+                            .clicked()
+                        {
+                            self.collection_new_name.clear();
+                            self.collection_new_smart = false;
+                            self.collection_new_open = true;
                         }
+                    });
+                });
+                if self.collections.is_empty() {
+                    ui.label(
+                        egui::RichText::new("Group assets into a collection")
+                            .small()
+                            .weak(),
+                    );
+                }
+                for c in &self.collections {
+                    let on = self.collection == Some(c.id);
+                    let smart = matches!(c.kind, CollectionKind::Smart);
+                    let suffix = if smart { " ~smart" } else { "" };
+                    let label = match c.count {
+                        Some(n) => format!("{} ({n}){suffix}", c.name),
+                        None => format!("{}{suffix}", c.name),
+                    };
+                    let resp = ui.selectable_label(on, label);
+                    if resp.clicked() {
+                        pick_collection = Some(if on { None } else { Some(c.id) });
                     }
+                    resp.context_menu(|ui| {
+                        if ui.button("Rename…").clicked() {
+                            open_rename = Some((c.id, c.name.clone()));
+                            ui.close_menu();
+                        }
+                        if ui.button("Delete").clicked() {
+                            collection_action = Some(CollectionAction::Delete(c.id));
+                            ui.close_menu();
+                        }
+                    });
                 }
 
                 // Theme toggle at the foot of the rail (dark-first).
@@ -2213,8 +2434,10 @@ impl eframe::App for DamGui {
                                 });
                             }
 
-                            // Collection memberships (read-only chips; per-asset add/remove is owed).
-                            if !asset.collections.is_empty() {
+                            // Collection memberships: current manual-collection chips (click × to
+                            // remove) + an "Add to…" menu of the manual collections it isn't in yet.
+                            {
+                                let aid = asset.summary.id;
                                 ui.separator();
                                 ui.label(egui::RichText::new("COLLECTIONS").small().weak());
                                 ui.horizontal_wrapped(|ui| {
@@ -2225,7 +2448,41 @@ impl eframe::App for DamGui {
                                             .find(|c| c.id == *cid)
                                             .map(|c| c.name.as_str())
                                             .unwrap_or("(collection)");
-                                        ui.label(egui::RichText::new(name).small());
+                                        if ui
+                                            .small_button(format!("{name} ×"))
+                                            .on_hover_text("Remove from collection")
+                                            .clicked()
+                                        {
+                                            collection_action =
+                                                Some(CollectionAction::RemoveMember {
+                                                    id: *cid,
+                                                    asset: aid,
+                                                });
+                                        }
+                                    }
+                                    // Manual collections this asset isn't a member of yet.
+                                    let addable: Vec<(CollectionId, String)> = self
+                                        .collections
+                                        .iter()
+                                        .filter(|c| {
+                                            matches!(c.kind, CollectionKind::Manual)
+                                                && !asset.collections.contains(&c.id)
+                                        })
+                                        .map(|c| (c.id, c.name.clone()))
+                                        .collect();
+                                    if !addable.is_empty() {
+                                        ui.menu_button("Add to…", |ui| {
+                                            for (cid, name) in addable {
+                                                if ui.button(name).clicked() {
+                                                    collection_action =
+                                                        Some(CollectionAction::AddMember {
+                                                            id: cid,
+                                                            asset: aid,
+                                                        });
+                                                    ui.close_menu();
+                                                }
+                                            }
+                                        });
                                     }
                                 });
                             }
@@ -2555,6 +2812,15 @@ impl eframe::App for DamGui {
         if self.advanced_modal(ctx) {
             do_query = true;
         }
+
+        // Collection CRUD: open the rename modal, apply a gathered action, and draw the modals.
+        if let Some(r) = open_rename {
+            self.collection_rename = Some(r);
+        }
+        if let Some(action) = collection_action {
+            self.collection_action(action);
+        }
+        self.collection_modals(ctx);
 
         // Collection selection (mutually exclusive with the facets, mirroring the web).
         if let Some(sel) = pick_collection {
