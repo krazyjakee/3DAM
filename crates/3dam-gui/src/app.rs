@@ -8,6 +8,7 @@
 //! The worker calls `Context::request_repaint()` when it posts a result, so the UI wakes exactly when
 //! there's something new to show rather than polling.
 
+use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 
@@ -23,6 +24,30 @@ use dam_api::{
 /// scroll / pagination is an owed parity item); a generous cap keeps a typical library one request.
 const LIST_LIMIT: u32 = 500;
 
+/// Thumbnail edge (px) requested from the engine — matches the web grid tile.
+const THUMB_EDGE: u32 = 128;
+
+/// Grid vs list browse (a subset of the web view toggle).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum View {
+    Grid,
+    List,
+}
+
+/// Decoded thumbnail pixels handed back from the worker; uploaded to a GPU texture on the UI thread.
+struct ThumbPixels {
+    size: [usize; 2],
+    rgba: Vec<u8>,
+}
+
+/// Per-asset thumbnail state in the UI-thread cache.
+enum Thumb {
+    Loading,
+    Ready(egui::TextureHandle),
+    /// No raster thumbnail (audio / a 3D model without the render feature) — show the typed tile.
+    None,
+}
+
 /// A result posted from the background runtime back to the UI thread. Variants differ in size
 /// (a full `Asset` vs a small stats struct), but each is posted at most once per user action, so the
 /// enum size is irrelevant here — not worth boxing every payload.
@@ -32,18 +57,21 @@ enum Msg {
     Detail(Result<Asset, String>),
     Sources(Result<Vec<SourceInfo>, String>),
     Stats(Result<LibraryStats, String>),
+    Thumb(AssetId, Option<ThumbPixels>),
 }
 
 pub struct DamGui {
     rt: Arc<tokio::runtime::Runtime>,
     lib: Arc<dyn LibraryService>,
     auth: AuthContext,
+    egui_ctx: egui::Context,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
 
     // ── view state ──
     search: String,
     media_filter: Option<MediaType>,
+    view: View,
     assets: Vec<AssetSummary>,
     total: Option<u64>,
     loading: bool,
@@ -53,6 +81,9 @@ pub struct DamGui {
     sources: Vec<SourceInfo>,
     stats: Option<LibraryStats>,
     error: Option<String>,
+    /// Thumbnail texture cache, keyed by asset. Presence of a key means "already requested", so it
+    /// doubles as the de-dupe set for the lazy, visible-only loader.
+    thumbs: HashMap<AssetId, Thumb>,
 }
 
 impl DamGui {
@@ -68,10 +99,12 @@ impl DamGui {
             rt,
             lib,
             auth,
+            egui_ctx: cc.egui_ctx.clone(),
             tx,
             rx,
             search: String::new(),
             media_filter: None,
+            view: View::Grid,
             assets: Vec::new(),
             total: None,
             loading: false,
@@ -81,6 +114,7 @@ impl DamGui {
             sources: Vec::new(),
             stats: None,
             error: None,
+            thumbs: HashMap::new(),
         };
         // Kick the initial loads against the freshly opened library.
         let egctx = cc.egui_ctx.clone();
@@ -177,6 +211,33 @@ impl DamGui {
         });
     }
 
+    /// Fetch + decode one asset's thumbnail off-thread. PNG decode happens on the worker; only the
+    /// GPU texture upload (which must be on the UI thread) is deferred to `apply`. Audio and (feature-
+    /// off) 3D assets have no raster thumbnail — those resolve to `Thumb::None` → the typed tile.
+    fn load_thumb(&self, id: AssetId) {
+        let (lib, auth, tx, egctx) = (
+            self.lib.clone(),
+            self.auth.clone(),
+            self.tx.clone(),
+            self.egui_ctx.clone(),
+        );
+        self.rt.spawn(async move {
+            let pixels = match lib.read_thumbnail(&auth, &id, THUMB_EDGE).await {
+                Ok(content) => image::load_from_memory(&content.bytes).ok().map(|img| {
+                    let rgba = img.to_rgba8();
+                    let size = [rgba.width() as usize, rgba.height() as usize];
+                    ThumbPixels {
+                        size,
+                        rgba: rgba.into_raw(),
+                    }
+                }),
+                Err(_) => None,
+            };
+            let _ = tx.send(Msg::Thumb(id, pixels));
+            egctx.request_repaint();
+        });
+    }
+
     /// Fold a posted result into view state.
     fn apply(&mut self, msg: Msg) {
         match msg {
@@ -202,6 +263,18 @@ impl DamGui {
             Msg::Sources(Err(e)) => self.error = Some(format!("Couldn't list sources: {e}")),
             Msg::Stats(Ok(s)) => self.stats = Some(s),
             Msg::Stats(Err(e)) => self.error = Some(format!("Couldn't load stats: {e}")),
+            Msg::Thumb(id, Some(px)) => {
+                let img = egui::ColorImage::from_rgba_unmultiplied(px.size, &px.rgba);
+                let tex = self.egui_ctx.load_texture(
+                    format!("thumb-{id}"),
+                    img,
+                    egui::TextureOptions::LINEAR,
+                );
+                self.thumbs.insert(id, Thumb::Ready(tex));
+            }
+            Msg::Thumb(id, None) => {
+                self.thumbs.insert(id, Thumb::None);
+            }
         }
     }
 }
@@ -255,6 +328,21 @@ impl eframe::App for DamGui {
                 if self.loading {
                     ui.spinner();
                 }
+                // View toggle (grid / list) — right-aligned like the web toolbar.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .selectable_label(self.view == View::List, "☰ List")
+                        .clicked()
+                    {
+                        self.view = View::List;
+                    }
+                    if ui
+                        .selectable_label(self.view == View::Grid, "▦ Grid")
+                        .clicked()
+                    {
+                        self.view = View::Grid;
+                    }
+                });
             });
             ui.add_space(4.0);
         });
@@ -307,6 +395,10 @@ impl eframe::App for DamGui {
                 }
             });
 
+        // Assets whose thumbnails are worth fetching this frame (visible + not yet requested),
+        // gathered under the immutable render borrow and kicked off afterwards.
+        let mut to_load: Vec<AssetId> = Vec::new();
+
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(err) = &self.error {
                 ui.colored_label(egui::Color32::from_rgb(0xef, 0x44, 0x44), err);
@@ -318,19 +410,10 @@ impl eframe::App for DamGui {
                     if self.assets.is_empty() && !self.loading {
                         ui.add_space(12.0);
                         ui.label(egui::RichText::new("No assets match.").weak());
-                    }
-                    for a in &self.assets {
-                        let selected = self.selected == Some(a.id);
-                        let text = format!(
-                            "{}   {}   ·   {}   ·   {}",
-                            media_tag(a.media),
-                            a.name,
-                            a.format.to_uppercase(),
-                            human_bytes(a.size),
-                        );
-                        if ui.selectable_label(selected, text).clicked() {
-                            open_asset = Some(a.id);
-                        }
+                    } else if self.view == View::Grid {
+                        self.grid(ui, &mut open_asset, &mut to_load);
+                    } else {
+                        self.list(ui, &mut open_asset);
                     }
                 });
         });
@@ -338,10 +421,92 @@ impl eframe::App for DamGui {
         if do_query {
             self.load_assets(ctx);
         }
+        for id in to_load {
+            self.thumbs.insert(id, Thumb::Loading);
+            self.load_thumb(id);
+        }
         if let Some(id) = open_asset {
             self.selected = Some(id);
             self.load_detail(id, ctx);
         }
+    }
+}
+
+impl DamGui {
+    /// The flat text list (audio-friendly; the web "table" analogue).
+    fn list(&self, ui: &mut egui::Ui, open_asset: &mut Option<AssetId>) {
+        for a in &self.assets {
+            let selected = self.selected == Some(a.id);
+            let text = format!(
+                "{}   {}   ·   {}   ·   {}",
+                media_tag(a.media),
+                a.name,
+                a.format.to_uppercase(),
+                human_bytes(a.size),
+            );
+            if ui.selectable_label(selected, text).clicked() {
+                *open_asset = Some(a.id);
+            }
+        }
+    }
+
+    /// The thumbnail grid — wrapped fixed-size cards, each a server thumbnail (loaded lazily as it
+    /// scrolls into view) or a typed placeholder tile for audio / un-rendered 3D.
+    fn grid(
+        &self,
+        ui: &mut egui::Ui,
+        open_asset: &mut Option<AssetId>,
+        to_load: &mut Vec<AssetId>,
+    ) {
+        const TILE: f32 = 128.0;
+        const CARD_W: f32 = TILE;
+        const CARD_H: f32 = TILE + 26.0; // tile + a two-ish-line label strip
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+            for a in &self.assets {
+                let (rect, resp) =
+                    ui.allocate_exact_size(egui::vec2(CARD_W, CARD_H), egui::Sense::click());
+                if resp.clicked() {
+                    *open_asset = Some(a.id);
+                }
+                if !ui.is_rect_visible(rect) {
+                    continue;
+                }
+                // Lazily request the thumbnail the first time a card is actually on screen.
+                if !self.thumbs.contains_key(&a.id) {
+                    to_load.push(a.id);
+                }
+
+                let painter = ui.painter_at(rect);
+                let selected = self.selected == Some(a.id);
+                if selected {
+                    painter.rect_filled(rect, 4.0, ui.visuals().selection.bg_fill);
+                } else if resp.hovered() {
+                    painter.rect_filled(rect, 4.0, ui.visuals().widgets.hovered.bg_fill);
+                }
+
+                let tile = egui::Rect::from_min_size(rect.min, egui::vec2(TILE, TILE));
+                match self.thumbs.get(&a.id) {
+                    Some(Thumb::Ready(tex)) => {
+                        let img = egui::Image::new(egui::load::SizedTexture::from_handle(tex))
+                            .maintain_aspect_ratio(true)
+                            .fit_to_exact_size(egui::vec2(TILE, TILE));
+                        img.paint_at(ui, tile);
+                    }
+                    _ => placeholder_tile(&painter, tile, a.media, ui.visuals()),
+                }
+
+                // One-line, ellipsised name under the tile.
+                let name_pos = rect.min + egui::vec2(2.0, TILE + 3.0);
+                painter.text(
+                    name_pos,
+                    egui::Align2::LEFT_TOP,
+                    ellipsize(&a.name, 18),
+                    egui::FontId::proportional(11.0),
+                    ui.visuals().text_color(),
+                );
+            }
+        });
     }
 }
 
@@ -369,6 +534,34 @@ fn inspector(ui: &mut egui::Ui, asset: &Asset) {
                 ui.label(egui::RichText::new(&t.name).small());
             }
         });
+    }
+}
+
+/// A typed placeholder tile for assets with no raster thumbnail (audio, un-rendered 3D) or one still
+/// loading — a filled panel with the media tag centred, so the grid never shows an empty hole.
+fn placeholder_tile(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    media: MediaType,
+    visuals: &egui::Visuals,
+) {
+    painter.rect_filled(rect, 3.0, visuals.extreme_bg_color);
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        media_tag(media),
+        egui::FontId::proportional(13.0),
+        visuals.weak_text_color(),
+    );
+}
+
+/// Truncate to `max` chars with an ellipsis (grid card names are one line).
+fn ellipsize(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let head: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{head}…")
     }
 }
 

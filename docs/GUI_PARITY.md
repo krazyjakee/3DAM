@@ -20,8 +20,8 @@ Legend: ✅ done · 🟡 partial · ⬜ owed (not yet in egui)
 | Window / app shell | ✅ | ✅ | eframe window, three-region layout + toolbar |
 | Text search | ✅ | ✅ | search box → `QueryRequest.text` (Enter / Search button) |
 | Media-type filter (audio/image/3D) | ✅ | ✅ | toolbar toggle → `FacetField::MediaType` |
-| Browse list | ✅ | 🟡 | egui is a flat list (name/type/format/size); grid + virtualization owed |
-| Thumbnails | ✅ | ⬜ | server-rendered tiles; egui needs texture upload + cache |
+| Browse grid + list | ✅ | ✅ | thumbnail grid + flat list, toggle in the toolbar |
+| Thumbnails | ✅ | ✅ | `read_thumbnail` → decode off-thread → egui texture cache; lazy, visible-only load; typed tile for audio/3D |
 | Inspector: core metadata | ✅ | ✅ | name, type, format, size, path, tags |
 | Inspector: media attributes | ✅ | ⬜ | audio/image/model attr blocks, seamlessness, audio features |
 | Inspector: preview (3D/audio/image) | ✅ | ⬜ | egui-wgpu paint callback for the 3D island; audio/image viewers |
@@ -34,7 +34,7 @@ Legend: ✅ done · 🟡 partial · ⬜ owed (not yet in egui)
 | Quick class facet (audio/image/model class) | ✅ | ⬜ | |
 | Favorites / Recently added | ✅ | ⬜ | favourite toggle + saved-sort shortcut |
 | Collections & smart folders | ✅ | ⬜ | list + membership editing |
-| Grid ⇄ table view toggle | ✅ | ⬜ | |
+| Grid ⇄ list view toggle | ✅ | 🟡 | grid + flat list; the web "table" (sortable columns) is richer |
 | Sort control | ✅ | 🟡 | egui fixed to name-asc; expose the sort control |
 | Tag review (reject/restore) | ✅ | ⬜ | reject-only lifecycle |
 | Similar / duplicates | ✅ | ⬜ | `find_similar`, exact/near dedup |
@@ -51,8 +51,10 @@ Legend: ✅ done · 🟡 partial · ⬜ owed (not yet in egui)
 
 ## Current egui slice
 
-`crates/3dam-gui` (issue #34, first slice): a real eframe window over the embedded
-`LibraryService` — **browse** (list from the catalog), **search** (text + media-type filter, live
-re-query), **inspect** (per-asset detail), plus library stats and a sources list. The async service
-runs on a background Tokio runtime; results reach the frame loop over a channel (no I/O on the UI
-thread — golden rule 5). Everything marked ⬜/🟡 above is the follow-up backlog.
+`crates/3dam-gui` (issue #34): a real eframe window over the embedded `LibraryService` —
+**browse** (thumbnail grid or flat list, toggle in the toolbar), **search** (text + media-type
+filter, live re-query), **inspect** (per-asset detail), plus library stats and a sources list.
+Thumbnails load off-thread (`read_thumbnail` → PNG decode → egui texture), lazily and visible-only,
+falling back to a typed tile for audio / un-rendered 3D. The async service runs on a background Tokio
+runtime; results reach the frame loop over a channel (no I/O on the UI thread — golden rule 5).
+Everything marked ⬜/🟡 above is the follow-up backlog.

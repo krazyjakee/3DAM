@@ -13,6 +13,8 @@ dam-frontend = { workspace = true }
 # A background Tokio runtime owns the async `LibraryService`; the egui thread talks to it over
 # channels so I/O never blocks the frame (golden rule 5).
 tokio = { workspace = true }
+# Decode the server's PNG thumbnails (off-thread) into RGBA for egui textures.
+image = { workspace = true }
 
 # egui/eframe (ADR 0005). glow (OpenGL) backend — the wgpu viewer-embedding path (egui-wgpu paint
 # callback) lands with the 3D-preview slice and would otherwise pull a second, mismatched wgpu.
