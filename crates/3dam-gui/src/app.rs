@@ -17,12 +17,13 @@ use eframe::egui;
 use dam_api::service::{AuthContext, LibraryService};
 use dam_api::{
     AddSource, AnalyzeRequest, Asset, AssetId, AssetSummary, Collection, CollectionId,
-    CollectionKind, DupGroup, DupKind, DupRequest, EventTopic, ExportFormat, ExportReport,
-    ExportRequest, FacetField, Filter, FilterOp, FilterValue, FolderEntry, FolderListing, JobState,
-    LibraryEvent, LibraryStats, LicenseStatus, MediaAttributes, MediaType, Page, PageParams,
-    QueryRequest, RemoveSource, ReviewAction, ScanMode, ScanRequest, SearchMode, SimilarHit,
-    SimilarRequest, Sort, SortDir, SortField, SourceId, SourceInfo, SourceKind, SubscribeRequest,
-    SuggestionReview, ThumbnailRegenRequest,
+    CollectionKind, CollisionRule, ConvertReport, ConvertRequest, ConvertTarget, DupGroup, DupKind,
+    DupRequest, EventTopic, ExportFormat, ExportReport, ExportRequest, FacetField, Filter,
+    FilterOp, FilterValue, FolderEntry, FolderListing, JobState, LibraryEvent, LibraryStats,
+    LicenseStatus, MediaAttributes, MediaType, Page, PageParams, QueryRequest, RemoveSource,
+    ReviewAction, ScanMode, ScanRequest, SearchMode, SimilarHit, SimilarRequest, Sort, SortDir,
+    SortField, SourceId, SourceInfo, SourceKind, SubscribeRequest, SuggestionReview,
+    ThumbnailRegenRequest,
 };
 use futures::StreamExt;
 
@@ -32,7 +33,18 @@ enum AssetAction {
     Reanalyze(AssetId),
     /// Drop + rebuild the cached preview thumbnail from source.
     RegenThumb(AssetId),
+    /// Open the convert modal for this image/audio asset.
+    Convert(AssetId, MediaType),
 }
+
+/// The convert target-format options per media (mirrors the CLI/web); 3D can't transcode.
+const CONVERT_FORMATS: &[(MediaType, &[&str])] = &[
+    (
+        MediaType::Image,
+        &["png", "jpg", "webp", "bmp", "tga", "tiff"],
+    ),
+    (MediaType::Audio, &["wav"]),
+];
 
 /// A source-relative folder-tree node key: which source, and the source-relative prefix (trailing
 /// slash, or empty for the source root).
@@ -167,6 +179,7 @@ enum Msg {
     Collections(Result<Vec<Collection>, String>),
     Export(Result<ExportReport, String>),
     Duplicates(Result<Vec<DupGroup>, String>),
+    Convert(Result<ConvertReport, String>),
 }
 
 pub struct DamGui {
@@ -238,6 +251,12 @@ pub struct DamGui {
     add_path: String,
     /// The source pending a remove confirmation (two-step to guard against accidental drops).
     confirm_remove: Option<SourceId>,
+    // ── convert modal ──
+    convert_open: bool,
+    convert_asset: Option<(AssetId, MediaType)>,
+    convert_format: String,
+    convert_output: String,
+    convert_status: Option<Result<String, String>>,
 }
 
 impl DamGui {
@@ -298,6 +317,11 @@ impl DamGui {
             add_open: false,
             add_path: String::new(),
             confirm_remove: None,
+            convert_open: false,
+            convert_asset: None,
+            convert_format: String::new(),
+            convert_output: default_convert_dir(),
+            convert_status: None,
         };
         // Kick the initial loads against the freshly opened library.
         let egctx = cc.egui_ctx.clone();
@@ -523,6 +547,37 @@ impl DamGui {
         self.rt.spawn(async move {
             let r = lib.export(&auth, req).await.map_err(|e| e.to_string());
             let _ = tx.send(Msg::Export(r));
+            egctx.request_repaint();
+        });
+    }
+
+    /// Convert one image/audio asset to another format (non-destructive: writes to `output_dir`,
+    /// never into a source; `Suffix` collision policy disambiguates rather than overwrites).
+    fn run_convert(&self, id: AssetId, media: MediaType, format: String, output_dir: String) {
+        let (lib, auth, tx, egctx) = (
+            self.lib.clone(),
+            self.auth.clone(),
+            self.tx.clone(),
+            self.egui_ctx.clone(),
+        );
+        self.rt.spawn(async move {
+            let target = match media {
+                MediaType::Audio => ConvertTarget::Audio { format },
+                _ => ConvertTarget::Image {
+                    format,
+                    max_edge: None,
+                    quality: None,
+                },
+            };
+            let req = ConvertRequest {
+                inputs: vec![id],
+                target,
+                output_dir,
+                dry_run: false,
+                on_collision: CollisionRule::Suffix,
+            };
+            let r = lib.convert(&auth, req).await.map_err(|e| e.to_string());
+            let _ = tx.send(Msg::Convert(r));
             egctx.request_repaint();
         });
     }
@@ -814,6 +869,13 @@ impl DamGui {
             Msg::Export(Err(e)) => self.export_status = Some(Err(e)),
             Msg::Duplicates(Ok(g)) => self.duplicates = g,
             Msg::Duplicates(Err(_)) => {} // non-fatal; the dup section just won't show
+            Msg::Convert(Ok(rep)) => {
+                self.convert_status = Some(Ok(format!(
+                    "{} done, {} failed, {} unsupported → {}",
+                    rep.done, rep.failed, rep.unsupported, rep.output_dir
+                )));
+            }
+            Msg::Convert(Err(e)) => self.convert_status = Some(Err(e)),
 
             // Map a live event to the coalesced refresh flags (flushed, throttled, in `update`).
             Msg::Event(ev) => match ev {
@@ -1445,6 +1507,78 @@ impl eframe::App for DamGui {
             self.run_export();
         }
 
+        // Convert modal (image/audio transcode; non-destructive, writes to an output dir).
+        let mut do_convert = false;
+        if self.convert_open {
+            let mut open = true;
+            if let Some((_, media)) = self.convert_asset {
+                let formats = CONVERT_FORMATS
+                    .iter()
+                    .find(|(m, _)| *m == media)
+                    .map(|(_, f)| *f)
+                    .unwrap_or(&[]);
+                egui::Window::new("Convert")
+                    .collapsible(false)
+                    .resizable(false)
+                    .open(&mut open)
+                    .show(ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("To:");
+                            for f in formats {
+                                if ui
+                                    .selectable_label(self.convert_format == *f, f.to_uppercase())
+                                    .clicked()
+                                {
+                                    self.convert_format = (*f).to_string();
+                                }
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Output dir:");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.convert_output)
+                                    .desired_width(300.0),
+                            );
+                        });
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            if ui.button("Convert").clicked() {
+                                do_convert = true;
+                            }
+                            if ui.button("Close").clicked() {
+                                self.convert_open = false;
+                            }
+                        });
+                        match &self.convert_status {
+                            Some(Ok(msg)) => {
+                                ui.colored_label(egui::Color32::from_rgb(0x4a, 0xde, 0x80), msg);
+                            }
+                            Some(Err(msg)) => {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(0xef, 0x44, 0x44),
+                                    format!("Convert failed: {msg}"),
+                                );
+                            }
+                            None => {}
+                        }
+                    });
+            }
+            if !open {
+                self.convert_open = false;
+            }
+        }
+        if do_convert {
+            if let Some((id, media)) = self.convert_asset {
+                self.convert_status = None;
+                self.run_convert(
+                    id,
+                    media,
+                    self.convert_format.clone(),
+                    self.convert_output.clone(),
+                );
+            }
+        }
+
         // Folder-tree actions (issue #66), applied before the query so a folder scope re-queries
         // with the updated source/path filters.
         for k in nav.toggle {
@@ -1540,6 +1674,16 @@ impl eframe::App for DamGui {
         match asset_action {
             Some(AssetAction::Reanalyze(id)) => self.submit_analyze_asset(id),
             Some(AssetAction::RegenThumb(id)) => self.regen_thumb(id),
+            Some(AssetAction::Convert(id, media)) => {
+                self.convert_asset = Some((id, media));
+                self.convert_format = match media {
+                    MediaType::Audio => "wav",
+                    _ => "png",
+                }
+                .to_string();
+                self.convert_status = None;
+                self.convert_open = true;
+            }
             None => {}
         }
         if let Some(id) = find_sim {
@@ -1678,6 +1822,11 @@ fn inspector(
             && ui.button("Regenerate thumbnail").clicked()
         {
             *action = Some(AssetAction::RegenThumb(s.id));
+        }
+        // Convert (transcode) — image/audio only; 3D can't transcode in v1.
+        if matches!(s.media, MediaType::Image | MediaType::Audio) && ui.button("Convert").clicked()
+        {
+            *action = Some(AssetAction::Convert(s.id, s.media));
         }
     });
 
@@ -1934,6 +2083,12 @@ fn media_tag(m: MediaType) -> &'static str {
 fn default_export_path() -> String {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     format!("{home}/3dam-manifest.json")
+}
+
+/// A sensible default output directory for conversions (never a source tree — §5.1).
+fn default_convert_dir() -> String {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    format!("{home}/3dam-converted")
 }
 
 /// Compact human-readable byte size (1.7 KB, 4.8 MB, …).
