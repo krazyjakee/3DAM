@@ -357,6 +357,9 @@ pub enum FacetField {
     TriCount,
     /// User-flagged favourite (issue #63). Presence of the filter means "favourites only".
     Favorite,
+    /// Source-relative path prefix (issue #66) — scopes the browse to a folder subtree. The value is
+    /// the prefix (e.g. `Environment/Rock/`); an empty prefix matches everything.
+    Path,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -413,6 +416,26 @@ pub enum SortField {
 pub enum SortDir {
     Asc,
     Desc,
+}
+
+// ── folder navigation (issue #66) ────────────────────────────────────────────
+
+/// Enumerate the immediate subfolders directly under `prefix` within one source — the lazy unit the
+/// folder tree expands. `prefix` is source-relative with a trailing slash (or empty for the source
+/// root); paths use `/` separators.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FolderListing {
+    pub source: SourceId,
+    #[serde(default)]
+    pub prefix: String,
+}
+
+/// One immediate subfolder (issue #66): its segment `name` and how many assets live anywhere beneath
+/// it (the whole subtree, so a collapsed folder still shows its weight).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FolderEntry {
+    pub name: String,
+    pub asset_count: u64,
 }
 
 // ── sources ────────────────────────────────────────────────────────────────

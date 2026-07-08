@@ -270,6 +270,20 @@ pub(crate) fn apply_filter(
             let test = if want { "!= 0" } else { "= 0" };
             where_sql.push_str(&format!(" AND (flags & {FAVORITE_FLAG}) {test}"));
         }
+        // Source-relative path prefix (issue #66): scope the browse to a folder subtree. `path` lives
+        // on the asset row, so it filters inline. An empty prefix is a no-op (matches everything).
+        Path => match &f.value {
+            FilterValue::Str(prefix) if !prefix.is_empty() => {
+                where_sql.push_str(" AND path LIKE ? ESCAPE '\\'");
+                binds.push(Value::Text(format!("{}%", escape_like(prefix))));
+            }
+            FilterValue::Str(_) => {}
+            _ => {
+                return Err(LibError::BadRequest(
+                    "path filter wants a string prefix".into(),
+                ))
+            }
+        },
     }
     Ok(())
 }
@@ -383,6 +397,7 @@ mod tests {
             Bpm => (FilterOp::Range, FilterValue::Range(90.0, 130.0)),
             TriCount => (FilterOp::Lt, FilterValue::Num(50_000.0)),
             Favorite => (FilterOp::Eq, FilterValue::Bool(true)),
+            Path => (FilterOp::Eq, FilterValue::Str("Environment/".into())),
         };
         Filter { field, op, value }
     }
@@ -404,6 +419,7 @@ mod tests {
             FacetField::Bpm,
             FacetField::TriCount,
             FacetField::Favorite,
+            FacetField::Path,
         ];
 
         // The schema the store runs against — enough for SQLite to plan each filter's subquery.

@@ -683,6 +683,21 @@ impl LibraryService for EmbeddedLibrary {
         .await
     }
 
+    async fn list_folders(
+        &self,
+        _ctx: &AuthContext,
+        req: FolderListing,
+    ) -> Result<Vec<FolderEntry>, LibError> {
+        // Normalise the prefix so the derived-tree SQL is well-defined: empty (root) or ending in `/`.
+        let prefix = if req.prefix.is_empty() || req.prefix.ends_with('/') {
+            req.prefix
+        } else {
+            format!("{}/", req.prefix)
+        };
+        let source = req.source;
+        self.db(move |s| s.list_folders(&source, &prefix)).await
+    }
+
     async fn add_source(&self, _ctx: &AuthContext, req: AddSource) -> Result<SourceId, LibError> {
         let opts = dam_sources::ConnOptions {
             username: req.options.username.clone(),

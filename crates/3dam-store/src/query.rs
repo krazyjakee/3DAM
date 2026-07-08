@@ -507,6 +507,80 @@ mod tests {
         assert!(store.query_assets(&fav_req).unwrap().items.is_empty());
     }
 
+    /// Folder navigation (issue #66): the on-the-fly tree derived from stored paths, and the
+    /// path-prefix filter that scopes a query to a subtree.
+    #[test]
+    fn folder_tree_and_path_filter() {
+        use dam_api::dto::{FacetField, Filter, FilterOp, FilterValue};
+        let store = Store::open_in_memory().unwrap();
+        let src = store
+            .add_source(
+                &SourceConnection::LocalFs {
+                    root: "/tmp".into(),
+                },
+                "t",
+                false,
+            )
+            .unwrap();
+        let mk = |path: &str| {
+            store
+                .upsert_asset(&NewAsset {
+                    source_id: src,
+                    path: path.to_string(),
+                    filename: path.rsplit('/').next().unwrap().to_string(),
+                    content_hash: None,
+                    size_bytes: Some(1),
+                    source_modified_at: None,
+                    scanned_at: now_ms(),
+                    media_type: MediaType::Image,
+                    format: "png".into(),
+                })
+                .unwrap();
+        };
+        mk("Environment/Rock/cliff.png");
+        mk("Environment/Rock/boulder.png");
+        mk("Environment/Tree/oak.png");
+        mk("Characters/hero.png");
+        mk("readme.png"); // a file at the root, not a folder
+
+        let names = |v: Vec<dam_api::dto::FolderEntry>| {
+            v.into_iter()
+                .map(|f| (f.name, f.asset_count))
+                .collect::<Vec<_>>()
+        };
+        // Root: two folders with whole-subtree counts; the root file is not a folder. NOCASE-sorted.
+        assert_eq!(
+            names(store.list_folders(&src, "").unwrap()),
+            vec![("Characters".into(), 1), ("Environment".into(), 3)]
+        );
+        // One level down.
+        assert_eq!(
+            names(store.list_folders(&src, "Environment/").unwrap()),
+            vec![("Rock".into(), 2), ("Tree".into(), 1)]
+        );
+        // A leaf folder has no subfolders.
+        assert!(store
+            .list_folders(&src, "Environment/Rock/")
+            .unwrap()
+            .is_empty());
+
+        // The path-prefix filter scopes a query to a subtree; an empty prefix is a no-op.
+        let scoped = |prefix: &str| {
+            let req = QueryRequest {
+                filters: vec![Filter {
+                    field: FacetField::Path,
+                    op: FilterOp::Eq,
+                    value: FilterValue::Str(prefix.into()),
+                }],
+                ..Default::default()
+            };
+            store.query_assets(&req).unwrap().total.unwrap()
+        };
+        assert_eq!(scoped("Environment/"), 3);
+        assert_eq!(scoped("Environment/Rock/"), 2);
+        assert_eq!(scoped(""), 5);
+    }
+
     fn search(store: &Store, text: &str) -> Vec<String> {
         search_mode(store, text, SearchMode::Lexical)
     }

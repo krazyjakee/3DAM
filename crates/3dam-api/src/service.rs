@@ -217,6 +217,14 @@ pub trait LibraryService: Send + Sync {
 
     async fn get_source(&self, ctx: &AuthContext, id: &SourceId) -> Result<SourceInfo, LibError>;
 
+    /// The immediate subfolders directly under a source path (issue #66) — the lazy unit the folder
+    /// tree expands, each with the asset count of its whole subtree. Sorted by name.
+    async fn list_folders(
+        &self,
+        ctx: &AuthContext,
+        req: FolderListing,
+    ) -> Result<Vec<FolderEntry>, LibError>;
+
     async fn add_source(&self, ctx: &AuthContext, req: AddSource) -> Result<SourceId, LibError>;
 
     async fn remove_source(

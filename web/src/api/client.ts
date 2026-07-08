@@ -28,6 +28,8 @@ import type {
   PageParams,
   AssetSummary,
   FavoriteRequest,
+  FolderEntry,
+  FolderListing,
   QueryRequest,
   RemoveAsset,
   RemoveSource,
@@ -169,6 +171,9 @@ export const api = {
   addSource: (req: AddSource) => send<{ id: SourceId }>("POST", `${API}/sources`, req),
   removeSource: (id: SourceId, req: RemoveSource = {}) =>
     send<void>("DELETE", `${API}/sources/${id}`, req),
+
+  /** Immediate subfolders under a source path — the lazy unit the folder tree expands (issue #66). */
+  listFolders: (req: FolderListing) => send<FolderEntry[]>("POST", `${API}/folders`, req),
 
   // jobs
   submitScan: (req: ScanRequest) => send<{ job_id: JobId }>("POST", `${API}/jobs/scan`, req),

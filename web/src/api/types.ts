@@ -154,7 +154,8 @@ export type FacetField =
   | "height"
   | "bpm"
   | "tri_count"
-  | "favorite";
+  | "favorite"
+  | "path";
 
 export type FilterOp =
   | "eq"
@@ -376,6 +377,20 @@ export interface SimilarHit {
   asset: AssetSummary;
   score: number; // cosine similarity in [0,1] (1 = identical direction)
   space: string; // the EmbeddingSpace id the ranking happened in
+}
+
+// ── folder navigation (issue #66) ────────────────────────────────────────────
+
+/** Enumerate the immediate subfolders under `prefix` in one source. `prefix` is source-relative,
+ *  empty (root) or ending in `/`. Backend route: POST /api/v1/folders. */
+export interface FolderListing {
+  source: SourceId;
+  prefix: string;
+}
+/** One immediate subfolder: its segment `name` and the asset count of its whole subtree. */
+export interface FolderEntry {
+  name: string;
+  asset_count: number;
 }
 
 // ── sources ────────────────────────────────────────────────────────────────

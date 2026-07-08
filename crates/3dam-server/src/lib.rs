@@ -121,6 +121,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/api/v1/jobs/analyze", post(submit_analyze))
         .route("/api/v1/thumbnails/regenerate", post(regenerate_thumbnails))
         .route("/api/v1/sources", get(list_sources).post(add_source))
+        .route("/api/v1/folders", post(list_folders))
         .route(
             "/api/v1/sources/{id}",
             get(get_source).delete(remove_source),
@@ -540,6 +541,14 @@ async fn list_sources(
     State(st): State<AppState>,
 ) -> Result<Json<Vec<SourceInfo>>, ApiError> {
     Ok(Json(st.lib.list_sources(&ctx).await?))
+}
+
+async fn list_folders(
+    Reader(ctx): Reader,
+    State(st): State<AppState>,
+    Json(req): Json<FolderListing>,
+) -> Result<Json<Vec<FolderEntry>>, ApiError> {
+    Ok(Json(st.lib.list_folders(&ctx, req).await?))
 }
 
 async fn get_source(

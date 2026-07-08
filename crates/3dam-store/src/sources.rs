@@ -63,6 +63,44 @@ impl Store {
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(internal)
     }
 
+    /// Immediate subfolders directly under `prefix` within one source, each with its whole-subtree
+    /// asset count (issue #66). `prefix` is source-relative, empty or ending in `/`. Derived on the
+    /// fly from the stored paths — the immediate child folder of a descendant is the first path
+    /// segment after the prefix, kept only when the remainder still holds a `/` (else it's a file
+    /// sitting directly in this folder, not a subfolder). `length()`/`substr()` are character-based
+    /// in SQLite, so a multibyte prefix offsets correctly.
+    pub fn list_folders(
+        &self,
+        source: &SourceId,
+        prefix: &str,
+    ) -> Result<Vec<FolderEntry>, LibError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT folder, COUNT(*) FROM (
+                    SELECT CASE WHEN instr(rest, '/') > 0
+                                THEN substr(rest, 1, instr(rest, '/') - 1)
+                                ELSE NULL END AS folder
+                    FROM (SELECT substr(path, length(?2) + 1) AS rest
+                          FROM asset
+                          WHERE source_id = ?1 AND path LIKE ?3 ESCAPE '\\')
+                 )
+                 WHERE folder IS NOT NULL AND folder <> ''
+                 GROUP BY folder ORDER BY folder COLLATE NOCASE",
+            )
+            .map_err(internal)?;
+        let like = format!("{}%", escape_like(prefix));
+        let rows = stmt
+            .query_map(params![source.as_bytes().to_vec(), prefix, like], |r| {
+                Ok(FolderEntry {
+                    name: r.get(0)?,
+                    asset_count: r.get::<_, i64>(1)? as u64,
+                })
+            })
+            .map_err(internal)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(internal)
+    }
+
     pub fn get_source(&self, id: &SourceId) -> Result<Option<SourceInfo>, LibError> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(

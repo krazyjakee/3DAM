@@ -455,6 +455,14 @@ impl LibraryService for ApiClient {
         self.get(&format!("/api/v1/sources/{id}")).await
     }
 
+    async fn list_folders(
+        &self,
+        _ctx: &AuthContext,
+        req: FolderListing,
+    ) -> Result<Vec<FolderEntry>, LibError> {
+        self.post("/api/v1/folders", &req).await
+    }
+
     async fn add_source(&self, _ctx: &AuthContext, req: AddSource) -> Result<SourceId, LibError> {
         let reply: IdReply = self.post("/api/v1/sources", &req).await?;
         Ok(reply.id)
