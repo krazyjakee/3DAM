@@ -21,11 +21,11 @@ futures = { workspace = true }
 # MP3/Vorbis; symphonia backs the rest.
 rodio = { version = "0.19", default-features = false, features = ["symphonia-all"] }
 
-# egui/eframe (ADR 0005). glow (OpenGL) backend — the wgpu viewer-embedding path (egui-wgpu paint
-# callback) lands with the 3D-preview slice and would otherwise pull a second, mismatched wgpu.
+# egui/eframe (ADR 0005). wgpu backend — enables egui-wgpu paint callbacks for the interactive 3D
+# viewer, and (unlike glow's OpenGL context) coexists with dam-render's wgpu without an EGL clash.
 eframe = { version = "0.31", default-features = false, features = [
     "default_fonts",
-    "glow",
+    "wgpu",
     "wayland",
     "x11",
 ] }
