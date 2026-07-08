@@ -20,6 +20,7 @@ export function StatusBar() {
 
   return (
     <footer className="flex h-7 shrink-0 items-center gap-3 border-t border-border bg-surface px-3 text-[11px] text-fg-dim">
+      <JobAnnouncer active={active} />
       {active.length === 0 ? (
         <span className="flex-1">Idle</span>
       ) : active.length === 1 ? (
@@ -65,6 +66,31 @@ function MediaBreakdown() {
           <span className="tabular-nums text-fg">{m.count.toLocaleString()}</span>
         </span>
       ))}
+    </span>
+  );
+}
+
+/** Screen-reader announcements for background jobs (a11y hardening, issue #44). A polite, visually
+ *  hidden live region that speaks only coarse lifecycle transitions — jobs starting, or all jobs
+ *  finishing — rather than every progress tick, so assistive tech isn't spammed with percentages
+ *  (the visual JobPill still shows the live %). */
+function JobAnnouncer({ active }: { active: JobStatus[] }) {
+  const [msg, setMsg] = useState("");
+  const prev = useRef(0);
+  const count = active.length;
+  useEffect(() => {
+    if (count > prev.current) {
+      const kinds = [...new Set(active.map((j) => j.kind))].join(", ");
+      setMsg(`${count} background ${count === 1 ? "task" : "tasks"} running: ${kinds}`);
+    } else if (count === 0 && prev.current > 0) {
+      setMsg("Background tasks complete");
+    }
+    prev.current = count;
+    // Keyed on the active-job count only: announce start/finish, not each progress update.
+  }, [count]);
+  return (
+    <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">
+      {msg}
     </span>
   );
 }

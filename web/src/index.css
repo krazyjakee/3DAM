@@ -136,6 +136,21 @@
   }
 }
 
+/* Reduced-motion (a11y hardening, issue #44): honour the OS "reduce motion" setting by collapsing
+   every animation/transition to near-instant — the drawer still opens and spinners still convey
+   "busy", just without the slide/pulse/spin that can trigger vestibular discomfort. Global by design
+   so no component has to opt in. Kept outside @layer so its !important reliably wins. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
 @layer components {
   .btn {
     @apply inline-flex items-center gap-1.5 rounded px-2.5 py-1 text-xs font-medium

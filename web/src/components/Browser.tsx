@@ -207,7 +207,8 @@ export function Browser({ onOpenNav }: { onOpenNav?: () => void }) {
   };
 
   return (
-    <section className="flex h-full min-w-0 flex-1 flex-col bg-bg">
+    // The centre browse region is the page's main landmark (a11y hardening, issue #44).
+    <main className="flex h-full min-w-0 flex-1 flex-col bg-bg" aria-label="Asset browser">
       <Toolbar count={visible.length} total={total} onOpenNav={onOpenNav} searching={searching} />
       {selection.size > 1 && (
         <SelectionBar
@@ -243,7 +244,7 @@ export function Browser({ onOpenNav }: { onOpenNav?: () => void }) {
       {convertTargets && (
         <ConvertDialog assets={convertTargets} onClose={() => setConvertTargets(null)} />
       )}
-    </section>
+    </main>
   );
 }
 
