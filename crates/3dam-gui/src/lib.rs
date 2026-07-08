@@ -21,6 +21,16 @@ use dam_frontend::{default_data_dir, open_backend, Backend};
 /// Entry point for the GUI role (bare `3dam`). Opens the embedded library, then hands the main
 /// thread to eframe's event loop. Returns a process exit code.
 pub fn run() -> u8 {
+    // The `3dam` binary links `dam-server`, so Cargo feature-unification turns dam-core's `render`
+    // feature on for *every* role — including this one. That renderer is wgpu; eframe here is glow
+    // (OpenGL). On Linux, wgpu's GL backend can't stand up its own EGL context alongside glow's and
+    // panics in `khronos-egl`, so pin the model-thumbnail renderer to Vulkan (eframe/glow is
+    // unaffected). Respect an explicit user override. Set before any thread/GPU init.
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("WGPU_BACKEND").is_none() {
+        std::env::set_var("WGPU_BACKEND", "vulkan");
+    }
+
     // A multi-thread runtime backs every service call (and stays alive for the window's lifetime).
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
