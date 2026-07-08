@@ -11,6 +11,7 @@ struct Globals {
     view_proj: mat4x4<f32>,
     camera_pos: vec4<f32>,
     params: vec4<f32>,      // x = surface is sRGB (1.0) → write linear; else gamma-encode in shader
+                            // y = lighting mode: 0 studio · 1 soft · 2 flat/unlit
 };
 
 struct MaterialU {
@@ -134,26 +135,35 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
     let v = normalize(globals.camera_pos.xyz - in.world_pos);
     let f0 = mix(vec3<f32>(0.04), albedo, metallic);
+    let mode = globals.params.y;   // 0 studio · 1 soft · 2 flat/unlit
 
-    // Fixed studio rig (world space): warm key, cool fill, back rim.
-    var lo = vec3<f32>(0.0);
-    lo = lo + direct_light(vec3<f32>(0.5, 0.8, 0.6), vec3<f32>(3.0, 2.9, 2.7), n, v, albedo, metallic, rough, f0);
-    lo = lo + direct_light(vec3<f32>(-0.6, 0.3, 0.4), vec3<f32>(0.7, 0.8, 1.0), n, v, albedo, metallic, rough, f0);
-    lo = lo + direct_light(vec3<f32>(-0.2, 0.5, -0.9), vec3<f32>(1.1, 1.1, 1.4), n, v, albedo, metallic, rough, f0);
+    // Emissive term (shared across lighting modes).
+    var emis = mat.emissive.rgb;
+    if (mat.flags.w > 0.5) {
+        emis = emis * textureSample(emissive_tex, samp, in.uv).rgb;
+    }
 
     // Hemispheric ambient (cheap IBL substitute): sky above, darker ground below.
     let sky = vec3<f32>(0.40, 0.44, 0.52);
     let ground = vec3<f32>(0.11, 0.10, 0.10);
     let hemi = mix(ground, sky, clamp(n.y * 0.5 + 0.5, 0.0, 1.0));
-    let ambient = hemi * albedo * (1.0 - metallic * 0.6);
-    lo = lo + ambient;
 
-    // Emissive.
-    if (mat.flags.w > 0.5) {
-        lo = lo + mat.emissive.rgb * textureSample(emissive_tex, samp, in.uv).rgb;
+    var lo = vec3<f32>(0.0);
+    if (mode < 0.5) {
+        // Studio: fixed 3-light rig (warm key, cool fill, back rim) + hemi ambient.
+        lo = lo + direct_light(vec3<f32>(0.5, 0.8, 0.6), vec3<f32>(3.0, 2.9, 2.7), n, v, albedo, metallic, rough, f0);
+        lo = lo + direct_light(vec3<f32>(-0.6, 0.3, 0.4), vec3<f32>(0.7, 0.8, 1.0), n, v, albedo, metallic, rough, f0);
+        lo = lo + direct_light(vec3<f32>(-0.2, 0.5, -0.9), vec3<f32>(1.1, 1.1, 1.4), n, v, albedo, metallic, rough, f0);
+        lo = lo + hemi * albedo * (1.0 - metallic * 0.6);
+    } else if (mode < 1.5) {
+        // Soft: hemispheric fill only, boosted — an even, shadowless read of form with no harsh
+        // speculars (good for silhouette / geometry inspection).
+        lo = albedo * (hemi * 1.7 + vec3<f32>(0.12));
     } else {
-        lo = lo + mat.emissive.rgb;
+        // Flat / unlit: raw albedo — inspect textures + base colour with no shading at all.
+        lo = albedo;
     }
+    lo = lo + emis;
 
     // Alpha mode: 0 opaque, 1 mask, 2 blend. Opaque/mask write fully opaque (mask discards below its
     // cutoff — deferred to here so texture sampling stays in uniform control flow). Blend keeps the
@@ -170,11 +180,26 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         if (alpha < cutoff) { discard; }
     }
 
-    // Reinhard tone-map. On an sRGB surface the hardware encodes, so emit linear; on a plain UNORM
+    // Studio/soft get a Reinhard tone-map (HDR rig → display); flat passes albedo straight through
+    // (already in range). On an sRGB surface the hardware encodes, so emit linear; on a plain UNORM
     // surface (many WebGL2 canvases) do the sRGB gamma encode ourselves so colours aren't crushed.
-    let mapped = lo / (lo + vec3<f32>(1.0));
+    var mapped = lo / (lo + vec3<f32>(1.0));
+    if (mode > 1.5) {
+        mapped = clamp(lo, vec3<f32>(0.0), vec3<f32>(1.0));
+    }
     if (globals.params.x > 0.5) {
         return vec4<f32>(mapped, out_a);
     }
     return vec4<f32>(pow(mapped, vec3<f32>(1.0 / 2.2)), out_a);
+}
+
+// Wireframe overlay fragment: a flat, accent-coloured edge (the app's sky accent). Paired with
+// `vs_main` over a line-list index buffer; honours the same sRGB-surface convention as `fs_main`.
+@fragment
+fn fs_wire() -> @location(0) vec4<f32> {
+    let lin = vec3<f32>(0.04, 0.50, 0.93); // linear ≈ sky accent #38bdf8
+    if (globals.params.x > 0.5) {
+        return vec4<f32>(lin, 1.0);
+    }
+    return vec4<f32>(pow(lin, vec3<f32>(1.0 / 2.2)), 1.0);
 }

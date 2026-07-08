@@ -20,6 +20,10 @@ export interface ModelViewerHandle {
   loadPreviewMesh(bytes: Uint8Array): void;
   /** Orbit + zoom. `yaw`/`pitch` in radians; `zoom` multiplies the bounds-fit distance. */
   setCamera(yaw: number, pitch: number, zoom: number): void;
+  /** Lighting mode (issue #65): 0 studio (3-light rig + hemi), 1 soft (shadowless fill), 2 flat/unlit. */
+  setLighting(mode: number): void;
+  /** Toggle the wireframe overlay — mesh edges instead of shaded surfaces (issue #65). */
+  setWireframe(on: boolean): void;
   /** New canvas backing size in device pixels — call on container resize (CSS owns layout). */
   resize(width: number, height: number): void;
   /** Whether a model has loaded (vs the empty neutral background). */

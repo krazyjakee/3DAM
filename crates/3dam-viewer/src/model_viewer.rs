@@ -112,6 +112,24 @@ impl ModelViewer {
         inner.dirty = true;
     }
 
+    /// Lighting mode for the on-canvas control bar (issue #65): 0 studio (3-light rig + hemi),
+    /// 1 soft (shadowless hemispheric fill), 2 flat/unlit (raw albedo). Out-of-range values clamp to
+    /// flat via the shader's `>= 2` branch.
+    #[wasm_bindgen(js_name = setLighting)]
+    pub fn set_lighting(&self, mode: u32) {
+        let mut inner = self.inner.borrow_mut();
+        inner.renderer.set_lighting(mode as f32);
+        inner.dirty = true;
+    }
+
+    /// Toggle the wireframe overlay (mesh edges instead of shaded surfaces) — issue #65.
+    #[wasm_bindgen(js_name = setWireframe)]
+    pub fn set_wireframe(&self, on: bool) {
+        let mut inner = self.inner.borrow_mut();
+        inner.renderer.set_wireframe(on);
+        inner.dirty = true;
+    }
+
     /// New canvas backing size in device pixels (CSS owns layout; call on container resize).
     pub fn resize(&self, width: u32, height: u32) {
         let mut inner = self.inner.borrow_mut();

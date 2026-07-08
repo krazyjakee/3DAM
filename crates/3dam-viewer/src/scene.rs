@@ -66,11 +66,15 @@ const SRGB: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 const LINEAR: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
 /// Uploaded geometry for one submesh: two buffers, an index count, its material slot, whether that
-/// material is blended (glass), and a centroid for back-to-front sorting of the blended pass.
+/// material is blended (glass), and a centroid for back-to-front sorting of the blended pass. The
+/// `line_*` pair is a derived line-list index buffer (triangle edges) for the wireframe overlay —
+/// browser wgpu can't do `PolygonMode::Line`, so edges are drawn as explicit lines instead.
 struct GpuMesh {
     vbuf: wgpu::Buffer,
     ibuf: wgpu::Buffer,
     index_count: u32,
+    line_ibuf: wgpu::Buffer,
+    line_count: u32,
     material: usize,
     blend: bool,
     centroid: glam::Vec3,
@@ -91,6 +95,9 @@ pub struct ModelRenderer {
     pipeline: wgpu::RenderPipeline,
     /// Blended (glass) surfaces: alpha blend, depth-test on / depth-write off, drawn back-to-front.
     pipeline_blend: wgpu::RenderPipeline,
+    /// Wireframe overlay: line-list topology, flat accent fragment (`fs_wire`), depth-tested so
+    /// hidden edges are culled. Selected by the `wireframe` toggle in place of the shaded passes.
+    pipeline_wire: wgpu::RenderPipeline,
     globals_buf: wgpu::Buffer,
     globals_group: wgpu::BindGroup,
     material_bgl: wgpu::BindGroupLayout,
@@ -107,6 +114,10 @@ pub struct ModelRenderer {
     materials: Vec<wgpu::BindGroup>,
     fallback_material: wgpu::BindGroup,
     srgb_output: f32,
+    /// Lighting mode driven from the DOM control bar (issue #65): 0 studio · 1 soft · 2 flat/unlit.
+    lighting_mode: f32,
+    /// Wireframe overlay toggle (issue #65) — draws mesh edges instead of the shaded surfaces.
+    wireframe: bool,
 }
 
 impl ModelRenderer {
@@ -242,6 +253,48 @@ impl ModelRenderer {
         let pipeline = make_pipeline(wgpu::BlendState::REPLACE, true);
         let pipeline_blend = make_pipeline(wgpu::BlendState::ALPHA_BLENDING, false);
 
+        // Wireframe overlay: same globals/vertex layout as the shaded pipelines, but line-list
+        // topology and the flat `fs_wire` fragment. Depth-tested + depth-writing so edges behind the
+        // surface are hidden (a readable hidden-line look rather than an x-ray mesh).
+        let pipeline_wire = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("viewer-wireframe"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[Some(Vertex::layout())],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_wire"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: ctx.config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::LineList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: sample_count,
+                ..Default::default()
+            },
+            multiview_mask: None,
+            cache: None,
+        });
+
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("viewer-sampler"),
             address_mode_u: wgpu::AddressMode::Repeat,
@@ -289,6 +342,7 @@ impl ModelRenderer {
         Self {
             pipeline,
             pipeline_blend,
+            pipeline_wire,
             globals_buf,
             globals_group,
             material_bgl,
@@ -303,7 +357,19 @@ impl ModelRenderer {
             materials: Vec::new(),
             fallback_material,
             srgb_output: ctx.config.format.is_srgb() as u32 as f32,
+            lighting_mode: 0.0,
+            wireframe: false,
         }
+    }
+
+    /// Set the lighting mode (0 studio · 1 soft · 2 flat); fed to the shader via `globals.params.y`.
+    pub fn set_lighting(&mut self, mode: f32) {
+        self.lighting_mode = mode;
+    }
+
+    /// Toggle the wireframe overlay (edges instead of shaded surfaces).
+    pub fn set_wireframe(&mut self, on: bool) {
+        self.wireframe = on;
     }
 
     /// Replace the drawn geometry + materials with a freshly decoded preview model.
@@ -324,6 +390,12 @@ impl ModelRenderer {
                     usage: wgpu::BufferUsages::INDEX,
                 }),
                 index_count: s.indices.len() as u32,
+                line_ibuf: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("viewer-line-indices"),
+                    contents: bytemuck::cast_slice(&triangle_edges(&s.indices)),
+                    usage: wgpu::BufferUsages::INDEX,
+                }),
+                line_count: (s.indices.len() / 3 * 6) as u32,
                 material: s.material,
                 blend: model
                     .materials
@@ -371,7 +443,7 @@ impl ModelRenderer {
         let globals = Globals {
             view_proj: camera.view_proj(ctx.aspect()).to_cols_array_2d(),
             camera_pos: camera.eye_pos().extend(1.0).to_array(),
-            params: [self.srgb_output, 0.0, 0.0, 0.0],
+            params: [self.srgb_output, self.lighting_mode, 0.0, 0.0],
         };
         ctx.queue
             .write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
@@ -426,35 +498,47 @@ impl ModelRenderer {
             });
 
             if !self.meshes.is_empty() {
-                let materials = &self.materials;
-                let fallback = &self.fallback_material;
-                let draw = |pass: &mut wgpu::RenderPass, mesh: &GpuMesh| {
-                    let mat = materials.get(mesh.material).unwrap_or(fallback);
-                    pass.set_bind_group(1, mat, &[]);
-                    pass.set_vertex_buffer(0, mesh.vbuf.slice(..));
-                    pass.set_index_buffer(mesh.ibuf.slice(..), wgpu::IndexFormat::Uint32);
-                    pass.draw_indexed(0..mesh.index_count, 0, 0..1);
-                };
-
-                // Opaque + mask surfaces first (depth-writing), then blended glass back-to-front from
-                // the current orbit camera so overlapping panes composite correctly.
                 pass.set_bind_group(0, &self.globals_group, &[]);
-                pass.set_pipeline(&self.pipeline);
-                for mesh in self.meshes.iter().filter(|m| !m.blend) {
-                    draw(&mut pass, mesh);
-                }
 
-                let mut blended: Vec<&GpuMesh> = self.meshes.iter().filter(|m| m.blend).collect();
-                if !blended.is_empty() {
-                    let eye = camera.eye_pos();
-                    blended.sort_by(|a, b| {
-                        let da = (a.centroid - eye).length_squared();
-                        let db = (b.centroid - eye).length_squared();
-                        db.total_cmp(&da) // farthest first (painter's order)
-                    });
-                    pass.set_pipeline(&self.pipeline_blend);
-                    for mesh in blended {
+                if self.wireframe {
+                    // Wireframe overlay: edges only, materials irrelevant (flat accent fragment).
+                    pass.set_pipeline(&self.pipeline_wire);
+                    for mesh in &self.meshes {
+                        pass.set_vertex_buffer(0, mesh.vbuf.slice(..));
+                        pass.set_index_buffer(mesh.line_ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.draw_indexed(0..mesh.line_count, 0, 0..1);
+                    }
+                } else {
+                    let materials = &self.materials;
+                    let fallback = &self.fallback_material;
+                    let draw = |pass: &mut wgpu::RenderPass, mesh: &GpuMesh| {
+                        let mat = materials.get(mesh.material).unwrap_or(fallback);
+                        pass.set_bind_group(1, mat, &[]);
+                        pass.set_vertex_buffer(0, mesh.vbuf.slice(..));
+                        pass.set_index_buffer(mesh.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                    };
+
+                    // Opaque + mask surfaces first (depth-writing), then blended glass back-to-front
+                    // from the current orbit camera so overlapping panes composite correctly.
+                    pass.set_pipeline(&self.pipeline);
+                    for mesh in self.meshes.iter().filter(|m| !m.blend) {
                         draw(&mut pass, mesh);
+                    }
+
+                    let mut blended: Vec<&GpuMesh> =
+                        self.meshes.iter().filter(|m| m.blend).collect();
+                    if !blended.is_empty() {
+                        let eye = camera.eye_pos();
+                        blended.sort_by(|a, b| {
+                            let da = (a.centroid - eye).length_squared();
+                            let db = (b.centroid - eye).length_squared();
+                            db.total_cmp(&da) // farthest first (painter's order)
+                        });
+                        pass.set_pipeline(&self.pipeline_blend);
+                        for mesh in blended {
+                            draw(&mut pass, mesh);
+                        }
                     }
                 }
             }
@@ -575,6 +659,17 @@ fn upload_texture(
         size,
     );
     tex.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+/// Expand a triangle index list into a line-list of its edges (each triangle → 3 edges = 6 indices)
+/// for the wireframe overlay. Shared edges are drawn twice — harmless overdraw of identical lines,
+/// and cheaper than deduping for a downscaled preview mesh. A trailing partial triangle is ignored.
+fn triangle_edges(indices: &[u32]) -> Vec<u32> {
+    let mut edges = Vec::with_capacity(indices.len() / 3 * 6);
+    for tri in indices.chunks_exact(3) {
+        edges.extend_from_slice(&[tri[0], tri[1], tri[1], tri[2], tri[2], tri[0]]);
+    }
+    edges
 }
 
 /// Average vertex position of a submesh — a cheap centroid for back-to-front sorting of blended
