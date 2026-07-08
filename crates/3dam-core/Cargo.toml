@@ -25,6 +25,8 @@ directories.workspace = true
 # watch/auto-rescan (local FS change notification) + CSV manifest export (phase 4 Reach).
 notify.workspace = true
 csv.workspace = true
+# Data-parallel CPU work: the whole-library analyze pass fans per-asset across cores (ADR 0007, #67).
+rayon = "1"
 # Semantic-embedding stack (semantic-search M4), all optional and pulled in only by the `semantic`
 # feature: SigLIP runs on candle (ADR 0006 §runtime), text is tokenized with `tokenizers`, and
 # `image` decodes + resizes to the vision tower's 224px input.

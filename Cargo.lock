@@ -1245,6 +1245,7 @@ dependencies = [
  "image",
  "notify",
  "ort",
+ "rayon",
  "serde",
  "serde_json",
  "tokenizers 0.23.1",

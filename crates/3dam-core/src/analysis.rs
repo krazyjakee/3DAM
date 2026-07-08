@@ -15,8 +15,9 @@ use dam_api::dto::*;
 use dam_api::event::{ChangeKind, LibraryEvent};
 use dam_api::id::JobId;
 use dam_store::{AnalysisTarget, ImageAnalysis, Store};
+use rayon::prelude::*;
 use std::path::{Component, Path};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
@@ -39,6 +40,12 @@ const PROGRESS_EVERY: u64 = 8;
 /// The background analysis job (mirrors `scan::run_scan`): plan is already done (the caller passed the
 /// due `targets`), so this runs Extract→Derive→Classify→Index per asset, emitting progress + a
 /// `Reanalyzed` change event as each completes (§1.3 incremental). Runs on a blocking thread.
+///
+/// Per-asset work is CPU-bound (decode → derive → classify → embed), so it fans out across the rayon
+/// pool (ADR 0007, issue #67) — a whole-library pass now scales with cores instead of pinning one. The
+/// async caller already handed off via `spawn_blocking`, so this stays a one-shot async→CPU hop. The
+/// store's writes still serialise on its single connection mutex (no `SQLITE_BUSY` — one guarded
+/// connection), but the expensive compute overlaps, which is where the time goes.
 pub(crate) fn run_analyze(
     store: Arc<Store>,
     events: broadcast::Sender<LibraryEvent>,
@@ -49,14 +56,16 @@ pub(crate) fn run_analyze(
 ) {
     let total = targets.len() as u64;
     let _ = store.update_job_progress(&job, JobState::Running, 0, Some(total), None);
-    let mut done: u64 = 0;
-    let mut warnings: u64 = 0;
+    // Shared across the rayon workers: a monotonic completion counter and a skip counter.
+    let done = AtomicU64::new(0);
+    let warnings = AtomicU64::new(0);
 
-    for t in targets {
+    targets.par_iter().for_each(|t| {
+        // Cooperative cancel: in-flight items finish; still-queued ones fall through as cheap no-ops.
         if cancel.load(Ordering::Relaxed) {
-            break;
+            return;
         }
-        match analyze_one(&store, &t, model.as_deref()) {
+        match analyze_one(&store, t, model.as_deref()) {
             Ok(()) => {
                 let _ = events.send(LibraryEvent::AssetChanged {
                     id: t.id,
@@ -64,23 +73,22 @@ pub(crate) fn run_analyze(
                 });
             }
             Err(e) => {
-                warnings += 1;
+                warnings.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(asset = %t.id, path = %t.path, error = %e, "analysis skipped asset");
             }
         }
-        done += 1;
-        if done.is_multiple_of(PROGRESS_EVERY) {
-            let _ = store.update_job_progress(
-                &job,
-                JobState::Running,
-                done,
-                Some(total),
-                Some(&t.path),
-            );
+        // Report on every Nth completion — `fetch_add` returns the prior value, so `n` is this
+        // worker's 1-based ordinal; the bar advances monotonically even as workers interleave.
+        let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_multiple_of(PROGRESS_EVERY) {
+            let _ =
+                store.update_job_progress(&job, JobState::Running, n, Some(total), Some(&t.path));
             emit_progress(&store, &events, &job);
         }
-    }
+    });
 
+    let done = done.load(Ordering::Relaxed);
+    let warnings = warnings.load(Ordering::Relaxed);
     if cancel.load(Ordering::Relaxed) {
         let _ = store.set_job_state(&job, JobState::Cancelled, None);
     } else {
