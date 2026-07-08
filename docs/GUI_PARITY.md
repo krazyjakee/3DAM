@@ -23,7 +23,7 @@ Legend: ✅ done · 🟡 partial · ⬜ owed (not yet in egui)
 | Browse grid + list | ✅ | ✅ | thumbnail grid + flat list, toggle in the toolbar |
 | Thumbnails | ✅ | ✅ | `read_thumbnail` → decode off-thread → egui texture cache; lazy, visible-only load; typed tile for audio/3D |
 | Inspector: core metadata | ✅ | ✅ | name, type, format, size, path, tags |
-| Inspector: media attributes | ✅ | ⬜ | audio/image/model attr blocks, seamlessness, audio features |
+| Inspector: media attributes | ✅ | 🟡 | audio/image/model attr rows (+ class, loudness, tiling); seamlessness/feature bars not yet visual |
 | Inspector: preview (3D/audio/image) | ✅ | ⬜ | egui-wgpu paint callback for the 3D island; audio/image viewers |
 | Library stats | ✅ | ✅ | totals + by-media counts in the left rail |
 | Sources list | ✅ | 🟡 | egui shows them read-only; add/remove/rescan owed |

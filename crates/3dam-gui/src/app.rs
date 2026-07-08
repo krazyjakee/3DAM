@@ -17,8 +17,8 @@ use eframe::egui;
 use dam_api::service::{AuthContext, LibraryService};
 use dam_api::{
     Asset, AssetId, AssetSummary, FacetField, Filter, FilterOp, FilterValue, LibraryStats,
-    LicenseStatus, MediaType, Page, PageParams, QueryRequest, SearchMode, Sort, SortDir, SortField,
-    SourceInfo,
+    LicenseStatus, MediaAttributes, MediaType, Page, PageParams, QueryRequest, SearchMode, Sort,
+    SortDir, SortField, SourceInfo,
 };
 
 /// The sort presets offered in the toolbar — label + (field, dir), mirroring the web sort control.
@@ -618,6 +618,19 @@ fn inspector(ui: &mut egui::Ui, asset: &Asset) {
         ui.end_row();
     });
 
+    // Media-specific attributes (audio/image/model), including the analysis-pass extras when present.
+    let media = media_rows(&asset.attributes);
+    if !media.is_empty() {
+        ui.separator();
+        ui.label(egui::RichText::new("MEDIA").small().weak());
+        egui::Grid::new("media").num_columns(2).show(ui, |ui| {
+            for (k, v) in &media {
+                row(ui, k, v);
+            }
+            ui.end_row();
+        });
+    }
+
     if !asset.tags.is_empty() {
         ui.separator();
         ui.label(
@@ -673,6 +686,132 @@ fn media_value(m: MediaType) -> &'static str {
         MediaType::Audio => "audio",
         MediaType::Image => "image",
         MediaType::Model => "model",
+    }
+}
+
+/// Build the inspector's media-attribute rows for the asset's media type — the cheap-tier container
+/// facts plus any analysis-pass extras that have been filled in. Empty (no block) when nothing known.
+fn media_rows(attrs: &MediaAttributes) -> Vec<(String, String)> {
+    let mut r: Vec<(String, String)> = Vec::new();
+    let mut push = |k: &str, v: String| r.push((k.to_string(), v));
+    match attrs {
+        MediaAttributes::Audio(a) => {
+            if let Some(x) = a.duration_ms {
+                push("Duration", duration(x));
+            }
+            if let Some(x) = a.sample_rate {
+                push("Sample rate", format!("{x} Hz"));
+            }
+            if let Some(x) = a.bit_depth {
+                push("Bit depth", format!("{x}-bit"));
+            }
+            if let Some(x) = a.channels {
+                push("Channels", channel_label(x));
+            }
+            if let Some(x) = &a.codec {
+                push("Codec", x.clone());
+            }
+            if let Some(x) = &a.container {
+                push("Container", x.clone());
+            }
+            if let Some(x) = &a.class {
+                push("Type", x.clone());
+            }
+            if let Some(x) = a.loudness_lufs {
+                push("Loudness", format!("{x:.1} LUFS"));
+            }
+        }
+        MediaAttributes::Image(a) => {
+            if let (Some(w), Some(h)) = (a.width, a.height) {
+                push("Dimensions", format!("{w} × {h}"));
+            }
+            if let Some(x) = a.color_depth {
+                push("Bit depth", format!("{x}-bit"));
+            }
+            if let Some(x) = a.has_alpha {
+                push("Alpha", yesno(x));
+            }
+            if let Some(x) = &a.color_space {
+                push("Color space", x.clone());
+            }
+            if let Some(x) = &a.tile_class {
+                push("Tiling", x.clone());
+            }
+            if let Some(x) = &a.class {
+                push("Type", x.clone());
+            }
+        }
+        MediaAttributes::Model(a) => {
+            if let Some(x) = a.vertex_count {
+                push("Vertices", group_int(x));
+            }
+            if let Some(x) = a.triangle_count {
+                push("Triangles", group_int(x));
+            }
+            if let Some(x) = a.mesh_count {
+                push("Meshes", x.to_string());
+            }
+            if let Some(x) = a.material_count {
+                push("Materials", x.to_string());
+            }
+            if let Some(x) = a.texture_count {
+                push("Textures", x.to_string());
+            }
+            if let Some(x) = a.has_rig {
+                push("Rigged", yesno(x));
+            }
+            if let Some(x) = a.has_animation {
+                push("Animation", yesno(x));
+            }
+            if let Some(x) = a.has_uvs {
+                push("UVs", yesno(x));
+            }
+            if let Some(x) = &a.class {
+                push("Complexity", x.clone());
+            }
+        }
+        MediaAttributes::None => {}
+    }
+    r
+}
+
+fn yesno(b: bool) -> String {
+    if b { "yes" } else { "no" }.to_string()
+}
+
+/// Human channel label: 1 → Mono, 2 → Stereo, else "N ch".
+fn channel_label(n: i64) -> String {
+    match n {
+        1 => "Mono".to_string(),
+        2 => "Stereo".to_string(),
+        _ => format!("{n} ch"),
+    }
+}
+
+/// `mm:ss` from milliseconds.
+fn duration(ms: i64) -> String {
+    let secs = (ms.max(0) / 1000) as u64;
+    format!("{}:{:02}", secs / 60, secs % 60)
+}
+
+/// Group an integer with thousands separators (12,345).
+// `is_multiple_of` (clippy's suggestion) only stabilised in 1.87; MSRV here is 1.85, so keep the `%`.
+#[allow(clippy::manual_is_multiple_of)]
+fn group_int(n: i64) -> String {
+    let neg = n < 0;
+    let digits = n.unsigned_abs().to_string();
+    let bytes = digits.as_bytes();
+    let mut out = String::new();
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    if neg {
+        format!("-{out}")
+    } else {
+        out
     }
 }
 
