@@ -26,7 +26,7 @@ Legend: ✅ done · 🟡 partial · ⬜ owed (not yet in egui)
 | Inspector: media attributes | ✅ | 🟡 | audio/image/model attr rows (+ class, loudness, tiling); seamlessness/feature bars not yet visual |
 | Inspector: preview (3D/audio/image) | ✅ | 🟡 | image preview (thumbnail texture) done; 3D island (egui-wgpu) + audio player owed |
 | Library stats | ✅ | ✅ | totals + by-media counts in the left rail |
-| Sources list | ✅ | 🟡 | egui shows them read-only; add/remove/rescan owed |
+| Sources list + manage | ✅ | ✅ | list/scope + add-local / remove (confirm) / rescan in the rail (SFTP/SMB owed) |
 | Folder-tree navigation (#66) | ✅ | ✅ | left-rail source tree, lazy `list_folders`, path-scoped browse (breadcrumb TBD) |
 | Search mode (lexical/hybrid/semantic) | ✅ | ✅ | toolbar combo, shown with a text query |
 | License facet | ✅ | ✅ | left-rail Permissive/Attribution/Restricted/Unknown |

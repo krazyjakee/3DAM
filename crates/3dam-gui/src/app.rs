@@ -16,12 +16,13 @@ use eframe::egui;
 
 use dam_api::service::{AuthContext, LibraryService};
 use dam_api::{
-    AnalyzeRequest, Asset, AssetId, AssetSummary, Collection, CollectionId, CollectionKind,
-    DupGroup, DupKind, DupRequest, EventTopic, ExportFormat, ExportReport, ExportRequest,
-    FacetField, Filter, FilterOp, FilterValue, FolderEntry, FolderListing, JobState, LibraryEvent,
-    LibraryStats, LicenseStatus, MediaAttributes, MediaType, Page, PageParams, QueryRequest,
-    ReviewAction, SearchMode, SimilarHit, SimilarRequest, Sort, SortDir, SortField, SourceId,
-    SourceInfo, SubscribeRequest, SuggestionReview, ThumbnailRegenRequest,
+    AddSource, AnalyzeRequest, Asset, AssetId, AssetSummary, Collection, CollectionId,
+    CollectionKind, DupGroup, DupKind, DupRequest, EventTopic, ExportFormat, ExportReport,
+    ExportRequest, FacetField, Filter, FilterOp, FilterValue, FolderEntry, FolderListing, JobState,
+    LibraryEvent, LibraryStats, LicenseStatus, MediaAttributes, MediaType, Page, PageParams,
+    QueryRequest, RemoveSource, ReviewAction, ScanMode, ScanRequest, SearchMode, SimilarHit,
+    SimilarRequest, Sort, SortDir, SortField, SourceId, SourceInfo, SourceKind, SubscribeRequest,
+    SuggestionReview, ThumbnailRegenRequest,
 };
 use futures::StreamExt;
 
@@ -44,6 +45,14 @@ enum FolderState {
     Failed,
 }
 
+/// A source-management action fired from the rail.
+enum SourceAction {
+    /// Add a local-filesystem source at this path (then scan it).
+    AddLocal(String),
+    Remove(SourceId),
+    Rescan(SourceId),
+}
+
 /// Actions collected while rendering the (immutably-borrowed) folder tree, applied after the panels.
 #[derive(Default)]
 struct NavActions {
@@ -53,6 +62,12 @@ struct NavActions {
     load: Vec<FolderKey>,
     /// A clicked scope target: source + optional path prefix (None = whole source).
     scope: Option<(SourceId, Option<String>)>,
+    /// A source add/remove/rescan action.
+    source: Option<SourceAction>,
+    /// Set/clear the "confirm remove" state for a source (`Some(None)` clears it).
+    set_confirm: Option<Option<SourceId>>,
+    /// Toggle the add-source input's visibility.
+    toggle_add: bool,
 }
 
 /// The sort presets offered in the toolbar — label + (field, dir), mirroring the web sort control.
@@ -218,6 +233,11 @@ pub struct DamGui {
     export_attribution: bool,
     /// Last export outcome (Ok message / Err message) shown in the modal.
     export_status: Option<Result<String, String>>,
+    // ── source management ──
+    add_open: bool,
+    add_path: String,
+    /// The source pending a remove confirmation (two-step to guard against accidental drops).
+    confirm_remove: Option<SourceId>,
 }
 
 impl DamGui {
@@ -275,6 +295,9 @@ impl DamGui {
             export_path: default_export_path(),
             export_attribution: false,
             export_status: None,
+            add_open: false,
+            add_path: String::new(),
+            confirm_remove: None,
         };
         // Kick the initial loads against the freshly opened library.
         let egctx = cc.egui_ctx.clone();
@@ -621,6 +644,61 @@ impl DamGui {
             let r = lib.library_stats(&auth).await.map_err(|e| e.to_string());
             let _ = tx.send(Msg::Stats(r));
             egctx.request_repaint();
+        });
+    }
+
+    /// Add a local-filesystem source, then kick a full scan so it ingests. Source/asset events from
+    /// the scan refresh the rail + grid live.
+    fn add_local_source(&self, path: String) {
+        let (lib, auth) = (self.lib.clone(), self.auth.clone());
+        self.rt.spawn(async move {
+            let req = AddSource {
+                kind: SourceKind::LocalFs,
+                uri: path,
+                name: None,
+                options: Default::default(),
+            };
+            if let Ok(id) = lib.add_source(&auth, req).await {
+                let _ = lib
+                    .submit_scan(
+                        &auth,
+                        ScanRequest {
+                            sources: vec![id],
+                            mode: ScanMode::Full,
+                        },
+                    )
+                    .await;
+            }
+        });
+    }
+
+    fn remove_source_svc(&self, id: SourceId) {
+        let (lib, auth) = (self.lib.clone(), self.auth.clone());
+        self.rt.spawn(async move {
+            let _ = lib
+                .remove_source(
+                    &auth,
+                    &id,
+                    RemoveSource {
+                        keep_metadata: false,
+                    },
+                )
+                .await;
+        });
+    }
+
+    fn rescan_source(&self, id: SourceId) {
+        let (lib, auth) = (self.lib.clone(), self.auth.clone());
+        self.rt.spawn(async move {
+            let _ = lib
+                .submit_scan(
+                    &auth,
+                    ScanRequest {
+                        sources: vec![id],
+                        mode: ScanMode::Delta,
+                    },
+                )
+                .await;
         });
     }
 
@@ -1036,13 +1114,34 @@ impl eframe::App for DamGui {
                 }
 
                 ui.separator();
-                ui.label(egui::RichText::new("SOURCES").small().weak());
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("SOURCES").small().weak());
+                    if ui.small_button("+").clicked() {
+                        nav.toggle_add = true;
+                    }
+                });
+                // Add-source input (local filesystem path). SFTP/SMB (credentials) stay owed.
+                if self.add_open {
+                    ui.horizontal(|ui| {
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut self.add_path)
+                                .hint_text("/path/to/assets")
+                                .desired_width(150.0),
+                        );
+                        let submit = ui.small_button("Add").clicked()
+                            || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                        if submit && !self.add_path.trim().is_empty() {
+                            nav.source =
+                                Some(SourceAction::AddLocal(self.add_path.trim().to_string()));
+                        }
+                    });
+                }
                 if self.sources.is_empty() {
-                    ui.label(egui::RichText::new("No sources yet — add one with the CLI.").weak());
+                    ui.label(egui::RichText::new("No sources yet — add one above.").weak());
                 }
                 // Each source is an expandable folder tree (issue #66): the disclosure loads its
                 // directory tree lazily; clicking the name scopes the browse to that source (or, for
-                // a folder, to its subtree via the path-prefix filter).
+                // a folder, to its subtree via the path-prefix filter). Trailing controls rescan/remove.
                 for s in &self.sources {
                     let sid = s.id;
                     let open = self.expanded.contains(&(sid, String::new()));
@@ -1059,6 +1158,23 @@ impl eframe::App for DamGui {
                             .clicked()
                         {
                             nav.scope = Some((sid, None));
+                        }
+                        if self.confirm_remove == Some(sid) {
+                            ui.label(egui::RichText::new("remove?").small());
+                            if ui.small_button("yes").clicked() {
+                                nav.source = Some(SourceAction::Remove(sid));
+                                nav.set_confirm = Some(None);
+                            }
+                            if ui.small_button("no").clicked() {
+                                nav.set_confirm = Some(None);
+                            }
+                        } else {
+                            if ui.small_button("scan").clicked() {
+                                nav.source = Some(SourceAction::Rescan(sid));
+                            }
+                            if ui.small_button("x").clicked() {
+                                nav.set_confirm = Some(Some(sid));
+                            }
                         }
                     });
                     if open {
@@ -1339,6 +1455,34 @@ impl eframe::App for DamGui {
         for k in nav.load {
             self.folders.insert(k.clone(), FolderState::Loading);
             self.load_folders(k);
+        }
+        // Source management (add/remove/rescan + the add input's toggle / confirm state).
+        if nav.toggle_add {
+            self.add_open = !self.add_open;
+        }
+        if let Some(c) = nav.set_confirm {
+            self.confirm_remove = c;
+        }
+        match nav.source {
+            Some(SourceAction::AddLocal(path)) => {
+                self.add_local_source(path);
+                self.add_path.clear();
+                self.add_open = false;
+                self.dirty_sources = true;
+            }
+            Some(SourceAction::Remove(id)) => {
+                self.remove_source_svc(id);
+                // Don't leave the browse scoped to a source that's going away.
+                if self.source_filter == Some(id) {
+                    self.source_filter = None;
+                    self.path = None;
+                    do_query = true;
+                }
+                self.dirty_sources = true;
+                self.dirty_stats = true;
+            }
+            Some(SourceAction::Rescan(id)) => self.rescan_source(id),
+            None => {}
         }
         if let Some((sid, p)) = nav.scope {
             // Clicking the already-active source/folder clears the scope; otherwise set it.
