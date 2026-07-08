@@ -24,7 +24,9 @@ use tokio::sync::broadcast;
 /// Plan stage re-enqueues assets behind it (§7.2). One monotonic number covers the v1 extractor set.
 /// V2: the audio classifier moved from a duration heuristic to measured DSP features (loopability,
 /// tonality/key, tempo, envelope) — every audio asset re-analyses to get an honest class.
-pub const PIPELINE_VERSION: i64 = 2;
+/// V3: the analyze pass also extracts continuous acoustic features (loudness/brightness/harmonicity,
+/// issue #61), so audio re-analyses once more to populate them.
+pub const PIPELINE_VERSION: i64 = 3;
 
 /// Embedding-space ids (§2.1). Model-free descriptors in v1 — see module docs. One logical index per
 /// media type; vectors from different spaces are never cross-ranked (§3.1).
@@ -241,6 +243,12 @@ fn analyze_audio(
                     ("transient", 0.5)
                 });
                 suggest_audio_extras(store, &t.id, &f);
+                // Persist the continuous acoustic features for the inspector bars (issue #61).
+                if let Err(e) =
+                    store.set_audio_features(&t.id, f.loudness_lufs, f.brightness, f.harmonicity)
+                {
+                    tracing::warn!(asset = %t.id, error = %e, "set_audio_features failed");
+                }
                 let conf = if f.loop_source == dam_media::LoopSource::Metadata {
                     0.95
                 } else {

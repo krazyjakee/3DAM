@@ -771,14 +771,72 @@ function MediaFacts({ attrs }: { attrs: MediaAttributes }) {
     if (attrs.has_animation != null) rows.push(["Animation", attrs.has_animation ? "yes" : "no"]);
     if (attrs.has_uvs != null) rows.push(["UVs", attrs.has_uvs ? "yes" : "no"]);
   }
-  if (rows.length === 0 && !seam) return null;
+  // "Extracted features" for audio (issue #61): the analysis pass's continuous acoustic signals —
+  // loudness (text) + brightness / harmonicity (0–1 bars). Its own group, separate from the container
+  // metadata rows above. Absent until `analyze` has run.
+  const audioFeatures =
+    attrs.media === "audio" &&
+    (attrs.loudness_lufs != null || attrs.brightness != null || attrs.harmonicity != null) ? (
+      <AudioFeatures
+        loudness={attrs.loudness_lufs ?? null}
+        brightness={attrs.brightness ?? null}
+        harmonicity={attrs.harmonicity ?? null}
+      />
+    ) : null;
+
+  if (rows.length === 0 && !seam && !audioFeatures) return null;
   return (
-    <Group title="Media">
-      {rows.map(([label, value]) => (
-        <Field key={label} label={label} value={value} />
-      ))}
-      {seam}
+    <>
+      {(rows.length > 0 || seam) && (
+        <Group title="Media">
+          {rows.map(([label, value]) => (
+            <Field key={label} label={label} value={value} />
+          ))}
+          {seam}
+        </Group>
+      )}
+      {audioFeatures}
+    </>
+  );
+}
+
+/** "Extracted features" readout for audio (issue #61): integrated loudness as a value, plus brightness
+ *  (spectral centroid) and harmonicity (harmonic-vs-noise) as 0–1 bars — the audio analogue of the
+ *  image Seamlessness block. Only rendered once the analyze pass has measured them. */
+function AudioFeatures({
+  loudness,
+  brightness,
+  harmonicity,
+}: {
+  loudness: number | null;
+  brightness: number | null;
+  harmonicity: number | null;
+}) {
+  return (
+    <Group title="Extracted features">
+      {loudness != null && (
+        <Field label="Loudness" value={`${loudness.toFixed(1)} LUFS`} />
+      )}
+      {brightness != null && <FeatureBar label="Brightness" value={brightness} />}
+      {harmonicity != null && <FeatureBar label="Harmonicity" value={harmonicity} />}
     </Group>
+  );
+}
+
+/** A labelled 0–1 feature bar (raw value on hover) — the shared shape behind the audio brightness /
+ *  harmonicity readouts. */
+function FeatureBar({ label, value }: { label: string; value: number }) {
+  const pct = Math.round(Math.max(0, Math.min(1, value)) * 100);
+  return (
+    <div className="pt-1.5">
+      <div className="mb-1 flex items-center justify-between">
+        <span className="text-[11px] text-fg-dim">{label}</span>
+        <span className="text-[10px] tabular-nums text-fg-muted">{pct}%</span>
+      </div>
+      <div className="h-1.5 overflow-hidden rounded bg-surface-2" title={value.toFixed(3)}>
+        <div style={{ width: `${pct}%`, height: "100%", background: "var(--color-accent)" }} />
+      </div>
+    </div>
   );
 }
 

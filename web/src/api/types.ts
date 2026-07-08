@@ -65,6 +65,13 @@ export interface AudioAttributes {
   channels: number | null;
   codec?: string | null;
   container?: string | null;
+  // ── derived by the analysis pass (null until `analyze` runs), issue #61 ──
+  /** Integrated loudness in dBFS (an RMS approximation of LUFS). Negative. */
+  loudness_lufs?: number | null;
+  /** Spectral-centroid brightness, normalised 0–1. */
+  brightness?: number | null;
+  /** Harmonic-vs-noise ratio, normalised 0–1. */
+  harmonicity?: number | null;
 }
 export interface ImageAttributes {
   width: number | null;

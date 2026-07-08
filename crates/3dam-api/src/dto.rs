@@ -224,6 +224,16 @@ pub struct AudioAttributes {
     /// Auto-category guess from analysis (`one_shot` | `loop` | `music` | `sfx`); tech-spec 05 §4.
     #[serde(default)]
     pub class: Option<String>,
+    // Continuous acoustic features from the analyze pass (issue #61); `None` until analysed.
+    /// Integrated loudness in dBFS (an RMS approximation of LUFS for v1). Typically negative.
+    #[serde(default)]
+    pub loudness_lufs: Option<f32>,
+    /// Spectral-centroid brightness, normalised 0–1 (0 = dark/low, 1 = bright/high).
+    #[serde(default)]
+    pub brightness: Option<f32>,
+    /// Harmonic-vs-noise ratio, normalised 0–1 (0 = noisy, 1 = tonal/harmonic).
+    #[serde(default)]
+    pub harmonicity: Option<f32>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

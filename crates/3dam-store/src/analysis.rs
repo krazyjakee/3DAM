@@ -98,6 +98,33 @@ impl Store {
         Ok(())
     }
 
+    /// Persist the continuous audio acoustic features from the analyze pass (issue #61). Upserts the
+    /// `audio_attr` row (the cheap-tier metadata may not have created it yet).
+    pub fn set_audio_features(
+        &self,
+        id: &AssetId,
+        loudness_lufs: f32,
+        brightness: f32,
+        harmonicity: f32,
+    ) -> Result<(), LibError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO audio_attr (asset_id, loudness_lufs, brightness, harmonicity)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(asset_id) DO UPDATE SET
+                loudness_lufs=excluded.loudness_lufs, brightness=excluded.brightness,
+                harmonicity=excluded.harmonicity",
+            params![
+                id.as_bytes().to_vec(),
+                loudness_lufs,
+                brightness,
+                harmonicity
+            ],
+        )
+        .map_err(internal)?;
+        Ok(())
+    }
+
     /// Upsert an asset's embedding for one space (§2.1, §3.1). `vec` must already be L2-normalised.
     pub fn set_embedding(
         &self,

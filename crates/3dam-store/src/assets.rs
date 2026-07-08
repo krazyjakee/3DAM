@@ -162,7 +162,8 @@ impl Store {
         match media {
             MediaType::Audio => conn
                 .query_row(
-                    "SELECT duration_ms, sample_rate, bit_depth, channels, codec, container, class FROM audio_attr WHERE asset_id = ?1",
+                    "SELECT duration_ms, sample_rate, bit_depth, channels, codec, container, class,
+                            loudness_lufs, brightness, harmonicity FROM audio_attr WHERE asset_id = ?1",
                     params![id_blob],
                     |r| {
                         Ok(AudioAttributes {
@@ -173,6 +174,9 @@ impl Store {
                             codec: r.get(4)?,
                             container: r.get(5)?,
                             class: r.get(6)?,
+                            loudness_lufs: r.get(7)?,
+                            brightness: r.get(8)?,
+                            harmonicity: r.get(9)?,
                         })
                     },
                 )

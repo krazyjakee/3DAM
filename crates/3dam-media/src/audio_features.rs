@@ -51,6 +51,14 @@ pub struct AudioFeatures {
     pub sustained: bool,
     /// Clip duration in seconds (from decoded PCM, not the header).
     pub duration_s: f32,
+    // Continuous acoustic features surfaced as inspector bars (issue #61).
+    /// Integrated loudness in dBFS — an RMS approximation of LUFS (K-weighting/gating is deferred to a
+    /// later pass). Negative; ~-14 for a hot master, quieter (more negative) for sparse SFX.
+    pub loudness_lufs: f32,
+    /// Brightness = mean spectral centroid normalised by Nyquist, 0–1 (dark → bright).
+    pub brightness: f32,
+    /// Harmonicity = 1 − mean spectral flatness, 0–1 (noisy → tonal/harmonic).
+    pub harmonicity: f32,
 }
 
 /// How loopability was decided (tech-spec 05 §4.2). Authored metadata outranks measurement.
@@ -121,6 +129,12 @@ pub fn extract_audio_features(path: &Path, format: &str) -> Result<AudioFeatures
 
     let class = classify(is_loop, onset_count, bpm, tonal, sustained, duration_s);
 
+    // Continuous acoustic features (issue #61). Loudness is integrated RMS in dBFS (floored so a
+    // near-silent clip doesn't report -inf); brightness/harmonicity come from the STFT pass above.
+    let loudness_lufs = rms_dbfs(&samples);
+    let brightness = spec.brightness;
+    let harmonicity = (1.0 - spec.flatness).clamp(0.0, 1.0);
+
     Ok(AudioFeatures {
         class,
         is_loop,
@@ -132,7 +146,23 @@ pub fn extract_audio_features(path: &Path, format: &str) -> Result<AudioFeatures
         key,
         sustained,
         duration_s,
+        loudness_lufs,
+        brightness,
+        harmonicity,
     })
+}
+
+/// Integrated loudness as root-mean-square in dBFS (issue #61). A pragmatic v1 stand-in for LUFS —
+/// no K-weighting or gating — floored at -100 dB so digital silence reports a finite value.
+fn rms_dbfs(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return -100.0;
+    }
+    let ms: f64 = samples.iter().map(|&s| s as f64 * s as f64).sum::<f64>() / samples.len() as f64;
+    if ms <= 1e-10 {
+        return -100.0;
+    }
+    (10.0 * ms.log10()).max(-100.0) as f32
 }
 
 /// The coarse class from the orthogonal signals (tech-spec 05 §4.2). Order matters: "it loops" is the
@@ -246,6 +276,12 @@ struct StftPass {
     /// Magnitude spectrum of the first and last frames, for the wrap-boundary flux.
     first_mag: Vec<f32>,
     last_mag: Vec<f32>,
+    /// Mean spectral centroid over energetic frames, normalised to [0,1] by the Nyquist bin — the
+    /// brightness feature (issue #61).
+    brightness: f32,
+    /// Mean spectral flatness over energetic frames, in [0,1] (1 = white-noise-flat). Harmonicity is
+    /// its complement (issue #61).
+    flatness: f32,
 }
 
 /// One windowed FFT sweep. Accumulates the onset envelope and chroma while keeping only the rolling
@@ -266,6 +302,14 @@ fn stft_pass(samples: &[f32], sr: u32) -> StftPass {
     let mut first_mag: Vec<f32> = Vec::new();
     let mut last_mag: Vec<f32> = Vec::new();
 
+    // Brightness (spectral centroid) + harmonicity (spectral flatness) accumulate over energetic
+    // frames — both are magnitude *ratios*, so the raw (unnormalised) FFT magnitudes are fine (issue
+    // #61). Silent frames carry no timbre and would divide by ~zero, so they're skipped.
+    let mut centroid_sum = 0.0f64;
+    let mut flatness_sum = 0.0f64;
+    let mut energetic_frames = 0u32;
+    let max_bin = (bins - 1).max(1) as f32;
+
     let mut pos = 0;
     while pos + FRAME <= samples.len() {
         for (i, s) in scratch.iter_mut().enumerate() {
@@ -279,6 +323,20 @@ fn stft_pass(samples: &[f32], sr: u32) -> StftPass {
                 chroma[pc] += m;
             }
         }
+
+        let energy: f32 = mag.iter().sum();
+        if energy > 1e-6 {
+            // Centroid in bin units → normalise by the top bin so it lands in [0,1].
+            let weighted: f32 = mag.iter().enumerate().map(|(k, &m)| k as f32 * m).sum();
+            centroid_sum += (weighted / energy / max_bin) as f64;
+            // Spectral flatness = geometric mean / arithmetic mean of the magnitude spectrum.
+            let log_sum: f64 = mag.iter().map(|&m| (m as f64 + 1e-9).ln()).sum();
+            let geo = (log_sum / bins as f64).exp();
+            let arith = energy as f64 / bins as f64;
+            flatness_sum += (geo / arith).clamp(0.0, 1.0);
+            energetic_frames += 1;
+        }
+
         if let Some(p) = &prev {
             let f: f32 = mag.iter().zip(p).map(|(m, pm)| (m - pm).max(0.0)).sum();
             flux.push(f);
@@ -291,11 +349,14 @@ fn stft_pass(samples: &[f32], sr: u32) -> StftPass {
         pos += HOP;
     }
 
+    let n = energetic_frames.max(1) as f64;
     StftPass {
         flux,
         chroma,
         first_mag,
         last_mag,
+        brightness: (centroid_sum / n).clamp(0.0, 1.0) as f32,
+        flatness: (flatness_sum / n).clamp(0.0, 1.0) as f32,
     }
 }
 
@@ -578,6 +639,67 @@ mod tests {
         assert!(!f.is_loop, "a fade-out cannot loop: {}", f.loopability);
         assert_eq!(f.class, "one_shot");
         std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn acoustic_features_track_timbre_and_level() {
+        // Issue #61: loudness/brightness/harmonicity from the analyze pass.
+        let sr = 44_100;
+
+        // A pure tone: strongly harmonic (low spectral flatness) and known level. A 0.6-amplitude
+        // sine has RMS 0.6/√2 ≈ 0.424 → 20·log10(0.424) ≈ -7.5 dBFS.
+        let lo = tmp("f61_lo.wav");
+        write_wav(&lo, &sine(441.0, 1.0, sr), sr);
+        let flo = extract_audio_features(&lo, "wav").unwrap();
+        assert!(
+            flo.harmonicity > 0.5,
+            "a sine is harmonic: {}",
+            flo.harmonicity
+        );
+        assert!(
+            (-12.0..-3.0).contains(&flo.loudness_lufs),
+            "0.6-amplitude sine ≈ -7.5 dBFS, got {}",
+            flo.loudness_lufs
+        );
+        assert!(
+            (0.0..=1.0).contains(&flo.brightness),
+            "brightness normalised: {}",
+            flo.brightness
+        );
+
+        // A much higher tone must read brighter (its spectral centroid is nearer Nyquist).
+        let hi = tmp("f61_hi.wav");
+        write_wav(&hi, &sine(8_000.0, 1.0, sr), sr);
+        let fhi = extract_audio_features(&hi, "wav").unwrap();
+        assert!(
+            fhi.brightness > flo.brightness,
+            "8 kHz ({}) should be brighter than 441 Hz ({})",
+            fhi.brightness,
+            flo.brightness
+        );
+
+        // Broadband noise is flat → far less harmonic than the tone.
+        let mut noise = vec![0.0f32; sr as usize];
+        let mut state = 0x9e37_79b9u32;
+        for s in noise.iter_mut() {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            *s = (state as f32 / u32::MAX as f32 - 0.5) * 1.0;
+        }
+        let np = tmp("f61_noise.wav");
+        write_wav(&np, &noise, sr);
+        let fno = extract_audio_features(&np, "wav").unwrap();
+        assert!(
+            fno.harmonicity < flo.harmonicity,
+            "noise ({}) is less harmonic than a tone ({})",
+            fno.harmonicity,
+            flo.harmonicity
+        );
+
+        for p in [lo, hi, np] {
+            std::fs::remove_file(&p).ok();
+        }
     }
 
     #[test]
