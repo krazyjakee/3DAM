@@ -18,9 +18,9 @@ use dam_api::service::{AuthContext, LibraryService};
 use dam_api::{
     AnalyzeRequest, Asset, AssetId, AssetSummary, EventTopic, FacetField, Filter, FilterOp,
     FilterValue, FolderEntry, FolderListing, JobState, LibraryEvent, LibraryStats, LicenseStatus,
-    MediaAttributes, MediaType, Page, PageParams, QueryRequest, ReviewAction, SearchMode, Sort,
-    SortDir, SortField, SourceId, SourceInfo, SubscribeRequest, SuggestionReview,
-    ThumbnailRegenRequest,
+    MediaAttributes, MediaType, Page, PageParams, QueryRequest, ReviewAction, SearchMode,
+    SimilarHit, SimilarRequest, Sort, SortDir, SortField, SourceId, SourceInfo, SubscribeRequest,
+    SuggestionReview, ThumbnailRegenRequest,
 };
 use futures::StreamExt;
 
@@ -115,6 +115,7 @@ enum Msg {
     Folders(FolderKey, Result<Vec<FolderEntry>, String>),
     /// A live change from the engine's event stream (scan/analyze/convert, source state, …).
     Event(LibraryEvent),
+    Similar(AssetId, Result<Vec<SimilarHit>, String>),
 }
 
 pub struct DamGui {
@@ -159,6 +160,11 @@ pub struct DamGui {
     dirty_sources: bool,
     dirty_detail: bool,
     last_refresh: f64,
+    // ── "find similar" (opt-in per asset) ──
+    /// The asset the current `similar` results belong to (so they hide when selection changes).
+    similar_for: Option<AssetId>,
+    similar: Vec<SimilarHit>,
+    similar_loading: bool,
 }
 
 impl DamGui {
@@ -203,6 +209,9 @@ impl DamGui {
             dirty_sources: false,
             dirty_detail: false,
             last_refresh: 0.0,
+            similar_for: None,
+            similar: Vec::new(),
+            similar_loading: false,
         };
         // Kick the initial loads against the freshly opened library.
         let egctx = cc.egui_ctx.clone();
@@ -343,6 +352,31 @@ impl DamGui {
         self.rt.spawn(async move {
             let r = lib.get_asset(&auth, &id).await.map_err(|e| e.to_string());
             let _ = tx.send(Msg::Detail(r));
+            egctx.request_repaint();
+        });
+    }
+
+    /// Rank an asset's nearest neighbours by embedding cosine (tech-spec 05 §3) — opt-in from the
+    /// inspector. Only analyzed assets have a vector; the caller gates on that.
+    fn find_similar_asset(&self, id: AssetId) {
+        let (lib, auth, tx, egctx) = (
+            self.lib.clone(),
+            self.auth.clone(),
+            self.tx.clone(),
+            self.egui_ctx.clone(),
+        );
+        self.rt.spawn(async move {
+            let req = SimilarRequest {
+                asset: id,
+                k: 12,
+                filters: Vec::new(),
+            };
+            let r = lib
+                .find_similar(&auth, req)
+                .await
+                .map(|p| p.items)
+                .map_err(|e| e.to_string());
+            let _ = tx.send(Msg::Similar(id, r));
             egctx.request_repaint();
         });
     }
@@ -532,6 +566,15 @@ impl DamGui {
             Msg::Folders(key, Err(_)) => {
                 self.folders.insert(key, FolderState::Failed);
             }
+            Msg::Similar(id, Ok(hits)) => {
+                self.similar_for = Some(id);
+                self.similar = hits;
+                self.similar_loading = false;
+            }
+            Msg::Similar(_, Err(e)) => {
+                self.similar_loading = false;
+                self.error = Some(format!("Similarity search failed: {e}"));
+            }
             // Map a live event to the coalesced refresh flags (flushed, throttled, in `update`).
             Msg::Event(ev) => match ev {
                 LibraryEvent::AssetAdded(_) | LibraryEvent::AssetRemoved(_) => {
@@ -669,6 +712,8 @@ impl eframe::App for DamGui {
         let mut nav = NavActions::default();
         let mut tag_review: Option<(AssetId, String, ReviewAction)> = None;
         let mut asset_action: Option<AssetAction> = None;
+        let mut find_sim: Option<AssetId> = None;
+        let mut open_similar: Option<AssetId> = None;
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.add_space(4.0);
@@ -851,6 +896,45 @@ impl eframe::App for DamGui {
                         _ => None,
                     };
                     inspector(ui, asset, thumb, &mut tag_review, &mut asset_action);
+
+                    // "Find similar" (tech-spec 05 §3): opt-in nearest-neighbour ranking. Un-analyzed
+                    // assets have no vector, so we point at Analyze instead of querying into the void.
+                    ui.separator();
+                    ui.label(egui::RichText::new("SIMILAR").small().weak());
+                    let id = asset.summary.id;
+                    if asset.timestamps.analyzed.is_none() {
+                        ui.label(
+                            egui::RichText::new("Analyze this asset to find similar ones.").weak(),
+                        );
+                    } else if self.similar_for == Some(id) {
+                        if self.similar_loading {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label("Searching…");
+                            });
+                        } else if self.similar.is_empty() {
+                            ui.label(egui::RichText::new("No similar assets found.").weak());
+                        } else {
+                            for hit in &self.similar {
+                                let pct = (hit.score * 100.0).round() as i32;
+                                if ui
+                                    .selectable_label(
+                                        false,
+                                        format!(
+                                            "{}  {}   ·   {pct}%",
+                                            media_tag(hit.asset.media),
+                                            hit.asset.name
+                                        ),
+                                    )
+                                    .clicked()
+                                {
+                                    open_similar = Some(hit.asset.id);
+                                }
+                            }
+                        }
+                    } else if ui.button("Find similar").clicked() {
+                        find_sim = Some(id);
+                    }
                 } else {
                     ui.label(egui::RichText::new("Select an asset to inspect it.").weak());
                 }
@@ -929,6 +1013,25 @@ impl eframe::App for DamGui {
             Some(AssetAction::Reanalyze(id)) => self.submit_analyze_asset(id),
             Some(AssetAction::RegenThumb(id)) => self.regen_thumb(id),
             None => {}
+        }
+        if let Some(id) = find_sim {
+            self.similar_for = Some(id);
+            self.similar.clear();
+            self.similar_loading = true;
+            self.find_similar_asset(id);
+        }
+        // Selecting a similar hit navigates the inspector to it (same as a grid click).
+        if let Some(id) = open_similar {
+            self.selected = Some(id);
+            self.load_detail(id, ctx);
+            let mut fetch = false;
+            self.thumbs.entry(id).or_insert_with(|| {
+                fetch = true;
+                Thumb::Loading
+            });
+            if fetch {
+                self.load_thumb(id);
+            }
         }
     }
 }
