@@ -18,7 +18,8 @@ use dam_api::service::{AuthContext, LibraryService};
 use dam_api::{
     Asset, AssetId, AssetSummary, FacetField, Filter, FilterOp, FilterValue, FolderEntry,
     FolderListing, LibraryStats, LicenseStatus, MediaAttributes, MediaType, Page, PageParams,
-    QueryRequest, SearchMode, Sort, SortDir, SortField, SourceId, SourceInfo,
+    QueryRequest, ReviewAction, SearchMode, Sort, SortDir, SortField, SourceId, SourceInfo,
+    SuggestionReview,
 };
 
 /// A source-relative folder-tree node key: which source, and the source-relative prefix (trailing
@@ -272,6 +273,30 @@ impl DamGui {
         });
     }
 
+    /// Reject / restore an auto-tag (reject-only lifecycle), then re-fetch the asset so the inspector
+    /// reflects the new tag state. Tag changes also affect search, but the grid refreshes on its next
+    /// query — keeping this to a detail refresh avoids a jarring re-sort under the user.
+    fn review_tag(&self, id: AssetId, tag: String, action: ReviewAction) {
+        let (lib, auth, tx, egctx) = (
+            self.lib.clone(),
+            self.auth.clone(),
+            self.tx.clone(),
+            self.egui_ctx.clone(),
+        );
+        self.rt.spawn(async move {
+            let req = SuggestionReview {
+                asset: id,
+                tag,
+                action,
+            };
+            if lib.review_suggestion(&auth, req).await.is_ok() {
+                let r = lib.get_asset(&auth, &id).await.map_err(|e| e.to_string());
+                let _ = tx.send(Msg::Detail(r));
+            }
+            egctx.request_repaint();
+        });
+    }
+
     fn load_sources(&mut self, egctx: &egui::Context) {
         let (lib, auth, tx, egctx) = (
             self.lib.clone(),
@@ -463,6 +488,7 @@ impl eframe::App for DamGui {
         let mut do_query = false;
         let mut open_asset: Option<AssetId> = None;
         let mut nav = NavActions::default();
+        let mut tag_review: Option<(AssetId, String, ReviewAction)> = None;
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.add_space(4.0);
@@ -640,7 +666,11 @@ impl eframe::App for DamGui {
                         ui.label("Loading…");
                     });
                 } else if let Some(asset) = &self.detail {
-                    inspector(ui, asset);
+                    let thumb = match self.thumbs.get(&asset.summary.id) {
+                        Some(Thumb::Ready(tex)) => Some(tex),
+                        _ => None,
+                    };
+                    inspector(ui, asset, thumb, &mut tag_review);
                 } else {
                     ui.label(egui::RichText::new("Select an asset to inspect it.").weak());
                 }
@@ -702,6 +732,18 @@ impl eframe::App for DamGui {
         if let Some(id) = open_asset {
             self.selected = Some(id);
             self.load_detail(id, ctx);
+            // Make sure the inspector preview has a thumbnail even if the asset wasn't in view.
+            let mut fetch = false;
+            self.thumbs.entry(id).or_insert_with(|| {
+                fetch = true;
+                Thumb::Loading
+            });
+            if fetch {
+                self.load_thumb(id);
+            }
+        }
+        if let Some((id, tag, action)) = tag_review {
+            self.review_tag(id, tag, action);
         }
     }
 }
@@ -785,8 +827,24 @@ impl DamGui {
 }
 
 /// Render the full-detail inspector for a selected asset.
-fn inspector(ui: &mut egui::Ui, asset: &Asset) {
+fn inspector(
+    ui: &mut egui::Ui,
+    asset: &Asset,
+    thumb: Option<&egui::TextureHandle>,
+    tag_review: &mut Option<(AssetId, String, ReviewAction)>,
+) {
     let s = &asset.summary;
+    // Preview: the asset's thumbnail (reuses the grid texture) scaled to the panel width. Absent for
+    // audio / un-rendered 3D — those just show the metadata below.
+    if let Some(tex) = thumb {
+        let w = ui.available_width().min(300.0);
+        ui.add(
+            egui::Image::new(egui::load::SizedTexture::from_handle(tex))
+                .maintain_aspect_ratio(true)
+                .max_width(w),
+        );
+        ui.add_space(6.0);
+    }
     ui.label(egui::RichText::new(&s.name).strong());
     egui::Grid::new("detail").num_columns(2).show(ui, |ui| {
         row(ui, "Type", media_label(s.media));
@@ -816,11 +874,29 @@ fn inspector(ui: &mut egui::Ui, asset: &Asset) {
                 .small()
                 .weak(),
         );
-        ui.horizontal_wrapped(|ui| {
-            for t in &asset.tags {
-                ui.label(egui::RichText::new(&t.name).small());
-            }
-        });
+        // Reject-only lifecycle (tech-spec 05): an auto tag is active (powers search) unless rejected.
+        // Active auto tags offer "reject"; rejected ones show struck-through with "restore". User tags
+        // are static.
+        for t in &asset.tags {
+            let auto = t.source == "auto";
+            let rejected = t.state == "rejected";
+            ui.horizontal(|ui| {
+                let mut label = egui::RichText::new(&t.name).small();
+                if rejected {
+                    label = label.strikethrough().weak();
+                }
+                ui.label(label);
+                if auto {
+                    if rejected {
+                        if ui.small_button("restore").clicked() {
+                            *tag_review = Some((s.id, t.name.clone(), ReviewAction::Accept));
+                        }
+                    } else if ui.small_button("reject").clicked() {
+                        *tag_review = Some((s.id, t.name.clone(), ReviewAction::Reject));
+                    }
+                }
+            });
+        }
     }
 }
 

@@ -24,7 +24,7 @@ Legend: ✅ done · 🟡 partial · ⬜ owed (not yet in egui)
 | Thumbnails | ✅ | ✅ | `read_thumbnail` → decode off-thread → egui texture cache; lazy, visible-only load; typed tile for audio/3D |
 | Inspector: core metadata | ✅ | ✅ | name, type, format, size, path, tags |
 | Inspector: media attributes | ✅ | 🟡 | audio/image/model attr rows (+ class, loudness, tiling); seamlessness/feature bars not yet visual |
-| Inspector: preview (3D/audio/image) | ✅ | ⬜ | egui-wgpu paint callback for the 3D island; audio/image viewers |
+| Inspector: preview (3D/audio/image) | ✅ | 🟡 | image preview (thumbnail texture) done; 3D island (egui-wgpu) + audio player owed |
 | Library stats | ✅ | ✅ | totals + by-media counts in the left rail |
 | Sources list | ✅ | 🟡 | egui shows them read-only; add/remove/rescan owed |
 | Folder-tree navigation (#66) | ✅ | ✅ | left-rail source tree, lazy `list_folders`, path-scoped browse (breadcrumb TBD) |
@@ -36,7 +36,7 @@ Legend: ✅ done · 🟡 partial · ⬜ owed (not yet in egui)
 | Collections & smart folders | ✅ | ⬜ | list + membership editing |
 | Grid ⇄ list view toggle | ✅ | 🟡 | grid + flat list; the web "table" (sortable columns) is richer |
 | Sort control | ✅ | ✅ | toolbar combo (name/size/scanned, both directions) |
-| Tag review (reject/restore) | ✅ | ⬜ | reject-only lifecycle |
+| Tag review (reject/restore) | ✅ | ✅ | reject-only lifecycle in the inspector, refreshes on review |
 | Similar / duplicates | ✅ | ⬜ | `find_similar`, exact/near dedup |
 | Convert / export | ✅ | ⬜ | |
 | Per-asset actions (reanalyze, regen thumbnail) | ✅ | ⬜ | |
