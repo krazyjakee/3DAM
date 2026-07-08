@@ -69,19 +69,36 @@ fn vs(@location(0) pos: vec3<f32>, @location(1) normal: vec3<f32>, @location(2) 
     return o;
 }
 
+// params.x = surface is sRGB; params.y = lighting mode (0 studio · 1 soft · 2 flat/unlit).
+fn encode(c: vec3<f32>) -> vec4<f32> {
+    if (g.params.x > 0.5) { return vec4<f32>(c, 1.0); }
+    return vec4<f32>(pow(c, vec3<f32>(1.0 / 2.2)), 1.0);
+}
+
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
     let n = normalize(in.normal);
-    // Two-sided lambert with a warm key + cool fill + ambient — a neutral studio read.
-    let key = max(dot(n, normalize(vec3<f32>(0.5, 0.8, 0.6))), 0.0) * 0.8;
-    let fill = max(dot(n, normalize(vec3<f32>(-0.6, 0.3, 0.4))), 0.0) * 0.25;
-    let lit = key + fill + 0.25;
-    var c = in.color.rgb * lit;
-    // If the surface is a plain UNORM target, gamma-encode ourselves.
-    if (g.params.x > 0.5) {
-        return vec4<f32>(c, 1.0);
+    let mode = g.params.y;
+    var lit: f32;
+    if (mode < 0.5) {
+        // Studio: warm key + cool fill + ambient.
+        let key = max(dot(n, normalize(vec3<f32>(0.5, 0.8, 0.6))), 0.0) * 0.8;
+        let fill = max(dot(n, normalize(vec3<f32>(-0.6, 0.3, 0.4))), 0.0) * 0.25;
+        lit = key + fill + 0.25;
+    } else if (mode < 1.5) {
+        // Soft: gentle hemispheric wrap, shadowless.
+        lit = (n.y * 0.5 + 0.5) * 0.6 + 0.5;
+    } else {
+        // Flat / unlit.
+        lit = 1.0;
     }
-    return vec4<f32>(pow(c, vec3<f32>(1.0 / 2.2)), 1.0);
+    return encode(in.color.rgb * lit);
+}
+
+// Wireframe overlay: a flat accent-coloured edge (line-list draw).
+@fragment
+fn fs_wire() -> @location(0) vec4<f32> {
+    return encode(vec3<f32>(0.04, 0.50, 0.93)); // linear ≈ sky accent #38bdf8
 }
 "#;
 
@@ -89,11 +106,13 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// Off-screen render size (square). The inspector scales it down; this keeps it crisp when enlarged.
 const SIZE: u32 = 512;
 
-/// One uploaded model.
+/// One uploaded model. `line_*` is a derived line-list edge buffer for the wireframe overlay.
 struct GpuModel {
     vbuf: wgpu::Buffer,
     ibuf: wgpu::Buffer,
     index_count: u32,
+    line_ibuf: wgpu::Buffer,
+    line_count: u32,
     bounds: Bounds,
 }
 
@@ -102,6 +121,7 @@ pub struct Viewer3d {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::RenderPipeline,
+    pipeline_wire: wgpu::RenderPipeline,
     globals_buf: wgpu::Buffer,
     globals_bg: wgpu::BindGroup,
     /// Kept alive so its `color_view` (registered with egui) stays valid; not read directly.
@@ -119,6 +139,10 @@ pub struct Viewer3d {
     pub yaw: f32,
     pub pitch: f32,
     pub zoom: f32,
+    // on-canvas controls (issue #65)
+    pub auto_orbit: bool,
+    pub wireframe: bool,
+    pub lighting: u32, // 0 studio · 1 soft · 2 flat
 }
 
 impl Viewer3d {
@@ -224,6 +248,48 @@ impl Viewer3d {
             cache: None,
         });
 
+        // Wireframe overlay: same vertex layout, line-list topology, flat accent fragment. Depth
+        // test on but write off so it draws crisply over the shaded surface without z-fighting.
+        let pipeline_wire = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("viewer3d-wire"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<Vertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &attrs,
+                }],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_wire"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: color_format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::LineList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
         let (color, color_view) = make_color(&device, color_format);
         let depth_view = make_depth(&device);
 
@@ -238,6 +304,7 @@ impl Viewer3d {
             device,
             queue,
             pipeline,
+            pipeline_wire,
             globals_buf,
             globals_bg,
             color,
@@ -251,6 +318,9 @@ impl Viewer3d {
             yaw: std::f32::consts::FRAC_PI_4,
             pitch: 0.5,
             zoom: 1.0,
+            auto_orbit: false,
+            wireframe: false,
+            lighting: 0,
         }
     }
 
@@ -269,10 +339,28 @@ impl Viewer3d {
             bytemuck::cast_slice(&indices),
             wgpu::BufferUsages::INDEX,
         );
+        // Derive a de-duplicated line-list edge buffer for the wireframe overlay: each triangle's
+        // three edges, keyed low→high so shared edges aren't drawn twice.
+        let mut edges: std::collections::HashSet<(u32, u32)> =
+            std::collections::HashSet::with_capacity(indices.len());
+        for tri in indices.chunks_exact(3) {
+            for &(a, b) in &[(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])] {
+                edges.insert(if a <= b { (a, b) } else { (b, a) });
+            }
+        }
+        let line_indices: Vec<u32> = edges.into_iter().flat_map(|(a, b)| [a, b]).collect();
+        let line_ibuf = create_buffer_init(
+            &self.device,
+            "viewer3d-line-indices",
+            bytemuck::cast_slice(&line_indices),
+            wgpu::BufferUsages::INDEX,
+        );
         self.model = Some(GpuModel {
             vbuf,
             ibuf,
             index_count: indices.len() as u32,
+            line_ibuf,
+            line_count: line_indices.len() as u32,
             bounds,
         });
         self.model_for = Some(id);
@@ -288,7 +376,7 @@ impl Viewer3d {
         let view_proj = self.view_proj();
         let globals = Globals {
             view_proj: view_proj.to_cols_array_2d(),
-            params: [self.srgb, 0.0, 0.0, 0.0],
+            params: [self.srgb, self.lighting as f32, 0.0, 0.0],
         };
         self.queue
             .write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
@@ -326,11 +414,18 @@ impl Viewer3d {
                 occlusion_query_set: None,
             });
             if let Some(m) = &self.model {
-                pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &self.globals_bg, &[]);
                 pass.set_vertex_buffer(0, m.vbuf.slice(..));
-                pass.set_index_buffer(m.ibuf.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..m.index_count, 0, 0..1);
+                // Solid shaded pass (skipped in pure-wireframe mode so edges read cleanly).
+                if !self.wireframe {
+                    pass.set_pipeline(&self.pipeline);
+                    pass.set_index_buffer(m.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..m.index_count, 0, 0..1);
+                } else {
+                    pass.set_pipeline(&self.pipeline_wire);
+                    pass.set_index_buffer(m.line_ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..m.line_count, 0, 0..1);
+                }
             }
         }
         self.queue.submit([encoder.finish()]);
@@ -367,6 +462,20 @@ impl Viewer3d {
         if scroll != 0.0 {
             self.zoom = (self.zoom * (scroll * -0.0015).exp()).clamp(0.1, 10.0);
         }
+    }
+
+    /// Advance the auto-orbit spin by `dt` seconds (no-op unless `auto_orbit` is set).
+    pub fn tick(&mut self, dt: f32) {
+        if self.auto_orbit {
+            self.yaw += dt * 0.6;
+        }
+    }
+
+    /// Restore the default framing pose (used by the reset button).
+    pub fn reset_pose(&mut self) {
+        self.yaw = std::f32::consts::FRAC_PI_4;
+        self.pitch = 0.5;
+        self.zoom = 1.0;
     }
 }
 

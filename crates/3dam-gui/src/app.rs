@@ -1222,6 +1222,17 @@ impl eframe::App for DamGui {
         let mut audio_stop = false;
         let mut orbit_drag = egui::Vec2::ZERO;
         let mut orbit_scroll = 0.0f32;
+        // 3D-viewer control-bar actions (issue #65), collected under the panel's immutable borrow
+        // and applied after the panels — mirrors the web viewer's auto-orbit/reset/wireframe/lighting.
+        let (v_auto, v_wire, v_light) = self
+            .viewer3d
+            .as_ref()
+            .map(|v| (v.auto_orbit, v.wireframe, v.lighting))
+            .unwrap_or((false, false, 0));
+        let mut ctl_auto = false;
+        let mut ctl_wire = false;
+        let mut ctl_light = false;
+        let mut ctl_reset = false;
 
         // Render the interactive 3D preview into its off-screen texture when the selected asset is a
         // model whose mesh is loaded — the inspector then draws it in place of the turntable still.
@@ -1235,7 +1246,14 @@ impl eframe::App for DamGui {
                 .as_ref()
                 .is_some_and(|v| v.model_for == self.selected);
         let model_tex = if show_3d {
-            self.viewer3d.as_mut().map(|v| v.render())
+            let dt = ctx.input(|i| i.stable_dt).min(0.1);
+            self.viewer3d.as_mut().map(|v| {
+                v.tick(dt);
+                if v.auto_orbit {
+                    ctx.request_repaint();
+                }
+                v.render()
+            })
         } else {
             None
         };
@@ -1564,6 +1582,37 @@ impl eframe::App for DamGui {
                                 if resp.hovered() {
                                     orbit_scroll = ui.input(|i| i.raw_scroll_delta.y);
                                 }
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui
+                                        .selectable_label(v_auto, "Auto-orbit")
+                                        .on_hover_text("Spin the model continuously")
+                                        .clicked()
+                                    {
+                                        ctl_auto = true;
+                                    }
+                                    if ui
+                                        .selectable_label(v_wire, "Wireframe")
+                                        .on_hover_text("Show mesh edges")
+                                        .clicked()
+                                    {
+                                        ctl_wire = true;
+                                    }
+                                    let light_name = match v_light {
+                                        0 => "Light: Studio",
+                                        1 => "Light: Soft",
+                                        _ => "Light: Flat",
+                                    };
+                                    if ui
+                                        .button(light_name)
+                                        .on_hover_text("Cycle lighting mode")
+                                        .clicked()
+                                    {
+                                        ctl_light = true;
+                                    }
+                                    if ui.button("Reset").on_hover_text("Reset view").clicked() {
+                                        ctl_reset = true;
+                                    }
+                                });
                                 ui.label(
                                     egui::RichText::new("drag to orbit · scroll to zoom")
                                         .small()
@@ -1975,6 +2024,25 @@ impl eframe::App for DamGui {
         if orbit_drag != egui::Vec2::ZERO || orbit_scroll != 0.0 {
             if let Some(v) = &mut self.viewer3d {
                 v.orbit(orbit_drag, orbit_scroll);
+            }
+            ctx.request_repaint();
+        }
+        // Apply 3D-viewer control-bar toggles (#65).
+        if ctl_auto || ctl_wire || ctl_light || ctl_reset {
+            if let Some(v) = &mut self.viewer3d {
+                if ctl_auto {
+                    v.auto_orbit = !v.auto_orbit;
+                }
+                if ctl_wire {
+                    v.wireframe = !v.wireframe;
+                }
+                if ctl_light {
+                    v.lighting = (v.lighting + 1) % 3;
+                }
+                if ctl_reset {
+                    v.reset_pose();
+                    v.auto_orbit = false;
+                }
             }
             ctx.request_repaint();
         }

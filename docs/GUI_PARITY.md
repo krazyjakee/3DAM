@@ -47,7 +47,7 @@ Legend: ✅ done · 🟡 partial · ⬜ owed (not yet in egui)
 | Duplicates page / blocklist page | ✅ | ⬜ | |
 | Theme (light/dark) | ✅ | ✅ | dark/light toggle at the foot of the rail (System mode owed) |
 | Responsive / touch / a11y pass | ✅ | ⬜ | |
-| 3D viewer on-canvas controls (#65) | ✅ | 🟡 | interactive orbit/zoom done; lighting / wireframe / auto-orbit / fullscreen toggles owed |
+| 3D viewer on-canvas controls (#65) | ✅ | ✅ | orbit/zoom + control bar: auto-orbit · wireframe · lighting cycle (studio/soft/flat) · reset |
 
 ## Current egui slice
 
