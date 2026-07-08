@@ -30,7 +30,7 @@ Legend: ✅ done · 🟡 partial · ⬜ owed (not yet in egui)
 | Folder-tree navigation (#66) | ✅ | ✅ | left-rail source tree, lazy `list_folders`, path-scoped browse (breadcrumb TBD) |
 | Search mode (lexical/hybrid/semantic) | ✅ | ✅ | toolbar combo, shown with a text query |
 | License facet | ✅ | ✅ | left-rail Permissive/Attribution/Restricted/Unknown |
-| Advanced Search (structured attr + tag filters) | ✅ | ⬜ | typed dropdown/range/toggle facets |
+| Advanced Search (structured attr + tag filters) | ✅ | ✅ | toolbar "Filters" popover: media-contextual enum/numEnum/bool dropdowns + numeric ranges + free tag filter, AND-ed onto the query |
 | Quick class facet (audio/image/model class) | ✅ | ✅ | contextual chips in the left rail when a media type is active |
 | Favorites / Recently added | ✅ | 🟡 | favourites facet done; "recently added" = the Newest sort |
 | Collections & smart folders | ✅ | 🟡 | list + browse-by + inspector membership; create/rename/delete + member editing owed |

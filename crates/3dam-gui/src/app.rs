@@ -105,6 +105,136 @@ const SORTS: &[(&str, SortField, SortDir)] = &[
     ("Oldest", SortField::Scanned, SortDir::Asc),
 ];
 
+/// One Advanced-Search control. Mirrors the web `Control` union (AdvancedSearch.tsx) one-for-one —
+/// keep in step with the `FacetField` variants and the analysis-pass classifier string literals.
+enum AdvCtl {
+    /// Dropdown of string values → one `Eq(Str)` filter. `(field, label, &[(value, label)])`.
+    Enum(
+        FacetField,
+        &'static str,
+        &'static [(&'static str, &'static str)],
+    ),
+    /// Dropdown of numeric values → one `Eq(Num)` filter. `(field, label, &[(value, label)])`.
+    NumEnum(FacetField, &'static str, &'static [(f64, &'static str)]),
+    /// Yes / No toggle → one `Eq(Bool)` filter. `(field, label)`.
+    Bool(FacetField, &'static str),
+    /// Min/max numeric range → a `Range` (both), `Gte` (min only), or `Lte` (max only) filter.
+    /// `(field, label, unit, scale)` — `scale` maps display units to stored (e.g. s → ms is 1000).
+    Range(FacetField, &'static str, &'static str, f64),
+}
+
+use AdvCtl::{Bool as B, Enum as E, NumEnum as N, Range as R};
+
+const ADV_AUDIO: &[AdvCtl] = &[
+    E(
+        FacetField::AudioClass,
+        "Type",
+        &[
+            ("one_shot", "One-shot"),
+            ("loop", "Loop"),
+            ("music", "Music"),
+            ("sfx", "SFX"),
+        ],
+    ),
+    E(
+        FacetField::MusicalKey,
+        "Key",
+        &[
+            ("c", "C"),
+            ("c#", "C#"),
+            ("d", "D"),
+            ("d#", "D#"),
+            ("e", "E"),
+            ("f", "F"),
+            ("f#", "F#"),
+            ("g", "G"),
+            ("g#", "G#"),
+            ("a", "A"),
+            ("a#", "A#"),
+            ("b", "B"),
+        ],
+    ),
+    R(FacetField::Bpm, "BPM", "BPM", 1.0),
+    R(FacetField::Duration, "Duration", "s", 1000.0),
+    N(
+        FacetField::SampleRate,
+        "Sample rate",
+        &[
+            (22050.0, "22.05 kHz"),
+            (44100.0, "44.1 kHz"),
+            (48000.0, "48 kHz"),
+            (96000.0, "96 kHz"),
+        ],
+    ),
+    N(
+        FacetField::Channels,
+        "Channels",
+        &[(1.0, "Mono"), (2.0, "Stereo")],
+    ),
+    N(
+        FacetField::BitDepth,
+        "Bit depth",
+        &[(16.0, "16-bit"), (24.0, "24-bit"), (32.0, "32-bit")],
+    ),
+    R(FacetField::Loudness, "Loudness", "LUFS", 1.0),
+    R(FacetField::Brightness, "Brightness", "", 1.0),
+    R(FacetField::Harmonicity, "Harmonicity", "", 1.0),
+];
+
+const ADV_IMAGE: &[AdvCtl] = &[
+    E(
+        FacetField::ImageClass,
+        "Type",
+        &[
+            ("texture", "Texture"),
+            ("sprite", "Sprite"),
+            ("photo", "Photo"),
+        ],
+    ),
+    E(
+        FacetField::TileClass,
+        "Tiling",
+        &[
+            ("seamless", "Seamless"),
+            ("tiled", "Tiled"),
+            ("non_tiling", "Non-tiling"),
+        ],
+    ),
+    R(FacetField::Width, "Width", "px", 1.0),
+    R(FacetField::Height, "Height", "px", 1.0),
+    R(FacetField::Tileability, "Tileability", "", 1.0),
+    B(FacetField::HasAlpha, "Alpha channel"),
+];
+
+const ADV_MODEL: &[AdvCtl] = &[
+    E(
+        FacetField::ModelClass,
+        "Complexity",
+        &[
+            ("prop_lowpoly", "Low-poly"),
+            ("prop", "Prop"),
+            ("prop_highpoly", "High-poly"),
+        ],
+    ),
+    R(FacetField::TriCount, "Triangles", "", 1.0),
+    R(FacetField::VertexCount, "Vertices", "", 1.0),
+    R(FacetField::MeshCount, "Meshes", "", 1.0),
+    R(FacetField::MaterialCount, "Materials", "", 1.0),
+    R(FacetField::TextureCount, "Textures", "", 1.0),
+    B(FacetField::HasRig, "Rigged"),
+    B(FacetField::HasAnimation, "Animated"),
+    B(FacetField::HasUv, "UV mapped"),
+];
+
+/// The structured-attribute controls for a media type (mirrors the web `CATALOG`).
+fn adv_catalog(m: MediaType) -> &'static [AdvCtl] {
+    match m {
+        MediaType::Audio => ADV_AUDIO,
+        MediaType::Image => ADV_IMAGE,
+        MediaType::Model => ADV_MODEL,
+    }
+}
+
 /// The analysis-class quick facet for a media type: the class `FacetField` and its `(value, label)`
 /// options (mirrors the web `CLASS_FACET`). Shown only when a single media type is selected.
 fn class_facet(m: MediaType) -> (FacetField, &'static [(&'static str, &'static str)]) {
@@ -134,6 +264,46 @@ fn class_facet(m: MediaType) -> (FacetField, &'static [(&'static str, &'static s
                 ("prop_highpoly", "High-poly"),
             ],
         ),
+    }
+}
+
+/// Build a `Range`/`Gte`/`Lte` filter from raw min/max display strings (or `None` when both are
+/// blank/invalid), applying `scale` to map display units to the stored units. Mirrors the web
+/// `rangeFilter`.
+fn range_filter(field: FacetField, min: &str, max: &str, scale: f64) -> Option<Filter> {
+    let lo = min.trim().parse::<f64>().ok().map(|v| v * scale);
+    let hi = max.trim().parse::<f64>().ok().map(|v| v * scale);
+    match (lo, hi) {
+        (Some(a), Some(b)) => Some(Filter {
+            field,
+            op: FilterOp::Range,
+            value: FilterValue::Range(a, b),
+        }),
+        (Some(a), None) => Some(Filter {
+            field,
+            op: FilterOp::Gte,
+            value: FilterValue::Num(a),
+        }),
+        (None, Some(b)) => Some(Filter {
+            field,
+            op: FilterOp::Lte,
+            value: FilterValue::Num(b),
+        }),
+        (None, None) => None,
+    }
+}
+
+/// Structural equality for `Filter` (which doesn't derive `PartialEq`; its parts do).
+fn filters_eq(a: &Filter, b: &Filter) -> bool {
+    a.field == b.field && a.op == b.op && a.value == b.value
+}
+
+/// Format a range bound for display: drop the fraction when it's a whole number.
+fn fmt_num(v: f64) -> String {
+    if v.fract() == 0.0 {
+        format!("{}", v as i64)
+    } else {
+        format!("{v}")
     }
 }
 
@@ -258,6 +428,14 @@ pub struct DamGui {
     similar_for: Option<AssetId>,
     similar: Vec<SimilarHit>,
     similar_loading: bool,
+    // ── advanced search (structured attr + tag filters, issue: tags→search) ──
+    /// Structured attribute + tag filters, contextual to the active media type. Composes with the
+    /// sidebar facets and text query in `build_query`. Mirrors the web `adv` `Filter[]`.
+    adv: Vec<Filter>,
+    adv_open: bool,
+    /// Transient min/max text buffers for range controls, keyed by the control's stable buffer key.
+    adv_range_bufs: std::collections::HashMap<&'static str, (String, String)>,
+    adv_tag_input: String,
     // ── export manifest modal ──
     export_open: bool,
     export_format: ExportFormat,
@@ -342,6 +520,10 @@ impl DamGui {
             similar_for: None,
             similar: Vec::new(),
             similar_loading: false,
+            adv: Vec::new(),
+            adv_open: false,
+            adv_range_bufs: std::collections::HashMap::new(),
+            adv_tag_input: String::new(),
             export_open: false,
             export_format: ExportFormat::Json,
             export_path: default_export_path(),
@@ -454,6 +636,8 @@ impl DamGui {
                 value: FilterValue::Str(p.to_string()),
             });
         }
+        // Advanced Search: structured attribute + tag filters, AND-ed onto the query.
+        filters.extend(self.adv.iter().cloned());
         let text = self.search.trim();
         let (_, field, dir) = SORTS[self.sort.min(SORTS.len() - 1)];
         QueryRequest {
@@ -467,6 +651,377 @@ impl DamGui {
             include_facets: false,
             mode: self.mode,
         }
+    }
+
+    // ── Advanced Search (structured attr + tag filters) ──────────────────────────────────────────
+
+    /// The "Advanced filters" popover window (mirrors web `AdvancedSearch.tsx`). Contextual to the
+    /// active media type: its structured controls appear, plus a free tag filter. Returns true when
+    /// the filter set changed this frame so the caller re-queries.
+    fn advanced_modal(&mut self, ctx: &egui::Context) -> bool {
+        if !self.adv_open {
+            return false;
+        }
+        let mut changed = false;
+        let mut open = true;
+        egui::Window::new("Advanced filters")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .default_width(320.0)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(460.0)
+                    .show(ui, |ui| {
+                        if let Some(m) = self.media_filter {
+                            egui::Grid::new("adv-grid")
+                                .num_columns(2)
+                                .spacing([8.0, 4.0])
+                                .show(ui, |ui| {
+                                    for ctl in adv_catalog(m) {
+                                        changed |= self.adv_control(ui, ctl);
+                                    }
+                                });
+                        } else {
+                            ui.label(
+                                egui::RichText::new(
+                                    "Pick a media type (Audio, Images, 3D) to filter on its \
+                                     properties — BPM, key, dimensions, triangle count, and more.",
+                                )
+                                .weak()
+                                .italics(),
+                            );
+                        }
+                        ui.separator();
+                        changed |= self.adv_tags(ui);
+                        if !self.adv.is_empty() {
+                            ui.separator();
+                            if ui.button("Clear all").clicked() {
+                                self.adv.clear();
+                                self.adv_range_bufs.clear();
+                                changed = true;
+                            }
+                        }
+                    });
+            });
+        if !open {
+            self.adv_open = false;
+        }
+        changed
+    }
+
+    fn adv_control(&mut self, ui: &mut egui::Ui, ctl: &AdvCtl) -> bool {
+        match ctl {
+            AdvCtl::Enum(field, label, opts) => self.adv_enum(ui, *field, label, opts),
+            AdvCtl::NumEnum(field, label, opts) => self.adv_num_enum(ui, *field, label, opts),
+            AdvCtl::Bool(field, label) => self.adv_bool(ui, *field, label),
+            AdvCtl::Range(field, label, unit, scale) => {
+                self.adv_range(ui, *field, label, unit, *scale)
+            }
+        }
+    }
+
+    /// The current string value of `field`'s filter, if it holds one.
+    fn adv_str(&self, field: FacetField) -> Option<String> {
+        self.adv.iter().find(|f| f.field == field).and_then(|f| {
+            if let FilterValue::Str(s) = &f.value {
+                Some(s.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    fn adv_num(&self, field: FacetField) -> Option<f64> {
+        self.adv.iter().find(|f| f.field == field).and_then(|f| {
+            if let FilterValue::Num(n) = &f.value {
+                Some(*n)
+            } else {
+                None
+            }
+        })
+    }
+
+    fn adv_bool_val(&self, field: FacetField) -> Option<bool> {
+        self.adv.iter().find(|f| f.field == field).and_then(|f| {
+            if let FilterValue::Bool(b) = &f.value {
+                Some(*b)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Remove the filter targeting `field`; returns true if one was present.
+    fn adv_remove(&mut self, field: FacetField) -> bool {
+        let before = self.adv.len();
+        self.adv.retain(|f| f.field != field);
+        self.adv.len() != before
+    }
+
+    /// Replace (single) the filter targeting `field`.
+    fn adv_replace(&mut self, field: FacetField, f: Filter) -> bool {
+        self.adv.retain(|x| x.field != field);
+        self.adv.push(f);
+        true
+    }
+
+    fn adv_enum(
+        &mut self,
+        ui: &mut egui::Ui,
+        field: FacetField,
+        label: &str,
+        opts: &[(&str, &str)],
+    ) -> bool {
+        ui.label(label);
+        let cur = self.adv_str(field);
+        let sel = cur
+            .as_deref()
+            .and_then(|c| opts.iter().find(|(v, _)| *v == c).map(|(_, l)| *l))
+            .unwrap_or("Any");
+        let mut pick: Option<Option<String>> = None;
+        egui::ComboBox::from_id_salt(("adve", label))
+            .selected_text(sel)
+            .width(150.0)
+            .show_ui(ui, |ui| {
+                if ui.selectable_label(cur.is_none(), "Any").clicked() {
+                    pick = Some(None);
+                }
+                for (v, l) in opts {
+                    if ui
+                        .selectable_label(cur.as_deref() == Some(*v), *l)
+                        .clicked()
+                    {
+                        pick = Some(Some((*v).to_string()));
+                    }
+                }
+            });
+        ui.end_row();
+        match pick {
+            Some(None) => self.adv_remove(field),
+            Some(Some(v)) => self.adv_replace(
+                field,
+                Filter {
+                    field,
+                    op: FilterOp::Eq,
+                    value: FilterValue::Str(v),
+                },
+            ),
+            None => false,
+        }
+    }
+
+    fn adv_num_enum(
+        &mut self,
+        ui: &mut egui::Ui,
+        field: FacetField,
+        label: &str,
+        opts: &[(f64, &str)],
+    ) -> bool {
+        ui.label(label);
+        let cur = self.adv_num(field);
+        let sel = cur
+            .and_then(|c| opts.iter().find(|(v, _)| *v == c).map(|(_, l)| *l))
+            .unwrap_or("Any");
+        let mut pick: Option<Option<f64>> = None;
+        egui::ComboBox::from_id_salt(("advn", label))
+            .selected_text(sel)
+            .width(150.0)
+            .show_ui(ui, |ui| {
+                if ui.selectable_label(cur.is_none(), "Any").clicked() {
+                    pick = Some(None);
+                }
+                for (v, l) in opts {
+                    if ui.selectable_label(cur == Some(*v), *l).clicked() {
+                        pick = Some(Some(*v));
+                    }
+                }
+            });
+        ui.end_row();
+        match pick {
+            Some(None) => self.adv_remove(field),
+            Some(Some(v)) => self.adv_replace(
+                field,
+                Filter {
+                    field,
+                    op: FilterOp::Eq,
+                    value: FilterValue::Num(v),
+                },
+            ),
+            None => false,
+        }
+    }
+
+    fn adv_bool(&mut self, ui: &mut egui::Ui, field: FacetField, label: &str) -> bool {
+        ui.label(label);
+        let cur = self.adv_bool_val(field);
+        let sel = match cur {
+            None => "Any",
+            Some(true) => "Yes",
+            Some(false) => "No",
+        };
+        let mut pick: Option<Option<bool>> = None;
+        egui::ComboBox::from_id_salt(("advb", label))
+            .selected_text(sel)
+            .width(150.0)
+            .show_ui(ui, |ui| {
+                if ui.selectable_label(cur.is_none(), "Any").clicked() {
+                    pick = Some(None);
+                }
+                if ui.selectable_label(cur == Some(true), "Yes").clicked() {
+                    pick = Some(Some(true));
+                }
+                if ui.selectable_label(cur == Some(false), "No").clicked() {
+                    pick = Some(Some(false));
+                }
+            });
+        ui.end_row();
+        match pick {
+            Some(None) => self.adv_remove(field),
+            Some(Some(b)) => self.adv_replace(
+                field,
+                Filter {
+                    field,
+                    op: FilterOp::Eq,
+                    value: FilterValue::Bool(b),
+                },
+            ),
+            None => false,
+        }
+    }
+
+    fn adv_range(
+        &mut self,
+        ui: &mut egui::Ui,
+        field: FacetField,
+        label: &'static str,
+        unit: &str,
+        scale: f64,
+    ) -> bool {
+        // Seed the transient min/max buffers from the current filter the first time this control shows.
+        if !self.adv_range_bufs.contains_key(label) {
+            let seeded = self.adv_range_read(field, scale);
+            self.adv_range_bufs.insert(label, seeded);
+        }
+        let (mut lo, mut hi) = self.adv_range_bufs.get(label).cloned().unwrap_or_default();
+
+        ui.label(if unit.is_empty() {
+            label.to_string()
+        } else {
+            format!("{label} ({unit})")
+        });
+        // Commit when either box loses focus (tab/click away/Enter) — the standard egui pattern.
+        let mut commit = false;
+        ui.horizontal(|ui| {
+            let r1 = ui.add(
+                egui::TextEdit::singleline(&mut lo)
+                    .desired_width(56.0)
+                    .hint_text("min"),
+            );
+            ui.label("–");
+            let r2 = ui.add(
+                egui::TextEdit::singleline(&mut hi)
+                    .desired_width(56.0)
+                    .hint_text("max"),
+            );
+            commit = r1.lost_focus() || r2.lost_focus();
+        });
+        ui.end_row();
+        self.adv_range_bufs.insert(label, (lo.clone(), hi.clone()));
+        if !commit {
+            return false;
+        }
+        // Only re-query when the resulting filter actually differs from the current one — tabbing
+        // through the boxes without edits shouldn't trigger a browse.
+        let new = range_filter(field, &lo, &hi, scale);
+        let cur = self.adv.iter().find(|f| f.field == field).cloned();
+        match (new, cur) {
+            (Some(n), Some(c)) if filters_eq(&n, &c) => false,
+            (None, None) => false,
+            (Some(n), _) => self.adv_replace(field, n),
+            (None, Some(_)) => self.adv_remove(field),
+        }
+    }
+
+    /// Read `field`'s current range filter back into display-unit `(min, max)` strings.
+    fn adv_range_read(&self, field: FacetField, scale: f64) -> (String, String) {
+        match self.adv.iter().find(|f| f.field == field) {
+            Some(f) => match (&f.op, &f.value) {
+                (FilterOp::Range, FilterValue::Range(a, b)) => {
+                    (fmt_num(a / scale), fmt_num(b / scale))
+                }
+                (FilterOp::Gte, FilterValue::Num(a)) => (fmt_num(a / scale), String::new()),
+                (FilterOp::Lte, FilterValue::Num(b)) => (String::new(), fmt_num(b / scale)),
+                _ => (String::new(), String::new()),
+            },
+            None => (String::new(), String::new()),
+        }
+    }
+
+    /// Free tag filter: each accepted tag AND-s a `Tag` equality onto the query (tags power search
+    /// now that they've left the sidebar). Returns true if a tag was added/removed.
+    fn adv_tags(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut changed = false;
+        ui.label(egui::RichText::new("Tags").weak());
+        let mut add = false;
+        ui.horizontal(|ui| {
+            let r = ui.add(
+                egui::TextEdit::singleline(&mut self.adv_tag_input)
+                    .hint_text("Add a tag filter, then Enter")
+                    .desired_width(200.0),
+            );
+            if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                add = true;
+            }
+            if ui.button("Add").clicked() {
+                add = true;
+            }
+        });
+        if add {
+            let n = self.adv_tag_input.trim().to_string();
+            let dup = self.adv.iter().any(|f| {
+                f.field == FacetField::Tag
+                    && matches!(&f.value, FilterValue::Str(s) if s.eq_ignore_ascii_case(&n))
+            });
+            if !n.is_empty() && !dup {
+                self.adv.push(Filter {
+                    field: FacetField::Tag,
+                    op: FilterOp::Eq,
+                    value: FilterValue::Str(n),
+                });
+                changed = true;
+            }
+            self.adv_tag_input.clear();
+        }
+        let tags: Vec<String> = self
+            .adv
+            .iter()
+            .filter(|f| f.field == FacetField::Tag)
+            .filter_map(|f| {
+                if let FilterValue::Str(s) = &f.value {
+                    Some(s.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let mut remove: Option<String> = None;
+        if !tags.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                for t in &tags {
+                    if ui.button(format!("{t} ×")).clicked() {
+                        remove = Some(t.clone());
+                    }
+                }
+            });
+        }
+        if let Some(t) = remove {
+            self.adv.retain(|f| {
+                !(f.field == FacetField::Tag && matches!(&f.value, FilterValue::Str(s) if *s == t))
+            });
+            changed = true;
+        }
+        changed
     }
 
     /// Run the current browse against the engine, off-thread: a collection's members when in
@@ -1328,6 +1883,20 @@ impl eframe::App for DamGui {
                 }
 
                 ui.separator();
+                // Advanced Search: structured attribute + tag filters (contextual to the media type).
+                let adv_label = if self.adv.is_empty() {
+                    "Filters".to_string()
+                } else {
+                    format!("Filters ({})", self.adv.len())
+                };
+                if ui
+                    .selectable_label(self.adv_open || !self.adv.is_empty(), adv_label)
+                    .on_hover_text("Advanced structured & tag filters")
+                    .clicked()
+                {
+                    self.adv_open = !self.adv_open;
+                }
+                ui.separator();
                 match self.total {
                     Some(t) => ui.label(format!("{} of {}", self.assets.len(), t)),
                     None => ui.label(format!("{}", self.assets.len())),
@@ -1979,6 +2548,11 @@ impl eframe::App for DamGui {
                 self.source_filter = Some(sid);
                 self.path = p;
             }
+            do_query = true;
+        }
+
+        // Advanced Search modal — returns true when the filter set changed (re-query).
+        if self.advanced_modal(ctx) {
             do_query = true;
         }
 
