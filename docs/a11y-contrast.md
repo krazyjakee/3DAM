@@ -1,11 +1,12 @@
 # Accessibility report — web client
 
 Part of the accessibility hardening epic ([#44](https://github.com/krazyjakee/3DAM/issues/44),
-PRODUCT_SPEC §9 phase 7). Two automated checks:
+PRODUCT_SPEC §9 phase 7). Three checks:
 
 1. **Contrast audit** — the colour tokens in [`web/src/index.css`](../web/src/index.css) against
    WCAG 2.1 §1.4.3 (AA). (below)
 2. **axe-core scan** — every route against WCAG 2 A/AA rules. ([jump ↓](#automated-axe-core-scan))
+3. **Keyboard-only walkthrough** — browse → inspect → act with no mouse. ([jump ↓](#keyboard-only-walkthrough))
 
 ---
 
@@ -165,3 +166,59 @@ s.onload = async () => {
 
 Note: axe scans the current DOM only, so exercise each route/state (open a dialog, select an asset,
 switch to the table) and re-run to cover controls that mount conditionally.
+
+---
+
+## Keyboard-only walkthrough
+
+The core loop — **browse → inspect → act** — is operable with no pointer. Verified by driving the DOM
+with synthetic key events against a seeded catalog; each step below was confirmed to behave as
+described.
+
+### The model
+
+- **Tab** moves between the landmark regions and their controls: the Browser toolbar (search box —
+  accessible name "Search assets…", sort/view selects, export), the Navigation rail, the asset list,
+  and the Inspector. Landmarks (`<nav>` / `<main aria-label="Asset browser">` / `<aside>` /
+  `<footer>`) let assistive tech jump straight to a region.
+- **The asset list is a single tab stop** (roving `tabindex`, issue #27): Tab lands on one cell/row,
+  then the **arrow keys** move focus *within* the list without leaving it — 2-D in the grid
+  (←/→ within a row, ↑/↓ between rows) and 1-D in the table (↑/↓). **Home/End** jump to the first/last
+  item. The roving `tabindex="0"` follows the focused item, so tabbing back returns to where you were.
+- **Enter / Space** on the focused item selects it (it's a native `<button>`), which populates the
+  Inspector; **double-activate** opens the asset. Selection lives in the URL (`?sel=`), so it's
+  shareable and survives back/forward.
+- **The Inspector's controls are all reachable and labelled** — collapse, zoom out/in, fit, 1:1,
+  check-tiling, reanalyze, favourite, etc. — so "act" (favourite, reanalyze, add to a collection)
+  is entirely keyboard-driven.
+- **Focus is always visible**: a single accent `:focus-visible` outline (issue #27, `index.css`
+  `@layer base`) marks the focused element for keyboard/AT users without adding chrome for mouse
+  users.
+- **Dialogs trap focus** and restore it to the trigger on close (issue #26); **Escape** dismisses
+  dialogs and the narrow-screen drawers.
+
+### Verified walk (grid, 3-asset catalog)
+
+| Step | Key | Result |
+|---|---|---|
+| Enter the list | Tab | focus lands on cell `0` (its `tabindex` is `0`) |
+| Move right | → | focus `0 → 1`, roving tab stop follows |
+| Move right | → | focus `1 → 2` (last) |
+| Select | Enter | `?sel=<id>` set, Inspector shows the asset |
+| Table view | ↓ | row focus `0 → 1` (1-D navigation) |
+
+### Reproduce
+
+Focus the list's tab stop and drive it (run each line, letting React settle between focus moves):
+
+```js
+const list = document.querySelector('[role="group"][aria-label="Assets"]');
+list.querySelector('[data-index][tabindex="0"]').focus();
+document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+// → document.activeElement is now the next cell; Enter (or .click()) selects it.
+```
+
+### Not yet covered (remaining #44 scope)
+
+- egui / AccessKit keyboard + screen-reader parity, once the native GUI
+  ([#34](https://github.com/krazyjakee/3DAM/issues/34)) is built.
