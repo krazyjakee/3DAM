@@ -23,7 +23,9 @@
   /* Text. */
   --color-fg: #e6e9ee;
   --color-fg-muted: #9aa3b0;
-  --color-fg-dim: #656d7a;
+  /* Lifted from #656d7a to clear WCAG AA (4.5:1) for the de-emphasised tier on every surface — it
+     was ~3.2–3.7:1 (issue #44 contrast audit, docs/a11y-contrast.md). Still the dimmest text tier. */
+  --color-fg-dim: #868f9c;
 
   /* The one accent. */
   --color-accent: #38bdf8;
@@ -63,21 +65,27 @@
 
   --color-fg: #1a1d23;
   --color-fg-muted: #55606e;
-  --color-fg-dim: #78828f;
+  /* Darkened #78828f → #5d6673 to clear AA (4.5:1) on every light surface (issue #44 audit). */
+  --color-fg-dim: #5d6673;
 
-  --color-accent: #0284c7;
+  /* Accent darkened #0284c7 → #075985 so accent text on white and white text on the accent button
+     both clear AA (was 4.1:1) — the light theme (#62) was less contrast-tuned than dark (issue #44). */
+  --color-accent: #075985;
   --color-accent-fg: #ffffff;
   --color-accent-muted: #dceffb;
 
-  --color-warn: #b45309;
+  /* Warn darkened so it clears AA on the elevated surface-2 (was 4.32:1). */
+  --color-warn: #9a5108;
   --color-danger: #dc2626;
 
   --color-lic-permissive: #15803d;
-  --color-lic-attribution: #0284c7;
+  /* Matches the darkened accent (same blue) so the attribution badge clears AA (was 4.1:1). */
+  --color-lic-attribution: #075985;
   --color-lic-restricted: #dc2626;
   --color-lic-unknown: #6b7280;
 
-  --color-media-audio: #0d9488;
+  /* Teal darkened #0d9488 → #0f766e so the "SFX" badge label clears AA (was 3.7:1). */
+  --color-media-audio: #0f766e;
   --color-media-image: #c2410c;
   --color-media-model: #4f46e5;
 }
