@@ -16,11 +16,19 @@ use eframe::egui;
 
 use dam_api::service::{AuthContext, LibraryService};
 use dam_api::{
-    Asset, AssetId, AssetSummary, FacetField, Filter, FilterOp, FilterValue, FolderEntry,
-    FolderListing, LibraryStats, LicenseStatus, MediaAttributes, MediaType, Page, PageParams,
-    QueryRequest, ReviewAction, SearchMode, Sort, SortDir, SortField, SourceId, SourceInfo,
-    SuggestionReview,
+    AnalyzeRequest, Asset, AssetId, AssetSummary, FacetField, Filter, FilterOp, FilterValue,
+    FolderEntry, FolderListing, LibraryStats, LicenseStatus, MediaAttributes, MediaType, Page,
+    PageParams, QueryRequest, ReviewAction, SearchMode, Sort, SortDir, SortField, SourceId,
+    SourceInfo, SuggestionReview, ThumbnailRegenRequest,
 };
+
+/// A per-asset maintenance action fired from the inspector (mirrors the web context-menu actions).
+enum AssetAction {
+    /// Force a re-analysis (embeddings, tileability, auto-tags) — background job.
+    Reanalyze(AssetId),
+    /// Drop + rebuild the cached preview thumbnail from source.
+    RegenThumb(AssetId),
+}
 
 /// A source-relative folder-tree node key: which source, and the source-relative prefix (trailing
 /// slash, or empty for the source root).
@@ -297,6 +305,49 @@ impl DamGui {
         });
     }
 
+    /// Submit a forced re-analysis of one asset (fire-and-forget background job). Results surface on
+    /// the next detail fetch — until live event updates land (owed parity), re-select to refresh.
+    fn submit_analyze_asset(&self, id: AssetId) {
+        let (lib, auth) = (self.lib.clone(), self.auth.clone());
+        self.rt.spawn(async move {
+            let req = AnalyzeRequest {
+                assets: vec![id],
+                force: true,
+            };
+            let _ = lib.submit_analyze(&auth, req).await;
+        });
+    }
+
+    /// Drop + rebuild one asset's cached thumbnail, then re-read it so the preview refreshes in place.
+    /// Marks the cache entry `Loading` first so the lazy grid loader doesn't race a stale re-request.
+    fn regen_thumb(&mut self, id: AssetId) {
+        self.thumbs.insert(id, Thumb::Loading);
+        let (lib, auth, tx, egctx) = (
+            self.lib.clone(),
+            self.auth.clone(),
+            self.tx.clone(),
+            self.egui_ctx.clone(),
+        );
+        self.rt.spawn(async move {
+            let _ = lib
+                .regenerate_thumbnails(&auth, ThumbnailRegenRequest { assets: vec![id] })
+                .await;
+            let pixels = match lib.read_thumbnail(&auth, &id, THUMB_EDGE).await {
+                Ok(content) => image::load_from_memory(&content.bytes).ok().map(|img| {
+                    let rgba = img.to_rgba8();
+                    let size = [rgba.width() as usize, rgba.height() as usize];
+                    ThumbPixels {
+                        size,
+                        rgba: rgba.into_raw(),
+                    }
+                }),
+                Err(_) => None,
+            };
+            let _ = tx.send(Msg::Thumb(id, pixels));
+            egctx.request_repaint();
+        });
+    }
+
     fn load_sources(&mut self, egctx: &egui::Context) {
         let (lib, auth, tx, egctx) = (
             self.lib.clone(),
@@ -489,6 +540,7 @@ impl eframe::App for DamGui {
         let mut open_asset: Option<AssetId> = None;
         let mut nav = NavActions::default();
         let mut tag_review: Option<(AssetId, String, ReviewAction)> = None;
+        let mut asset_action: Option<AssetAction> = None;
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.add_space(4.0);
@@ -670,7 +722,7 @@ impl eframe::App for DamGui {
                         Some(Thumb::Ready(tex)) => Some(tex),
                         _ => None,
                     };
-                    inspector(ui, asset, thumb, &mut tag_review);
+                    inspector(ui, asset, thumb, &mut tag_review, &mut asset_action);
                 } else {
                     ui.label(egui::RichText::new("Select an asset to inspect it.").weak());
                 }
@@ -744,6 +796,11 @@ impl eframe::App for DamGui {
         }
         if let Some((id, tag, action)) = tag_review {
             self.review_tag(id, tag, action);
+        }
+        match asset_action {
+            Some(AssetAction::Reanalyze(id)) => self.submit_analyze_asset(id),
+            Some(AssetAction::RegenThumb(id)) => self.regen_thumb(id),
+            None => {}
         }
     }
 }
@@ -832,6 +889,7 @@ fn inspector(
     asset: &Asset,
     thumb: Option<&egui::TextureHandle>,
     tag_review: &mut Option<(AssetId, String, ReviewAction)>,
+    action: &mut Option<AssetAction>,
 ) {
     let s = &asset.summary;
     // Preview: the asset's thumbnail (reuses the grid texture) scaled to the panel width. Absent for
@@ -846,6 +904,24 @@ fn inspector(
         ui.add_space(6.0);
     }
     ui.label(egui::RichText::new(&s.name).strong());
+
+    // Per-asset maintenance actions (mirrors the web context menu / inspector actions).
+    ui.horizontal(|ui| {
+        let analyzed = asset.timestamps.analyzed.is_some();
+        if ui
+            .button(if analyzed { "Reanalyze" } else { "Analyze" })
+            .clicked()
+        {
+            *action = Some(AssetAction::Reanalyze(s.id));
+        }
+        // Only media with a server thumbnail can be regenerated.
+        if matches!(s.media, MediaType::Image | MediaType::Model)
+            && ui.button("Regenerate thumbnail").clicked()
+        {
+            *action = Some(AssetAction::RegenThumb(s.id));
+        }
+    });
+
     egui::Grid::new("detail").num_columns(2).show(ui, |ui| {
         row(ui, "Type", media_label(s.media));
         row(ui, "Format", &s.format.to_uppercase());

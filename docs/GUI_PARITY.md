@@ -39,7 +39,7 @@ Legend: ✅ done · 🟡 partial · ⬜ owed (not yet in egui)
 | Tag review (reject/restore) | ✅ | ✅ | reject-only lifecycle in the inspector, refreshes on review |
 | Similar / duplicates | ✅ | ⬜ | `find_similar`, exact/near dedup |
 | Convert / export | ✅ | ⬜ | |
-| Per-asset actions (reanalyze, regen thumbnail) | ✅ | ⬜ | |
+| Per-asset actions (reanalyze, regen thumbnail) | ✅ | ✅ | inspector buttons over `submit_analyze` + `regenerate_thumbnails` |
 | Multi-select + batch actions | ✅ | ⬜ | |
 | Context menus | ✅ | ⬜ | |
 | Live updates | ✅ | ⬜ | web uses a WebSocket; egui embedded can subscribe to engine events |
