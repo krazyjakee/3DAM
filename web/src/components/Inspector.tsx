@@ -1,6 +1,7 @@
 import type React from "react";
 import { useEffect, useState } from "react";
 import {
+  Box,
   Grid3x3,
   PanelRightClose,
   PanelRightOpen,
@@ -34,6 +35,7 @@ import type {
   TagRef,
 } from "@/api/types";
 import { bytes, duration, mediaLabel, originLabel, relTime } from "@/lib/format";
+import { hasInteractive3D } from "@/lib/model-formats";
 import { useViewState } from "@/lib/view-state";
 import { ModelViewerIsland } from "@/islands/ModelViewerIsland";
 import { AudioPlayer } from "./AudioPlayer";
@@ -186,15 +188,23 @@ function InspectorSkeleton() {
 function Preview({ asset }: { asset: Asset }) {
   const { summary } = asset;
   const [tiling, setTiling] = useState(false);
-  // `.blend` has no interactive 3D: Assimp can't decode a modern .blend, and a full Blender render of
-  // a large file is unreasonable. It falls through to the server thumbnail below, which surfaces
-  // Blender's own embedded preview image when the file has one.
-  if (summary.media === "model" && summary.format !== "blend") {
-    return (
-      <div className="aspect-square border-b border-border">
-        <ModelViewerIsland src={api.assetPreviewMeshUrl(summary.id)} />
-      </div>
-    );
+  if (summary.media === "model") {
+    // Interactive island for every Assimp-decodable mesh format (issue #18) — the server decodes the
+    // preview blob so the DOM never resolves external buffers.
+    if (hasInteractive3D(summary.format)) {
+      return (
+        <div className="aspect-square border-b border-border">
+          <ModelViewerIsland src={api.assetPreviewMeshUrl(summary.id)} />
+        </div>
+      );
+    }
+    // `.blend` has no interactive 3D (Assimp can't decode a modern .blend), so it falls through to
+    // the server thumbnail below — which surfaces Blender's own embedded preview image when present.
+    // Anything else (the USD family) has no decode path yet: show a clear "preview not available"
+    // state rather than a doomed fetch or a silent blank (issue #18 acceptance).
+    if (summary.format !== "blend") {
+      return <NoModelPreview format={summary.format} />;
+    }
   }
   const src = api.assetContentUrl(summary.id);
   if (summary.media === "audio") {
@@ -229,6 +239,21 @@ function Preview({ asset }: { asset: Asset }) {
   return (
     <div className="aspect-square border-b border-border">
       <Thumbnail asset={summary} size={64} />
+    </div>
+  );
+}
+
+/** "Preview not available" state for a 3D format with no decode path yet (the USD family) — issue #18.
+ *  Metadata still loads below; this just makes the absent preview explicit rather than a blank tile. */
+function NoModelPreview({ format }: { format: string }) {
+  return (
+    <div className="flex aspect-square flex-col items-center justify-center gap-2 border-b border-border bg-surface-2 px-6 text-center">
+      <Box size={28} className="text-fg-dim" />
+      <p className="text-xs font-medium text-fg-muted">Preview not available</p>
+      <p className="text-[11px] text-fg-dim">
+        3DAM can’t render <span className="font-mono uppercase">.{format}</span> yet — its metadata is
+        still catalogued below.
+      </p>
     </div>
   );
 }
