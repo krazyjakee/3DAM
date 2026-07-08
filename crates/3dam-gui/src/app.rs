@@ -66,6 +66,38 @@ const SORTS: &[(&str, SortField, SortDir)] = &[
     ("Oldest", SortField::Scanned, SortDir::Asc),
 ];
 
+/// The analysis-class quick facet for a media type: the class `FacetField` and its `(value, label)`
+/// options (mirrors the web `CLASS_FACET`). Shown only when a single media type is selected.
+fn class_facet(m: MediaType) -> (FacetField, &'static [(&'static str, &'static str)]) {
+    match m {
+        MediaType::Audio => (
+            FacetField::AudioClass,
+            &[
+                ("one_shot", "One-shot"),
+                ("loop", "Loop"),
+                ("music", "Music"),
+                ("sfx", "SFX"),
+            ],
+        ),
+        MediaType::Image => (
+            FacetField::ImageClass,
+            &[
+                ("texture", "Texture"),
+                ("sprite", "Sprite"),
+                ("photo", "Photo"),
+            ],
+        ),
+        MediaType::Model => (
+            FacetField::ModelClass,
+            &[
+                ("prop_lowpoly", "Low-poly"),
+                ("prop", "Prop"),
+                ("prop_highpoly", "High-poly"),
+            ],
+        ),
+    }
+}
+
 /// The license facet options (matches the web sidebar), as `(LicenseStatus, label)`.
 const LICENSES: &[(LicenseStatus, &str)] = &[
     (LicenseStatus::Permissive, "Permissive"),
@@ -129,8 +161,12 @@ pub struct DamGui {
     // ── view state ──
     search: String,
     media_filter: Option<MediaType>,
+    /// Analysis-class quick facet (audio/image/model class), contextual to the active media type.
+    class: Option<String>,
     license: Option<LicenseStatus>,
     favorites: bool,
+    /// Dark vs light theme (dark-first, DESIGN_GUIDELINES §4).
+    dark: bool,
     source_filter: Option<SourceId>,
     /// Folder scope (issue #66): a source-relative path prefix, paired with `source_filter`.
     path: Option<String>,
@@ -185,8 +221,10 @@ impl DamGui {
             rx,
             search: String::new(),
             media_filter: None,
+            class: None,
             license: None,
             favorites: false,
+            dark: true,
             source_filter: None,
             path: None,
             sort: 0,
@@ -267,6 +305,14 @@ impl DamGui {
                 field: FacetField::License,
                 op: FilterOp::Eq,
                 value: FilterValue::Str(license_value(license).to_string()),
+            });
+        }
+        // Analysis class (contextual to media) — only meaningful with a single media type selected.
+        if let (Some(m), Some(c)) = (self.media_filter, self.class.as_deref()) {
+            filters.push(Filter {
+                field: class_facet(m).0,
+                op: FilterOp::Eq,
+                value: FilterValue::Str(c.to_string()),
             });
         }
         if self.favorites {
@@ -742,6 +788,7 @@ impl eframe::App for DamGui {
                         .clicked()
                     {
                         self.media_filter = val;
+                        self.class = None; // class is media-specific
                         do_query = true;
                     }
                 }
@@ -836,6 +883,21 @@ impl eframe::App for DamGui {
                     do_query = true;
                 }
 
+                // Analysis-class quick facet — contextual to a single active media type (the full
+                // typed-attribute set is Advanced Search, still owed). Chips toggle a class filter.
+                if let Some(m) = self.media_filter {
+                    let (_, options) = class_facet(m);
+                    ui.horizontal_wrapped(|ui| {
+                        for (val, label) in options {
+                            let on = self.class.as_deref() == Some(*val);
+                            if ui.selectable_label(on, *label).clicked() {
+                                self.class = if on { None } else { Some((*val).to_string()) };
+                                do_query = true;
+                            }
+                        }
+                    });
+                }
+
                 ui.separator();
                 ui.label(egui::RichText::new("LICENSE").small().weak());
                 for (lic, label) in LICENSES {
@@ -875,6 +937,22 @@ impl eframe::App for DamGui {
                     if open {
                         self.folder_level(ui, sid, "", 1, &mut nav);
                     }
+                }
+
+                // Theme toggle at the foot of the rail (dark-first).
+                ui.separator();
+                let label = if self.dark {
+                    "Theme: Dark"
+                } else {
+                    "Theme: Light"
+                };
+                if ui.button(label).clicked() {
+                    self.dark = !self.dark;
+                    ui.ctx().set_visuals(if self.dark {
+                        egui::Visuals::dark()
+                    } else {
+                        egui::Visuals::light()
+                    });
                 }
             });
 

@@ -31,7 +31,7 @@ Legend: ✅ done · 🟡 partial · ⬜ owed (not yet in egui)
 | Search mode (lexical/hybrid/semantic) | ✅ | ✅ | toolbar combo, shown with a text query |
 | License facet | ✅ | ✅ | left-rail Permissive/Attribution/Restricted/Unknown |
 | Advanced Search (structured attr + tag filters) | ✅ | ⬜ | typed dropdown/range/toggle facets |
-| Quick class facet (audio/image/model class) | ✅ | ⬜ | |
+| Quick class facet (audio/image/model class) | ✅ | ✅ | contextual chips in the left rail when a media type is active |
 | Favorites / Recently added | ✅ | 🟡 | favourites facet done; "recently added" = the Newest sort |
 | Collections & smart folders | ✅ | ⬜ | list + membership editing |
 | Grid ⇄ list view toggle | ✅ | 🟡 | grid + flat list; the web "table" (sortable columns) is richer |
@@ -45,7 +45,7 @@ Legend: ✅ done · 🟡 partial · ⬜ owed (not yet in egui)
 | Live updates | ✅ | ✅ | subscribes to the engine event stream; coalesced/throttled refreshes |
 | Settings / admin | ✅ | ⬜ | flags, tokens, audit |
 | Duplicates page / blocklist page | ✅ | ⬜ | |
-| Theme (light/dark) | ✅ | 🟡 | egui defaults to dark; expose the toggle |
+| Theme (light/dark) | ✅ | ✅ | dark/light toggle at the foot of the rail (System mode owed) |
 | Responsive / touch / a11y pass | ✅ | ⬜ | |
 | 3D viewer on-canvas controls (#65) | ✅ | ⬜ | lighting / wireframe / auto-orbit / fullscreen — lands with the egui 3D preview |
 
