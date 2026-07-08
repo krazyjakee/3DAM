@@ -17,10 +17,11 @@ use eframe::egui;
 use dam_api::service::{AuthContext, LibraryService};
 use dam_api::{
     AnalyzeRequest, Asset, AssetId, AssetSummary, Collection, CollectionId, CollectionKind,
-    EventTopic, FacetField, Filter, FilterOp, FilterValue, FolderEntry, FolderListing, JobState,
-    LibraryEvent, LibraryStats, LicenseStatus, MediaAttributes, MediaType, Page, PageParams,
-    QueryRequest, ReviewAction, SearchMode, SimilarHit, SimilarRequest, Sort, SortDir, SortField,
-    SourceId, SourceInfo, SubscribeRequest, SuggestionReview, ThumbnailRegenRequest,
+    EventTopic, ExportFormat, ExportReport, ExportRequest, FacetField, Filter, FilterOp,
+    FilterValue, FolderEntry, FolderListing, JobState, LibraryEvent, LibraryStats, LicenseStatus,
+    MediaAttributes, MediaType, Page, PageParams, QueryRequest, ReviewAction, SearchMode,
+    SimilarHit, SimilarRequest, Sort, SortDir, SortField, SourceId, SourceInfo, SubscribeRequest,
+    SuggestionReview, ThumbnailRegenRequest,
 };
 use futures::StreamExt;
 
@@ -149,6 +150,7 @@ enum Msg {
     Event(LibraryEvent),
     Similar(AssetId, Result<Vec<SimilarHit>, String>),
     Collections(Result<Vec<Collection>, String>),
+    Export(Result<ExportReport, String>),
 }
 
 pub struct DamGui {
@@ -206,6 +208,13 @@ pub struct DamGui {
     similar_for: Option<AssetId>,
     similar: Vec<SimilarHit>,
     similar_loading: bool,
+    // ── export manifest modal ──
+    export_open: bool,
+    export_format: ExportFormat,
+    export_path: String,
+    export_attribution: bool,
+    /// Last export outcome (Ok message / Err message) shown in the modal.
+    export_status: Option<Result<String, String>>,
 }
 
 impl DamGui {
@@ -257,6 +266,11 @@ impl DamGui {
             similar_for: None,
             similar: Vec::new(),
             similar_loading: false,
+            export_open: false,
+            export_format: ExportFormat::Json,
+            export_path: default_export_path(),
+            export_attribution: false,
+            export_status: None,
         };
         // Kick the initial loads against the freshly opened library.
         let egctx = cc.egui_ctx.clone();
@@ -430,6 +444,34 @@ impl DamGui {
         self.rt.spawn(async move {
             let r = lib.get_asset(&auth, &id).await.map_err(|e| e.to_string());
             let _ = tx.send(Msg::Detail(r));
+            egctx.request_repaint();
+        });
+    }
+
+    /// Export a manifest of the current browse view (a collection when in collection mode, else the
+    /// faceted query) — the same non-destructive export the CLI/web offer.
+    fn run_export(&self) {
+        let (lib, auth, tx, egctx) = (
+            self.lib.clone(),
+            self.auth.clone(),
+            self.tx.clone(),
+            self.egui_ctx.clone(),
+        );
+        let req = ExportRequest {
+            assets: Vec::new(),
+            collection: self.collection,
+            query: if self.collection.is_some() {
+                None
+            } else {
+                Some(self.build_query())
+            },
+            format: self.export_format,
+            output: self.export_path.clone(),
+            attribution_only: self.export_attribution,
+        };
+        self.rt.spawn(async move {
+            let r = lib.export(&auth, req).await.map_err(|e| e.to_string());
+            let _ = tx.send(Msg::Export(r));
             egctx.request_repaint();
         });
     }
@@ -657,6 +699,13 @@ impl DamGui {
             Msg::Collections(Err(e)) => {
                 self.error = Some(format!("Couldn't load collections: {e}"))
             }
+            Msg::Export(Ok(rep)) => {
+                self.export_status = Some(Ok(format!(
+                    "Exported {} asset(s) → {} ({} file(s))",
+                    rep.assets, rep.output, rep.files_written
+                )));
+            }
+            Msg::Export(Err(e)) => self.export_status = Some(Err(e)),
             // Map a live event to the coalesced refresh flags (flushed, throttled, in `update`).
             Msg::Event(ev) => match ev {
                 LibraryEvent::AssetAdded(_) | LibraryEvent::AssetRemoved(_) => {
@@ -892,6 +941,12 @@ impl eframe::App for DamGui {
                     {
                         self.view = View::Grid;
                     }
+                    ui.separator();
+                    // Export the current view (collection or faceted query) as a manifest.
+                    if ui.button("Export").clicked() {
+                        self.export_status = None;
+                        self.export_open = true;
+                    }
                 });
             });
             ui.add_space(4.0);
@@ -1120,6 +1175,71 @@ impl eframe::App for DamGui {
                     }
                 });
         });
+
+        // Export-manifest modal (non-destructive; writes a JSON/CSV/sidecar over the current view).
+        let mut do_export = false;
+        if self.export_open {
+            let mut open = true;
+            egui::Window::new("Export manifest")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Format:");
+                        for (f, label) in [
+                            (ExportFormat::Json, "JSON"),
+                            (ExportFormat::Csv, "CSV"),
+                            (ExportFormat::Sidecar, "Sidecar"),
+                        ] {
+                            if ui
+                                .selectable_label(self.export_format == f, label)
+                                .clicked()
+                            {
+                                self.export_format = f;
+                            }
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Output:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.export_path).desired_width(320.0),
+                        );
+                    });
+                    ui.checkbox(
+                        &mut self.export_attribution,
+                        "Attribution / license fields only",
+                    );
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("Export").clicked() {
+                            do_export = true;
+                        }
+                        if ui.button("Close").clicked() {
+                            self.export_open = false;
+                        }
+                    });
+                    match &self.export_status {
+                        Some(Ok(msg)) => {
+                            ui.colored_label(egui::Color32::from_rgb(0x4a, 0xde, 0x80), msg);
+                        }
+                        Some(Err(msg)) => {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(0xef, 0x44, 0x44),
+                                format!("Export failed: {msg}"),
+                            );
+                        }
+                        None => {}
+                    }
+                });
+            if !open {
+                self.export_open = false;
+            }
+        }
+        if do_export {
+            self.export_status = None;
+            self.run_export();
+        }
 
         // Folder-tree actions (issue #66), applied before the query so a folder scope re-queries
         // with the updated source/path filters.
@@ -1576,6 +1696,12 @@ fn media_tag(m: MediaType) -> &'static str {
         MediaType::Image => "[IMG]",
         MediaType::Model => "[3D ]",
     }
+}
+
+/// A sensible default manifest path under the user's home directory (falls back to the cwd).
+fn default_export_path() -> String {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    format!("{home}/3dam-manifest.json")
 }
 
 /// Compact human-readable byte size (1.7 KB, 4.8 MB, …).
