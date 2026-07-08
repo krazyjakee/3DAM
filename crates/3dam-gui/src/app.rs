@@ -17,8 +17,29 @@ use eframe::egui;
 use dam_api::service::{AuthContext, LibraryService};
 use dam_api::{
     Asset, AssetId, AssetSummary, FacetField, Filter, FilterOp, FilterValue, LibraryStats,
-    MediaType, Page, PageParams, QueryRequest, SortField, SourceInfo,
+    LicenseStatus, MediaType, Page, PageParams, QueryRequest, SearchMode, Sort, SortDir, SortField,
+    SourceInfo,
 };
+
+/// The sort presets offered in the toolbar — label + (field, dir), mirroring the web sort control.
+/// "Best match" (relevance) is only meaningful with a text query, so it's filtered in at render.
+// Labels stay ASCII — egui's default font has no ↑/↓ glyph (renders as a tofu box).
+const SORTS: &[(&str, SortField, SortDir)] = &[
+    ("Name A-Z", SortField::Name, SortDir::Asc),
+    ("Name Z-A", SortField::Name, SortDir::Desc),
+    ("Largest", SortField::Size, SortDir::Desc),
+    ("Smallest", SortField::Size, SortDir::Asc),
+    ("Newest", SortField::Scanned, SortDir::Desc),
+    ("Oldest", SortField::Scanned, SortDir::Asc),
+];
+
+/// The license facet options (matches the web sidebar), as `(LicenseStatus, label)`.
+const LICENSES: &[(LicenseStatus, &str)] = &[
+    (LicenseStatus::Permissive, "Permissive"),
+    (LicenseStatus::Attribution, "Attribution"),
+    (LicenseStatus::Restricted, "Restricted"),
+    (LicenseStatus::Unknown, "Unknown"),
+];
 
 /// The most assets to pull into the list at once. The GUI is a single-page browse for now (infinite
 /// scroll / pagination is an owed parity item); a generous cap keeps a typical library one request.
@@ -71,6 +92,10 @@ pub struct DamGui {
     // ── view state ──
     search: String,
     media_filter: Option<MediaType>,
+    license: Option<LicenseStatus>,
+    favorites: bool,
+    sort: usize, // index into SORTS
+    mode: SearchMode,
     view: View,
     assets: Vec<AssetSummary>,
     total: Option<u64>,
@@ -104,6 +129,10 @@ impl DamGui {
             rx,
             search: String::new(),
             media_filter: None,
+            license: None,
+            favorites: false,
+            sort: 0,
+            mode: SearchMode::Lexical,
             view: View::Grid,
             assets: Vec::new(),
             total: None,
@@ -133,20 +162,32 @@ impl DamGui {
                 value: FilterValue::Str(media_value(media).to_string()),
             });
         }
+        if let Some(license) = self.license {
+            filters.push(Filter {
+                field: FacetField::License,
+                op: FilterOp::Eq,
+                value: FilterValue::Str(license_value(license).to_string()),
+            });
+        }
+        if self.favorites {
+            filters.push(Filter {
+                field: FacetField::Favorite,
+                op: FilterOp::Eq,
+                value: FilterValue::Bool(true),
+            });
+        }
         let text = self.search.trim();
+        let (_, field, dir) = SORTS[self.sort.min(SORTS.len() - 1)];
         QueryRequest {
             text: (!text.is_empty()).then(|| text.to_string()),
             filters,
-            sort: dam_api::Sort {
-                field: SortField::Name,
-                dir: dam_api::SortDir::Asc,
-            },
+            sort: Sort { field, dir },
             page: PageParams {
                 after: None,
                 limit: LIST_LIMIT,
             },
             include_facets: false,
-            mode: dam_api::SearchMode::Lexical,
+            mode: self.mode,
         }
     }
 
@@ -321,6 +362,44 @@ impl eframe::App for DamGui {
                     }
                 }
                 ui.separator();
+
+                // Sort preset (mirrors the web sort control).
+                egui::ComboBox::from_id_salt("sort")
+                    .selected_text(SORTS[self.sort].0)
+                    .show_ui(ui, |ui| {
+                        for (i, (label, _, _)) in SORTS.iter().enumerate() {
+                            if ui.selectable_label(self.sort == i, *label).clicked() {
+                                self.sort = i;
+                                do_query = true;
+                            }
+                        }
+                    });
+
+                // Search-mode selector — only meaningful with a text query, so it appears with one
+                // (semantic-search M5: hybrid/semantic widen with embedding neighbours of the hits).
+                if !self.search.trim().is_empty() {
+                    let mode_label = match self.mode {
+                        SearchMode::Lexical => "Keywords",
+                        SearchMode::Hybrid => "Keywords + similar",
+                        SearchMode::Semantic => "Most similar",
+                    };
+                    egui::ComboBox::from_id_salt("mode")
+                        .selected_text(mode_label)
+                        .show_ui(ui, |ui| {
+                            for (m, label) in [
+                                (SearchMode::Lexical, "Keywords"),
+                                (SearchMode::Hybrid, "Keywords + similar"),
+                                (SearchMode::Semantic, "Most similar"),
+                            ] {
+                                if ui.selectable_label(self.mode == m, label).clicked() {
+                                    self.mode = m;
+                                    do_query = true;
+                                }
+                            }
+                        });
+                }
+
+                ui.separator();
                 match self.total {
                     Some(t) => ui.label(format!("{} of {}", self.assets.len(), t)),
                     None => ui.label(format!("{}", self.assets.len())),
@@ -331,13 +410,13 @@ impl eframe::App for DamGui {
                 // View toggle (grid / list) — right-aligned like the web toolbar.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
-                        .selectable_label(self.view == View::List, "☰ List")
+                        .selectable_label(self.view == View::List, "List")
                         .clicked()
                     {
                         self.view = View::List;
                     }
                     if ui
-                        .selectable_label(self.view == View::Grid, "▦ Grid")
+                        .selectable_label(self.view == View::Grid, "Grid")
                         .clicked()
                     {
                         self.view = View::Grid;
@@ -366,6 +445,23 @@ impl eframe::App for DamGui {
                         ui.label(format!("{label}: {n}"));
                     }
                 }
+
+                // Favorites facet (composes with media/license/text).
+                if ui.selectable_label(self.favorites, "★ Favorites").clicked() {
+                    self.favorites = !self.favorites;
+                    do_query = true;
+                }
+
+                ui.separator();
+                ui.label(egui::RichText::new("LICENSE").small().weak());
+                for (lic, label) in LICENSES {
+                    let on = self.license == Some(*lic);
+                    if ui.selectable_label(on, *label).clicked() {
+                        self.license = if on { None } else { Some(*lic) };
+                        do_query = true;
+                    }
+                }
+
                 ui.separator();
                 ui.label(egui::RichText::new("SOURCES").small().weak());
                 if self.sources.is_empty() {
@@ -577,6 +673,16 @@ fn media_value(m: MediaType) -> &'static str {
         MediaType::Audio => "audio",
         MediaType::Image => "image",
         MediaType::Model => "model",
+    }
+}
+
+/// The store's `license` facet value (matches `LicenseStatus`'s lowercase serde name).
+fn license_value(l: LicenseStatus) -> &'static str {
+    match l {
+        LicenseStatus::Permissive => "permissive",
+        LicenseStatus::Attribution => "attribution",
+        LicenseStatus::Restricted => "restricted",
+        LicenseStatus::Unknown => "unknown",
     }
 }
 

@@ -28,14 +28,14 @@ Legend: ✅ done · 🟡 partial · ⬜ owed (not yet in egui)
 | Library stats | ✅ | ✅ | totals + by-media counts in the left rail |
 | Sources list | ✅ | 🟡 | egui shows them read-only; add/remove/rescan owed |
 | Folder-tree navigation + breadcrumb (#66) | ✅ | ⬜ | `list_folders` + path-prefix filter |
-| Search mode (lexical/hybrid/semantic) | ✅ | ⬜ | `QueryRequest.mode` selector |
-| License facet | ✅ | ⬜ | |
+| Search mode (lexical/hybrid/semantic) | ✅ | ✅ | toolbar combo, shown with a text query |
+| License facet | ✅ | ✅ | left-rail Permissive/Attribution/Restricted/Unknown |
 | Advanced Search (structured attr + tag filters) | ✅ | ⬜ | typed dropdown/range/toggle facets |
 | Quick class facet (audio/image/model class) | ✅ | ⬜ | |
-| Favorites / Recently added | ✅ | ⬜ | favourite toggle + saved-sort shortcut |
+| Favorites / Recently added | ✅ | 🟡 | favourites facet done; "recently added" = the Newest sort |
 | Collections & smart folders | ✅ | ⬜ | list + membership editing |
 | Grid ⇄ list view toggle | ✅ | 🟡 | grid + flat list; the web "table" (sortable columns) is richer |
-| Sort control | ✅ | 🟡 | egui fixed to name-asc; expose the sort control |
+| Sort control | ✅ | ✅ | toolbar combo (name/size/scanned, both directions) |
 | Tag review (reject/restore) | ✅ | ⬜ | reject-only lifecycle |
 | Similar / duplicates | ✅ | ⬜ | `find_similar`, exact/near dedup |
 | Convert / export | ✅ | ⬜ | |
