@@ -37,6 +37,15 @@ enum AssetAction {
     Convert(AssetId, MediaType),
 }
 
+/// Modifier keys on a grid/list click that change the multi-selection (issue #10/#22).
+#[derive(Clone, Copy, Default)]
+struct ClickMods {
+    /// ctrl/cmd → toggle one in the selection.
+    toggle: bool,
+    /// shift → extend a range from the anchor.
+    range: bool,
+}
+
 /// The convert target-format options per media (mirrors the CLI/web); 3D can't transcode.
 const CONVERT_FORMATS: &[(MediaType, &[&str])] = &[
     (
@@ -218,6 +227,10 @@ pub struct DamGui {
     total: Option<u64>,
     loading: bool,
     selected: Option<AssetId>,
+    /// Multi-selection for batch actions (issue #10) — distinct from the single inspector focus.
+    selection: HashSet<AssetId>,
+    /// The pivot for a shift-range extend.
+    anchor: Option<AssetId>,
     detail: Option<Asset>,
     detail_loading: bool,
     sources: Vec<SourceInfo>,
@@ -244,6 +257,8 @@ pub struct DamGui {
     export_format: ExportFormat,
     export_path: String,
     export_attribution: bool,
+    /// When non-empty, the export modal exports this explicit selection instead of the current view.
+    export_assets: Vec<AssetId>,
     /// Last export outcome (Ok message / Err message) shown in the modal.
     export_status: Option<Result<String, String>>,
     // ── source management ──
@@ -295,6 +310,8 @@ impl DamGui {
             total: None,
             loading: false,
             selected: None,
+            selection: HashSet::new(),
+            anchor: None,
             detail: None,
             detail_loading: false,
             sources: Vec::new(),
@@ -313,6 +330,7 @@ impl DamGui {
             export_format: ExportFormat::Json,
             export_path: default_export_path(),
             export_attribution: false,
+            export_assets: Vec::new(),
             export_status: None,
             add_open: false,
             add_path: String::new(),
@@ -506,6 +524,46 @@ impl DamGui {
         });
     }
 
+    /// Apply a grid/list click to the multi-selection + inspector focus (issue #10): ctrl/cmd toggles
+    /// one, shift extends a range from the anchor within the current order, plain click single-selects.
+    /// The clicked asset always becomes the inspector focus.
+    fn select_asset(&mut self, id: AssetId, mods: ClickMods, ctx: &egui::Context) {
+        if mods.toggle {
+            if !self.selection.remove(&id) {
+                self.selection.insert(id);
+            }
+            self.anchor = Some(id);
+        } else if mods.range {
+            let order: Vec<AssetId> = self.assets.iter().map(|a| a.id).collect();
+            let bi = order.iter().position(|x| *x == id);
+            let ai = self
+                .anchor
+                .and_then(|an| order.iter().position(|x| *x == an));
+            if let (Some(ai), Some(bi)) = (ai, bi) {
+                let (lo, hi) = if ai <= bi { (ai, bi) } else { (bi, ai) };
+                self.selection = order[lo..=hi].iter().copied().collect();
+            } else {
+                self.selection.clear();
+                self.selection.insert(id);
+                self.anchor = Some(id);
+            }
+        } else {
+            self.selection.clear();
+            self.selection.insert(id);
+            self.anchor = Some(id);
+        }
+        self.selected = Some(id);
+        self.load_detail(id, ctx);
+        let mut fetch = false;
+        self.thumbs.entry(id).or_insert_with(|| {
+            fetch = true;
+            Thumb::Loading
+        });
+        if fetch {
+            self.load_thumb(id);
+        }
+    }
+
     /// Re-fetch the selected asset's detail without blanking the current view — used by live updates
     /// so an in-place refresh doesn't flicker the inspector (unlike `load_detail`, which shows a
     /// loading state for an explicit selection).
@@ -532,10 +590,12 @@ impl DamGui {
             self.tx.clone(),
             self.egui_ctx.clone(),
         );
+        // An explicit selection (batch export) takes precedence over the current view.
+        let selection = !self.export_assets.is_empty();
         let req = ExportRequest {
-            assets: Vec::new(),
-            collection: self.collection,
-            query: if self.collection.is_some() {
+            assets: self.export_assets.clone(),
+            collection: if selection { None } else { self.collection },
+            query: if selection || self.collection.is_some() {
                 None
             } else {
                 Some(self.build_query())
@@ -634,13 +694,16 @@ impl DamGui {
     /// Submit a forced re-analysis of one asset (fire-and-forget background job). Results surface on
     /// the next detail fetch — until live event updates land (owed parity), re-select to refresh.
     fn submit_analyze_asset(&self, id: AssetId) {
+        self.submit_analyze_batch(vec![id], true);
+    }
+
+    /// Submit an analysis pass over a set of assets (batch action). `force` re-runs up-to-date ones.
+    fn submit_analyze_batch(&self, assets: Vec<AssetId>, force: bool) {
         let (lib, auth) = (self.lib.clone(), self.auth.clone());
         self.rt.spawn(async move {
-            let req = AnalyzeRequest {
-                assets: vec![id],
-                force: true,
-            };
-            let _ = lib.submit_analyze(&auth, req).await;
+            let _ = lib
+                .submit_analyze(&auth, AnalyzeRequest { assets, force })
+                .await;
         });
     }
 
@@ -1013,7 +1076,7 @@ impl eframe::App for DamGui {
 
         // Actions gathered while rendering (immutable borrows of self), applied after the panels.
         let mut do_query = false;
-        let mut open_asset: Option<AssetId> = None;
+        let mut grid_click: Option<(AssetId, ClickMods)> = None;
         let mut nav = NavActions::default();
         let mut tag_review: Option<(AssetId, String, ReviewAction)> = None;
         let mut asset_action: Option<AssetAction> = None;
@@ -1116,6 +1179,7 @@ impl eframe::App for DamGui {
                     ui.separator();
                     // Export the current view (collection or faceted query) as a manifest.
                     if ui.button("Export").clicked() {
+                        self.export_assets.clear(); // export the view, not a stale selection
                         self.export_status = None;
                         self.export_open = true;
                     }
@@ -1123,6 +1187,34 @@ impl eframe::App for DamGui {
             });
             ui.add_space(4.0);
         });
+
+        // Batch-action bar (issue #10): shown when a multi-selection is active. Actions collected
+        // here and applied after the panels.
+        let mut batch_analyze = false;
+        let mut batch_export = false;
+        let mut batch_clear = false;
+        if self.selection.len() > 1 {
+            egui::TopBottomPanel::top("batchbar").show(ctx, |ui| {
+                ui.add_space(3.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("{} selected", self.selection.len())).strong(),
+                    );
+                    ui.separator();
+                    if ui.button("Analyze").clicked() {
+                        batch_analyze = true;
+                    }
+                    if ui.button("Export").clicked() {
+                        batch_export = true;
+                    }
+                    ui.separator();
+                    if ui.button("Clear").clicked() {
+                        batch_clear = true;
+                    }
+                });
+                ui.add_space(3.0);
+            });
+        }
 
         egui::SidePanel::left("nav")
             .resizable(true)
@@ -1435,9 +1527,9 @@ impl eframe::App for DamGui {
                         ui.add_space(12.0);
                         ui.label(egui::RichText::new("No assets match.").weak());
                     } else if self.view == View::Grid {
-                        self.grid(ui, &mut open_asset, &mut to_load);
+                        self.grid(ui, &mut grid_click, &mut to_load);
                     } else {
-                        self.list(ui, &mut open_asset);
+                        self.list(ui, &mut grid_click);
                     }
                 });
         });
@@ -1505,6 +1597,20 @@ impl eframe::App for DamGui {
         if do_export {
             self.export_status = None;
             self.run_export();
+        }
+
+        // Batch actions over the multi-selection (issue #10).
+        if batch_analyze {
+            self.submit_analyze_batch(self.selection.iter().copied().collect(), false);
+        }
+        if batch_export {
+            self.export_assets = self.selection.iter().copied().collect();
+            self.export_status = None;
+            self.export_open = true;
+        }
+        if batch_clear {
+            self.selection.clear();
+            self.anchor = None;
         }
 
         // Convert modal (image/audio transcode; non-destructive, writes to an output dir).
@@ -1655,18 +1761,8 @@ impl eframe::App for DamGui {
             self.thumbs.insert(id, Thumb::Loading);
             self.load_thumb(id);
         }
-        if let Some(id) = open_asset {
-            self.selected = Some(id);
-            self.load_detail(id, ctx);
-            // Make sure the inspector preview has a thumbnail even if the asset wasn't in view.
-            let mut fetch = false;
-            self.thumbs.entry(id).or_insert_with(|| {
-                fetch = true;
-                Thumb::Loading
-            });
-            if fetch {
-                self.load_thumb(id);
-            }
+        if let Some((id, mods)) = grid_click {
+            self.select_asset(id, mods, ctx);
         }
         if let Some((id, tag, action)) = tag_review {
             self.review_tag(id, tag, action);
@@ -1692,27 +1788,18 @@ impl eframe::App for DamGui {
             self.similar_loading = true;
             self.find_similar_asset(id);
         }
-        // Selecting a similar hit navigates the inspector to it (same as a grid click).
+        // Selecting a similar/duplicate hit navigates the inspector to it (a plain single-select).
         if let Some(id) = open_similar {
-            self.selected = Some(id);
-            self.load_detail(id, ctx);
-            let mut fetch = false;
-            self.thumbs.entry(id).or_insert_with(|| {
-                fetch = true;
-                Thumb::Loading
-            });
-            if fetch {
-                self.load_thumb(id);
-            }
+            self.select_asset(id, ClickMods::default(), ctx);
         }
     }
 }
 
 impl DamGui {
     /// The flat text list (audio-friendly; the web "table" analogue).
-    fn list(&self, ui: &mut egui::Ui, open_asset: &mut Option<AssetId>) {
+    fn list(&self, ui: &mut egui::Ui, click: &mut Option<(AssetId, ClickMods)>) {
         for a in &self.assets {
-            let selected = self.selected == Some(a.id);
+            let selected = self.selected == Some(a.id) || self.selection.contains(&a.id);
             let text = format!(
                 "{}   {}   ·   {}   ·   {}",
                 media_tag(a.media),
@@ -1721,7 +1808,7 @@ impl DamGui {
                 human_bytes(a.size),
             );
             if ui.selectable_label(selected, text).clicked() {
-                *open_asset = Some(a.id);
+                *click = Some((a.id, click_mods(ui)));
             }
         }
     }
@@ -1731,7 +1818,7 @@ impl DamGui {
     fn grid(
         &self,
         ui: &mut egui::Ui,
-        open_asset: &mut Option<AssetId>,
+        click: &mut Option<(AssetId, ClickMods)>,
         to_load: &mut Vec<AssetId>,
     ) {
         const TILE: f32 = 128.0;
@@ -1743,7 +1830,7 @@ impl DamGui {
                 let (rect, resp) =
                     ui.allocate_exact_size(egui::vec2(CARD_W, CARD_H), egui::Sense::click());
                 if resp.clicked() {
-                    *open_asset = Some(a.id);
+                    *click = Some((a.id, click_mods(ui)));
                 }
                 if !ui.is_rect_visible(rect) {
                     continue;
@@ -1754,7 +1841,7 @@ impl DamGui {
                 }
 
                 let painter = ui.painter_at(rect);
-                let selected = self.selected == Some(a.id);
+                let selected = self.selected == Some(a.id) || self.selection.contains(&a.id);
                 if selected {
                     painter.rect_filled(rect, 4.0, ui.visuals().selection.bg_fill);
                 } else if resp.hovered() {
@@ -2076,6 +2163,15 @@ fn media_tag(m: MediaType) -> &'static str {
         MediaType::Audio => "[AUD]",
         MediaType::Image => "[IMG]",
         MediaType::Model => "[3D ]",
+    }
+}
+
+/// Read the ctrl/cmd + shift modifiers at click time (for multi-select).
+fn click_mods(ui: &egui::Ui) -> ClickMods {
+    let m = ui.input(|i| i.modifiers);
+    ClickMods {
+        toggle: m.ctrl || m.command,
+        range: m.shift,
     }
 }
 
