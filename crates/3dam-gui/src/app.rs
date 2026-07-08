@@ -347,6 +347,32 @@ fn compute_peaks(bytes: &[u8]) -> Result<Vec<f32>, String> {
     Ok(peaks)
 }
 
+/// The media-specific "detail" column value from `key_attrs` (mirrors the web `detailAttr`):
+/// image dimensions, audio duration (+ analysis type), or model triangle count.
+fn detail_attr(a: &AssetSummary) -> Option<String> {
+    let k = &a.key_attrs;
+    match a.media {
+        MediaType::Image => k.get("dimensions").cloned(),
+        MediaType::Audio => match (k.get("duration"), k.get("type")) {
+            (Some(d), Some(t)) => Some(format!("{d} · {t}")),
+            (Some(d), None) => Some(d.clone()),
+            (None, Some(t)) => Some(t.clone()),
+            (None, None) => None,
+        },
+        MediaType::Model => k.get("tris").map(|t| format!("{t} tris")),
+    }
+}
+
+/// A short display label for a license status (matches the web sidebar labels).
+fn license_label(status: LicenseStatus) -> &'static str {
+    match status {
+        LicenseStatus::Permissive => "Permissive",
+        LicenseStatus::Attribution => "Attribution",
+        LicenseStatus::Restricted => "Restricted",
+        LicenseStatus::Unknown => "Unknown",
+    }
+}
+
 /// Paint a mirrored waveform (accent bars around a centre line) from normalised peaks.
 fn draw_waveform(ui: &mut egui::Ui, peaks: &[f32]) {
     let width = ui.available_width().min(300.0);
@@ -2076,6 +2102,8 @@ impl eframe::App for DamGui {
         // Actions gathered while rendering (immutable borrows of self), applied after the panels.
         let mut do_query = false;
         let mut grid_click: Option<(AssetId, ClickMods)> = None;
+        // A table-header sort click (new SORTS index), applied post-panel to re-query.
+        let mut sort_click: Option<usize> = None;
         let mut nav = NavActions::default();
         let mut tag_review: Option<(AssetId, String, ReviewAction)> = None;
         let mut asset_action: Option<AssetAction> = None;
@@ -2733,7 +2761,7 @@ impl eframe::App for DamGui {
                     } else if self.view == View::Grid {
                         self.grid(ui, &mut grid_click, &mut to_load, &mut asset_action);
                     } else {
-                        self.list(ui, &mut grid_click, &mut asset_action);
+                        self.list(ui, &mut grid_click, &mut asset_action, &mut sort_click);
                     }
                 });
         });
@@ -2940,6 +2968,14 @@ impl eframe::App for DamGui {
             do_query = true;
         }
 
+        // A table-header sort click changes the sort preset and re-queries.
+        if let Some(idx) = sort_click {
+            if idx != self.sort {
+                self.sort = idx;
+                do_query = true;
+            }
+        }
+
         // Advanced Search modal — returns true when the filter set changed (re-query).
         if self.advanced_modal(ctx) {
             do_query = true;
@@ -3052,27 +3088,182 @@ impl eframe::App for DamGui {
 }
 
 impl DamGui {
-    /// The flat text list (audio-friendly; the web "table" analogue).
+    /// The list view — a responsive multi-column table (Name · Format · License · Detail · Size)
+    /// mirroring the web table. Optional columns drop as the panel narrows so nothing overlaps. The
+    /// Name and Size headers are clickable to sort; a click posts the new `SORTS` index via
+    /// `sort_click` (the other columns aren't sortable).
     fn list(
         &self,
         ui: &mut egui::Ui,
         click: &mut Option<(AssetId, ClickMods)>,
         menu: &mut Option<AssetAction>,
+        sort_click: &mut Option<usize>,
     ) {
-        for a in &self.assets {
-            let selected = self.selected == Some(a.id) || self.selection.contains(&a.id);
-            let text = format!(
-                "{}   {}   ·   {}   ·   {}",
-                media_tag(a.media),
-                a.name,
-                a.format.to_uppercase(),
-                human_bytes(a.size),
+        const FORMAT_W: f32 = 56.0;
+        const LICENSE_W: f32 = 96.0;
+        const DETAIL_W: f32 = 150.0;
+        const SIZE_W: f32 = 74.0;
+        const ROW_H: f32 = 20.0;
+        let w = ui.available_width();
+        // Drop optional columns as width shrinks (Name + Size are always shown) so they never collide.
+        let show_format = w >= 360.0;
+        let show_license = w >= 470.0;
+        let show_detail = w >= 620.0;
+        let fixed = SIZE_W
+            + if show_format { FORMAT_W } else { 0.0 }
+            + if show_license { LICENSE_W } else { 0.0 }
+            + if show_detail { DETAIL_W } else { 0.0 };
+        let name_w = (w - fixed - 8.0).max(80.0);
+        let name_end = 4.0 + name_w; // NAME column right edge / start of the optional columns
+        let mut cx = name_end;
+        let format_x = cx;
+        if show_format {
+            cx += FORMAT_W;
+        }
+        let license_x = cx;
+        if show_license {
+            cx += LICENSE_W;
+        }
+        let detail_x = cx;
+        if show_detail {
+            cx += DETAIL_W;
+        }
+        let size_col_x = cx; // left edge of the (right-aligned) size column
+        let font = egui::FontId::proportional(11.0);
+        let name_chars = ((name_w - 34.0) / 6.2).max(6.0) as usize; // media tag + ellipsised name
+
+        // Sort state → header arrows (ASCII; the egui default font lacks ↑/↓ glyphs).
+        let name_active = self.sort <= 1;
+        let size_active = self.sort == 2 || self.sort == 3;
+        let arrow = |asc_idx: usize| if self.sort == asc_idx { " ^" } else { " v" };
+        let name_hdr = format!("NAME{}", if name_active { arrow(0) } else { "" });
+        let size_hdr = format!("SIZE{}", if size_active { arrow(3) } else { "" });
+        let dim = ui.visuals().weak_text_color();
+        let fg = ui.visuals().text_color();
+
+        // Paint one table row's cells into `rect` (shared by the header and data rows).
+        let paint_row = |p: &egui::Painter,
+                         rect: egui::Rect,
+                         name: &str,
+                         name_col: egui::Color32,
+                         format: &str,
+                         license: &str,
+                         detail: Option<&str>,
+                         size: &str,
+                         size_col: egui::Color32| {
+            let y = rect.center().y;
+            let l = rect.left();
+            p.text(
+                egui::pos2(l + 4.0, y),
+                egui::Align2::LEFT_CENTER,
+                name,
+                font.clone(),
+                name_col,
             );
-            let resp = ui.selectable_label(selected, text);
+            if show_format {
+                p.text(
+                    egui::pos2(l + format_x, y),
+                    egui::Align2::LEFT_CENTER,
+                    format,
+                    font.clone(),
+                    dim,
+                );
+            }
+            if show_license {
+                p.text(
+                    egui::pos2(l + license_x, y),
+                    egui::Align2::LEFT_CENTER,
+                    license,
+                    font.clone(),
+                    dim,
+                );
+            }
+            if show_detail {
+                if let Some(d) = detail {
+                    p.text(
+                        egui::pos2(l + detail_x, y),
+                        egui::Align2::LEFT_CENTER,
+                        d,
+                        font.clone(),
+                        dim,
+                    );
+                }
+            }
+            p.text(
+                egui::pos2(rect.right() - 4.0, y),
+                egui::Align2::RIGHT_CENTER,
+                size,
+                font.clone(),
+                size_col,
+            );
+        };
+
+        // ── header (clickable Name / Size) ──
+        let (hrect, _) = ui.allocate_exact_size(egui::vec2(w, ROW_H), egui::Sense::hover());
+        paint_row(
+            &ui.painter_at(hrect),
+            hrect,
+            &name_hdr,
+            if name_active { fg } else { dim },
+            "FORMAT",
+            "LICENSE",
+            Some("DETAIL"),
+            &size_hdr,
+            if size_active { fg } else { dim },
+        );
+        // Two explicit interaction rects for the sortable columns — more reliable than hit-testing a
+        // single wide response's pointer position (which can be `None` on release).
+        let name_rect = egui::Rect::from_min_max(
+            hrect.left_top(),
+            egui::pos2(hrect.left() + name_end, hrect.bottom()),
+        );
+        let size_rect = egui::Rect::from_min_max(
+            egui::pos2(hrect.left() + size_col_x, hrect.top()),
+            hrect.right_bottom(),
+        );
+        if ui
+            .interact(name_rect, ui.id().with("sort-name"), egui::Sense::click())
+            .clicked()
+        {
+            *sort_click = Some(if self.sort == 0 { 1 } else { 0 }); // Name A-Z ⇄ Z-A
+        }
+        if ui
+            .interact(size_rect, ui.id().with("sort-size"), egui::Sense::click())
+            .clicked()
+        {
+            *sort_click = Some(if self.sort == 2 { 3 } else { 2 }); // Largest ⇄ Smallest
+        }
+        ui.separator();
+
+        // ── rows ──
+        for a in &self.assets {
+            let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, ROW_H), egui::Sense::click());
             if resp.clicked() {
                 *click = Some((a.id, click_mods(ui)));
             }
             resp.context_menu(|ui| asset_context_menu(ui, a, menu));
+            if !ui.is_rect_visible(rect) {
+                continue;
+            }
+            let selected = self.selected == Some(a.id) || self.selection.contains(&a.id);
+            let p = ui.painter_at(rect);
+            if selected {
+                p.rect_filled(rect, 3.0, ui.visuals().selection.bg_fill);
+            } else if resp.hovered() {
+                p.rect_filled(rect, 3.0, ui.visuals().widgets.hovered.bg_fill);
+            }
+            let detail = detail_attr(a).map(|d| ellipsize(&d, 20));
+            paint_row(
+                &p,
+                rect,
+                &format!("{}  {}", media_tag(a.media), ellipsize(&a.name, name_chars)),
+                fg,
+                &a.format.to_uppercase(),
+                license_label(a.license.status),
+                detail.as_deref(),
+                &human_bytes(a.size),
+                dim,
+            );
         }
     }
 

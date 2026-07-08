@@ -34,7 +34,7 @@ Legend: ✅ done · 🟡 partial · ⬜ owed (not yet in egui)
 | Quick class facet (audio/image/model class) | ✅ | ✅ | contextual chips in the left rail when a media type is active |
 | Favorites / Recently added | ✅ | 🟡 | favourites facet done; "recently added" = the Newest sort |
 | Collections & smart folders | ✅ | ✅ | list + browse-by + "+ New" create (manual / smart-from-search) + right-click rename/delete + inspector add/remove membership |
-| Grid ⇄ list view toggle | ✅ | 🟡 | grid + flat list; the web "table" (sortable columns) is richer |
+| Grid ⇄ list view toggle | ✅ | ✅ | grid + a responsive multi-column table (Name·Format·License·Detail·Size); clickable Name/Size sort headers, columns drop as the panel narrows |
 | Sort control | ✅ | ✅ | toolbar combo (name/size/scanned, both directions) |
 | Tag review (reject/restore) | ✅ | ✅ | reject-only lifecycle in the inspector, refreshes on review |
 | Similar / duplicates | ✅ | 🟡 | "Find similar" + exact-dup group (keep marker) in the inspector; dedicated dedup page owed |
