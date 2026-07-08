@@ -193,6 +193,8 @@ enum Msg {
     Convert(Result<ConvertReport, String>),
     /// Raw bytes of an audio asset fetched for inspector playback.
     AudioBytes(AssetId, Result<Vec<u8>, String>),
+    /// The DMSH preview-mesh blob for a model asset (interactive 3D viewer).
+    ModelMesh(AssetId, Result<Vec<u8>, String>),
 }
 
 pub struct DamGui {
@@ -284,6 +286,8 @@ pub struct DamGui {
     audio_sink: Option<rodio::Sink>,
     audio_for: Option<AssetId>,
     audio_error: Option<String>,
+    /// Interactive 3D preview renderer (present only on the wgpu backend). `!Send`; UI-thread only.
+    viewer3d: Option<crate::viewer3d::Viewer3d>,
 }
 
 impl DamGui {
@@ -357,6 +361,10 @@ impl DamGui {
             audio_sink: None,
             audio_for: None,
             audio_error: None,
+            viewer3d: cc
+                .wgpu_render_state
+                .as_ref()
+                .map(crate::viewer3d::Viewer3d::new),
         };
         // Kick the initial loads against the freshly opened library.
         let egctx = cc.egui_ctx.clone();
@@ -624,6 +632,25 @@ impl DamGui {
         self.rt.spawn(async move {
             let r = lib.export(&auth, req).await.map_err(|e| e.to_string());
             let _ = tx.send(Msg::Export(r));
+            egctx.request_repaint();
+        });
+    }
+
+    /// Fetch a model's DMSH preview-mesh blob off-thread for the interactive 3D viewer.
+    fn load_model_mesh(&self, id: AssetId) {
+        let (lib, auth, tx, egctx) = (
+            self.lib.clone(),
+            self.auth.clone(),
+            self.tx.clone(),
+            self.egui_ctx.clone(),
+        );
+        self.rt.spawn(async move {
+            let r = lib
+                .read_model_preview(&auth, &id)
+                .await
+                .map(|c| c.bytes)
+                .map_err(|e| e.to_string());
+            let _ = tx.send(Msg::ModelMesh(id, r));
             egctx.request_repaint();
         });
     }
@@ -957,8 +984,24 @@ impl DamGui {
                 self.error = Some(format!("Search failed: {e}"));
             }
             Msg::Detail(Ok(asset)) => {
+                // Kick the interactive-3D mesh fetch for a previewable model (not .blend/USD; those
+                // fall back to the turntable still / typed tile).
+                let id = asset.summary.id;
+                let previewable_model = asset.summary.media == MediaType::Model
+                    && !matches!(
+                        asset.summary.format.as_str(),
+                        "blend" | "usd" | "usdz" | "usdc" | "usda"
+                    );
                 self.detail = Some(asset);
                 self.detail_loading = false;
+                if previewable_model
+                    && self
+                        .viewer3d
+                        .as_ref()
+                        .is_some_and(|v| v.model_for != Some(id))
+                {
+                    self.load_model_mesh(id);
+                }
             }
             Msg::Detail(Err(e)) => {
                 self.detail_loading = false;
@@ -1019,6 +1062,12 @@ impl DamGui {
             Msg::AudioBytes(_, Err(e)) => {
                 self.audio_error = Some(format!("couldn't read audio: {e}"))
             }
+            Msg::ModelMesh(id, Ok(bytes)) => {
+                if let Some(v) = &mut self.viewer3d {
+                    let _ = v.set_model(id, &bytes); // fail-soft: inspector uses the still on error
+                }
+            }
+            Msg::ModelMesh(_, Err(_)) => {}
 
             // Map a live event to the coalesced refresh flags (flushed, throttled, in `update`).
             Msg::Event(ev) => match ev {
@@ -1171,6 +1220,25 @@ impl eframe::App for DamGui {
         let mut pick_collection: Option<Option<CollectionId>> = None;
         let mut audio_play: Option<AssetId> = None;
         let mut audio_stop = false;
+        let mut orbit_drag = egui::Vec2::ZERO;
+        let mut orbit_scroll = 0.0f32;
+
+        // Render the interactive 3D preview into its off-screen texture when the selected asset is a
+        // model whose mesh is loaded — the inspector then draws it in place of the turntable still.
+        let show_3d = self.selected.is_some()
+            && self
+                .detail
+                .as_ref()
+                .is_some_and(|a| a.summary.media == MediaType::Model)
+            && self
+                .viewer3d
+                .as_ref()
+                .is_some_and(|v| v.model_for == self.selected);
+        let model_tex = if show_3d {
+            self.viewer3d.as_mut().map(|v| v.render())
+        } else {
+            None
+        };
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.add_space(4.0);
@@ -1483,7 +1551,28 @@ impl eframe::App for DamGui {
                                 Some(Thumb::Ready(tex)) => Some(tex),
                                 _ => None,
                             };
-                            inspector(ui, asset, thumb, &mut tag_review, &mut asset_action);
+                            // Interactive 3D preview replaces the still when the mesh is loaded.
+                            if let Some(tex) = model_tex {
+                                let sz = ui.available_width().min(300.0);
+                                let resp = ui.add(
+                                    egui::Image::new((tex, egui::vec2(sz, sz)))
+                                        .sense(egui::Sense::drag()),
+                                );
+                                if resp.dragged() {
+                                    orbit_drag = resp.drag_delta();
+                                }
+                                if resp.hovered() {
+                                    orbit_scroll = ui.input(|i| i.raw_scroll_delta.y);
+                                }
+                                ui.label(
+                                    egui::RichText::new("drag to orbit · scroll to zoom")
+                                        .small()
+                                        .weak(),
+                                );
+                                inspector(ui, asset, None, &mut tag_review, &mut asset_action);
+                            } else {
+                                inspector(ui, asset, thumb, &mut tag_review, &mut asset_action);
+                            }
 
                             // Audio preview: play/stop the selected audio asset (rodio).
                             if asset.summary.media == MediaType::Audio {
@@ -1881,6 +1970,13 @@ impl eframe::App for DamGui {
         }
         if audio_stop {
             self.stop_audio();
+        }
+        // Apply an orbit/zoom to the 3D preview and repaint so it re-renders this interaction.
+        if orbit_drag != egui::Vec2::ZERO || orbit_scroll != 0.0 {
+            if let Some(v) = &mut self.viewer3d {
+                v.orbit(orbit_drag, orbit_scroll);
+            }
+            ctx.request_repaint();
         }
         match asset_action {
             Some(AssetAction::Reanalyze(id)) => self.submit_analyze_asset(id),

@@ -1551,10 +1551,12 @@ dependencies = [
 name = "dam-gui"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "dam-api",
  "dam-frontend",
  "eframe",
  "futures",
+ "glam",
  "image",
  "rodio",
  "tokio",
