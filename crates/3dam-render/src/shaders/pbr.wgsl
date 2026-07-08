@@ -9,8 +9,8 @@ struct Globals {
 };
 
 struct MaterialU {
-    base_color: vec4<f32>,  // rgba factor
-    mr: vec4<f32>,          // x = metallic, y = roughness
+    base_color: vec4<f32>,  // rgba factor (a = opacity)
+    mr: vec4<f32>,          // x = metallic, y = roughness, z = alpha cutoff, w = alpha mode (0/1/2)
     emissive: vec4<f32>,    // rgb factor
     flags: vec4<f32>,       // x has_base, y has_mr, z has_normal, w has_emissive
 };
@@ -97,10 +97,14 @@ fn direct_light(
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    // Albedo (base colour texture is sRGB → linear on sample) × factor × vertex colour.
+    // Albedo (base colour texture is sRGB → linear on sample) × factor × vertex colour. The base
+    // texture's alpha (linear, not sRGB-encoded) multiplies the base-colour opacity for mask/blend.
     var albedo = mat.base_color.rgb * in.color.rgb;
+    var alpha = mat.base_color.a * in.color.a;
     if (mat.flags.x > 0.5) {
-        albedo = albedo * textureSample(base_tex, samp, in.uv).rgb;
+        let bs = textureSample(base_tex, samp, in.uv);
+        albedo = albedo * bs.rgb;
+        alpha = alpha * bs.a;
     }
 
     var metallic = mat.mr.x;
@@ -148,5 +152,20 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
     // Reinhard tone-map + write linear to the sRGB target (hardware encodes).
     let mapped = lo / (lo + vec3<f32>(1.0));
-    return vec4<f32>(mapped, 1.0);
+
+    // Alpha mode: 0 opaque, 1 mask, 2 blend. Opaque/mask write fully opaque (mask discards below its
+    // cutoff — deferred to here so texture sampling stays in uniform control flow). Blend keeps the
+    // opacity, firmed up at grazing angles by a Fresnel term so glass reads as glass: see-through
+    // face-on, reflective at the silhouette.
+    let alpha_mode = mat.mr.w;
+    let cutoff = mat.mr.z;
+    var out_a = 1.0;
+    if (alpha_mode > 1.5) {
+        let ndv = max(dot(n, v), 0.0);
+        let fres = pow(1.0 - ndv, 5.0);
+        out_a = clamp(alpha + (1.0 - alpha) * fres, 0.0, 1.0);
+    } else if (alpha_mode > 0.5) {
+        if (alpha < cutoff) { discard; }
+    }
+    return vec4<f32>(mapped, out_a);
 }

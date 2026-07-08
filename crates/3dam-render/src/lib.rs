@@ -107,8 +107,9 @@ pub fn render_model_thumbnail_png(
 /// key). v2: Assimp import backend + textured metallic-roughness PBR. v3: FlipUVs — corrects the
 /// vertically-flipped textures (Assimp emits lower-left UVs; the pipeline samples top-left). v4:
 /// game-asset companion-map discovery + sibling texture folders, dropped uniform-constant vertex
-/// colours (export junk that tinted albedo), shininess→roughness, and SSAA thumbnails.
-pub const RENDER_VERSION: u32 = 4;
+/// colours (export junk that tinted albedo), shininess→roughness, and SSAA thumbnails. v5: material
+/// transparency — glTF `alphaMode`/opacity/transmission render as alpha-blended glass, not opaque.
+pub const RENDER_VERSION: u32 = 5;
 
 /// Decode a model to the compact self-contained `DMSH` blob the browser 3D island uploads
 /// directly (see [`preview`]). Reuses the **same Assimp decode** as the turntable thumbnail, so the
@@ -131,5 +132,6 @@ pub fn model_preview_blob(path: &Path, format: &str) -> Result<Vec<u8>, RenderEr
 /// in the shared decode — corrects the vertically-flipped textures in the interactive viewer. v3:
 /// companion-map discovery + sibling texture folders + dropped uniform-constant vertex colours (the
 /// shared decode now feeds the viewer the same faithful materials as the thumbnail), and the raised
-/// preview texture cap.
-pub const PREVIEW_VERSION: u32 = 3;
+/// preview texture cap. v4: `DMSH` v2 — per-material `alpha_mode`/`alpha_cutoff` so the viewer
+/// renders transparency (glass) instead of forcing every surface opaque.
+pub const PREVIEW_VERSION: u32 = 4;

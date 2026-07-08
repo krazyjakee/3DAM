@@ -56,21 +56,24 @@ struct Globals {
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct MaterialU {
     base_color: [f32; 4],
-    mr: [f32; 4],       // x = metallic, y = roughness
+    mr: [f32; 4], // x = metallic, y = roughness, z = alpha cutoff, w = alpha mode (0/1/2)
     emissive: [f32; 4], // rgb factor
-    flags: [f32; 4],    // x has_base, y has_mr, z has_normal, w has_emissive
+    flags: [f32; 4], // x has_base, y has_mr, z has_normal, w has_emissive
 }
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const SRGB: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 const LINEAR: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
-/// Uploaded geometry for one submesh: two buffers, an index count, and its material slot.
+/// Uploaded geometry for one submesh: two buffers, an index count, its material slot, whether that
+/// material is blended (glass), and a centroid for back-to-front sorting of the blended pass.
 struct GpuMesh {
     vbuf: wgpu::Buffer,
     ibuf: wgpu::Buffer,
     index_count: u32,
     material: usize,
+    blend: bool,
+    centroid: glam::Vec3,
 }
 
 /// 1×1 fallback textures for absent material maps (same neutral values as the headless renderer).
@@ -84,7 +87,10 @@ struct Defaults {
 /// Owns the pipeline, the per-frame globals, the depth target, and (once a model is loaded) the
 /// per-submesh GPU meshes + per-material bind groups. `render()` is the single draw loop.
 pub struct ModelRenderer {
+    /// Opaque + mask surfaces: replace blend, depth-write on.
     pipeline: wgpu::RenderPipeline,
+    /// Blended (glass) surfaces: alpha blend, depth-test on / depth-write off, drawn back-to-front.
+    pipeline_blend: wgpu::RenderPipeline,
     globals_buf: wgpu::Buffer,
     globals_group: wgpu::BindGroup,
     material_bgl: wgpu::BindGroupLayout,
@@ -190,44 +196,51 @@ impl ModelRenderer {
             immediate_size: 0,
         });
 
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("viewer-pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[Some(Vertex::layout())],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: ctx.config.format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState {
-                // Two-sided: game assets often ship inconsistent winding (matches dam-render).
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::Less),
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState {
-                count: sample_count,
-                ..Default::default()
-            },
-            multiview_mask: None,
-            cache: None,
-        });
+        // Opaque and blend variants share everything but the blend state + depth-write. Blended glass
+        // depth-tests against the opaque pass (so it's occluded correctly) but never writes depth, and
+        // is drawn back-to-front at render time so overlapping panes composite in the right order.
+        let make_pipeline = |blend: wgpu::BlendState, depth_write: bool| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("viewer-pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[Some(Vertex::layout())],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: ctx.config.format,
+                        blend: Some(blend),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    // Two-sided: game assets often ship inconsistent winding (matches dam-render).
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(depth_write),
+                    depth_compare: Some(wgpu::CompareFunction::Less),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState {
+                    count: sample_count,
+                    ..Default::default()
+                },
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let pipeline = make_pipeline(wgpu::BlendState::REPLACE, true);
+        let pipeline_blend = make_pipeline(wgpu::BlendState::ALPHA_BLENDING, false);
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("viewer-sampler"),
@@ -262,6 +275,8 @@ impl ModelRenderer {
                 mr: None,
                 normal: None,
                 emissive_tex: None,
+                alpha_mode: 0,
+                alpha_cutoff: 0.5,
             },
             &[],
         );
@@ -273,6 +288,7 @@ impl ModelRenderer {
 
         Self {
             pipeline,
+            pipeline_blend,
             globals_buf,
             globals_group,
             material_bgl,
@@ -309,6 +325,11 @@ impl ModelRenderer {
                 }),
                 index_count: s.indices.len() as u32,
                 material: s.material,
+                blend: model
+                    .materials
+                    .get(s.material)
+                    .is_some_and(|m| m.alpha_mode == 2),
+                centroid: submesh_centroid(&s.vertices),
             })
             .collect();
 
@@ -405,17 +426,36 @@ impl ModelRenderer {
             });
 
             if !self.meshes.is_empty() {
-                pass.set_pipeline(&self.pipeline);
-                pass.set_bind_group(0, &self.globals_group, &[]);
-                for mesh in &self.meshes {
-                    let mat = self
-                        .materials
-                        .get(mesh.material)
-                        .unwrap_or(&self.fallback_material);
+                let materials = &self.materials;
+                let fallback = &self.fallback_material;
+                let draw = |pass: &mut wgpu::RenderPass, mesh: &GpuMesh| {
+                    let mat = materials.get(mesh.material).unwrap_or(fallback);
                     pass.set_bind_group(1, mat, &[]);
                     pass.set_vertex_buffer(0, mesh.vbuf.slice(..));
                     pass.set_index_buffer(mesh.ibuf.slice(..), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                };
+
+                // Opaque + mask surfaces first (depth-writing), then blended glass back-to-front from
+                // the current orbit camera so overlapping panes composite correctly.
+                pass.set_bind_group(0, &self.globals_group, &[]);
+                pass.set_pipeline(&self.pipeline);
+                for mesh in self.meshes.iter().filter(|m| !m.blend) {
+                    draw(&mut pass, mesh);
+                }
+
+                let mut blended: Vec<&GpuMesh> = self.meshes.iter().filter(|m| m.blend).collect();
+                if !blended.is_empty() {
+                    let eye = camera.eye_pos();
+                    blended.sort_by(|a, b| {
+                        let da = (a.centroid - eye).length_squared();
+                        let db = (b.centroid - eye).length_squared();
+                        db.total_cmp(&da) // farthest first (painter's order)
+                    });
+                    pass.set_pipeline(&self.pipeline_blend);
+                    for mesh in blended {
+                        draw(&mut pass, mesh);
+                    }
                 }
             }
         }
@@ -448,7 +488,7 @@ fn build_material(
 
     let uniform = MaterialU {
         base_color: m.base_color,
-        mr: [m.metallic, m.roughness, 0.0, 0.0],
+        mr: [m.metallic, m.roughness, m.alpha_cutoff, m.alpha_mode as f32],
         emissive: [m.emissive[0], m.emissive[1], m.emissive[2], 0.0],
         flags: [
             m.base.is_some() as u32 as f32,
@@ -535,6 +575,16 @@ fn upload_texture(
         size,
     );
     tex.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+/// Average vertex position of a submesh — a cheap centroid for back-to-front sorting of blended
+/// (glass) surfaces against the orbit camera. Vertexless runs never reach here.
+fn submesh_centroid(vertices: &[Vertex]) -> glam::Vec3 {
+    if vertices.is_empty() {
+        return glam::Vec3::ZERO;
+    }
+    let sum: glam::Vec3 = vertices.iter().map(|v| glam::Vec3::from(v.pos)).sum();
+    sum / vertices.len() as f32
 }
 
 /// A 1×1 texture of a single RGBA colour — the neutral stand-in for an absent material map.

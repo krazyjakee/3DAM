@@ -5,14 +5,17 @@
 //! so every professional format renders identically and the browser never re-parses buffers or
 //! textures — which is what retired the fragile loose-glTF "missing or unreadable buffers" path.
 //!
-//! ## Wire format (`DMSH` v1, little-endian)
+//! ## Wire format (`DMSH` v2, little-endian)
 //! ```text
-//! magic  "DMSH" (4 B) · version u32 (=1) · bounds 6×f32 (min xyz, max xyz)
+//! magic  "DMSH" (4 B) · version u32 (=2) · bounds 6×f32 (min xyz, max xyz)
 //! n_tex  u32 · per tex: len u32, png bytes[len]
 //! n_mat  u32 · per mat: base_color 4×f32, metallic f32, roughness f32, emissive 3×f32,
-//!             tex_base u32, tex_mr u32, tex_normal u32, tex_emissive u32   (u32::MAX = none)
+//!             tex_base u32, tex_mr u32, tex_normal u32, tex_emissive u32   (u32::MAX = none),
+//!             alpha_mode u32 (0 opaque, 1 mask, 2 blend), alpha_cutoff f32
 //! n_sub  u32 · per sub: material u32, n_vert u32, verts[n_vert], n_idx u32, idx[n_idx] u32
 //! ```
+//! v2 appended `alpha_mode`/`alpha_cutoff` so the interactive viewer renders transparency (glass)
+//! the same way the turntable thumbnail does.
 //! Vertices are [`model::Vertex`](crate::model::Vertex) verbatim (`bytemuck`-castable on both ends).
 //! Textures are PNG-encoded and downscaled to [`MAX_TEX`] px on the long edge so the blob stays
 //! small over the wire — a browser preview never needs an 8k material map.
@@ -36,7 +39,7 @@ const NONE: u32 = u32::MAX;
 pub fn serialize(model: &Model) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(MAGIC);
-    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(&2u32.to_le_bytes());
 
     for v in [model.bounds.min, model.bounds.max] {
         out.extend_from_slice(&v.x.to_le_bytes());
@@ -75,6 +78,8 @@ pub fn serialize(model: &Model) -> Vec<u8> {
         for s in slots {
             out.extend_from_slice(&s.to_le_bytes());
         }
+        out.extend_from_slice(&m.alpha_mode.as_u32().to_le_bytes());
+        out.extend_from_slice(&m.alpha_cutoff.to_le_bytes());
     }
 
     out.extend_from_slice(&(model.submeshes.len() as u32).to_le_bytes());

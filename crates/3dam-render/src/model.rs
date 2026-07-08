@@ -62,6 +62,28 @@ pub struct TexImage {
     pub height: u32,
 }
 
+/// How a material's alpha is interpreted (glTF `alphaMode`). Drives the render/viewer draw order and
+/// blend state: `Opaque`/`Mask` render in the depth-writing opaque pass (Mask discards below its
+/// cutoff), `Blend` renders back-to-front with alpha blending and no depth write.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum AlphaMode {
+    #[default]
+    Opaque,
+    Mask,
+    Blend,
+}
+
+impl AlphaMode {
+    /// Wire/shader encoding (0 = opaque, 1 = mask, 2 = blend).
+    pub fn as_u32(self) -> u32 {
+        match self {
+            AlphaMode::Opaque => 0,
+            AlphaMode::Mask => 1,
+            AlphaMode::Blend => 2,
+        }
+    }
+}
+
 /// A metallic-roughness PBR material. Textures are optional; factors apply when a map is absent.
 pub struct Material {
     pub base_color: [f32; 4],
@@ -73,6 +95,11 @@ pub struct Material {
     pub mr_tex: Option<TexImage>,
     pub normal_tex: Option<TexImage>,
     pub emissive_tex: Option<TexImage>,
+    /// Alpha interpretation. `base_color[3]` (× a base texture's alpha) is the opacity; for `Blend`
+    /// glass this is what makes it see-through.
+    pub alpha_mode: AlphaMode,
+    /// `Mask` coverage threshold (glTF `alphaCutoff`, default 0.5); ignored for `Opaque`/`Blend`.
+    pub alpha_cutoff: f32,
 }
 
 /// A run of geometry sharing one material.
@@ -300,6 +327,8 @@ fn load_material(m: &AiMaterial, dir: &Path) -> Material {
         base_factor
     };
 
+    let (alpha_mode, alpha_cutoff, base_color) = resolve_alpha(m, base_color);
+
     Material {
         base_color,
         metallic,
@@ -309,7 +338,61 @@ fn load_material(m: &AiMaterial, dir: &Path) -> Material {
         mr_tex: mr.map(|r| r.img),
         normal_tex: normal.map(|r| r.img),
         emissive_tex: emissive_tex.map(|r| r.img),
+        alpha_mode,
+        alpha_cutoff,
     }
+}
+
+/// Resolve a material's alpha interpretation from the assorted signals Assimp exposes, returning the
+/// mode, the mask cutoff, and a possibly-adjusted base colour whose `[3]` carries the final opacity.
+///
+/// Priority: glTF's explicit `alphaMode` wins when present (the car-glass case — `BLEND` with a
+/// base-colour alpha < 1). Otherwise transparency is inferred so non-glTF formats and PBR extensions
+/// still read as glass: `KHR_materials_transmission` (`$mat.transmission.factor`) and a generic
+/// `$mat.opacity` (`d`/`Tr` in OBJ/FBX) both fold into the base alpha and promote the mode to
+/// `Blend`. A bare base-colour alpha < 1 with no declared mode is treated as `Blend` too.
+///
+/// Transmission is a coarse approximation — we render it as a see-through blended surface (specular
+/// highlights survive; refraction/roughness-blur do not), which is the honest limit of a
+/// single-pass forward preview without an OIT/transmission pass.
+fn resolve_alpha(m: &AiMaterial, base_color: [f32; 4]) -> (AlphaMode, f32, [f32; 4]) {
+    let cutoff = prop_f32(m, "$mat.gltf.alphaCutoff").unwrap_or(0.5);
+    let mut alpha = base_color[3];
+    let mut mode = match prop_string(m, "$mat.gltf.alphaMode").as_deref() {
+        Some("BLEND") => AlphaMode::Blend,
+        Some("MASK") => AlphaMode::Mask,
+        _ => AlphaMode::Opaque, // "OPAQUE", absent, or unknown → refine from other signals below
+    };
+
+    // Generic opacity (OBJ `d`/`Tr`, FBX transparency). Ignore a bogus exact-0 (common export junk
+    // that would wrongly vanish an opaque mesh); a genuine 0..1 folds into the base alpha.
+    if let Some(op) = prop_f32(m, "$mat.opacity") {
+        if op > 0.0 && op < 1.0 {
+            alpha = alpha.min(op);
+            if mode == AlphaMode::Opaque {
+                mode = AlphaMode::Blend;
+            }
+        }
+    }
+
+    // KHR_materials_transmission → approximate as blended glass. Keep a little body (×0.85) so a
+    // fully-transmissive pane still catches light rather than disappearing entirely.
+    if let Some(t) = prop_f32(m, "$mat.transmission.factor") {
+        if t > 0.0 {
+            alpha = alpha.min(1.0 - t * 0.85);
+            if mode == AlphaMode::Opaque {
+                mode = AlphaMode::Blend;
+            }
+        }
+    }
+
+    // A base-colour alpha < 1 with no declared mode (some exporters omit alphaMode) still means blend.
+    if mode == AlphaMode::Opaque && alpha < 0.999 {
+        mode = AlphaMode::Blend;
+    }
+
+    let base_color = [base_color[0], base_color[1], base_color[2], alpha];
+    (mode, cutoff, base_color)
 }
 
 /// Convert a legacy Phong specular `shininess` exponent to a perceptual roughness in `[0,1]`
@@ -346,6 +429,17 @@ fn prop_floats(m: &AiMaterial, key: &str) -> Option<Vec<f32>> {
 
 fn prop_f32(m: &AiMaterial, key: &str) -> Option<f32> {
     prop_floats(m, key).and_then(|v| v.first().copied())
+}
+
+/// A string material property (e.g. glTF `$mat.gltf.alphaMode` → `"OPAQUE"`/`"MASK"`/`"BLEND"`).
+fn prop_string(m: &AiMaterial, key: &str) -> Option<String> {
+    m.properties.iter().find(|p| p.key == key).and_then(|p| {
+        if let PropertyTypeInfo::String(s) = &p.data {
+            Some(s.clone())
+        } else {
+            None
+        }
+    })
 }
 
 fn prop_vec3(m: &AiMaterial, key: &str) -> Option<[f32; 3]> {

@@ -28,6 +28,10 @@ pub struct CpuMaterial {
     pub mr: Option<usize>,
     pub normal: Option<usize>,
     pub emissive_tex: Option<usize>,
+    /// Alpha interpretation (0 = opaque, 1 = mask, 2 = blend); drives draw order + blend state.
+    pub alpha_mode: u32,
+    /// Mask coverage threshold (glTF `alphaCutoff`); only meaningful when `alpha_mode == 1`.
+    pub alpha_cutoff: f32,
 }
 
 /// A run of geometry sharing one material (index into [`CpuModel::materials`]).
@@ -78,7 +82,7 @@ fn slot(v: u32) -> Option<usize> {
     (v != u32::MAX).then_some(v as usize)
 }
 
-/// Decode a `DMSH` v1 blob. `Err` (bad magic/version, truncation, undecodable texture) surfaces to
+/// Decode a `DMSH` v2 blob. `Err` (bad magic/version, truncation, undecodable texture) surfaces to
 /// the wrapper as a readable "3D preview unavailable" state.
 pub fn parse(bytes: &[u8]) -> Result<CpuModel, String> {
     let mut c = Cursor { b: bytes, p: 0 };
@@ -86,7 +90,7 @@ pub fn parse(bytes: &[u8]) -> Result<CpuModel, String> {
         return Err("not a DMSH preview blob".to_string());
     }
     let version = c.u32()?;
-    if version != 1 {
+    if version != 2 {
         return Err(format!("unsupported DMSH version {version}"));
     }
 
@@ -122,6 +126,8 @@ pub fn parse(bytes: &[u8]) -> Result<CpuModel, String> {
             mr: slot(c.u32()?),
             normal: slot(c.u32()?),
             emissive_tex: slot(c.u32()?),
+            alpha_mode: c.u32()?,
+            alpha_cutoff: c.f32()?,
         });
     }
 

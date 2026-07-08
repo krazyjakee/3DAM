@@ -200,10 +200,11 @@ fn unsupported_format_is_soft_error() {
 
 /// Walk a `DMSH` blob's structure, asserting the layout is well-formed and the cursor consumes it
 /// exactly. Returns `(n_tex, n_mat, n_sub)` for content assertions. Mirrors the WASM parser and
-/// `dam-render`'s serializer (a `Vertex` is 16×f32 = 64 bytes; a material is 52 bytes).
+/// `dam-render`'s serializer (a `Vertex` is 16×f32 = 64 bytes; a material is 60 bytes).
 fn parse_dmsh(blob: &[u8]) -> (u32, u32, u32) {
     const VERT: usize = 64;
-    const MAT: usize = 52; // base_color(16) + metallic(4) + roughness(4) + emissive(12) + 4 slots(16)
+    // base_color(16) + metallic(4) + roughness(4) + emissive(12) + 4 slots(16) + alpha_mode(4) + alpha_cutoff(4)
+    const MAT: usize = 60;
     let u32at = |p: &mut usize| {
         let v = u32::from_le_bytes(blob[*p..*p + 4].try_into().unwrap());
         *p += 4;
@@ -211,7 +212,7 @@ fn parse_dmsh(blob: &[u8]) -> (u32, u32, u32) {
     };
     assert_eq!(&blob[0..4], b"DMSH", "bad magic");
     let mut p = 4usize; // past the magic
-    assert_eq!(u32at(&mut p), 1, "unexpected DMSH version");
+    assert_eq!(u32at(&mut p), 2, "unexpected DMSH version");
     p += 24; // bounds: 6 × f32
 
     let n_tex = u32at(&mut p);
@@ -244,6 +245,39 @@ fn preview_blob_is_self_contained_and_textured() {
     assert!(
         n_tex >= 1,
         "a textured fixture must carry its texture in the self-contained blob"
+    );
+}
+
+#[test]
+fn preview_blob_encodes_blend_transparency() {
+    // A glTF material declaring `alphaMode:"BLEND"` with a base-colour alpha < 1 (the car-glass case)
+    // must reach the blob as a blended material carrying its opacity — not silently forced opaque.
+    let blob = dam_render::model_preview_blob(&fixture("glass_cube.gltf"), "gltf")
+        .expect("decode glass cube to DMSH");
+
+    let u32at = |p: usize| u32::from_le_bytes(blob[p..p + 4].try_into().unwrap());
+    let f32at = |p: usize| f32::from_bits(u32at(p));
+
+    // Walk to the first material record: magic(4) + version(4) + bounds(24), then the texture table.
+    let mut p = 4 + 4 + 24;
+    let n_tex = u32at(p);
+    p += 4;
+    for _ in 0..n_tex {
+        let len = u32at(p) as usize;
+        p += 4 + len;
+    }
+    let n_mat = u32at(p);
+    p += 4;
+    assert!(n_mat >= 1, "expected a material");
+
+    // Material layout: base_color(16) metallic(4) roughness(4) emissive(12) 4 slots(16)
+    // alpha_mode(4) alpha_cutoff(4).
+    let base_alpha = f32at(p + 12);
+    let alpha_mode = u32at(p + 52);
+    assert_eq!(alpha_mode, 2, "alphaMode:BLEND must serialize as blend (2)");
+    assert!(
+        (base_alpha - 0.25).abs() < 1e-4,
+        "base-colour alpha should survive to the blob, got {base_alpha}"
     );
 }
 

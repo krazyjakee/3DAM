@@ -6,7 +6,7 @@
 //! once and shared — device init is the dominant cost, so it must not happen per thumbnail.
 
 use crate::camera;
-use crate::model::{Material, Model, TexImage, Vertex};
+use crate::model::{AlphaMode, Material, Model, TexImage, Vertex};
 use crate::RenderError;
 use wgpu::util::DeviceExt;
 
@@ -38,6 +38,7 @@ struct Globals {
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct MaterialU {
     base_color: [f32; 4],
+    /// x = metallic, y = roughness, z = alpha cutoff (mask), w = alpha mode (0 opaque, 1 mask, 2 blend).
     mr: [f32; 4],
     emissive: [f32; 4],
     flags: [f32; 4],
@@ -46,7 +47,10 @@ struct MaterialU {
 pub struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
+    /// Opaque + mask surfaces: replace blend, depth-write on.
     pbr_pipeline: wgpu::RenderPipeline,
+    /// Blended (glass) surfaces: alpha blend, depth-test on but depth-write off, drawn back-to-front.
+    pbr_pipeline_blend: wgpu::RenderPipeline,
     mip_pipeline_srgb: wgpu::RenderPipeline,
     mip_pipeline_linear: wgpu::RenderPipeline,
     globals_bgl: wgpu::BindGroupLayout,
@@ -187,50 +191,57 @@ impl Renderer {
             bind_group_layouts: &[Some(&globals_bgl), Some(&material_bgl)],
             immediate_size: 0,
         });
-        let pbr_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("pbr-pipeline"),
-            layout: Some(&pbr_layout),
-            vertex: wgpu::VertexState {
-                module: &pbr_shader,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[Some(wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<Vertex>() as u64,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![
-                        0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Float32x2, 4 => Float32x4
-                    ],
-                })],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &pbr_shader,
-                entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: COLOR_FORMAT,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState {
-                cull_mode: None, // two-sided: game assets often have inconsistent winding
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::Less),
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState {
-                count: sample_count,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            multiview_mask: None,
-            cache: None,
-        });
+        // Opaque and blend variants share everything but the blend state + depth-write. Blended glass
+        // depth-tests against the opaque pass (so it's occluded correctly) but never writes depth, and
+        // is drawn back-to-front at render time so overlapping panes composite in the right order.
+        let make_pbr_pipeline = |blend: wgpu::BlendState, depth_write: bool| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("pbr-pipeline"),
+                layout: Some(&pbr_layout),
+                vertex: wgpu::VertexState {
+                    module: &pbr_shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[Some(wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<Vertex>() as u64,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &wgpu::vertex_attr_array![
+                            0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Float32x2, 4 => Float32x4
+                        ],
+                    })],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &pbr_shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: COLOR_FORMAT,
+                        blend: Some(blend),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    cull_mode: None, // two-sided: game assets often have inconsistent winding
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(depth_write),
+                    depth_compare: Some(wgpu::CompareFunction::Less),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState {
+                    count: sample_count,
+                    mask: !0,
+                    alpha_to_coverage_enabled: false,
+                },
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let pbr_pipeline = make_pbr_pipeline(wgpu::BlendState::REPLACE, true);
+        let pbr_pipeline_blend = make_pbr_pipeline(wgpu::BlendState::ALPHA_BLENDING, false);
 
         let mip_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("blit"),
@@ -306,6 +317,7 @@ impl Renderer {
             device,
             queue,
             pbr_pipeline,
+            pbr_pipeline_blend,
             mip_pipeline_srgb,
             mip_pipeline_linear,
             globals_bgl,
@@ -348,14 +360,19 @@ impl Renderer {
             mr_tex: None,
             normal_tex: None,
             emissive_tex: None,
+            alpha_mode: AlphaMode::Opaque,
+            alpha_cutoff: 0.5,
         });
 
-        // Submeshes → vertex/index buffers.
+        // Submeshes → vertex/index buffers. Each mesh also records whether its material is blended
+        // (glass) and its centroid, so the draw loop can render opaque first and blended back-to-front.
         struct GpuMesh {
             vbuf: wgpu::Buffer,
             ibuf: wgpu::Buffer,
             count: u32,
             material: usize,
+            blend: bool,
+            centroid: [f32; 3],
         }
         let meshes: Vec<GpuMesh> = model
             .submeshes
@@ -373,6 +390,11 @@ impl Renderer {
                 }),
                 count: s.indices.len() as u32,
                 material: s.material,
+                blend: model
+                    .materials
+                    .get(s.material)
+                    .is_some_and(|m| m.alpha_mode == AlphaMode::Blend),
+                centroid: submesh_centroid(&s.vertices),
             })
             .collect();
 
@@ -471,9 +493,7 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.pbr_pipeline);
-            pass.set_bind_group(0, &globals_group, &[]);
-            for mesh in &meshes {
+            let draw = |pass: &mut wgpu::RenderPass, mesh: &GpuMesh| {
                 let mat = material_groups
                     .get(mesh.material)
                     .unwrap_or(&fallback_material);
@@ -481,6 +501,29 @@ impl Renderer {
                 pass.set_vertex_buffer(0, mesh.vbuf.slice(..));
                 pass.set_index_buffer(mesh.ibuf.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..mesh.count, 0, 0..1);
+            };
+
+            // Opaque + mask surfaces first (depth-writing), then blended glass back-to-front so
+            // overlapping panes composite correctly against the depth the opaque pass laid down.
+            pass.set_bind_group(0, &globals_group, &[]);
+            pass.set_pipeline(&self.pbr_pipeline);
+            for mesh in meshes.iter().filter(|m| !m.blend) {
+                draw(&mut pass, mesh);
+            }
+
+            let mut blended: Vec<&GpuMesh> = meshes.iter().filter(|m| m.blend).collect();
+            if !blended.is_empty() {
+                let eye = cam.eye;
+                let dist2 = |m: &GpuMesh| {
+                    let d = glam::Vec3::from(m.centroid) - eye;
+                    d.length_squared()
+                };
+                // Farthest first (painter's order).
+                blended.sort_by(|a, b| dist2(b).total_cmp(&dist2(a)));
+                pass.set_pipeline(&self.pbr_pipeline_blend);
+                for mesh in blended {
+                    draw(&mut pass, mesh);
+                }
             }
         }
 
@@ -502,7 +545,12 @@ impl Renderer {
 
         let uniform = MaterialU {
             base_color: m.base_color,
-            mr: [m.metallic, m.roughness, 0.0, 0.0],
+            mr: [
+                m.metallic,
+                m.roughness,
+                m.alpha_cutoff,
+                m.alpha_mode.as_u32() as f32,
+            ],
             emissive: [m.emissive[0], m.emissive[1], m.emissive[2], 0.0],
             flags: [
                 m.base_color_tex.is_some() as u32 as f32,
@@ -739,6 +787,19 @@ impl Renderer {
 
         Ok(pixels)
     }
+}
+
+/// Average vertex position of a submesh — a cheap centroid for back-to-front sorting of blended
+/// (glass) surfaces. Empty runs never reach here (the loader drops vertexless meshes).
+fn submesh_centroid(vertices: &[Vertex]) -> [f32; 3] {
+    let n = vertices.len().max(1) as f32;
+    let mut sum = [0.0f32; 3];
+    for v in vertices {
+        sum[0] += v.pos[0];
+        sum[1] += v.pos[1];
+        sum[2] += v.pos[2];
+    }
+    [sum[0] / n, sum[1] / n, sum[2] / n]
 }
 
 /// Create a single-pixel texture (defaults for absent material maps).
