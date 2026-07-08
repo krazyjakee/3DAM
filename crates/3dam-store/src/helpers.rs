@@ -259,10 +259,39 @@ pub(crate) fn apply_filter(
             }
             _ => return Err(LibError::BadRequest("unsupported tag filter".into())),
         },
+        // Image attributes (image_attr).
         Width => attr_num_filter(f, "image_attr", "width", where_sql, binds)?,
         Height => attr_num_filter(f, "image_attr", "height", where_sql, binds)?,
+        ColorDepth => attr_num_filter(f, "image_attr", "color_depth", where_sql, binds)?,
+        HasAlpha => attr_bool_filter(f, "image_attr", "has_alpha", where_sql, binds)?,
+        ColorSpace => attr_str_filter(f, "image_attr", "color_space", where_sql, binds)?,
+        ImageClass => attr_str_filter(f, "image_attr", "class", where_sql, binds)?,
+        Tileability => attr_num_filter(f, "image_attr", "tileability", where_sql, binds)?,
+        TileClass => attr_str_filter(f, "image_attr", "tile_class", where_sql, binds)?,
+        // Audio attributes (audio_attr).
         Bpm => attr_num_filter(f, "audio_attr", "bpm", where_sql, binds)?,
+        Duration => attr_num_filter(f, "audio_attr", "duration_ms", where_sql, binds)?,
+        SampleRate => attr_num_filter(f, "audio_attr", "sample_rate", where_sql, binds)?,
+        BitDepth => attr_num_filter(f, "audio_attr", "bit_depth", where_sql, binds)?,
+        Channels => attr_num_filter(f, "audio_attr", "channels", where_sql, binds)?,
+        MusicalKey => attr_str_filter(f, "audio_attr", "musical_key", where_sql, binds)?,
+        Loudness => attr_num_filter(f, "audio_attr", "loudness_lufs", where_sql, binds)?,
+        Brightness => attr_num_filter(f, "audio_attr", "brightness", where_sql, binds)?,
+        Harmonicity => attr_num_filter(f, "audio_attr", "harmonicity", where_sql, binds)?,
+        AudioClass => attr_str_filter(f, "audio_attr", "class", where_sql, binds)?,
+        Codec => attr_str_filter(f, "audio_attr", "codec", where_sql, binds)?,
+        Container => attr_str_filter(f, "audio_attr", "container", where_sql, binds)?,
+        // Model attributes (model_attr).
         TriCount => attr_num_filter(f, "model_attr", "triangle_count", where_sql, binds)?,
+        VertexCount => attr_num_filter(f, "model_attr", "vertex_count", where_sql, binds)?,
+        MeshCount => attr_num_filter(f, "model_attr", "mesh_count", where_sql, binds)?,
+        MaterialCount => attr_num_filter(f, "model_attr", "material_count", where_sql, binds)?,
+        TextureCount => attr_num_filter(f, "model_attr", "texture_count", where_sql, binds)?,
+        DependencyBytes => attr_num_filter(f, "model_attr", "dependency_bytes", where_sql, binds)?,
+        HasRig => attr_bool_filter(f, "model_attr", "has_rig", where_sql, binds)?,
+        HasAnimation => attr_bool_filter(f, "model_attr", "has_animation", where_sql, binds)?,
+        HasUv => attr_bool_filter(f, "model_attr", "has_uv", where_sql, binds)?,
+        ModelClass => attr_str_filter(f, "model_attr", "class", where_sql, binds)?,
         // A boolean flag on the asset row itself — presence of the filter means "favourites only".
         // `Eq false` inverts it (everything not favourited), which keeps the op meaningful.
         Favorite => {
@@ -333,6 +362,63 @@ fn attr_num_filter(
     Ok(())
 }
 
+/// A string match against a per-media attribute column (`audio_attr.class`, `image_attr.tile_class`,
+/// `audio_attr.musical_key`, …) — the enum-valued dropdowns of Advanced Search. Supports `Eq` and
+/// `In` (multi-select). Emitted as a correlated subquery like [`attr_num_filter`] so it composes with
+/// both the JOINed page query and the bare `COUNT(*)`. Compared `COLLATE NOCASE` so a dropdown value
+/// need not match the stored casing exactly.
+fn attr_str_filter(
+    f: &Filter,
+    table: &str,
+    col: &str,
+    where_sql: &mut String,
+    binds: &mut Vec<Value>,
+) -> Result<(), LibError> {
+    let cond = match (&f.op, &f.value) {
+        (FilterOp::Eq, FilterValue::Str(s)) => {
+            binds.push(Value::Text(s.clone()));
+            format!("{col} = ? COLLATE NOCASE")
+        }
+        (FilterOp::In, FilterValue::List(items)) => {
+            let placeholders = items.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            for it in items {
+                match it {
+                    FilterValue::Str(s) => binds.push(Value::Text(s.clone())),
+                    _ => return Err(LibError::BadRequest(format!("{col} IN list wants strings"))),
+                }
+            }
+            format!("{col} COLLATE NOCASE IN ({placeholders})")
+        }
+        _ => return Err(LibError::BadRequest(format!("unsupported filter on {col}"))),
+    };
+    where_sql.push_str(&format!(
+        " AND asset.id IN (SELECT asset_id FROM {table} WHERE {cond})"
+    ));
+    Ok(())
+}
+
+/// A boolean match against a per-media attribute column stored as INTEGER 0/1 (`model_attr.has_rig`,
+/// `image_attr.has_alpha`, …) — the on/off toggles of Advanced Search. `Eq true` requires `= 1`,
+/// `Eq false` requires `= 0` (an explicit negative, not the NULL "unknown"). Correlated subquery so
+/// it composes with the bare `COUNT(*)` query.
+fn attr_bool_filter(
+    f: &Filter,
+    table: &str,
+    col: &str,
+    where_sql: &mut String,
+    binds: &mut Vec<Value>,
+) -> Result<(), LibError> {
+    let want = match (&f.op, &f.value) {
+        (FilterOp::Eq, FilterValue::Bool(b)) => *b,
+        _ => return Err(LibError::BadRequest(format!("unsupported filter on {col}"))),
+    };
+    binds.push(Value::Integer(if want { 1 } else { 0 }));
+    where_sql.push_str(&format!(
+        " AND asset.id IN (SELECT asset_id FROM {table} WHERE {col} = ?)"
+    ));
+    Ok(())
+}
+
 pub(crate) fn eq_or_in(
     f: &Filter,
     col: &str,
@@ -392,10 +478,39 @@ mod tests {
             SizeBytes => (FilterOp::Gt, FilterValue::Num(1024.0)),
             License => (FilterOp::Eq, FilterValue::Str("permissive".into())),
             UsageRight => (FilterOp::Eq, FilterValue::Str("commercial".into())),
+            // Image attrs.
             Width => (FilterOp::Gte, FilterValue::Num(512.0)),
             Height => (FilterOp::Lte, FilterValue::Num(512.0)),
+            ColorDepth => (FilterOp::Eq, FilterValue::Num(8.0)),
+            HasAlpha => (FilterOp::Eq, FilterValue::Bool(true)),
+            ColorSpace => (FilterOp::Eq, FilterValue::Str("srgb".into())),
+            ImageClass => (FilterOp::Eq, FilterValue::Str("texture".into())),
+            Tileability => (FilterOp::Gte, FilterValue::Num(0.8)),
+            TileClass => (FilterOp::Eq, FilterValue::Str("seamless".into())),
+            // Audio attrs.
             Bpm => (FilterOp::Range, FilterValue::Range(90.0, 130.0)),
+            Duration => (FilterOp::Range, FilterValue::Range(0.0, 5000.0)),
+            SampleRate => (FilterOp::Eq, FilterValue::Num(44_100.0)),
+            BitDepth => (FilterOp::Eq, FilterValue::Num(16.0)),
+            Channels => (FilterOp::Eq, FilterValue::Num(2.0)),
+            MusicalKey => (FilterOp::Eq, FilterValue::Str("c".into())),
+            Loudness => (FilterOp::Gte, FilterValue::Num(-23.0)),
+            Brightness => (FilterOp::Range, FilterValue::Range(0.0, 1.0)),
+            Harmonicity => (FilterOp::Range, FilterValue::Range(0.0, 1.0)),
+            AudioClass => (FilterOp::Eq, FilterValue::Str("loop".into())),
+            Codec => (FilterOp::Eq, FilterValue::Str("pcm".into())),
+            Container => (FilterOp::Eq, FilterValue::Str("wav".into())),
+            // Model attrs.
             TriCount => (FilterOp::Lt, FilterValue::Num(50_000.0)),
+            VertexCount => (FilterOp::Lt, FilterValue::Num(50_000.0)),
+            MeshCount => (FilterOp::Lte, FilterValue::Num(8.0)),
+            MaterialCount => (FilterOp::Lte, FilterValue::Num(4.0)),
+            TextureCount => (FilterOp::Lte, FilterValue::Num(4.0)),
+            DependencyBytes => (FilterOp::Lt, FilterValue::Num(1_000_000.0)),
+            HasRig => (FilterOp::Eq, FilterValue::Bool(true)),
+            HasAnimation => (FilterOp::Eq, FilterValue::Bool(false)),
+            HasUv => (FilterOp::Eq, FilterValue::Bool(true)),
+            ModelClass => (FilterOp::Eq, FilterValue::Str("prop_lowpoly".into())),
             Favorite => (FilterOp::Eq, FilterValue::Bool(true)),
             Path => (FilterOp::Eq, FilterValue::Str("Environment/".into())),
         };
@@ -406,20 +521,50 @@ mod tests {
     /// builds a WHERE clause that a live SQLite catalog accepts.
     #[test]
     fn every_facet_field_builds_and_runs() {
+        use FacetField::*;
         let fields = [
-            FacetField::MediaType,
-            FacetField::Format,
-            FacetField::Source,
-            FacetField::Tag,
-            FacetField::SizeBytes,
-            FacetField::License,
-            FacetField::UsageRight,
-            FacetField::Width,
-            FacetField::Height,
-            FacetField::Bpm,
-            FacetField::TriCount,
-            FacetField::Favorite,
-            FacetField::Path,
+            MediaType,
+            Format,
+            Source,
+            Tag,
+            SizeBytes,
+            License,
+            UsageRight,
+            Favorite,
+            Path,
+            // Image attrs.
+            Width,
+            Height,
+            ColorDepth,
+            HasAlpha,
+            ColorSpace,
+            ImageClass,
+            Tileability,
+            TileClass,
+            // Audio attrs.
+            Bpm,
+            Duration,
+            SampleRate,
+            BitDepth,
+            Channels,
+            MusicalKey,
+            Loudness,
+            Brightness,
+            Harmonicity,
+            AudioClass,
+            Codec,
+            Container,
+            // Model attrs.
+            TriCount,
+            VertexCount,
+            MeshCount,
+            MaterialCount,
+            TextureCount,
+            DependencyBytes,
+            HasRig,
+            HasAnimation,
+            HasUv,
+            ModelClass,
         ];
 
         // The schema the store runs against — enough for SQLite to plan each filter's subquery.

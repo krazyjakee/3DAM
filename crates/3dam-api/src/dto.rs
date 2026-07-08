@@ -350,11 +350,44 @@ pub enum FacetField {
     SizeBytes,
     License,
     UsageRight,
-    // media-specific (subset wired in phase 1; the rest are accepted but may be Unsupported)
+    // ── media-specific structured attributes ────────────────────────────────
+    // Each maps to a typed column in a per-media attr table (`audio_attr`/`image_attr`/`model_attr`).
+    // Numeric fields take Eq/Lt/Lte/Gt/Gte/Range; string fields Eq/In; boolean fields Eq(bool). These
+    // back the Advanced Search dropdown/range controls — the tags-vs-attributes split (bounded,
+    // extracted metadata belongs here, not in the open-vocabulary tag set).
+    // Image (image_attr):
     Width,
     Height,
+    ColorDepth,
+    HasAlpha,
+    ColorSpace,
+    ImageClass,
+    Tileability,
+    TileClass,
+    // Audio (audio_attr):
     Bpm,
+    Duration,
+    SampleRate,
+    BitDepth,
+    Channels,
+    MusicalKey,
+    Loudness,
+    Brightness,
+    Harmonicity,
+    AudioClass,
+    Codec,
+    Container,
+    // Model (model_attr):
     TriCount,
+    VertexCount,
+    MeshCount,
+    MaterialCount,
+    TextureCount,
+    DependencyBytes,
+    HasRig,
+    HasAnimation,
+    HasUv,
+    ModelClass,
     /// User-flagged favourite (issue #63). Presence of the filter means "favourites only".
     Favorite,
     /// Source-relative path prefix (issue #66) — scopes the browse to a folder subtree. The value is

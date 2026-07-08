@@ -618,6 +618,124 @@ mod tests {
         assert!(search(&store, "piano").is_empty());
     }
 
+    /// V7: an auto-tag makes an asset findable by text even when the filename never mentions it, and
+    /// rejecting the tag drops it back out of the index — the reject-only lifecycle, end to end.
+    #[test]
+    fn tag_name_is_searchable_and_reject_removes_it() {
+        let store = store_with("clip_0001.wav");
+        let id = store.query_assets(&QueryRequest::default()).unwrap().items[0].id;
+        // A term that appears only as a tag, never in the filename.
+        assert!(search(&store, "snare").is_empty());
+        store.suggest_tag(&id, "snare", 0.9, "test@1").unwrap();
+        assert_eq!(search(&store, "snare"), vec!["clip_0001.wav"]);
+        // Rejecting hides it from search again; restoring (confirm) brings it back.
+        store.set_tag_state(&id, "snare", "rejected").unwrap();
+        assert!(search(&store, "snare").is_empty());
+        store.set_tag_state(&id, "snare", "confirmed").unwrap();
+        assert_eq!(search(&store, "snare"), vec!["clip_0001.wav"]);
+    }
+
+    /// Advanced Search: a typed structured-attribute filter round-trips against the stored columns —
+    /// a numeric range (sample rate) and a boolean toggle (has_rig) each return exactly the matching
+    /// asset. Proves the new `attr_num_filter`/`attr_bool_filter` arms filter, not just parse.
+    #[test]
+    fn structured_attribute_filters_select_matching_assets() {
+        use dam_api::dto::{
+            AudioAttributes, FacetField, Filter, FilterOp, FilterValue, MediaAttributes,
+            ModelAttributes,
+        };
+        let store = Store::open_in_memory().unwrap();
+        let src = store
+            .add_source(
+                &SourceConnection::LocalFs {
+                    root: "/tmp".into(),
+                },
+                "t",
+                false,
+            )
+            .unwrap();
+        let mk = |name: &str, media: MediaType| {
+            store
+                .upsert_asset(&NewAsset {
+                    source_id: src,
+                    path: name.to_string(),
+                    filename: name.to_string(),
+                    content_hash: None,
+                    size_bytes: Some(1),
+                    source_modified_at: None,
+                    scanned_at: now_ms(),
+                    media_type: media,
+                    format: "x".into(),
+                })
+                .unwrap()
+                .0
+        };
+        // Two audio clips at different sample rates.
+        let hi = mk("hi.wav", MediaType::Audio);
+        let lo = mk("lo.wav", MediaType::Audio);
+        store
+            .set_media_attrs(
+                &hi,
+                &MediaAttributes::Audio(AudioAttributes {
+                    sample_rate: Some(48_000),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        store
+            .set_media_attrs(
+                &lo,
+                &MediaAttributes::Audio(AudioAttributes {
+                    sample_rate: Some(22_050),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        // Two models, one rigged.
+        let rigged = mk("rigged.glb", MediaType::Model);
+        let _static_mesh = mk("static.glb", MediaType::Model);
+        store
+            .set_media_attrs(
+                &rigged,
+                &MediaAttributes::Model(ModelAttributes {
+                    has_rig: Some(true),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+
+        let filtered = |field, op, value| {
+            let req = QueryRequest {
+                filters: vec![Filter { field, op, value }],
+                ..Default::default()
+            };
+            let mut names = store
+                .query_assets(&req)
+                .unwrap()
+                .items
+                .into_iter()
+                .map(|s| s.name)
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        };
+
+        // Sample-rate range 44.1k–96k catches only the 48k clip.
+        assert_eq!(
+            filtered(
+                FacetField::SampleRate,
+                FilterOp::Range,
+                FilterValue::Range(44_100.0, 96_000.0)
+            ),
+            vec!["hi.wav"]
+        );
+        // has_rig = true catches only the rigged model.
+        assert_eq!(
+            filtered(FacetField::HasRig, FilterOp::Eq, FilterValue::Bool(true)),
+            vec!["rigged.glb"]
+        );
+    }
+
     /// M2: the tokens column carries camelCase splits, so "poly" (a sub-token of "LowPoly") matches.
     #[test]
     fn tokens_column_carries_camelcase_splits() {

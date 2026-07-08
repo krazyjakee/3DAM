@@ -27,6 +27,10 @@ export interface ViewState {
   collection: string | null;
   /** Favorites-only (issue #63) — a boolean facet that composes with media/source/license/tag. */
   fav: boolean;
+  /** Advanced Search: structured attribute filters (typed dropdown/range/toggle controls over the
+   *  per-media attr columns) plus tag filters. Carried as a JSON `Filter[]` in the `adv` URL param so
+   *  a whole faceted query stays linkable. AND-ed with the sidebar facets and text search. */
+  adv: Filter[];
   sort: SortField;
   dir: SortDir;
   /** Text-search strategy (semantic-search M5). `lexical` is the default FTS+synonym path;
@@ -34,6 +38,18 @@ export interface ViewState {
   mode: SearchMode;
   view: ViewMode;
   selected: string | null;
+}
+
+/** Decode the `adv` URL param (a JSON `Filter[]`). Malformed input degrades to no advanced filters
+ *  rather than throwing — a hand-edited URL never breaks the browse. */
+function parseAdv(raw: string | null): Filter[] {
+  if (!raw) return [];
+  try {
+    const v = JSON.parse(raw);
+    return Array.isArray(v) ? (v as Filter[]) : [];
+  } catch {
+    return [];
+  }
 }
 
 export function useViewState() {
@@ -48,6 +64,7 @@ export function useViewState() {
       tag: params.get("tag"),
       collection: params.get("col"),
       fav: params.get("fav") === "1",
+      adv: parseAdv(params.get("adv")),
       sort: (params.get("sort") as SortField | null) ?? "name",
       dir: (params.get("dir") as SortDir | null) ?? "asc",
       mode: (params.get("mode") as SearchMode | null) ?? "lexical",
@@ -73,6 +90,7 @@ export function useViewState() {
           if ("tag" in next) set("tag", next.tag);
           if ("collection" in next) set("col", next.collection);
           if ("fav" in next) set("fav", next.fav ? "1" : null);
+          if ("adv" in next) set("adv", next.adv && next.adv.length ? JSON.stringify(next.adv) : null);
           if ("sort" in next) set("sort", next.sort);
           if ("dir" in next) set("dir", next.dir);
           if ("mode" in next) set("mode", next.mode === "lexical" ? null : next.mode);
@@ -94,6 +112,8 @@ export function useViewState() {
       filters.push({ field: "license", op: "eq", value: { str: state.license } });
     if (state.tag) filters.push({ field: "tag", op: "eq", value: { str: state.tag } });
     if (state.fav) filters.push({ field: "favorite", op: "eq", value: { bool: true } });
+    // Advanced Search structured/tag filters, AND-ed onto the sidebar facets.
+    filters.push(...state.adv);
     return {
       text: state.q || null,
       filters,

@@ -1,11 +1,11 @@
 import type React from "react";
 import { useEffect, useState } from "react";
 import {
-  Check,
   Grid3x3,
   PanelRightClose,
   PanelRightOpen,
   RefreshCw,
+  RotateCcw,
   Sparkles,
   Star,
   X,
@@ -598,15 +598,16 @@ function SimilarTile({ hit, onOpen }: { hit: SimilarHit; onOpen: () => void }) {
   );
 }
 
-/** Auto-tag review (tech-spec 05 §1.4): a *suggested* tag shows accept/reject; a *confirmed* or
- *  *rejected* tag shows its state and lets the user flip the decision (the one endpoint supports
- *  both directions). User-authored tags are static — there is nothing to review. */
+/** Auto-tag review (reject-only lifecycle): every auto-tag is active — it powers search and
+ *  filtering as soon as the analysis pass proposes it, no accept step. The only review action is
+ *  *reject*, which hides a wrong tag from search and stops the same extractor re-suggesting it;
+ *  a rejected tag can be *restored*. User-authored tags are static — there is nothing to review. */
 function TagList({ assetId, tags }: { assetId: AssetId; tags: TagRef[] }) {
   const review = useReviewSuggestion();
   if (tags.length === 0) {
     return (
       <p className="text-[11px] text-fg-dim italic">
-        No tags yet — the analysis pass proposes auto-tags to accept or reject.
+        No tags yet — the analysis pass proposes auto-tags that power search. Reject any that are wrong.
       </p>
     );
   }
@@ -636,57 +637,47 @@ function TagChip({
   const auto = tag.source === "auto";
   const confidence =
     tag.confidence != null ? ` · ${Math.round(tag.confidence * 100)}%` : "";
-  const title = `${tag.state} · ${tag.source}${confidence}`;
 
   // User tags (and any non-auto) are not reviewable — render a plain chip.
   if (!auto) {
     return (
       <span
         className="rounded bg-surface-2 px-1.5 py-0.5 text-[10px] text-fg-muted"
-        title={title}
+        title="user tag"
       >
         {tag.name}
       </span>
     );
   }
 
+  // Reject-only lifecycle: an auto tag is active (searchable) unless rejected. Active tags offer a
+  // reject; rejected tags show struck-through with a restore. There is no accept-to-confirm step.
   const rejected = tag.state === "rejected";
-  const confirmed = tag.state === "confirmed";
   return (
     <span
       className="inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px]"
       style={{
-        borderColor: confirmed
-          ? "var(--color-lic-permissive)"
-          : rejected
-            ? "var(--color-border)"
-            : "var(--color-accent)",
-        color: confirmed
-          ? "var(--color-lic-permissive)"
-          : rejected
-            ? "var(--color-fg-dim)"
-            : "var(--color-accent)",
+        borderColor: rejected ? "var(--color-border)" : "var(--color-accent)",
+        color: rejected ? "var(--color-fg-dim)" : "var(--color-accent)",
         background: "color-mix(in srgb, currentColor 10%, transparent)",
       }}
-      title={title}
+      title={rejected ? `rejected auto tag${confidence}` : `auto tag${confidence} · powers search`}
     >
       <span className={rejected ? "line-through" : ""}>{tag.name}</span>
-      {/* Accept is offered unless already confirmed; reject unless already rejected. */}
-      {!confirmed && (
+      {rejected ? (
         <button
-          className="flex items-center justify-center hover:text-lic-permissive disabled:opacity-40 coarse:min-h-11 coarse:min-w-11"
-          title={rejected ? "Accept tag" : "Accept suggestion"}
-          aria-label={`Accept tag ${tag.name}`}
+          className="flex items-center justify-center hover:text-accent disabled:opacity-40 coarse:min-h-11 coarse:min-w-11"
+          title="Restore tag — include it in search again"
+          aria-label={`Restore tag ${tag.name}`}
           disabled={busy}
           onClick={() => onReview("accept")}
         >
-          <Check size={12} />
+          <RotateCcw size={12} />
         </button>
-      )}
-      {!rejected && (
+      ) : (
         <button
           className="flex items-center justify-center hover:text-danger disabled:opacity-40 coarse:min-h-11 coarse:min-w-11"
-          title={confirmed ? "Reject tag" : "Reject suggestion"}
+          title="Reject tag — hide it from search"
           aria-label={`Reject tag ${tag.name}`}
           disabled={busy}
           onClick={() => onReview("reject")}

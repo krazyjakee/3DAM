@@ -35,7 +35,14 @@ import {
   useStats,
 } from "@/api/queries";
 import { useConnection } from "@/api/connection";
-import type { Collection, LicenseStatus, MediaType, SourceInfo } from "@/api/types";
+import type {
+  Collection,
+  FacetField,
+  Filter,
+  LicenseStatus,
+  MediaType,
+  SourceInfo,
+} from "@/api/types";
 import { licenseColorVar, licenseLabel, sourceStateLabel } from "@/lib/format";
 import { useViewState } from "@/lib/view-state";
 import { useDialogs } from "@/lib/dialogs";
@@ -50,31 +57,75 @@ const MEDIA: { key: MediaType; label: string; Icon: typeof AudioLines }[] = [
 
 const LICENSES: LicenseStatus[] = ["permissive", "attribution", "restricted", "unknown"];
 
-/** Tags filter facet (design: the sidebar "Tags" chip row). Renders the most-used confirmed tags
- *  from stats as clickable chips; the active tag is highlighted. Hidden entirely until the library
- *  has confirmed tags, so a fresh/unanalysed catalog shows no empty header. */
-function TagFacet({
-  tags,
-  active,
-  onSelect,
+function SectionLabel({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="px-3 pt-4 pb-1 text-[10px] font-semibold tracking-wider text-fg-dim uppercase">
+      {children}
+    </div>
+  );
+}
+
+/** The one high-value structured facet worth a sidebar chip row, contextual to the active media
+ *  type: the analysis-pass *class* (audio type, image type, model complexity). The full set of typed
+ *  attribute filters lives in Advanced Search; this is the quick pick. Reads/writes the same `adv`
+ *  Filter[] so the two surfaces stay in sync. Hidden unless a single media type is selected. */
+const CLASS_FACET: Record<MediaType, { field: FacetField; label: string; options: [string, string][] }> = {
+  audio: {
+    field: "audio_class",
+    label: "Type",
+    options: [
+      ["one_shot", "One-shot"],
+      ["loop", "Loop"],
+      ["music", "Music"],
+      ["sfx", "SFX"],
+    ],
+  },
+  image: {
+    field: "image_class",
+    label: "Type",
+    options: [
+      ["texture", "Texture"],
+      ["sprite", "Sprite"],
+      ["photo", "Photo"],
+    ],
+  },
+  model: {
+    field: "model_class",
+    label: "Complexity",
+    options: [
+      ["prop_lowpoly", "Low-poly"],
+      ["prop", "Prop"],
+      ["prop_highpoly", "High-poly"],
+    ],
+  },
+};
+
+function QuickFacet({
+  media,
+  adv,
+  onChange,
 }: {
-  tags: Record<string, number>;
-  active: string | null;
-  onSelect: (tag: string) => void;
+  media: MediaType;
+  adv: Filter[];
+  onChange: (next: Filter[]) => void;
 }) {
-  const names = Object.keys(tags).sort();
-  if (names.length === 0) return null;
+  const { field, label, options } = CLASS_FACET[media];
+  const cur = adv.find((f) => f.field === field);
+  const active = cur && "str" in cur.value ? cur.value.str : null;
+  const select = (v: string) => {
+    const rest = adv.filter((f) => f.field !== field);
+    onChange(active === v ? rest : [...rest, { field, op: "eq", value: { str: v } }]);
+  };
   return (
     <>
-      <SectionLabel>Tags</SectionLabel>
+      <SectionLabel>{label}</SectionLabel>
       <div className="flex flex-wrap gap-1.5 px-3 py-1">
-        {names.map((name) => {
-          const on = active === name;
+        {options.map(([v, l]) => {
+          const on = active === v;
           return (
             <button
-              key={name}
-              onClick={() => onSelect(name)}
-              title={`${tags[name].toLocaleString()} asset${tags[name] === 1 ? "" : "s"}`}
+              key={v}
+              onClick={() => select(v)}
               aria-pressed={on}
               className="rounded-md border px-2 py-0.5 text-xs transition-colors coarse:min-h-11"
               style={{
@@ -83,20 +134,12 @@ function TagFacet({
                 borderColor: on ? "var(--color-accent)" : "var(--color-border)",
               }}
             >
-              {name}
+              {l}
             </button>
           );
         })}
       </div>
     </>
-  );
-}
-
-function SectionLabel({ children }: { children: React.ReactNode }) {
-  return (
-    <div className="px-3 pt-4 pb-1 text-[10px] font-semibold tracking-wider text-fg-dim uppercase">
-      {children}
-    </div>
   );
 }
 
@@ -246,13 +289,19 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
         </Row>
       ))}
 
-      {/* tags facet — the most-used confirmed tags, from stats. Composes with the media/license/
-          source facets; clicking one toggles it (and exits any collection view). */}
-      <TagFacet
-        tags={stats.data?.tags ?? {}}
-        active={state.tag}
-        onSelect={(t) => go({ tag: state.tag === t ? null : t, collection: null })}
-      />
+      {/* Tags no longer live in the sidebar: auto-tags are open-vocabulary and audio-heavy, so they
+          cluttered the rail without earning their place. They now power search/filtering instead —
+          a tag control lands in Advanced Search. Structured, bounded attributes (media class, BPM,
+          key, dimensions…) get their own typed facets there rather than masquerading as tags.
+          The single highest-value one — the analysis class — gets a quick chip row here when a media
+          type is active; the full set lives in the Browser's Advanced Search panel. */}
+      {state.media && !state.collection && (
+        <QuickFacet
+          media={state.media}
+          adv={state.adv}
+          onChange={(next) => go({ adv: next, collection: null })}
+        />
+      )}
 
       {/* sources */}
       <div className="flex items-center justify-between px-3 pt-4 pb-1">
@@ -310,7 +359,7 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
       <Collections
         activeId={state.collection}
         onSelect={(id) =>
-          go({ collection: id, media: null, source: null, license: null, tag: null, q: "" })
+          go({ collection: id, media: null, source: null, license: null, tag: null, adv: [], q: "" })
         }
       />
 

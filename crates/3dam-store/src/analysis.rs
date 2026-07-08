@@ -197,6 +197,20 @@ impl Store {
         }
     }
 
+    /// Rewrite an asset's `tags` FTS column to its current non-rejected tag names (schema V7), so tag
+    /// text feeds full-text search and a rejected tag drops back out. Called after every tag mutation.
+    /// Best-effort: an FTS hiccup must never sink the tag write that triggered it.
+    fn reindex_asset_tags(conn: &Connection, id: &AssetId) {
+        let _ = conn.execute(
+            "UPDATE asset_fts SET tags = COALESCE((
+                SELECT group_concat(t.name, ' ') FROM asset_tag at
+                JOIN tag t ON t.id = at.tag_id
+                WHERE at.asset_id = ?1 AND at.state <> 'rejected'), '')
+             WHERE rowid = (SELECT rowid FROM asset WHERE id = ?1)",
+            params![id.as_bytes().to_vec()],
+        );
+    }
+
     /// Intern a tag name, returning its id (case-insensitive unique).
     fn intern_tag(conn: &Connection, name: &str) -> Result<Vec<u8>, LibError> {
         if let Some(id) = conn
@@ -237,6 +251,7 @@ impl Store {
             params![id.as_bytes().to_vec(), tag_id, confidence as f64, extractor, now_ms()],
         )
         .map_err(internal)?;
+        Self::reindex_asset_tags(&conn, id);
         Ok(())
     }
 
@@ -260,6 +275,7 @@ impl Store {
             )
             .map_err(internal)?;
         }
+        Self::reindex_asset_tags(&conn, id);
         Ok(())
     }
 

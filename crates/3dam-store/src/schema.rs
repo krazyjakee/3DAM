@@ -229,4 +229,51 @@ pub const MIGRATIONS: &[&str] = &[
         UPDATE asset_fts SET filename = new.filename WHERE rowid = new.rowid;
     END;
     "#,
+    // ── V7: fold tag names into the FTS index so tags power text search ───────────────────────────
+    // Auto-tags no longer live in the sidebar; they earn their keep by making assets findable ("kick"
+    // surfaces a `kick`-tagged one-shot even when the filename never says so). FTS5 has no ADD COLUMN,
+    // so the two-column index is rebuilt with a third `tags` column. The filename-derived `tokens`
+    // (M2) live *only* in the index, so they're stashed and restored rather than lost; `tags` is
+    // seeded from the current non-rejected tag names. The MATCH expression is column-agnostic, so the
+    // new column is searched automatically — no query change. The write path (analysis.rs) keeps the
+    // column current on every tag mutation; a rejected tag drops straight back out of search.
+    r#"
+    -- tokens (filename sub-tokens) exist only in the FTS index — stash before the rebuild.
+    CREATE TEMP TABLE _fts_tokens AS SELECT rowid AS rid, tokens FROM asset_fts;
+
+    DROP TRIGGER asset_fts_ai;
+    DROP TRIGGER asset_fts_ad;
+    DROP TRIGGER asset_fts_au;
+    DROP TABLE asset_fts;
+
+    CREATE VIRTUAL TABLE asset_fts USING fts5(
+        filename,
+        tokens,
+        tags,
+        tokenize = "unicode61 remove_diacritics 2"
+    );
+
+    -- Re-seed: filename from the base table, tokens from the stash, tags from non-rejected tag names.
+    INSERT INTO asset_fts(rowid, filename, tokens, tags)
+        SELECT a.rowid,
+               a.filename,
+               COALESCE(t.tokens, ''),
+               COALESCE((SELECT group_concat(tg.name, ' ')
+                         FROM asset_tag at JOIN tag tg ON tg.id = at.tag_id
+                         WHERE at.asset_id = a.id AND at.state <> 'rejected'), '')
+        FROM asset a LEFT JOIN _fts_tokens t ON t.rid = a.rowid;
+
+    DROP TABLE _fts_tokens;
+
+    -- Recreate the sync triggers (insert seeds empty tokens/tags; the write paths fill them).
+    CREATE TRIGGER asset_fts_ai AFTER INSERT ON asset BEGIN
+        INSERT INTO asset_fts(rowid, filename, tokens, tags) VALUES (new.rowid, new.filename, '', '');
+    END;
+    CREATE TRIGGER asset_fts_ad AFTER DELETE ON asset BEGIN
+        DELETE FROM asset_fts WHERE rowid = old.rowid;
+    END;
+    CREATE TRIGGER asset_fts_au AFTER UPDATE OF filename ON asset BEGIN
+        UPDATE asset_fts SET filename = new.filename WHERE rowid = new.rowid;
+    END;
+    "#,
 ];

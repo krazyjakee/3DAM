@@ -150,12 +150,41 @@ export type FacetField =
   | "size_bytes"
   | "license"
   | "usage_right"
+  | "favorite"
+  | "path"
+  // image (image_attr)
   | "width"
   | "height"
+  | "color_depth"
+  | "has_alpha"
+  | "color_space"
+  | "image_class"
+  | "tileability"
+  | "tile_class"
+  // audio (audio_attr)
   | "bpm"
+  | "duration"
+  | "sample_rate"
+  | "bit_depth"
+  | "channels"
+  | "musical_key"
+  | "loudness"
+  | "brightness"
+  | "harmonicity"
+  | "audio_class"
+  | "codec"
+  | "container"
+  // model (model_attr)
   | "tri_count"
-  | "favorite"
-  | "path";
+  | "vertex_count"
+  | "mesh_count"
+  | "material_count"
+  | "texture_count"
+  | "dependency_bytes"
+  | "has_rig"
+  | "has_animation"
+  | "has_uv"
+  | "model_class";
 
 export type FilterOp =
   | "eq"

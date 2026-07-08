@@ -32,6 +32,7 @@ import { MediaBadge } from "./MediaBadge";
 import { ContextMenu, useLongPress, type MenuState } from "./ContextMenu";
 import { ExportDialog } from "./ExportDialog";
 import { ConvertDialog } from "./ConvertDialog";
+import { AdvancedSearch } from "./AdvancedSearch";
 import { Centered } from "@/lib/ui";
 
 /** Modifier keys that change what a click does to the multi-selection (issue #10/#22). */
@@ -391,6 +392,10 @@ function Toolbar({
           <option value="semantic">Most similar</option>
         </select>
       )}
+
+      {/* Advanced Search: typed structured-attribute filters (dropdowns / ranges / toggles over the
+          per-media attr columns) + tag filters. Contextual to the active media type. */}
+      <AdvancedSearch />
 
       <select
         className="field w-auto"
