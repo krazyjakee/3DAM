@@ -3,7 +3,22 @@ name = "dam-gui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Native desktop shell (egui/eframe, ADR 0005) over the LibraryService seam (tech-spec 12). Stub until the GUI phase."
+description = "Native desktop shell (egui/eframe, ADR 0005) over the LibraryService seam (tech-spec 12)."
 
 [dependencies]
-# egui/eframe + egui-wgpu land with the GUI phase (desktop follows the web client — PRODUCT_SPEC §9).
+# The seam: the trait + DTOs, and the shared backend opener — the GUI links neither the engine
+# internals nor the clap grammar (crate-map invariant; it goes through `dam-frontend::open_backend`).
+dam-api = { workspace = true }
+dam-frontend = { workspace = true }
+# A background Tokio runtime owns the async `LibraryService`; the egui thread talks to it over
+# channels so I/O never blocks the frame (golden rule 5).
+tokio = { workspace = true }
+
+# egui/eframe (ADR 0005). glow (OpenGL) backend — the wgpu viewer-embedding path (egui-wgpu paint
+# callback) lands with the 3D-preview slice and would otherwise pull a second, mismatched wgpu.
+eframe = { version = "0.31", default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }

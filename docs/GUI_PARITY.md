@@ -1,0 +1,58 @@
+# Web ↔ native-GUI parity checklist
+
+3DAM ships two user-facing clients (golden rule 1): the **web** client (`web/`, React) and the
+**native** GUI (`crates/3dam-gui`, egui/eframe). The web client leads (web-first phasing,
+PRODUCT_SPEC §9); this file tracks what the egui shell has reached vs. what it still owes, so a new
+user-facing feature lands in **both** — or the gap is recorded here rather than silently forgotten.
+
+**When you add or change a user-facing web feature, update the matching row here** and either
+implement the egui equivalent or move it to "Owed" with a note.
+
+Both clients are thin front-ends over the same `LibraryService` seam (`crates/3dam-api`), so parity
+is about UI surface, not engine work — the capability already exists behind the trait.
+
+## Status
+
+Legend: ✅ done · 🟡 partial · ⬜ owed (not yet in egui)
+
+| Capability | Web | egui | Notes |
+|---|---|---|---|
+| Window / app shell | ✅ | ✅ | eframe window, three-region layout + toolbar |
+| Text search | ✅ | ✅ | search box → `QueryRequest.text` (Enter / Search button) |
+| Media-type filter (audio/image/3D) | ✅ | ✅ | toolbar toggle → `FacetField::MediaType` |
+| Browse list | ✅ | 🟡 | egui is a flat list (name/type/format/size); grid + virtualization owed |
+| Thumbnails | ✅ | ⬜ | server-rendered tiles; egui needs texture upload + cache |
+| Inspector: core metadata | ✅ | ✅ | name, type, format, size, path, tags |
+| Inspector: media attributes | ✅ | ⬜ | audio/image/model attr blocks, seamlessness, audio features |
+| Inspector: preview (3D/audio/image) | ✅ | ⬜ | egui-wgpu paint callback for the 3D island; audio/image viewers |
+| Library stats | ✅ | ✅ | totals + by-media counts in the left rail |
+| Sources list | ✅ | 🟡 | egui shows them read-only; add/remove/rescan owed |
+| Folder-tree navigation + breadcrumb (#66) | ✅ | ⬜ | `list_folders` + path-prefix filter |
+| Search mode (lexical/hybrid/semantic) | ✅ | ⬜ | `QueryRequest.mode` selector |
+| License facet | ✅ | ⬜ | |
+| Advanced Search (structured attr + tag filters) | ✅ | ⬜ | typed dropdown/range/toggle facets |
+| Quick class facet (audio/image/model class) | ✅ | ⬜ | |
+| Favorites / Recently added | ✅ | ⬜ | favourite toggle + saved-sort shortcut |
+| Collections & smart folders | ✅ | ⬜ | list + membership editing |
+| Grid ⇄ table view toggle | ✅ | ⬜ | |
+| Sort control | ✅ | 🟡 | egui fixed to name-asc; expose the sort control |
+| Tag review (reject/restore) | ✅ | ⬜ | reject-only lifecycle |
+| Similar / duplicates | ✅ | ⬜ | `find_similar`, exact/near dedup |
+| Convert / export | ✅ | ⬜ | |
+| Per-asset actions (reanalyze, regen thumbnail) | ✅ | ⬜ | |
+| Multi-select + batch actions | ✅ | ⬜ | |
+| Context menus | ✅ | ⬜ | |
+| Live updates | ✅ | ⬜ | web uses a WebSocket; egui embedded can subscribe to engine events |
+| Settings / admin | ✅ | ⬜ | flags, tokens, audit |
+| Duplicates page / blocklist page | ✅ | ⬜ | |
+| Theme (light/dark) | ✅ | 🟡 | egui defaults to dark; expose the toggle |
+| Responsive / touch / a11y pass | ✅ | ⬜ | |
+| 3D viewer on-canvas controls (#65) | ✅ | ⬜ | lighting / wireframe / auto-orbit / fullscreen — lands with the egui 3D preview |
+
+## Current egui slice
+
+`crates/3dam-gui` (issue #34, first slice): a real eframe window over the embedded
+`LibraryService` — **browse** (list from the catalog), **search** (text + media-type filter, live
+re-query), **inspect** (per-asset detail), plus library stats and a sources list. The async service
+runs on a background Tokio runtime; results reach the frame loop over a channel (no I/O on the UI
+thread — golden rule 5). Everything marked ⬜/🟡 above is the follow-up backlog.
