@@ -16,11 +16,11 @@ use eframe::egui;
 
 use dam_api::service::{AuthContext, LibraryService};
 use dam_api::{
-    AnalyzeRequest, Asset, AssetId, AssetSummary, EventTopic, FacetField, Filter, FilterOp,
-    FilterValue, FolderEntry, FolderListing, JobState, LibraryEvent, LibraryStats, LicenseStatus,
-    MediaAttributes, MediaType, Page, PageParams, QueryRequest, ReviewAction, SearchMode,
-    SimilarHit, SimilarRequest, Sort, SortDir, SortField, SourceId, SourceInfo, SubscribeRequest,
-    SuggestionReview, ThumbnailRegenRequest,
+    AnalyzeRequest, Asset, AssetId, AssetSummary, Collection, CollectionId, CollectionKind,
+    EventTopic, FacetField, Filter, FilterOp, FilterValue, FolderEntry, FolderListing, JobState,
+    LibraryEvent, LibraryStats, LicenseStatus, MediaAttributes, MediaType, Page, PageParams,
+    QueryRequest, ReviewAction, SearchMode, SimilarHit, SimilarRequest, Sort, SortDir, SortField,
+    SourceId, SourceInfo, SubscribeRequest, SuggestionReview, ThumbnailRegenRequest,
 };
 use futures::StreamExt;
 
@@ -148,6 +148,7 @@ enum Msg {
     /// A live change from the engine's event stream (scan/analyze/convert, source state, …).
     Event(LibraryEvent),
     Similar(AssetId, Result<Vec<SimilarHit>, String>),
+    Collections(Result<Vec<Collection>, String>),
 }
 
 pub struct DamGui {
@@ -170,6 +171,10 @@ pub struct DamGui {
     source_filter: Option<SourceId>,
     /// Folder scope (issue #66): a source-relative path prefix, paired with `source_filter`.
     path: Option<String>,
+    /// Collection browse mode: when set, the Browser shows this collection's members instead of the
+    /// faceted query (mutually exclusive with the facets, mirroring the web).
+    collection: Option<CollectionId>,
+    collections: Vec<Collection>,
     sort: usize, // index into SORTS
     mode: SearchMode,
     view: View,
@@ -227,6 +232,8 @@ impl DamGui {
             dark: true,
             source_filter: None,
             path: None,
+            collection: None,
+            collections: Vec::new(),
             sort: 0,
             mode: SearchMode::Lexical,
             view: View::Grid,
@@ -256,6 +263,7 @@ impl DamGui {
         app.load_assets(&egctx);
         app.load_sources(&egctx);
         app.load_stats(&egctx);
+        app.load_collections(&egctx);
         app.spawn_events();
         app
     }
@@ -352,19 +360,43 @@ impl DamGui {
         }
     }
 
-    /// Run the current search/filter against the engine, off-thread.
+    /// Run the current browse against the engine, off-thread: a collection's members when in
+    /// collection mode, else the faceted query.
     fn load_assets(&mut self, egctx: &egui::Context) {
         self.loading = true;
-        let (lib, auth, tx, egctx, req) = (
+        let (lib, auth, tx, egctx) = (
             self.lib.clone(),
             self.auth.clone(),
             self.tx.clone(),
             egctx.clone(),
-            self.build_query(),
+        );
+        let collection = self.collection;
+        let req = self.build_query();
+        let page = PageParams {
+            after: None,
+            limit: LIST_LIMIT,
+        };
+        self.rt.spawn(async move {
+            let r = match collection {
+                Some(id) => lib.collection_assets(&auth, &id, page).await,
+                None => lib.query(&auth, req).await,
+            }
+            .map_err(|e| e.to_string());
+            let _ = tx.send(Msg::Assets(r));
+            egctx.request_repaint();
+        });
+    }
+
+    fn load_collections(&self, egctx: &egui::Context) {
+        let (lib, auth, tx, egctx) = (
+            self.lib.clone(),
+            self.auth.clone(),
+            self.tx.clone(),
+            egctx.clone(),
         );
         self.rt.spawn(async move {
-            let r = lib.query(&auth, req).await.map_err(|e| e.to_string());
-            let _ = tx.send(Msg::Assets(r));
+            let r = lib.list_collections(&auth).await.map_err(|e| e.to_string());
+            let _ = tx.send(Msg::Collections(r));
             egctx.request_repaint();
         });
     }
@@ -621,6 +653,10 @@ impl DamGui {
                 self.similar_loading = false;
                 self.error = Some(format!("Similarity search failed: {e}"));
             }
+            Msg::Collections(Ok(c)) => self.collections = c,
+            Msg::Collections(Err(e)) => {
+                self.error = Some(format!("Couldn't load collections: {e}"))
+            }
             // Map a live event to the coalesced refresh flags (flushed, throttled, in `update`).
             Msg::Event(ev) => match ev {
                 LibraryEvent::AssetAdded(_) | LibraryEvent::AssetRemoved(_) => {
@@ -673,6 +709,8 @@ impl DamGui {
         }
         if std::mem::take(&mut self.dirty_stats) {
             self.load_stats(ctx);
+            // Catalog changes also shift smart-folder counts.
+            self.load_collections(ctx);
         }
         if std::mem::take(&mut self.dirty_sources) {
             self.load_sources(ctx);
@@ -760,6 +798,8 @@ impl eframe::App for DamGui {
         let mut asset_action: Option<AssetAction> = None;
         let mut find_sim: Option<AssetId> = None;
         let mut open_similar: Option<AssetId> = None;
+        // Some(Some(id)) selects a collection; Some(None) clears collection mode.
+        let mut pick_collection: Option<Option<CollectionId>> = None;
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.add_space(4.0);
@@ -939,6 +979,29 @@ impl eframe::App for DamGui {
                     }
                 }
 
+                // Collections & smart folders — clicking one browses its members (mutually exclusive
+                // with the facets). Create/rename/delete + membership editing stay owed (the web
+                // creates manual collections here; the GUI lists + filters for now).
+                if !self.collections.is_empty() {
+                    ui.separator();
+                    ui.label(egui::RichText::new("COLLECTIONS").small().weak());
+                    for c in &self.collections {
+                        let on = self.collection == Some(c.id);
+                        let smart = if matches!(c.kind, CollectionKind::Smart) {
+                            " ~smart"
+                        } else {
+                            ""
+                        };
+                        let label = match c.count {
+                            Some(n) => format!("{} ({n}){smart}", c.name),
+                            None => format!("{}{smart}", c.name),
+                        };
+                        if ui.selectable_label(on, label).clicked() {
+                            pick_collection = Some(if on { None } else { Some(c.id) });
+                        }
+                    }
+                }
+
                 // Theme toggle at the foot of the rail (dark-first).
                 ui.separator();
                 let label = if self.dark {
@@ -974,6 +1037,23 @@ impl eframe::App for DamGui {
                         _ => None,
                     };
                     inspector(ui, asset, thumb, &mut tag_review, &mut asset_action);
+
+                    // Collection memberships (read-only chips; per-asset add/remove is owed).
+                    if !asset.collections.is_empty() {
+                        ui.separator();
+                        ui.label(egui::RichText::new("COLLECTIONS").small().weak());
+                        ui.horizontal_wrapped(|ui| {
+                            for cid in &asset.collections {
+                                let name = self
+                                    .collections
+                                    .iter()
+                                    .find(|c| c.id == *cid)
+                                    .map(|c| c.name.as_str())
+                                    .unwrap_or("(collection)");
+                                ui.label(egui::RichText::new(name).small());
+                            }
+                        });
+                    }
 
                     // "Find similar" (tech-spec 05 §3): opt-in nearest-neighbour ranking. Un-analyzed
                     // assets have no vector, so we point at Analyze instead of querying into the void.
@@ -1062,6 +1142,24 @@ impl eframe::App for DamGui {
                 self.path = p;
             }
             do_query = true;
+        }
+
+        // Collection selection (mutually exclusive with the facets, mirroring the web).
+        if let Some(sel) = pick_collection {
+            self.collection = sel;
+            if sel.is_some() {
+                self.media_filter = None;
+                self.class = None;
+                self.license = None;
+                self.favorites = false;
+                self.source_filter = None;
+                self.path = None;
+                self.search.clear();
+            }
+            do_query = true;
+        } else if do_query {
+            // Any facet/search/sort/scope change exits collection mode.
+            self.collection = None;
         }
 
         if do_query {
