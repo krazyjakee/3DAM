@@ -8,7 +8,7 @@
 //! The worker calls `Context::request_repaint()` when it posts a result, so the UI wakes exactly when
 //! there's something new to show rather than polling.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 
@@ -16,10 +16,32 @@ use eframe::egui;
 
 use dam_api::service::{AuthContext, LibraryService};
 use dam_api::{
-    Asset, AssetId, AssetSummary, FacetField, Filter, FilterOp, FilterValue, LibraryStats,
-    LicenseStatus, MediaAttributes, MediaType, Page, PageParams, QueryRequest, SearchMode, Sort,
-    SortDir, SortField, SourceInfo,
+    Asset, AssetId, AssetSummary, FacetField, Filter, FilterOp, FilterValue, FolderEntry,
+    FolderListing, LibraryStats, LicenseStatus, MediaAttributes, MediaType, Page, PageParams,
+    QueryRequest, SearchMode, Sort, SortDir, SortField, SourceId, SourceInfo,
 };
+
+/// A source-relative folder-tree node key: which source, and the source-relative prefix (trailing
+/// slash, or empty for the source root).
+type FolderKey = (SourceId, String);
+
+/// Lazy-loaded state of one folder node's immediate children.
+enum FolderState {
+    Loading,
+    Loaded(Vec<FolderEntry>),
+    Failed,
+}
+
+/// Actions collected while rendering the (immutably-borrowed) folder tree, applied after the panels.
+#[derive(Default)]
+struct NavActions {
+    /// Folder nodes whose expand/collapse toggle was clicked.
+    toggle: Vec<FolderKey>,
+    /// Folder nodes whose children need fetching.
+    load: Vec<FolderKey>,
+    /// A clicked scope target: source + optional path prefix (None = whole source).
+    scope: Option<(SourceId, Option<String>)>,
+}
 
 /// The sort presets offered in the toolbar — label + (field, dir), mirroring the web sort control.
 /// "Best match" (relevance) is only meaningful with a text query, so it's filtered in at render.
@@ -79,6 +101,7 @@ enum Msg {
     Sources(Result<Vec<SourceInfo>, String>),
     Stats(Result<LibraryStats, String>),
     Thumb(AssetId, Option<ThumbPixels>),
+    Folders(FolderKey, Result<Vec<FolderEntry>, String>),
 }
 
 pub struct DamGui {
@@ -94,9 +117,15 @@ pub struct DamGui {
     media_filter: Option<MediaType>,
     license: Option<LicenseStatus>,
     favorites: bool,
+    source_filter: Option<SourceId>,
+    /// Folder scope (issue #66): a source-relative path prefix, paired with `source_filter`.
+    path: Option<String>,
     sort: usize, // index into SORTS
     mode: SearchMode,
     view: View,
+    /// Which folder-tree nodes are expanded, and the lazily-fetched children of the open ones.
+    expanded: HashSet<FolderKey>,
+    folders: HashMap<FolderKey, FolderState>,
     assets: Vec<AssetSummary>,
     total: Option<u64>,
     loading: bool,
@@ -131,9 +160,13 @@ impl DamGui {
             media_filter: None,
             license: None,
             favorites: false,
+            source_filter: None,
+            path: None,
             sort: 0,
             mode: SearchMode::Lexical,
             view: View::Grid,
+            expanded: HashSet::new(),
+            folders: HashMap::new(),
             assets: Vec::new(),
             total: None,
             loading: false,
@@ -174,6 +207,21 @@ impl DamGui {
                 field: FacetField::Favorite,
                 op: FilterOp::Eq,
                 value: FilterValue::Bool(true),
+            });
+        }
+        if let Some(src) = self.source_filter {
+            filters.push(Filter {
+                field: FacetField::Source,
+                op: FilterOp::Eq,
+                value: FilterValue::Str(src.to_string()),
+            });
+        }
+        // Folder scope (issue #66): a source-relative path prefix restricting the browse to a subtree.
+        if let Some(p) = self.path.as_deref().filter(|p| !p.is_empty()) {
+            filters.push(Filter {
+                field: FacetField::Path,
+                op: FilterOp::Eq,
+                value: FilterValue::Str(p.to_string()),
             });
         }
         let text = self.search.trim();
@@ -252,6 +300,26 @@ impl DamGui {
         });
     }
 
+    /// Fetch the immediate subfolders under one folder-tree node, off-thread (issue #66).
+    fn load_folders(&self, key: FolderKey) {
+        let (lib, auth, tx, egctx) = (
+            self.lib.clone(),
+            self.auth.clone(),
+            self.tx.clone(),
+            self.egui_ctx.clone(),
+        );
+        let (source, prefix) = key.clone();
+        self.rt.spawn(async move {
+            let req = FolderListing { source, prefix };
+            let r = lib
+                .list_folders(&auth, req)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(Msg::Folders(key, r));
+            egctx.request_repaint();
+        });
+    }
+
     /// Fetch + decode one asset's thumbnail off-thread. PNG decode happens on the worker; only the
     /// GPU texture upload (which must be on the UI thread) is deferred to `apply`. Audio and (feature-
     /// off) 3D assets have no raster thumbnail — those resolve to `Thumb::None` → the typed tile.
@@ -316,8 +384,72 @@ impl DamGui {
             Msg::Thumb(id, None) => {
                 self.thumbs.insert(id, Thumb::None);
             }
+            Msg::Folders(key, Ok(entries)) => {
+                self.folders.insert(key, FolderState::Loaded(entries));
+            }
+            Msg::Folders(key, Err(_)) => {
+                self.folders.insert(key, FolderState::Failed);
+            }
         }
     }
+
+    /// Render one source's folder subtree at `prefix` (issue #66), recursing into expanded nodes and
+    /// collecting clicks/loads into `acts` (the panel closure borrows `self` immutably).
+    fn folder_level(
+        &self,
+        ui: &mut egui::Ui,
+        source: SourceId,
+        prefix: &str,
+        depth: usize,
+        acts: &mut NavActions,
+    ) {
+        let key = (source, prefix.to_string());
+        match self.folders.get(&key) {
+            None => {
+                acts.load.push(key);
+                indent_hint(ui, depth, "Loading…");
+            }
+            Some(FolderState::Loading) => indent_hint(ui, depth, "Loading…"),
+            Some(FolderState::Failed) => indent_hint(ui, depth, "(couldn't list)"),
+            Some(FolderState::Loaded(entries)) => {
+                if entries.is_empty() {
+                    if depth == 1 {
+                        indent_hint(ui, depth, "(no subfolders)");
+                    }
+                    return;
+                }
+                for e in entries {
+                    let full = format!("{prefix}{}/", e.name);
+                    let open = self.expanded.contains(&(source, full.clone()));
+                    let scoped = self.source_filter == Some(source)
+                        && self.path.as_deref() == Some(full.as_str());
+                    ui.horizontal(|ui| {
+                        ui.add_space(depth as f32 * 10.0);
+                        if ui.small_button(if open { "v" } else { ">" }).clicked() {
+                            acts.toggle.push((source, full.clone()));
+                        }
+                        if ui
+                            .selectable_label(scoped, format!("{} ({})", e.name, e.asset_count))
+                            .clicked()
+                        {
+                            acts.scope = Some((source, Some(full.clone())));
+                        }
+                    });
+                    if open {
+                        self.folder_level(ui, source, &full, depth + 1, acts);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A left-indented, muted hint line inside the folder tree (loading / empty / error).
+fn indent_hint(ui: &mut egui::Ui, depth: usize, text: &str) {
+    ui.horizontal(|ui| {
+        ui.add_space(depth as f32 * 10.0 + 6.0);
+        ui.label(egui::RichText::new(text).small().weak());
+    });
 }
 
 impl eframe::App for DamGui {
@@ -330,6 +462,7 @@ impl eframe::App for DamGui {
         // Actions gathered while rendering (immutable borrows of self), applied after the panels.
         let mut do_query = false;
         let mut open_asset: Option<AssetId> = None;
+        let mut nav = NavActions::default();
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.add_space(4.0);
@@ -467,8 +600,30 @@ impl eframe::App for DamGui {
                 if self.sources.is_empty() {
                     ui.label(egui::RichText::new("No sources yet — add one with the CLI.").weak());
                 }
+                // Each source is an expandable folder tree (issue #66): the disclosure loads its
+                // directory tree lazily; clicking the name scopes the browse to that source (or, for
+                // a folder, to its subtree via the path-prefix filter).
                 for s in &self.sources {
-                    ui.label(format!("{}  ({})", s.name, s.stats.asset_count));
+                    let sid = s.id;
+                    let open = self.expanded.contains(&(sid, String::new()));
+                    let scoped = self.source_filter == Some(sid) && self.path.is_none();
+                    ui.horizontal(|ui| {
+                        if ui.small_button(if open { "v" } else { ">" }).clicked() {
+                            nav.toggle.push((sid, String::new()));
+                        }
+                        if ui
+                            .selectable_label(
+                                scoped,
+                                format!("{} ({})", s.name, s.stats.asset_count),
+                            )
+                            .clicked()
+                        {
+                            nav.scope = Some((sid, None));
+                        }
+                    });
+                    if open {
+                        self.folder_level(ui, sid, "", 1, &mut nav);
+                    }
                 }
             });
 
@@ -513,6 +668,29 @@ impl eframe::App for DamGui {
                     }
                 });
         });
+
+        // Folder-tree actions (issue #66), applied before the query so a folder scope re-queries
+        // with the updated source/path filters.
+        for k in nav.toggle {
+            if !self.expanded.remove(&k) {
+                self.expanded.insert(k);
+            }
+        }
+        for k in nav.load {
+            self.folders.insert(k.clone(), FolderState::Loading);
+            self.load_folders(k);
+        }
+        if let Some((sid, p)) = nav.scope {
+            // Clicking the already-active source/folder clears the scope; otherwise set it.
+            if self.source_filter == Some(sid) && self.path == p {
+                self.source_filter = None;
+                self.path = None;
+            } else {
+                self.source_filter = Some(sid);
+                self.path = p;
+            }
+            do_query = true;
+        }
 
         if do_query {
             self.load_assets(ctx);

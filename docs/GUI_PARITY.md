@@ -27,7 +27,7 @@ Legend: ✅ done · 🟡 partial · ⬜ owed (not yet in egui)
 | Inspector: preview (3D/audio/image) | ✅ | ⬜ | egui-wgpu paint callback for the 3D island; audio/image viewers |
 | Library stats | ✅ | ✅ | totals + by-media counts in the left rail |
 | Sources list | ✅ | 🟡 | egui shows them read-only; add/remove/rescan owed |
-| Folder-tree navigation + breadcrumb (#66) | ✅ | ⬜ | `list_folders` + path-prefix filter |
+| Folder-tree navigation (#66) | ✅ | ✅ | left-rail source tree, lazy `list_folders`, path-scoped browse (breadcrumb TBD) |
 | Search mode (lexical/hybrid/semantic) | ✅ | ✅ | toolbar combo, shown with a text query |
 | License facet | ✅ | ✅ | left-rail Permissive/Attribution/Restricted/Unknown |
 | Advanced Search (structured attr + tag filters) | ✅ | ⬜ | typed dropdown/range/toggle facets |
