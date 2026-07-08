@@ -191,6 +191,8 @@ enum Msg {
     Export(Result<ExportReport, String>),
     Duplicates(Result<Vec<DupGroup>, String>),
     Convert(Result<ConvertReport, String>),
+    /// Raw bytes of an audio asset fetched for inspector playback.
+    AudioBytes(AssetId, Result<Vec<u8>, String>),
 }
 
 pub struct DamGui {
@@ -274,6 +276,14 @@ pub struct DamGui {
     convert_format: String,
     convert_output: String,
     convert_status: Option<Result<String, String>>,
+    // ── audio preview player ──
+    /// The rodio output stream + handle, opened lazily on first play (kept alive so audio keeps
+    /// flowing). `!Send`, but the app lives on the main thread.
+    audio_stream: Option<rodio::OutputStream>,
+    audio_handle: Option<rodio::OutputStreamHandle>,
+    audio_sink: Option<rodio::Sink>,
+    audio_for: Option<AssetId>,
+    audio_error: Option<String>,
 }
 
 impl DamGui {
@@ -342,6 +352,11 @@ impl DamGui {
             convert_format: String::new(),
             convert_output: default_convert_dir(),
             convert_status: None,
+            audio_stream: None,
+            audio_handle: None,
+            audio_sink: None,
+            audio_for: None,
+            audio_error: None,
         };
         // Kick the initial loads against the freshly opened library.
         let egctx = cc.egui_ctx.clone();
@@ -611,6 +626,65 @@ impl DamGui {
             let _ = tx.send(Msg::Export(r));
             egctx.request_repaint();
         });
+    }
+
+    /// Fetch an audio asset's bytes off-thread for inspector playback.
+    fn load_audio(&self, id: AssetId) {
+        let (lib, auth, tx, egctx) = (
+            self.lib.clone(),
+            self.auth.clone(),
+            self.tx.clone(),
+            self.egui_ctx.clone(),
+        );
+        self.rt.spawn(async move {
+            let r = lib
+                .read_content(&auth, &id)
+                .await
+                .map(|c| c.bytes)
+                .map_err(|e| e.to_string());
+            let _ = tx.send(Msg::AudioBytes(id, r));
+            egctx.request_repaint();
+        });
+    }
+
+    /// Start playing decoded audio bytes on the (lazily opened) output stream.
+    fn play_audio(&mut self, id: AssetId, bytes: Vec<u8>) {
+        self.stop_audio();
+        if self.audio_handle.is_none() {
+            match rodio::OutputStream::try_default() {
+                Ok((stream, handle)) => {
+                    self.audio_stream = Some(stream);
+                    self.audio_handle = Some(handle);
+                }
+                Err(e) => {
+                    self.audio_error = Some(format!("no audio device: {e}"));
+                    return;
+                }
+            }
+        }
+        let Some(handle) = &self.audio_handle else {
+            return;
+        };
+        match (
+            rodio::Sink::try_new(handle),
+            rodio::Decoder::new(std::io::Cursor::new(bytes)),
+        ) {
+            (Ok(sink), Ok(source)) => {
+                sink.append(source);
+                sink.play();
+                self.audio_sink = Some(sink);
+                self.audio_for = Some(id);
+                self.audio_error = None;
+            }
+            _ => self.audio_error = Some("couldn't decode this audio".to_string()),
+        }
+    }
+
+    fn stop_audio(&mut self) {
+        if let Some(sink) = self.audio_sink.take() {
+            sink.stop();
+        }
+        self.audio_for = None;
     }
 
     /// Convert one image/audio asset to another format (non-destructive: writes to `output_dir`,
@@ -941,6 +1015,10 @@ impl DamGui {
                 )));
             }
             Msg::Convert(Err(e)) => self.convert_status = Some(Err(e)),
+            Msg::AudioBytes(id, Ok(bytes)) => self.play_audio(id, bytes),
+            Msg::AudioBytes(_, Err(e)) => {
+                self.audio_error = Some(format!("couldn't read audio: {e}"))
+            }
 
             // Map a live event to the coalesced refresh flags (flushed, throttled, in `update`).
             Msg::Event(ev) => match ev {
@@ -1075,6 +1153,11 @@ impl eframe::App for DamGui {
         }
         // Fold any live-update events into throttled refreshes.
         self.flush_live_updates(ctx);
+        // Clear the "playing" state once a track finishes on its own.
+        if self.audio_sink.as_ref().is_some_and(|s| s.empty()) {
+            self.audio_sink = None;
+            self.audio_for = None;
+        }
 
         // Actions gathered while rendering (immutable borrows of self), applied after the panels.
         let mut do_query = false;
@@ -1086,6 +1169,8 @@ impl eframe::App for DamGui {
         let mut open_similar: Option<AssetId> = None;
         // Some(Some(id)) selects a collection; Some(None) clears collection mode.
         let mut pick_collection: Option<Option<CollectionId>> = None;
+        let mut audio_play: Option<AssetId> = None;
+        let mut audio_stop = false;
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.add_space(4.0);
@@ -1399,6 +1484,27 @@ impl eframe::App for DamGui {
                                 _ => None,
                             };
                             inspector(ui, asset, thumb, &mut tag_review, &mut asset_action);
+
+                            // Audio preview: play/stop the selected audio asset (rodio).
+                            if asset.summary.media == MediaType::Audio {
+                                let aid = asset.summary.id;
+                                let playing = self.audio_for == Some(aid);
+                                ui.horizontal(|ui| {
+                                    if playing {
+                                        if ui.button("Stop").clicked() {
+                                            audio_stop = true;
+                                        }
+                                    } else if ui.button("Play").clicked() {
+                                        audio_play = Some(aid);
+                                    }
+                                    if let Some(err) = &self.audio_error {
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(0xef, 0x44, 0x44),
+                                            err,
+                                        );
+                                    }
+                                });
+                            }
 
                             // Collection memberships (read-only chips; per-asset add/remove is owed).
                             if !asset.collections.is_empty() {
@@ -1768,6 +1874,13 @@ impl eframe::App for DamGui {
         }
         if let Some((id, tag, action)) = tag_review {
             self.review_tag(id, tag, action);
+        }
+        if let Some(id) = audio_play {
+            self.audio_error = None;
+            self.load_audio(id);
+        }
+        if audio_stop {
+            self.stop_audio();
         }
         match asset_action {
             Some(AssetAction::Reanalyze(id)) => self.submit_analyze_asset(id),

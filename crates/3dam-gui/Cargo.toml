@@ -17,6 +17,9 @@ tokio = { workspace = true }
 image = { workspace = true }
 # Consume the engine's `LibraryService::subscribe` event stream (live updates).
 futures = { workspace = true }
+# Audio preview playback in the inspector (cpal/ALSA under the hood). Default codecs cover WAV/FLAC/
+# MP3/Vorbis; symphonia backs the rest.
+rodio = { version = "0.19", default-features = false, features = ["symphonia-all"] }
 
 # egui/eframe (ADR 0005). glow (OpenGL) backend — the wgpu viewer-embedding path (egui-wgpu paint
 # callback) lands with the 3D-preview slice and would otherwise pull a second, mismatched wgpu.
