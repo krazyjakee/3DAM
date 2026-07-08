@@ -27,6 +27,10 @@ export interface ViewState {
   collection: string | null;
   /** Favorites-only (issue #63) — a boolean facet that composes with media/source/license/tag. */
   fav: boolean;
+  /** Folder navigation (issue #66): a source-relative path prefix that scopes the browse to a
+   *  directory subtree. Always paired with a `source` (paths are source-relative), and mutually
+   *  exclusive with a collection. Empty/absent = the whole source (or library). */
+  path: string | null;
   /** Advanced Search: structured attribute filters (typed dropdown/range/toggle controls over the
    *  per-media attr columns) plus tag filters. Carried as a JSON `Filter[]` in the `adv` URL param so
    *  a whole faceted query stays linkable. AND-ed with the sidebar facets and text search. */
@@ -64,6 +68,7 @@ export function useViewState() {
       tag: params.get("tag"),
       collection: params.get("col"),
       fav: params.get("fav") === "1",
+      path: params.get("path"),
       adv: parseAdv(params.get("adv")),
       sort: (params.get("sort") as SortField | null) ?? "name",
       dir: (params.get("dir") as SortDir | null) ?? "asc",
@@ -90,6 +95,7 @@ export function useViewState() {
           if ("tag" in next) set("tag", next.tag);
           if ("collection" in next) set("col", next.collection);
           if ("fav" in next) set("fav", next.fav ? "1" : null);
+          if ("path" in next) set("path", next.path);
           if ("adv" in next) set("adv", next.adv && next.adv.length ? JSON.stringify(next.adv) : null);
           if ("sort" in next) set("sort", next.sort);
           if ("dir" in next) set("dir", next.dir);
@@ -112,6 +118,8 @@ export function useViewState() {
       filters.push({ field: "license", op: "eq", value: { str: state.license } });
     if (state.tag) filters.push({ field: "tag", op: "eq", value: { str: state.tag } });
     if (state.fav) filters.push({ field: "favorite", op: "eq", value: { bool: true } });
+    // Folder scope (issue #66): a source-relative path prefix restricts the browse to a subtree.
+    if (state.path) filters.push({ field: "path", op: "eq", value: { str: state.path } });
     // Advanced Search structured/tag filters, AND-ed onto the sidebar facets.
     filters.push(...state.adv);
     return {

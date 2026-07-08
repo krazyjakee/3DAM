@@ -57,6 +57,8 @@ export function useLiveUpdates(): void {
           // analyze/convert that mutates the inspected asset refreshes the panel without a reload.
           qc.invalidateQueries({ queryKey: ["asset"] });
           qc.invalidateQueries({ queryKey: ["similar"] });
+          // Add/remove reshapes the folder tree and its subtree counts (issue #66).
+          qc.invalidateQueries({ queryKey: ["folders"] });
           break;
         case "source_state":
           qc.invalidateQueries({ queryKey: qk.sources });
@@ -71,6 +73,7 @@ export function useLiveUpdates(): void {
           qc.invalidateQueries({ queryKey: qk.jobs });
           qc.invalidateQueries({ queryKey: ["asset"] });
           qc.invalidateQueries({ queryKey: ["similar"] });
+          qc.invalidateQueries({ queryKey: ["folders"] });
           break;
         case "job_progress":
           qc.invalidateQueries({ queryKey: qk.jobs });
@@ -84,6 +87,8 @@ export function useLiveUpdates(): void {
             qc.invalidateQueries({ queryKey: qk.duplicates });
             qc.invalidateQueries({ queryKey: ["asset"] });
             qc.invalidateQueries({ queryKey: ["similar"] });
+            // A finished scan/convert can add or move files — refresh the folder tree (issue #66).
+            qc.invalidateQueries({ queryKey: ["folders"] });
           }
           break;
       }

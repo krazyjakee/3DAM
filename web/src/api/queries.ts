@@ -42,6 +42,7 @@ export const qk = {
   duplicates: ["duplicates"] as const,
   blocklist: ["blocklist"] as const,
   similar: (id: AssetId) => ["similar", id] as const,
+  folders: (source: string, prefix: string) => ["folders", source, prefix] as const,
 };
 
 const PAGE_LIMIT = 60;
@@ -86,6 +87,19 @@ export function useSimilar(id: AssetId | null, enabled: boolean) {
     queryFn: () => api.findSimilar({ asset: id as AssetId }),
     enabled: enabled && !!id,
     staleTime: 60_000,
+  });
+}
+
+/** Folder navigation (issue #66): the immediate subfolders under `prefix` in one source — the lazy
+ *  unit the sidebar tree expands. Enabled per-node only when that node is open, so an unexpanded
+ *  source pulls nothing. Keyed by (source, prefix); ws.ts invalidates the `["folders"]` root when a
+ *  scan or asset change reshapes the tree. */
+export function useFolders(source: SourceId | null, prefix: string, enabled: boolean) {
+  return useQuery({
+    queryKey: source ? qk.folders(source, prefix) : ["folders", "none"],
+    queryFn: () => api.listFolders({ source: source as SourceId, prefix }),
+    enabled: enabled && !!source,
+    staleTime: 30_000,
   });
 }
 

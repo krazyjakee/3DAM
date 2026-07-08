@@ -5,6 +5,7 @@ import {
   AudioLines,
   Ban,
   Box,
+  ChevronRight,
   Clock,
   Copy,
   Folder,
@@ -48,6 +49,7 @@ import { useViewState } from "@/lib/view-state";
 import { useDialogs } from "@/lib/dialogs";
 import { useTheme, type ThemePref } from "@/lib/theme";
 import { AddSourceDialog } from "./AddSourceDialog";
+import { FolderTree } from "./FolderTree";
 
 const MEDIA: { key: MediaType; label: string; Icon: typeof AudioLines }[] = [
   { key: "audio", label: "Audio", Icon: AudioLines },
@@ -330,9 +332,13 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
         <SourceRow
           key={s.id}
           source={s}
-          active={state.source === s.id && !state.collection}
+          active={state.source === s.id && !state.path && !state.collection}
           removing={removeSource.isPending && removeSource.variables === s.id}
-          onSelect={() => go({ source: state.source === s.id ? null : s.id, collection: null })}
+          onNavigate={onNavigate}
+          onSelect={() =>
+            // Selecting the source row means the whole source — drop any folder scope (issue #66).
+            go({ source: state.source === s.id ? null : s.id, path: null, collection: null })
+          }
           onRescan={() => scan.mutate({ sources: [s.id], mode: "delta" })}
           onRemove={async () => {
             const n = s.stats.asset_count;
@@ -346,8 +352,9 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
             ) {
               removeSource.mutate(s.id, {
                 onSuccess: () => {
-                  // Don't leave the browser filtered on a source that no longer exists (issue #29).
-                  if (state.source === s.id) patch({ source: null });
+                  // Don't leave the browser filtered on a source that no longer exists (issue #29),
+                  // and drop any folder scope under it (issue #66).
+                  if (state.source === s.id) patch({ source: null, path: null });
                 },
               });
             }
@@ -359,7 +366,16 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
       <Collections
         activeId={state.collection}
         onSelect={(id) =>
-          go({ collection: id, media: null, source: null, license: null, tag: null, adv: [], q: "" })
+          go({
+            collection: id,
+            media: null,
+            source: null,
+            path: null,
+            license: null,
+            tag: null,
+            adv: [],
+            q: "",
+          })
         }
       />
 
@@ -577,6 +593,7 @@ function SourceRow({
   onSelect,
   onRescan,
   onRemove,
+  onNavigate,
 }: {
   source: SourceInfo;
   active: boolean;
@@ -584,17 +601,36 @@ function SourceRow({
   onSelect: () => void;
   onRescan: () => void;
   onRemove: () => void;
+  onNavigate?: () => void;
 }) {
   const scanning = source.state === "scanning";
   const errored = typeof source.state === "object";
+  // Folder navigation (issue #66): a source row is expandable to reveal its directory tree, lazily
+  // loaded. Kept local — the choice is transient UI, not part of the linkable view state.
+  const [open, setOpen] = useState(false);
   return (
+    <>
     <div
-      className="group flex items-center gap-2 px-3 py-1 text-xs"
+      className="group flex items-center gap-1 pr-3 pl-1 py-1 text-xs"
       style={{
         background: active ? "var(--color-accent-muted)" : "transparent",
         color: active ? "var(--color-accent)" : "var(--color-fg-muted)",
       }}
     >
+      {/* Disclosure — expand the source's folder tree (issue #66). Separate from selecting the
+          source, so a user can browse into folders without first scoping to the whole source. */}
+      <button
+        onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
+        aria-label={open ? `Collapse ${source.name} folders` : `Expand ${source.name} folders`}
+        className="flex items-center justify-center text-fg-dim hover:text-fg coarse:min-h-11 coarse:min-w-11"
+      >
+        <ChevronRight
+          size={12}
+          className="transition-transform"
+          style={{ transform: open ? "rotate(90deg)" : "none" }}
+        />
+      </button>
       <button
         className="flex min-w-0 flex-1 items-center gap-2 text-left coarse:min-h-11"
         onClick={onSelect}
@@ -642,5 +678,7 @@ function SourceRow({
         </button>
       </div>
     </div>
+    {open && <FolderTree source={source.id} prefix="" depth={0} onNavigate={onNavigate} />}
+    </>
   );
 }

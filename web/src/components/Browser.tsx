@@ -1,9 +1,11 @@
 import type React from "react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
+  ChevronRight,
   FileCog,
   FileDown,
+  Layers,
   LayoutGrid,
   Loader2,
   Menu,
@@ -20,6 +22,7 @@ import {
   useCollections,
   useDuplicates,
   useSetFavorite,
+  useSources,
 } from "@/api/queries";
 import type { AssetSummary, DupGroup, SearchMode, SortField } from "@/api/types";
 import { useViewState } from "@/lib/view-state";
@@ -211,6 +214,9 @@ export function Browser({ onOpenNav }: { onOpenNav?: () => void }) {
     // The centre browse region is the page's main landmark (a11y hardening, issue #44).
     <main className="flex h-full min-w-0 flex-1 flex-col bg-bg" aria-label="Asset browser">
       <Toolbar count={visible.length} total={total} onOpenNav={onOpenNav} searching={searching} />
+      {/* Folder breadcrumb (issue #66) — the current source + path segments, each clickable to jump
+          up the tree. Only shown when browsing a source (not a collection view). */}
+      <Breadcrumb />
       {selection.size > 1 && (
         <SelectionBar
           assets={selectedAssets}
@@ -246,6 +252,53 @@ export function Browser({ onOpenNav }: { onOpenNav?: () => void }) {
         <ConvertDialog assets={convertTargets} onClose={() => setConvertTargets(null)} />
       )}
     </main>
+  );
+}
+
+/** Folder breadcrumb (issue #66): when the browse is scoped to a source, show the source name
+ *  followed by each path segment, `/`-separated. Clicking a crumb re-scopes to that level (the
+ *  source name clears the folder path entirely); the trailing crumb is the current folder and is
+ *  inert. Hidden in collection views and when no source is active. Reads/writes the same `source` +
+ *  `path` view state the sidebar tree drives, so the two surfaces stay in lockstep. */
+function Breadcrumb() {
+  const { state, patch } = useViewState();
+  const sources = useSources();
+  if (!state.source || state.collection) return null;
+
+  const sourceName = sources.data?.find((s) => s.id === state.source)?.name ?? "Source";
+  const segs = (state.path ?? "").split("/").filter(Boolean);
+  const crumbs: { label: string; path: string | null }[] = [{ label: sourceName, path: null }];
+  let acc = "";
+  for (const seg of segs) {
+    acc += `${seg}/`;
+    crumbs.push({ label: seg, path: acc });
+  }
+
+  return (
+    <nav
+      aria-label="Folder path"
+      className="flex items-center gap-1 overflow-x-auto border-b border-border bg-surface px-3 py-1 text-[11px] text-fg-dim"
+    >
+      <Layers size={12} className="mr-0.5 shrink-0 text-fg-dim" />
+      {crumbs.map((c, i) => {
+        const last = i === crumbs.length - 1;
+        return (
+          <Fragment key={i}>
+            {i > 0 && <ChevronRight size={11} className="shrink-0 opacity-60" />}
+            <button
+              className={`max-w-[10rem] shrink-0 truncate coarse:min-h-11 ${
+                last ? "font-medium text-fg-muted" : "hover:text-accent"
+              }`}
+              disabled={last}
+              onClick={() => patch({ path: c.path })}
+              title={c.label}
+            >
+              {c.label}
+            </button>
+          </Fragment>
+        );
+      })}
+    </nav>
   );
 }
 
