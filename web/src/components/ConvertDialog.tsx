@@ -143,6 +143,7 @@ export function ConvertDialog({
                 <label className="mb-1 block text-[11px] text-fg-muted">Format</label>
                 <select
                   className="field"
+                  aria-label="Output format"
                   value={format}
                   onChange={(e) => setFormat(e.target.value)}
                 >
@@ -203,6 +204,7 @@ export function ConvertDialog({
                 <label className="mb-1 block text-[11px] text-fg-muted">On collision</label>
                 <select
                   className="field"
+                  aria-label="On collision"
                   value={collision}
                   onChange={(e) => setCollision(e.target.value as CollisionRule)}
                 >

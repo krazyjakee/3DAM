@@ -291,6 +291,7 @@ function SelectionBar({
       )}
       <select
         className="field w-auto"
+        aria-label="Add selection to collection"
         value=""
         disabled={manual.length === 0 || members.isPending}
         onChange={(e) => {
@@ -393,6 +394,8 @@ function Toolbar({
 
       <select
         className="field w-auto"
+        aria-label="Sort order"
+        title="Sort order"
         value={`${state.sort}:${state.dir}`}
         onChange={(e) => {
           const [sort, dir] = e.target.value.split(":") as [SortField, "asc" | "desc"];
@@ -430,10 +433,18 @@ function Toolbar({
       </button>
 
       <div className="flex overflow-hidden rounded border border-border">
-        <ViewBtn active={state.view === "grid"} onClick={() => patch({ view: "grid" })}>
+        <ViewBtn
+          active={state.view === "grid"}
+          onClick={() => patch({ view: "grid" })}
+          label="Grid view"
+        >
           <LayoutGrid size={14} />
         </ViewBtn>
-        <ViewBtn active={state.view === "table"} onClick={() => patch({ view: "table" })}>
+        <ViewBtn
+          active={state.view === "table"}
+          onClick={() => patch({ view: "table" })}
+          label="Table view"
+        >
           <Rows3 size={14} />
         </ViewBtn>
       </div>
@@ -451,15 +462,21 @@ function Toolbar({
 function ViewBtn({
   active,
   onClick,
+  label,
   children,
 }: {
   active: boolean;
   onClick: () => void;
+  /** Accessible name for the icon-only toggle (a11y — axe button-name, issue #44). */
+  label: string;
   children: React.ReactNode;
 }) {
   return (
     <button
       onClick={onClick}
+      title={label}
+      aria-label={label}
+      aria-pressed={active}
       className="flex items-center justify-center px-2 py-1 coarse:min-h-11 coarse:min-w-11"
       style={{
         background: active ? "var(--color-accent)" : "var(--color-surface-2)",
@@ -849,8 +866,11 @@ function Table({
       aria-label="Assets"
       onKeyDown={onKeyDown}
     >
+      {/* Presentational column-label strip. Not `role="row"`: the list is a roving-focus group of
+          labelled row buttons (issue #27), not a full ARIA grid, so an orphaned row role here just
+          triggers aria-required-parent/children (a11y, issue #44). */}
       <div
-        role="row"
+        aria-hidden="true"
         className="sticky top-0 z-10 grid grid-cols-[1fr_64px_104px_112px_84px] gap-2 border-b border-border bg-surface px-3 py-1.5 text-[10px] font-semibold tracking-wider text-fg-dim uppercase"
       >
         <span>Name</span>
@@ -955,19 +975,18 @@ function TableRow({
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-/** Favourite toggle for a grid tile / table row (issue #63). The cell itself is a `<button>`, so this
- *  is a `role="button"` span — never a nested `<button>` — and it stops propagation so starring never
- *  selects/opens the asset. Hidden until hover/focus (always shown once starred, or on touch), so the
- *  dense grid stays low-chrome. Active state uses the one accent (warn/danger are exposure-risk only). */
+/** Favourite toggle for a grid tile / table row (issue #63). The cell itself is a `<button>`, so a
+ *  nested interactive control here would be an a11y violation (axe `nested-interactive`, issue #44) —
+ *  this is therefore a *presentational* click target: `aria-hidden`, no role, no tab stop. It's a
+ *  pointer convenience; the keyboard/AT-accessible favourite toggle is the real `<button>` in the
+ *  Inspector title. `stopPropagation` keeps a star click from selecting/opening the asset. Hidden
+ *  until hover/focus (always shown once starred, or on touch) so the dense grid stays low-chrome. */
 function FavoriteStar({ asset }: { asset: AssetSummary }) {
   const setFavorite = useSetFavorite();
   const on = asset.favorite;
   return (
     <span
-      role="button"
-      tabIndex={-1}
-      aria-label={on ? "Remove from favourites" : "Add to favourites"}
-      aria-pressed={on}
+      aria-hidden="true"
       title={on ? "Remove from favourites" : "Add to favourites"}
       onClick={(e) => {
         e.stopPropagation();

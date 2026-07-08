@@ -81,6 +81,7 @@ export function ExportDialog({ scope, onClose }: { scope: ExportScope; onClose: 
               <label className="mb-1 block text-[11px] text-fg-muted">Format</label>
               <select
                 className="field"
+                aria-label="Format"
                 value={format}
                 onChange={(e) => setFormat(e.target.value as ExportFormat)}
               >

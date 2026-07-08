@@ -421,6 +421,7 @@ function CollectionsGroup({ asset }: { asset: Asset }) {
       {addable.length > 0 && (
         <select
           className="field mt-2"
+          aria-label="Add to collection"
           value=""
           disabled={members.isPending}
           onChange={(e) => {

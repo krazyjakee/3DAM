@@ -139,6 +139,7 @@ export function Settings() {
           flag={flag("authentication")}
         >
           <Choice
+            label="Authentication"
             value={String(flag("authentication")?.value ?? "off")}
             options={["off", "anonymous", "token"]}
             disabled={busyFlag !== null}
@@ -155,6 +156,7 @@ export function Settings() {
           flag={flag("mcp_server")}
         >
           <Choice
+            label="MCP agent server"
             value={String(flag("mcp_server")?.value ?? "off")}
             options={["off", "read_only", "read_write"]}
             disabled={busyFlag !== null}
@@ -171,6 +173,7 @@ export function Settings() {
           flag={flag("network_writes")}
         >
           <Toggle
+            label="Network writes"
             checked={flag("network_writes")?.value === true}
             disabled={busyFlag !== null}
             onChange={(v) => {
@@ -273,15 +276,19 @@ function Choice({
   options,
   onChange,
   disabled,
+  label,
 }: {
   value: string;
   options: string[];
   onChange: (v: string) => void;
   disabled?: boolean;
+  /** Accessible name — the flag's title (a11y: axe select-name, issue #44). */
+  label: string;
 }) {
   return (
     <select
       className="field w-auto disabled:opacity-50"
+      aria-label={label}
       value={value}
       disabled={disabled}
       onChange={(e) => onChange(e.target.value)}
@@ -299,16 +306,20 @@ function Toggle({
   checked,
   onChange,
   disabled,
+  label,
 }: {
   checked: boolean;
   onChange: (v: boolean) => void;
   disabled?: boolean;
+  /** Accessible name — the flag's title (a11y: axe button-name, issue #44). */
+  label: string;
 }) {
   return (
     <button
       type="button"
       role="switch"
       aria-checked={checked}
+      aria-label={label}
       disabled={disabled}
       onClick={() => onChange(!checked)}
       className={`h-6 w-11 rounded-full transition disabled:opacity-50 ${

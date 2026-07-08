@@ -95,6 +95,7 @@ export function AddSourceDialog({ onClose }: { onClose: () => void }) {
         <label className="mb-1 block text-[11px] text-fg-muted">Kind</label>
         <select
           className="field mb-3"
+          aria-label="Source kind"
           value={kind}
           onChange={(e) => setKind(e.target.value as SourceKind)}
         >

@@ -1,8 +1,18 @@
-# Contrast report — WCAG AA audit of the design tokens
+# Accessibility report — web client
 
 Part of the accessibility hardening epic ([#44](https://github.com/krazyjakee/3DAM/issues/44),
-PRODUCT_SPEC §9 phase 7). Audits the colour tokens in [`web/src/index.css`](../web/src/index.css)
-(`@theme` = dark, `:root[data-theme="light"]` = light) against **WCAG 2.1 §1.4.3 (AA)**.
+PRODUCT_SPEC §9 phase 7). Two automated checks:
+
+1. **Contrast audit** — the colour tokens in [`web/src/index.css`](../web/src/index.css) against
+   WCAG 2.1 §1.4.3 (AA). (below)
+2. **axe-core scan** — every route against WCAG 2 A/AA rules. ([jump ↓](#automated-axe-core-scan))
+
+---
+
+## Contrast audit — WCAG AA of the design tokens
+
+Audits the tokens (`@theme` = dark, `:root[data-theme="light"]` = light) against **WCAG 2.1
+§1.4.3 (AA)**.
 
 ## Method
 
@@ -112,3 +122,46 @@ print(round(ratio('#868f9c', '#14171c'), 2))  # -> 5.49  (>= 4.5 : AA pass)
 ```
 
 Paste the current token hexes from `web/src/index.css` and re-run to re-verify after any palette change.
+
+---
+
+## Automated axe-core scan
+
+axe-core 4.10.2, WCAG 2 A/AA rule set (`wcag2a`, `wcag2aa`, `wcag21a`, `wcag21aa`), run against a
+running dev client with a seeded catalog. **Every route passes with 0 violations.**
+
+| Route / state | Violations | Passing checks |
+|---|---|---|
+| Workspace — grid | 0 | 25 |
+| Workspace — table + inspector open | 0 | 26 |
+| Settings | 0 | 22 |
+| Duplicates | 0 | 18 |
+| Blocklist | 0 | 14 |
+
+### Violations found and fixed
+
+The first scan surfaced these (all now resolved):
+
+| Rule | Impact | Where | Fix |
+|---|---|---|---|
+| `button-name` | critical | grid/table view toggle, Settings flag toggle | `aria-label` (+ `aria-pressed` on the view toggle) |
+| `select-name` | critical | sort order, search mode, Settings flag `<select>`s, dedupe filter, and the Export / Convert / Add-source / collection selects | `aria-label` on each |
+| `nested-interactive` | serious | the grid/table favourite star (a `role="button"` span inside the cell `<button>`) | made the star **presentational** (`aria-hidden`, no role/tab stop) — a pointer convenience; the keyboard/AT favourite toggle is the real `<button>` in the Inspector |
+| `aria-required-parent` / `-children` | critical | the table header carried an orphan `role="row"` with no grid container | dropped the role — the list is a roving-focus group of labelled row buttons (#27), not a full ARIA grid; the header is now presentational |
+
+### Reproduce
+
+With the dev client running, in the browser console:
+
+```js
+const s = document.createElement('script');
+s.src = 'https://cdn.jsdelivr.net/npm/axe-core@4.10.2/axe.min.js';
+document.head.appendChild(s);
+s.onload = async () => {
+  const r = await axe.run(document, { runOnly: { type: 'tag', values: ['wcag2a','wcag2aa','wcag21a','wcag21aa'] } });
+  console.log(r.violations.length, 'violations', r.violations);
+};
+```
+
+Note: axe scans the current DOM only, so exercise each route/state (open a dialog, select an asset,
+switch to the table) and re-run to cover controls that mount conditionally.

@@ -81,6 +81,7 @@ export function Duplicates() {
         </div>
         <select
           className="field w-auto"
+          aria-label="Filter by media type"
           value={media}
           onChange={(e) => setMedia(e.target.value as MediaType | "")}
         >
