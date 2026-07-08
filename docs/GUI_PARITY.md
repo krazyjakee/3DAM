@@ -42,7 +42,7 @@ Legend: ✅ done · 🟡 partial · ⬜ owed (not yet in egui)
 | Per-asset actions (reanalyze, regen thumbnail) | ✅ | ✅ | inspector buttons over `submit_analyze` + `regenerate_thumbnails` |
 | Multi-select + batch actions | ✅ | ⬜ | |
 | Context menus | ✅ | ⬜ | |
-| Live updates | ✅ | ⬜ | web uses a WebSocket; egui embedded can subscribe to engine events |
+| Live updates | ✅ | ✅ | subscribes to the engine event stream; coalesced/throttled refreshes |
 | Settings / admin | ✅ | ⬜ | flags, tokens, audit |
 | Duplicates page / blocklist page | ✅ | ⬜ | |
 | Theme (light/dark) | ✅ | 🟡 | egui defaults to dark; expose the toggle |

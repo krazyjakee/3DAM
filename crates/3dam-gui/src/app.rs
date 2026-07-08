@@ -16,11 +16,13 @@ use eframe::egui;
 
 use dam_api::service::{AuthContext, LibraryService};
 use dam_api::{
-    AnalyzeRequest, Asset, AssetId, AssetSummary, FacetField, Filter, FilterOp, FilterValue,
-    FolderEntry, FolderListing, LibraryStats, LicenseStatus, MediaAttributes, MediaType, Page,
-    PageParams, QueryRequest, ReviewAction, SearchMode, Sort, SortDir, SortField, SourceId,
-    SourceInfo, SuggestionReview, ThumbnailRegenRequest,
+    AnalyzeRequest, Asset, AssetId, AssetSummary, EventTopic, FacetField, Filter, FilterOp,
+    FilterValue, FolderEntry, FolderListing, JobState, LibraryEvent, LibraryStats, LicenseStatus,
+    MediaAttributes, MediaType, Page, PageParams, QueryRequest, ReviewAction, SearchMode, Sort,
+    SortDir, SortField, SourceId, SourceInfo, SubscribeRequest, SuggestionReview,
+    ThumbnailRegenRequest,
 };
+use futures::StreamExt;
 
 /// A per-asset maintenance action fired from the inspector (mirrors the web context-menu actions).
 enum AssetAction {
@@ -111,6 +113,8 @@ enum Msg {
     Stats(Result<LibraryStats, String>),
     Thumb(AssetId, Option<ThumbPixels>),
     Folders(FolderKey, Result<Vec<FolderEntry>, String>),
+    /// A live change from the engine's event stream (scan/analyze/convert, source state, …).
+    Event(LibraryEvent),
 }
 
 pub struct DamGui {
@@ -147,6 +151,14 @@ pub struct DamGui {
     /// Thumbnail texture cache, keyed by asset. Presence of a key means "already requested", so it
     /// doubles as the de-dupe set for the lazy, visible-only loader.
     thumbs: HashMap<AssetId, Thumb>,
+    // ── live updates (coalesced) ──
+    /// Pending refreshes flagged by the event stream, flushed at most a few times a second so a big
+    /// scan's event burst doesn't re-query per event.
+    dirty_assets: bool,
+    dirty_stats: bool,
+    dirty_sources: bool,
+    dirty_detail: bool,
+    last_refresh: f64,
 }
 
 impl DamGui {
@@ -186,13 +198,50 @@ impl DamGui {
             stats: None,
             error: None,
             thumbs: HashMap::new(),
+            dirty_assets: false,
+            dirty_stats: false,
+            dirty_sources: false,
+            dirty_detail: false,
+            last_refresh: 0.0,
         };
         // Kick the initial loads against the freshly opened library.
         let egctx = cc.egui_ctx.clone();
         app.load_assets(&egctx);
         app.load_sources(&egctx);
         app.load_stats(&egctx);
+        app.spawn_events();
         app
+    }
+
+    /// Subscribe to the engine's event stream and forward each change to the UI thread (live
+    /// updates). The events are coalesced into throttled refreshes in `update` — this task just
+    /// pumps them across the channel and wakes the frame loop.
+    fn spawn_events(&self) {
+        let (lib, auth, tx, egctx) = (
+            self.lib.clone(),
+            self.auth.clone(),
+            self.tx.clone(),
+            self.egui_ctx.clone(),
+        );
+        self.rt.spawn(async move {
+            let req = SubscribeRequest {
+                topics: vec![
+                    EventTopic::Assets,
+                    EventTopic::Sources,
+                    EventTopic::Jobs,
+                    EventTopic::Analysis,
+                ],
+            };
+            let Ok(mut stream) = lib.subscribe(&auth, req).await else {
+                return;
+            };
+            while let Some(ev) = stream.next().await {
+                if tx.send(Msg::Event(ev)).is_err() {
+                    break; // UI gone
+                }
+                egctx.request_repaint();
+            }
+        });
     }
 
     fn build_query(&self) -> QueryRequest {
@@ -273,6 +322,23 @@ impl DamGui {
             self.auth.clone(),
             self.tx.clone(),
             egctx.clone(),
+        );
+        self.rt.spawn(async move {
+            let r = lib.get_asset(&auth, &id).await.map_err(|e| e.to_string());
+            let _ = tx.send(Msg::Detail(r));
+            egctx.request_repaint();
+        });
+    }
+
+    /// Re-fetch the selected asset's detail without blanking the current view — used by live updates
+    /// so an in-place refresh doesn't flicker the inspector (unlike `load_detail`, which shows a
+    /// loading state for an explicit selection).
+    fn reload_detail(&self, id: AssetId) {
+        let (lib, auth, tx, egctx) = (
+            self.lib.clone(),
+            self.auth.clone(),
+            self.tx.clone(),
+            self.egui_ctx.clone(),
         );
         self.rt.spawn(async move {
             let r = lib.get_asset(&auth, &id).await.map_err(|e| e.to_string());
@@ -466,6 +532,66 @@ impl DamGui {
             Msg::Folders(key, Err(_)) => {
                 self.folders.insert(key, FolderState::Failed);
             }
+            // Map a live event to the coalesced refresh flags (flushed, throttled, in `update`).
+            Msg::Event(ev) => match ev {
+                LibraryEvent::AssetAdded(_) | LibraryEvent::AssetRemoved(_) => {
+                    self.dirty_assets = true;
+                    self.dirty_stats = true;
+                }
+                LibraryEvent::AssetChanged { id, .. } => {
+                    self.dirty_assets = true;
+                    self.dirty_stats = true;
+                    if self.selected == Some(id) {
+                        self.dirty_detail = true;
+                    }
+                }
+                LibraryEvent::SourceState { .. } => self.dirty_sources = true,
+                LibraryEvent::JobProgress(status) => {
+                    // A finished job (scan/analyze/convert) reshapes the catalogue.
+                    if matches!(status.state, JobState::Done) {
+                        self.dirty_assets = true;
+                        self.dirty_stats = true;
+                        self.dirty_sources = true;
+                        self.dirty_detail = self.selected.is_some();
+                        self.folders.clear(); // subtree counts may have changed
+                    }
+                }
+                LibraryEvent::CatalogReset => {
+                    self.dirty_assets = true;
+                    self.dirty_stats = true;
+                    self.dirty_sources = true;
+                    self.folders.clear();
+                    self.expanded.clear();
+                }
+            },
+        }
+    }
+
+    /// Flush the coalesced live-update refreshes, throttled so a scan's event burst can't re-query
+    /// per event. Keeps the flags set (and reschedules a repaint) when inside the throttle window.
+    fn flush_live_updates(&mut self, ctx: &egui::Context) {
+        if !(self.dirty_assets || self.dirty_stats || self.dirty_sources || self.dirty_detail) {
+            return;
+        }
+        let now = ctx.input(|i| i.time);
+        if now - self.last_refresh < 0.4 {
+            ctx.request_repaint_after(std::time::Duration::from_millis(400));
+            return;
+        }
+        self.last_refresh = now;
+        if std::mem::take(&mut self.dirty_assets) {
+            self.load_assets(ctx);
+        }
+        if std::mem::take(&mut self.dirty_stats) {
+            self.load_stats(ctx);
+        }
+        if std::mem::take(&mut self.dirty_sources) {
+            self.load_sources(ctx);
+        }
+        if std::mem::take(&mut self.dirty_detail) {
+            if let Some(id) = self.selected {
+                self.reload_detail(id);
+            }
         }
     }
 
@@ -534,6 +660,8 @@ impl eframe::App for DamGui {
         while let Ok(msg) = self.rx.try_recv() {
             self.apply(msg);
         }
+        // Fold any live-update events into throttled refreshes.
+        self.flush_live_updates(ctx);
 
         // Actions gathered while rendering (immutable borrows of self), applied after the panels.
         let mut do_query = false;

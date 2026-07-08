@@ -1483,6 +1483,7 @@ dependencies = [
  "dam-api",
  "dam-frontend",
  "eframe",
+ "futures",
  "image",
  "tokio",
 ]
