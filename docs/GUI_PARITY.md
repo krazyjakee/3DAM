@@ -41,7 +41,7 @@ Legend: ✅ done · 🟡 partial · ⬜ owed (not yet in egui)
 | Convert / export | ✅ | ✅ | export-manifest modal + per-asset convert modal (image/audio transcode) |
 | Per-asset actions (reanalyze, regen thumbnail) | ✅ | ✅ | inspector buttons over `submit_analyze` + `regenerate_thumbnails` |
 | Multi-select + batch actions | ✅ | ✅ | ctrl/shift-click selection + batch bar (analyze / export / clear) |
-| Context menus | ✅ | ⬜ | |
+| Context menus | ✅ | ✅ | right-click grid/list → Analyze / Regen thumbnail / Convert / Export (media-aware) |
 | Live updates | ✅ | ✅ | subscribes to the engine event stream; coalesced/throttled refreshes |
 | Settings / admin | ✅ | ⬜ | flags, tokens, audit |
 | Duplicates page / blocklist page | ✅ | ⬜ | |

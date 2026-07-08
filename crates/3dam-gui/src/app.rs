@@ -35,6 +35,8 @@ enum AssetAction {
     RegenThumb(AssetId),
     /// Open the convert modal for this image/audio asset.
     Convert(AssetId, MediaType),
+    /// Open the export modal scoped to this single asset.
+    Export(AssetId),
 }
 
 /// Modifier keys on a grid/list click that change the multi-selection (issue #10/#22).
@@ -1527,9 +1529,9 @@ impl eframe::App for DamGui {
                         ui.add_space(12.0);
                         ui.label(egui::RichText::new("No assets match.").weak());
                     } else if self.view == View::Grid {
-                        self.grid(ui, &mut grid_click, &mut to_load);
+                        self.grid(ui, &mut grid_click, &mut to_load, &mut asset_action);
                     } else {
-                        self.list(ui, &mut grid_click);
+                        self.list(ui, &mut grid_click, &mut asset_action);
                     }
                 });
         });
@@ -1780,6 +1782,11 @@ impl eframe::App for DamGui {
                 self.convert_status = None;
                 self.convert_open = true;
             }
+            Some(AssetAction::Export(id)) => {
+                self.export_assets = vec![id];
+                self.export_status = None;
+                self.export_open = true;
+            }
             None => {}
         }
         if let Some(id) = find_sim {
@@ -1797,7 +1804,12 @@ impl eframe::App for DamGui {
 
 impl DamGui {
     /// The flat text list (audio-friendly; the web "table" analogue).
-    fn list(&self, ui: &mut egui::Ui, click: &mut Option<(AssetId, ClickMods)>) {
+    fn list(
+        &self,
+        ui: &mut egui::Ui,
+        click: &mut Option<(AssetId, ClickMods)>,
+        menu: &mut Option<AssetAction>,
+    ) {
         for a in &self.assets {
             let selected = self.selected == Some(a.id) || self.selection.contains(&a.id);
             let text = format!(
@@ -1807,9 +1819,11 @@ impl DamGui {
                 a.format.to_uppercase(),
                 human_bytes(a.size),
             );
-            if ui.selectable_label(selected, text).clicked() {
+            let resp = ui.selectable_label(selected, text);
+            if resp.clicked() {
                 *click = Some((a.id, click_mods(ui)));
             }
+            resp.context_menu(|ui| asset_context_menu(ui, a, menu));
         }
     }
 
@@ -1820,6 +1834,7 @@ impl DamGui {
         ui: &mut egui::Ui,
         click: &mut Option<(AssetId, ClickMods)>,
         to_load: &mut Vec<AssetId>,
+        menu: &mut Option<AssetAction>,
     ) {
         const TILE: f32 = 128.0;
         const CARD_W: f32 = TILE;
@@ -1832,6 +1847,7 @@ impl DamGui {
                 if resp.clicked() {
                     *click = Some((a.id, click_mods(ui)));
                 }
+                resp.context_menu(|ui| asset_context_menu(ui, a, menu));
                 if !ui.is_rect_visible(rect) {
                     continue;
                 }
@@ -2163,6 +2179,29 @@ fn media_tag(m: MediaType) -> &'static str {
         MediaType::Audio => "[AUD]",
         MediaType::Image => "[IMG]",
         MediaType::Model => "[3D ]",
+    }
+}
+
+/// The right-click context menu for a grid card / list row — the per-asset actions, mirroring the
+/// web context menu. Writes the chosen action into `menu` (applied after the panels).
+fn asset_context_menu(ui: &mut egui::Ui, a: &AssetSummary, menu: &mut Option<AssetAction>) {
+    if ui.button("Analyze").clicked() {
+        *menu = Some(AssetAction::Reanalyze(a.id));
+        ui.close_menu();
+    }
+    if matches!(a.media, MediaType::Image | MediaType::Model)
+        && ui.button("Regenerate thumbnail").clicked()
+    {
+        *menu = Some(AssetAction::RegenThumb(a.id));
+        ui.close_menu();
+    }
+    if matches!(a.media, MediaType::Image | MediaType::Audio) && ui.button("Convert…").clicked() {
+        *menu = Some(AssetAction::Convert(a.id, a.media));
+        ui.close_menu();
+    }
+    if ui.button("Export…").clicked() {
+        *menu = Some(AssetAction::Export(a.id));
+        ui.close_menu();
     }
 }
 
