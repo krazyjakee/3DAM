@@ -298,6 +298,80 @@ fn filters_eq(a: &Filter, b: &Filter) -> bool {
     a.field == b.field && a.op == b.op && a.value == b.value
 }
 
+/// Number of peak buckets in an inspector waveform (the drawn bar count).
+const WAVEFORM_BUCKETS: usize = 240;
+
+/// Decode audio bytes and reduce them to `WAVEFORM_BUCKETS` normalised (0..1) peak values — the
+/// max absolute mono amplitude in each equal time slice. Mirrors the web waveform island's shape.
+fn compute_peaks(bytes: &[u8]) -> Result<Vec<f32>, String> {
+    use rodio::Source;
+    let dec =
+        rodio::Decoder::new(std::io::Cursor::new(bytes.to_vec())).map_err(|e| e.to_string())?;
+    let channels = dec.channels().max(1) as usize;
+    // Fold interleaved samples to mono absolute amplitude. Cap the sample count so a long track's
+    // preview stays cheap (the peaks still span the whole file — this only limits resolution).
+    const MAX_SAMPLES: usize = 6_000_000;
+    let mut mono: Vec<f32> = Vec::new();
+    let mut acc = 0f32;
+    let mut c = 0usize;
+    for s in dec {
+        acc += (s as f32 / i16::MAX as f32).abs();
+        c += 1;
+        if c == channels {
+            mono.push(acc / channels as f32);
+            acc = 0.0;
+            c = 0;
+        }
+        if mono.len() >= MAX_SAMPLES {
+            break;
+        }
+    }
+    if mono.is_empty() {
+        return Err("no samples".into());
+    }
+    let n = mono.len();
+    let mut peaks = vec![0f32; WAVEFORM_BUCKETS];
+    for (i, &v) in mono.iter().enumerate() {
+        let b = (i * WAVEFORM_BUCKETS / n).min(WAVEFORM_BUCKETS - 1);
+        if v > peaks[b] {
+            peaks[b] = v;
+        }
+    }
+    // Normalise so the loudest slice fills the height.
+    let max = peaks.iter().copied().fold(0f32, f32::max);
+    if max > 0.0 {
+        for p in &mut peaks {
+            *p /= max;
+        }
+    }
+    Ok(peaks)
+}
+
+/// Paint a mirrored waveform (accent bars around a centre line) from normalised peaks.
+fn draw_waveform(ui: &mut egui::Ui, peaks: &[f32]) {
+    let width = ui.available_width().min(300.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 56.0), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 3.0, egui::Color32::from_rgb(0x0f, 0x17, 0x21)); // dark trough
+    if peaks.is_empty() {
+        return;
+    }
+    let accent = egui::Color32::from_rgb(0x38, 0xbd, 0xf8); // sky #38bdf8
+    let mid = rect.center().y;
+    let half = rect.height() / 2.0 - 3.0;
+    let slot = rect.width() / peaks.len() as f32;
+    let bar = (slot * 0.7).max(1.0);
+    for (i, &p) in peaks.iter().enumerate() {
+        let x = rect.left() + i as f32 * slot;
+        let h = (p * half).max(0.5);
+        painter.rect_filled(
+            egui::Rect::from_min_max(egui::pos2(x, mid - h), egui::pos2(x + bar, mid + h)),
+            0.0,
+            accent,
+        );
+    }
+}
+
 /// Format a range bound for display: drop the fraction when it's a whole number.
 fn fmt_num(v: f64) -> String {
     if v.fract() == 0.0 {
@@ -363,6 +437,8 @@ enum Msg {
     Convert(Result<ConvertReport, String>),
     /// Raw bytes of an audio asset fetched for inspector playback.
     AudioBytes(AssetId, Result<Vec<u8>, String>),
+    /// Normalised peak buckets (0..1) for an audio asset's inspector waveform.
+    Waveform(AssetId, Result<Vec<f32>, String>),
     /// The DMSH preview-mesh blob for a model asset (interactive 3D viewer).
     ModelMesh(AssetId, Result<Vec<u8>, String>),
     /// A collection create/rename/delete/membership mutation finished (reload on success).
@@ -481,6 +557,9 @@ pub struct DamGui {
     audio_handle: Option<rodio::OutputStreamHandle>,
     audio_sink: Option<rodio::Sink>,
     audio_for: Option<AssetId>,
+    /// Cached waveform peaks (0..1) for the selected audio asset's inspector preview.
+    waveform: Option<(AssetId, Vec<f32>)>,
+    waveform_loading: bool,
     audio_error: Option<String>,
     /// Interactive 3D preview renderer (present only on the wgpu backend). `!Send`; UI-thread only.
     viewer3d: Option<crate::viewer3d::Viewer3d>,
@@ -564,6 +643,8 @@ impl DamGui {
             audio_handle: None,
             audio_sink: None,
             audio_for: None,
+            waveform: None,
+            waveform_loading: false,
             audio_error: None,
             viewer3d: cc
                 .wgpu_render_state
@@ -1408,6 +1489,32 @@ impl DamGui {
         });
     }
 
+    /// Fetch + decode an audio asset and reduce it to normalised peak buckets for the inspector
+    /// waveform. Decode is CPU work → `spawn_blocking` (golden rule 5); the peaks post over a `Msg`.
+    fn load_waveform(&self, id: AssetId) {
+        let (lib, auth, tx, egctx) = (
+            self.lib.clone(),
+            self.auth.clone(),
+            self.tx.clone(),
+            self.egui_ctx.clone(),
+        );
+        self.rt.spawn(async move {
+            let r = async {
+                let bytes = lib
+                    .read_content(&auth, &id)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .bytes;
+                tokio::task::spawn_blocking(move || compute_peaks(&bytes))
+                    .await
+                    .map_err(|e| e.to_string())?
+            }
+            .await;
+            let _ = tx.send(Msg::Waveform(id, r));
+            egctx.request_repaint();
+        });
+    }
+
     /// Start playing decoded audio bytes on the (lazily opened) output stream.
     fn play_audio(&mut self, id: AssetId, bytes: Vec<u8>) {
         self.stop_audio();
@@ -1726,6 +1833,7 @@ impl DamGui {
                         asset.summary.format.as_str(),
                         "blend" | "usd" | "usdz" | "usdc" | "usda"
                     );
+                let is_audio = asset.summary.media == MediaType::Audio;
                 self.detail = Some(asset);
                 self.detail_loading = false;
                 if previewable_model
@@ -1735,6 +1843,12 @@ impl DamGui {
                         .is_some_and(|v| v.model_for != Some(id))
                 {
                     self.load_model_mesh(id);
+                }
+                // Kick the inspector waveform for a newly-selected audio asset.
+                if is_audio && self.waveform.as_ref().map(|(w, _)| *w) != Some(id) {
+                    self.waveform = None;
+                    self.waveform_loading = true;
+                    self.load_waveform(id);
                 }
             }
             Msg::Detail(Err(e)) => {
@@ -1804,6 +1918,11 @@ impl DamGui {
                 )));
             }
             Msg::Convert(Err(e)) => self.convert_status = Some(Err(e)),
+            Msg::Waveform(id, Ok(peaks)) => {
+                self.waveform = Some((id, peaks));
+                self.waveform_loading = false;
+            }
+            Msg::Waveform(_, Err(_)) => self.waveform_loading = false, // non-fatal; just no waveform
             Msg::AudioBytes(id, Ok(bytes)) => self.play_audio(id, bytes),
             Msg::AudioBytes(_, Err(e)) => {
                 self.audio_error = Some(format!("couldn't read audio: {e}"))
@@ -2413,9 +2532,22 @@ impl eframe::App for DamGui {
                                 inspector(ui, asset, thumb, &mut tag_review, &mut asset_action);
                             }
 
-                            // Audio preview: play/stop the selected audio asset (rodio).
+                            // Audio preview: waveform + play/stop for the selected audio asset.
                             if asset.summary.media == MediaType::Audio {
                                 let aid = asset.summary.id;
+                                // Waveform (peaks computed off-thread on selection).
+                                match &self.waveform {
+                                    Some((wid, peaks)) if *wid == aid => draw_waveform(ui, peaks),
+                                    _ if self.waveform_loading => {
+                                        ui.horizontal(|ui| {
+                                            ui.spinner();
+                                            ui.label(
+                                                egui::RichText::new("waveform…").small().weak(),
+                                            );
+                                        });
+                                    }
+                                    _ => {}
+                                }
                                 let playing = self.audio_for == Some(aid);
                                 ui.horizontal(|ui| {
                                     if playing {
