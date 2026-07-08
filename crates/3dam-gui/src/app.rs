@@ -3394,6 +3394,10 @@ fn inspector(
         });
     }
 
+    // Continuous analysis features as 0–1 bars (image seamlessness; audio brightness/harmonicity) —
+    // the visual analogue of the web inspector's FeatureBar / Seamlessness blocks.
+    feature_bars(ui, &asset.attributes);
+
     if !asset.tags.is_empty() {
         ui.separator();
         ui.label(
@@ -3472,6 +3476,59 @@ fn media_value(m: MediaType) -> &'static str {
 
 /// Build the inspector's media-attribute rows for the asset's media type — the cheap-tier container
 /// facts plus any analysis-pass extras that have been filled in. Empty (no block) when nothing known.
+/// Paint the analysis "features" block: 0–1 bars for image seamlessness (+ a coloured tile-class
+/// badge) and audio brightness / harmonicity. Mirrors the web inspector's Seamlessness / FeatureBar.
+/// No-op until the analyze pass has scored the asset.
+fn feature_bars(ui: &mut egui::Ui, attrs: &MediaAttributes) {
+    let mut bars: Vec<(&str, f32)> = Vec::new();
+    let mut badge: Option<(String, egui::Color32)> = None;
+    match attrs {
+        MediaAttributes::Image(a) => {
+            if let Some(t) = a.tileability {
+                bars.push(("Seamlessness", t));
+            }
+            badge = a.tile_class.as_deref().map(|tc| {
+                let (label, color) = match tc {
+                    "seamless" => ("Seamless", egui::Color32::from_rgb(0x22, 0xc5, 0x5e)),
+                    "tiled" => ("Tiled", egui::Color32::from_rgb(0x38, 0xbd, 0xf8)),
+                    "non_tiling" => ("Non-tiling", egui::Color32::GRAY),
+                    other => (other, egui::Color32::GRAY),
+                };
+                (label.to_string(), color)
+            });
+        }
+        MediaAttributes::Audio(a) => {
+            if let Some(b) = a.brightness {
+                bars.push(("Brightness", b));
+            }
+            if let Some(h) = a.harmonicity {
+                bars.push(("Harmonicity", h));
+            }
+        }
+        _ => {}
+    }
+    if bars.is_empty() && badge.is_none() {
+        return;
+    }
+    ui.separator();
+    ui.label(egui::RichText::new("FEATURES").small().weak());
+    if let Some((label, color)) = badge {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Tiling").small().weak());
+            ui.colored_label(color, egui::RichText::new(label).small());
+        });
+    }
+    for (label, val) in bars {
+        let v = val.clamp(0.0, 1.0);
+        ui.add(
+            egui::ProgressBar::new(v)
+                .desired_height(9.0)
+                .text(egui::RichText::new(format!("{label}  {:.0}%", v * 100.0)).small()),
+        )
+        .on_hover_text(format!("{val:.3}"));
+    }
+}
+
 fn media_rows(attrs: &MediaAttributes) -> Vec<(String, String)> {
     let mut r: Vec<(String, String)> = Vec::new();
     let mut push = |k: &str, v: String| r.push((k.to_string(), v));
