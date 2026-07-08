@@ -17,11 +17,11 @@ use eframe::egui;
 use dam_api::service::{AuthContext, LibraryService};
 use dam_api::{
     AnalyzeRequest, Asset, AssetId, AssetSummary, Collection, CollectionId, CollectionKind,
-    EventTopic, ExportFormat, ExportReport, ExportRequest, FacetField, Filter, FilterOp,
-    FilterValue, FolderEntry, FolderListing, JobState, LibraryEvent, LibraryStats, LicenseStatus,
-    MediaAttributes, MediaType, Page, PageParams, QueryRequest, ReviewAction, SearchMode,
-    SimilarHit, SimilarRequest, Sort, SortDir, SortField, SourceId, SourceInfo, SubscribeRequest,
-    SuggestionReview, ThumbnailRegenRequest,
+    DupGroup, DupKind, DupRequest, EventTopic, ExportFormat, ExportReport, ExportRequest,
+    FacetField, Filter, FilterOp, FilterValue, FolderEntry, FolderListing, JobState, LibraryEvent,
+    LibraryStats, LicenseStatus, MediaAttributes, MediaType, Page, PageParams, QueryRequest,
+    ReviewAction, SearchMode, SimilarHit, SimilarRequest, Sort, SortDir, SortField, SourceId,
+    SourceInfo, SubscribeRequest, SuggestionReview, ThumbnailRegenRequest,
 };
 use futures::StreamExt;
 
@@ -151,6 +151,7 @@ enum Msg {
     Similar(AssetId, Result<Vec<SimilarHit>, String>),
     Collections(Result<Vec<Collection>, String>),
     Export(Result<ExportReport, String>),
+    Duplicates(Result<Vec<DupGroup>, String>),
 }
 
 pub struct DamGui {
@@ -177,6 +178,8 @@ pub struct DamGui {
     /// faceted query (mutually exclusive with the facets, mirroring the web).
     collection: Option<CollectionId>,
     collections: Vec<Collection>,
+    /// Exact (byte-identical) duplicate groups, cached for the inspector's per-asset dup section.
+    duplicates: Vec<DupGroup>,
     sort: usize, // index into SORTS
     mode: SearchMode,
     view: View,
@@ -243,6 +246,7 @@ impl DamGui {
             path: None,
             collection: None,
             collections: Vec::new(),
+            duplicates: Vec::new(),
             sort: 0,
             mode: SearchMode::Lexical,
             view: View::Grid,
@@ -278,6 +282,7 @@ impl DamGui {
         app.load_sources(&egctx);
         app.load_stats(&egctx);
         app.load_collections(&egctx);
+        app.load_duplicates(&egctx);
         app.spawn_events();
         app
     }
@@ -411,6 +416,29 @@ impl DamGui {
         self.rt.spawn(async move {
             let r = lib.list_collections(&auth).await.map_err(|e| e.to_string());
             let _ = tx.send(Msg::Collections(r));
+            egctx.request_repaint();
+        });
+    }
+
+    /// Load the exact (byte-identical) duplicate groups, cached for the inspector's dup section.
+    fn load_duplicates(&self, egctx: &egui::Context) {
+        let (lib, auth, tx, egctx) = (
+            self.lib.clone(),
+            self.auth.clone(),
+            self.tx.clone(),
+            egctx.clone(),
+        );
+        self.rt.spawn(async move {
+            let req = DupRequest {
+                kind: DupKind::Exact,
+                media: None,
+                limit: 10_000,
+            };
+            let r = lib
+                .list_duplicates(&auth, req)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(Msg::Duplicates(r));
             egctx.request_repaint();
         });
     }
@@ -706,6 +734,9 @@ impl DamGui {
                 )));
             }
             Msg::Export(Err(e)) => self.export_status = Some(Err(e)),
+            Msg::Duplicates(Ok(g)) => self.duplicates = g,
+            Msg::Duplicates(Err(_)) => {} // non-fatal; the dup section just won't show
+
             // Map a live event to the coalesced refresh flags (flushed, throttled, in `update`).
             Msg::Event(ev) => match ev {
                 LibraryEvent::AssetAdded(_) | LibraryEvent::AssetRemoved(_) => {
@@ -758,8 +789,9 @@ impl DamGui {
         }
         if std::mem::take(&mut self.dirty_stats) {
             self.load_stats(ctx);
-            // Catalog changes also shift smart-folder counts.
+            // Catalog changes also shift smart-folder counts + duplicate groups.
             self.load_collections(ctx);
+            self.load_duplicates(ctx);
         }
         if std::mem::take(&mut self.dirty_sources) {
             self.load_sources(ctx);
@@ -1081,76 +1113,132 @@ impl eframe::App for DamGui {
                 ui.add_space(6.0);
                 ui.heading("Inspector");
                 ui.separator();
-                if self.detail_loading {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label("Loading…");
-                    });
-                } else if let Some(asset) = &self.detail {
-                    let thumb = match self.thumbs.get(&asset.summary.id) {
-                        Some(Thumb::Ready(tex)) => Some(tex),
-                        _ => None,
-                    };
-                    inspector(ui, asset, thumb, &mut tag_review, &mut asset_action);
-
-                    // Collection memberships (read-only chips; per-asset add/remove is owed).
-                    if !asset.collections.is_empty() {
-                        ui.separator();
-                        ui.label(egui::RichText::new("COLLECTIONS").small().weak());
-                        ui.horizontal_wrapped(|ui| {
-                            for cid in &asset.collections {
-                                let name = self
-                                    .collections
-                                    .iter()
-                                    .find(|c| c.id == *cid)
-                                    .map(|c| c.name.as_str())
-                                    .unwrap_or("(collection)");
-                                ui.label(egui::RichText::new(name).small());
-                            }
-                        });
-                    }
-
-                    // "Find similar" (tech-spec 05 §3): opt-in nearest-neighbour ranking. Un-analyzed
-                    // assets have no vector, so we point at Analyze instead of querying into the void.
-                    ui.separator();
-                    ui.label(egui::RichText::new("SIMILAR").small().weak());
-                    let id = asset.summary.id;
-                    if asset.timestamps.analyzed.is_none() {
-                        ui.label(
-                            egui::RichText::new("Analyze this asset to find similar ones.").weak(),
-                        );
-                    } else if self.similar_for == Some(id) {
-                        if self.similar_loading {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if self.detail_loading {
                             ui.horizontal(|ui| {
                                 ui.spinner();
-                                ui.label("Searching…");
+                                ui.label("Loading…");
                             });
-                        } else if self.similar.is_empty() {
-                            ui.label(egui::RichText::new("No similar assets found.").weak());
-                        } else {
-                            for hit in &self.similar {
-                                let pct = (hit.score * 100.0).round() as i32;
-                                if ui
-                                    .selectable_label(
-                                        false,
-                                        format!(
-                                            "{}  {}   ·   {pct}%",
-                                            media_tag(hit.asset.media),
-                                            hit.asset.name
-                                        ),
-                                    )
-                                    .clicked()
-                                {
-                                    open_similar = Some(hit.asset.id);
+                        } else if let Some(asset) = &self.detail {
+                            let thumb = match self.thumbs.get(&asset.summary.id) {
+                                Some(Thumb::Ready(tex)) => Some(tex),
+                                _ => None,
+                            };
+                            inspector(ui, asset, thumb, &mut tag_review, &mut asset_action);
+
+                            // Collection memberships (read-only chips; per-asset add/remove is owed).
+                            if !asset.collections.is_empty() {
+                                ui.separator();
+                                ui.label(egui::RichText::new("COLLECTIONS").small().weak());
+                                ui.horizontal_wrapped(|ui| {
+                                    for cid in &asset.collections {
+                                        let name = self
+                                            .collections
+                                            .iter()
+                                            .find(|c| c.id == *cid)
+                                            .map(|c| c.name.as_str())
+                                            .unwrap_or("(collection)");
+                                        ui.label(egui::RichText::new(name).small());
+                                    }
+                                });
+                            }
+
+                            // Exact duplicates: the byte-identical copies of this asset (grouping only —
+                            // 3DAM never deletes; the user disposes of a copy). Absent when it has no twin.
+                            let id = asset.summary.id;
+                            if let Some(g) = self.duplicates.iter().find(|g| {
+                                g.members.len() > 1 && g.members.iter().any(|m| m.id == id)
+                            }) {
+                                ui.separator();
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "DUPLICATES ({})",
+                                        g.members.len() - 1
+                                    ))
+                                    .small()
+                                    .weak(),
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "byte-identical ({}); dispose of copies yourself",
+                                        g.signal
+                                    ))
+                                    .small()
+                                    .weak(),
+                                );
+                                // Cap the rendered list — a big pack can have hundreds of identical copies.
+                                const DUP_CAP: usize = 24;
+                                for m in g.members.iter().take(DUP_CAP) {
+                                    let keep = m.id == g.suggested_keep;
+                                    let cur = m.id == id;
+                                    let label = format!(
+                                        "{}{}{}",
+                                        if keep { "[keep] " } else { "" },
+                                        m.name,
+                                        if cur { "  (this)" } else { "" },
+                                    );
+                                    if ui.selectable_label(cur, label).clicked() {
+                                        open_similar = Some(m.id);
+                                    }
+                                }
+                                if g.members.len() > DUP_CAP {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "… and {} more",
+                                            g.members.len() - DUP_CAP
+                                        ))
+                                        .small()
+                                        .weak(),
+                                    );
                                 }
                             }
+
+                            // "Find similar" (tech-spec 05 §3): opt-in nearest-neighbour ranking. Un-analyzed
+                            // assets have no vector, so we point at Analyze instead of querying into the void.
+                            ui.separator();
+                            ui.label(egui::RichText::new("SIMILAR").small().weak());
+                            if asset.timestamps.analyzed.is_none() {
+                                ui.label(
+                                    egui::RichText::new("Analyze this asset to find similar ones.")
+                                        .weak(),
+                                );
+                            } else if self.similar_for == Some(id) {
+                                if self.similar_loading {
+                                    ui.horizontal(|ui| {
+                                        ui.spinner();
+                                        ui.label("Searching…");
+                                    });
+                                } else if self.similar.is_empty() {
+                                    ui.label(
+                                        egui::RichText::new("No similar assets found.").weak(),
+                                    );
+                                } else {
+                                    for hit in &self.similar {
+                                        let pct = (hit.score * 100.0).round() as i32;
+                                        if ui
+                                            .selectable_label(
+                                                false,
+                                                format!(
+                                                    "{}  {}   ·   {pct}%",
+                                                    media_tag(hit.asset.media),
+                                                    hit.asset.name
+                                                ),
+                                            )
+                                            .clicked()
+                                        {
+                                            open_similar = Some(hit.asset.id);
+                                        }
+                                    }
+                                }
+                            } else if ui.button("Find similar").clicked() {
+                                find_sim = Some(id);
+                            }
+                        } else {
+                            ui.label(egui::RichText::new("Select an asset to inspect it.").weak());
                         }
-                    } else if ui.button("Find similar").clicked() {
-                        find_sim = Some(id);
-                    }
-                } else {
-                    ui.label(egui::RichText::new("Select an asset to inspect it.").weak());
-                }
+                    });
             });
 
         // Assets whose thumbnails are worth fetching this frame (visible + not yet requested),

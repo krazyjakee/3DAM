@@ -37,7 +37,7 @@ Legend: ✅ done · 🟡 partial · ⬜ owed (not yet in egui)
 | Grid ⇄ list view toggle | ✅ | 🟡 | grid + flat list; the web "table" (sortable columns) is richer |
 | Sort control | ✅ | ✅ | toolbar combo (name/size/scanned, both directions) |
 | Tag review (reject/restore) | ✅ | ✅ | reject-only lifecycle in the inspector, refreshes on review |
-| Similar / duplicates | ✅ | 🟡 | "Find similar" (find_similar) in the inspector; dedup review owed |
+| Similar / duplicates | ✅ | 🟡 | "Find similar" + exact-dup group (keep marker) in the inspector; dedicated dedup page owed |
 | Convert / export | ✅ | 🟡 | export-manifest modal (JSON/CSV/sidecar over the current view); convert owed |
 | Per-asset actions (reanalyze, regen thumbnail) | ✅ | ✅ | inspector buttons over `submit_analyze` + `regenerate_thumbnails` |
 | Multi-select + batch actions | ✅ | ⬜ | |
