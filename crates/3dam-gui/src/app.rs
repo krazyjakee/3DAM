@@ -16,14 +16,14 @@ use eframe::egui;
 
 use dam_api::service::{AuthContext, LibraryService};
 use dam_api::{
-    AddSource, AnalyzeRequest, Asset, AssetId, AssetSummary, Collection, CollectionId,
-    CollectionKind, CollectionMembers, CollisionRule, ConvertReport, ConvertRequest, ConvertTarget,
-    DupGroup, DupKind, DupRequest, EventTopic, ExportFormat, ExportReport, ExportRequest,
-    FacetField, Filter, FilterOp, FilterValue, FolderEntry, FolderListing, JobState, LibraryEvent,
-    LibraryStats, LicenseStatus, MediaAttributes, MediaType, NewCollection, Page, PageParams,
-    QueryRequest, RemoveSource, ReviewAction, ScanMode, ScanRequest, SearchMode, SimilarHit,
-    SimilarRequest, Sort, SortDir, SortField, SourceId, SourceInfo, SourceKind, SubscribeRequest,
-    SuggestionReview, ThumbnailRegenRequest, UpdateCollection,
+    AddSource, AnalyzeRequest, Asset, AssetId, AssetSummary, BlockEntry, Collection, CollectionId,
+    CollectionKind, CollectionMembers, CollisionRule, ContentHash, ConvertReport, ConvertRequest,
+    ConvertTarget, DupGroup, DupKind, DupRequest, EventTopic, ExportFormat, ExportReport,
+    ExportRequest, FacetField, Filter, FilterOp, FilterValue, FolderEntry, FolderListing, JobState,
+    LibraryEvent, LibraryStats, LicenseStatus, MediaAttributes, MediaType, NewCollection, Page,
+    PageParams, QueryRequest, RemoveAsset, RemoveSource, ReviewAction, ScanMode, ScanRequest,
+    SearchMode, SimilarHit, SimilarRequest, Sort, SortDir, SortField, SourceId, SourceInfo,
+    SourceKind, SubscribeRequest, SuggestionReview, ThumbnailRegenRequest, UpdateCollection,
 };
 use futures::StreamExt;
 
@@ -37,6 +37,9 @@ enum AssetAction {
     Convert(AssetId, MediaType),
     /// Open the export modal scoped to this single asset.
     Export(AssetId),
+    /// Remove from the catalog (`bool` = also block its content hash). Carries the name for the
+    /// confirmation dialog. Non-destructive: the file in the source is never touched (issue #21).
+    Remove(AssetId, String, bool),
 }
 
 /// Modifier keys on a grid/list click that change the multi-selection (issue #10/#22).
@@ -463,6 +466,12 @@ enum Msg {
     /// Groups for the dedicated duplicates view (filterable by kind/media; distinct from the
     /// inspector's exact-only `duplicates` cache).
     DupView(Result<Vec<DupGroup>, String>),
+    /// An asset removal finished (reload the browse + blocklist on success).
+    AssetRemoved(Result<(), String>),
+    /// The current blocklist entries.
+    Blocklist(Result<Vec<BlockEntry>, String>),
+    /// An unblock finished (reload the blocklist).
+    Unblocked(Result<(), String>),
     Convert(Result<ConvertReport, String>),
     /// Raw bytes of an audio asset fetched for inspector playback.
     AudioBytes(AssetId, Result<Vec<u8>, String>),
@@ -523,6 +532,13 @@ pub struct DamGui {
     dup_media: Option<MediaType>,
     dup_groups: Vec<DupGroup>,
     dup_loading: bool,
+    // ── remove / blocklist (issue #21) ──
+    /// Pending remove confirmation: (asset, name, also-block). None when no dialog is open.
+    confirm_remove_asset: Option<(AssetId, String, bool)>,
+    /// When set, the central panel shows the blocklist management surface.
+    blocklist_view: bool,
+    blocklist: Vec<BlockEntry>,
+    blocklist_loading: bool,
     sort: usize, // index into SORTS
     mode: SearchMode,
     view: View,
@@ -637,6 +653,10 @@ impl DamGui {
             dup_media: None,
             dup_groups: Vec::new(),
             dup_loading: false,
+            confirm_remove_asset: None,
+            blocklist_view: false,
+            blocklist: Vec::new(),
+            blocklist_loading: false,
             sort: 0,
             mode: SearchMode::Lexical,
             view: View::Grid,
@@ -699,6 +719,7 @@ impl DamGui {
         app.load_stats(&egctx);
         app.load_collections(&egctx);
         app.load_duplicates(&egctx);
+        app.load_blocklist(&egctx);
         app.spawn_events();
         app
     }
@@ -1412,6 +1433,105 @@ impl DamGui {
         });
     }
 
+    /// Remove an asset from the catalog off-thread (optionally blocking its hash). Non-destructive:
+    /// the source file is never touched. Posts `AssetRemoved` (reload on success).
+    fn remove_asset(&self, id: AssetId, block: bool) {
+        let (lib, auth, tx, egctx) = (
+            self.lib.clone(),
+            self.auth.clone(),
+            self.tx.clone(),
+            self.egui_ctx.clone(),
+        );
+        self.rt.spawn(async move {
+            let r = lib
+                .remove_asset(&auth, &id, RemoveAsset { block })
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(Msg::AssetRemoved(r));
+            egctx.request_repaint();
+        });
+    }
+
+    /// Load the blocked-content-hash list for the blocklist view.
+    fn load_blocklist(&self, egctx: &egui::Context) {
+        let (lib, auth, tx, egctx) = (
+            self.lib.clone(),
+            self.auth.clone(),
+            self.tx.clone(),
+            egctx.clone(),
+        );
+        self.rt.spawn(async move {
+            let r = lib.list_blocklist(&auth).await.map_err(|e| e.to_string());
+            let _ = tx.send(Msg::Blocklist(r));
+            egctx.request_repaint();
+        });
+    }
+
+    /// Lift a block so a future scan can re-import the content. Posts `Unblocked` (reload on success).
+    fn unblock(&self, hash: ContentHash) {
+        let (lib, auth, tx, egctx) = (
+            self.lib.clone(),
+            self.auth.clone(),
+            self.tx.clone(),
+            self.egui_ctx.clone(),
+        );
+        self.rt.spawn(async move {
+            let r = lib.unblock(&auth, &hash).await.map_err(|e| e.to_string());
+            let _ = tx.send(Msg::Unblocked(r));
+            egctx.request_repaint();
+        });
+    }
+
+    /// The remove-confirmation dialog (issue #21). Stresses that the file is untouched; the "+ block"
+    /// variant also blocklists the content hash. Fires `remove_asset` on confirm.
+    fn confirm_remove_modal(&mut self, ctx: &egui::Context) {
+        let Some((id, name, block)) = self.confirm_remove_asset.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut confirmed = false;
+        let mut cancel = false;
+        egui::Window::new("Remove asset")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(format!("Remove \"{name}\" from the catalog?"));
+                ui.label(
+                    egui::RichText::new(
+                        "The file in its source is never touched — only the catalog entry is dropped.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                if block {
+                    ui.label(
+                        egui::RichText::new(
+                            "Its content hash is blocked so a rescan can't re-import it.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let label = if block { "Remove + block" } else { "Remove" };
+                    if ui.button(label).clicked() {
+                        confirmed = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if confirmed {
+            self.remove_asset(id, block);
+            self.confirm_remove_asset = None;
+        } else if cancel || !open {
+            self.confirm_remove_asset = None;
+        }
+    }
+
     fn load_detail(&mut self, id: AssetId, egctx: &egui::Context) {
         self.detail = None;
         self.detail_loading = true;
@@ -1983,6 +2103,33 @@ impl DamGui {
                 self.dup_loading = false;
                 self.error = Some(format!("Couldn't load duplicates: {e}"));
             }
+            Msg::AssetRemoved(Ok(())) => {
+                let ctx = self.egui_ctx.clone();
+                // Clear a stale inspector focus, then refresh the browse, dup caches, and blocklist.
+                self.selected = None;
+                self.detail = None;
+                self.selection.clear();
+                self.load_assets(&ctx);
+                self.load_duplicates(&ctx);
+                if self.dup_view {
+                    self.load_dup_view(&ctx);
+                }
+                self.load_blocklist(&ctx);
+            }
+            Msg::AssetRemoved(Err(e)) => self.error = Some(format!("Remove failed: {e}")),
+            Msg::Blocklist(Ok(b)) => {
+                self.blocklist = b;
+                self.blocklist_loading = false;
+            }
+            Msg::Blocklist(Err(e)) => {
+                self.blocklist_loading = false;
+                self.error = Some(format!("Couldn't load blocklist: {e}"));
+            }
+            Msg::Unblocked(Ok(())) => {
+                let ctx = self.egui_ctx.clone();
+                self.load_blocklist(&ctx);
+            }
+            Msg::Unblocked(Err(e)) => self.error = Some(format!("Unblock failed: {e}")),
             Msg::Convert(Ok(rep)) => {
                 self.convert_status = Some(Ok(format!(
                     "{} done, {} failed, {} unsupported → {}",
@@ -2156,6 +2303,9 @@ impl eframe::App for DamGui {
         let mut dup_member_click: Option<AssetId> = None;
         let mut pick_dup_kind: Option<DupKind> = None;
         let mut pick_dup_media: Option<Option<MediaType>> = None;
+        // Blocklist view: toggle request + an unblock action.
+        let mut open_blocklist_view = false;
+        let mut unblock_hash: Option<ContentHash> = None;
         let mut nav = NavActions::default();
         let mut tag_review: Option<(AssetId, String, ReviewAction)> = None;
         let mut asset_action: Option<AssetAction> = None;
@@ -2391,6 +2541,16 @@ impl eframe::App for DamGui {
                 };
                 if ui.selectable_label(self.dup_view, dup_label).clicked() {
                     open_dup_view = true;
+                }
+
+                // Blocklist management (issue #21): the removed-and-blocked content hashes.
+                let bl_label = if self.blocklist.is_empty() {
+                    "Blocklist".to_string()
+                } else {
+                    format!("Blocklist ({})", self.blocklist.len())
+                };
+                if ui.selectable_label(self.blocklist_view, bl_label).clicked() {
+                    open_blocklist_view = true;
                 }
 
                 // Analysis-class quick facet — contextual to a single active media type (the full
@@ -2822,7 +2982,9 @@ impl eframe::App for DamGui {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    if self.dup_view {
+                    if self.blocklist_view {
+                        self.blocklist_review(ui, &mut unblock_hash);
+                    } else if self.dup_view {
                         self.dup_review(
                             ui,
                             &mut dup_member_click,
@@ -3055,6 +3217,7 @@ impl eframe::App for DamGui {
         if open_dup_view {
             self.dup_view = !self.dup_view;
             if self.dup_view {
+                self.blocklist_view = false; // the two full-panel views are mutually exclusive
                 self.dup_loading = true;
                 self.load_dup_view(ctx);
             }
@@ -3081,6 +3244,19 @@ impl eframe::App for DamGui {
             self.select_asset(id, ClickMods::default(), ctx);
         }
 
+        // Blocklist view: toggle + unblock.
+        if open_blocklist_view {
+            self.blocklist_view = !self.blocklist_view;
+            if self.blocklist_view {
+                self.dup_view = false; // the two full-panel views are mutually exclusive
+                self.blocklist_loading = true;
+                self.load_blocklist(ctx);
+            }
+        }
+        if let Some(hash) = unblock_hash {
+            self.unblock(hash);
+        }
+
         // Advanced Search modal — returns true when the filter set changed (re-query).
         if self.advanced_modal(ctx) {
             do_query = true;
@@ -3094,6 +3270,7 @@ impl eframe::App for DamGui {
             self.collection_action(action);
         }
         self.collection_modals(ctx);
+        self.confirm_remove_modal(ctx);
 
         // Collection selection (mutually exclusive with the facets, mirroring the web).
         if let Some(sel) = pick_collection {
@@ -3176,6 +3353,9 @@ impl eframe::App for DamGui {
                 self.export_assets = vec![id];
                 self.export_status = None;
                 self.export_open = true;
+            }
+            Some(AssetAction::Remove(id, name, block)) => {
+                self.confirm_remove_asset = Some((id, name, block));
             }
             None => {}
         }
@@ -3370,6 +3550,59 @@ impl DamGui {
                 dim,
             );
         }
+    }
+
+    /// The blocklist management surface (issue #21): the removed-and-blocked content hashes, each
+    /// with an Unblock button that lets a future scan re-import the content. Mirrors the web
+    /// blocklist page.
+    fn blocklist_review(&self, ui: &mut egui::Ui, unblock: &mut Option<ContentHash>) {
+        ui.add_space(4.0);
+        ui.heading("Blocklist");
+        ui.label(
+            egui::RichText::new(
+                "Content hashes of assets you removed with \"block\". A scan / watch / auto-rescan \
+                 won't re-import these bytes until you unblock them.",
+            )
+            .small()
+            .weak(),
+        );
+        ui.separator();
+        if self.blocklist_loading {
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Loading blocklist…");
+            });
+            return;
+        }
+        if self.blocklist.is_empty() {
+            ui.add_space(12.0);
+            ui.label(
+                egui::RichText::new(
+                    "Nothing blocked. Remove an asset with \"Remove + block\" to add its hash here.",
+                )
+                .weak(),
+            );
+            return;
+        }
+        egui::Grid::new("blocklist")
+            .num_columns(3)
+            .striped(true)
+            .spacing([12.0, 4.0])
+            .show(ui, |ui| {
+                for e in &self.blocklist {
+                    let name = e.label.as_deref().unwrap_or("(unknown)");
+                    ui.label(egui::RichText::new(name).small());
+                    // Short hash prefix (monospace) — the full 32-byte hash is long.
+                    let hex = e.hash.to_string();
+                    let short = hex.get(..16).unwrap_or(&hex);
+                    ui.label(egui::RichText::new(short).small().monospace().weak());
+                    if ui.small_button("Unblock").clicked() {
+                        *unblock = Some(e.hash);
+                    }
+                    ui.end_row();
+                }
+            });
     }
 
     /// The dedicated duplicate-review surface (issue #8): kind (exact/near) + media filters, then a
@@ -3590,6 +3823,15 @@ fn inspector(
         if matches!(s.media, MediaType::Image | MediaType::Audio) && ui.button("Convert").clicked()
         {
             *action = Some(AssetAction::Convert(s.id, s.media));
+        }
+        // Remove from the catalog (non-destructive to the file; confirms first). Block is offered in
+        // the right-click menu.
+        if ui
+            .button("Remove")
+            .on_hover_text("Remove from the catalog (the file is untouched)")
+            .clicked()
+        {
+            *action = Some(AssetAction::Remove(s.id, s.name.clone(), false));
         }
     });
 
@@ -3918,6 +4160,17 @@ fn asset_context_menu(ui: &mut egui::Ui, a: &AssetSummary, menu: &mut Option<Ass
     }
     if ui.button("Export…").clicked() {
         *menu = Some(AssetAction::Export(a.id));
+        ui.close_menu();
+    }
+    ui.separator();
+    // Remove from the catalog (the file is never touched). "+ block" also blocklists its hash so a
+    // rescan can't re-import it. Both confirm first (issue #21).
+    if ui.button("Remove…").clicked() {
+        *menu = Some(AssetAction::Remove(a.id, a.name.clone(), false));
+        ui.close_menu();
+    }
+    if ui.button("Remove + block…").clicked() {
+        *menu = Some(AssetAction::Remove(a.id, a.name.clone(), true));
         ui.close_menu();
     }
 }
