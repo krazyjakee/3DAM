@@ -108,6 +108,9 @@ const SORTS: &[(&str, SortField, SortDir)] = &[
     ("Oldest", SortField::Scanned, SortDir::Asc),
 ];
 
+/// Index into `SORTS` for "newest first" (scan-time desc) — the "Recently added" shortcut's sort.
+const NEWEST_SORT: usize = 4;
+
 /// One Advanced-Search control. Mirrors the web `Control` union (AdvancedSearch.tsx) one-for-one —
 /// keep in step with the `FacetField` variants and the analysis-pass classifier string literals.
 enum AdvCtl {
@@ -507,8 +510,8 @@ pub struct DamGui {
     class: Option<String>,
     license: Option<LicenseStatus>,
     favorites: bool,
-    /// Dark vs light theme (dark-first, DESIGN_GUIDELINES §4).
-    dark: bool,
+    /// Theme preference (dark-first, DESIGN_GUIDELINES §4). `System` follows the OS; egui resolves it.
+    theme_pref: egui::ThemePreference,
     source_filter: Option<SourceId>,
     /// Folder scope (issue #66): a source-relative path prefix, paired with `source_filter`.
     path: Option<String>,
@@ -624,7 +627,7 @@ impl DamGui {
         lib: Arc<dyn LibraryService>,
         auth: AuthContext,
     ) -> Self {
-        cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        cc.egui_ctx.set_theme(egui::ThemePreference::Dark); // dark-first (DESIGN_GUIDELINES §4)
         let (tx, rx) = std::sync::mpsc::channel();
         let mut app = Self {
             rt,
@@ -638,7 +641,7 @@ impl DamGui {
             class: None,
             license: None,
             favorites: false,
-            dark: true,
+            theme_pref: egui::ThemePreference::Dark,
             source_filter: None,
             path: None,
             collection: None,
@@ -2528,6 +2531,20 @@ impl eframe::App for DamGui {
                     do_query = true;
                 }
 
+                // Recently added — a shortcut that sorts by scan time, newest first (mirrors the web
+                // shortcut). Active when that sort is applied in the ordinary library view.
+                let recent_active =
+                    self.sort == NEWEST_SORT && !self.dup_view && !self.blocklist_view;
+                if ui
+                    .selectable_label(recent_active, "Recently added")
+                    .clicked()
+                {
+                    self.sort = NEWEST_SORT;
+                    self.dup_view = false;
+                    self.blocklist_view = false;
+                    do_query = true;
+                }
+
                 // Duplicate review (issue #8) — a dedicated dedupe view over the linked groups.
                 let dup_count = self
                     .duplicates
@@ -2696,20 +2713,21 @@ impl eframe::App for DamGui {
                     });
                 }
 
-                // Theme toggle at the foot of the rail (dark-first).
+                // Theme selector at the foot of the rail — cycles System → Dark → Light (dark-first).
+                // `System` follows the OS; egui resolves the preference to concrete visuals.
                 ui.separator();
-                let label = if self.dark {
-                    "Theme: Dark"
-                } else {
-                    "Theme: Light"
+                let label = match self.theme_pref {
+                    egui::ThemePreference::System => "Theme: System",
+                    egui::ThemePreference::Dark => "Theme: Dark",
+                    egui::ThemePreference::Light => "Theme: Light",
                 };
                 if ui.button(label).clicked() {
-                    self.dark = !self.dark;
-                    ui.ctx().set_visuals(if self.dark {
-                        egui::Visuals::dark()
-                    } else {
-                        egui::Visuals::light()
-                    });
+                    self.theme_pref = match self.theme_pref {
+                        egui::ThemePreference::System => egui::ThemePreference::Dark,
+                        egui::ThemePreference::Dark => egui::ThemePreference::Light,
+                        egui::ThemePreference::Light => egui::ThemePreference::System,
+                    };
+                    ui.ctx().set_theme(self.theme_pref);
                 }
             });
 

@@ -32,7 +32,7 @@ Legend: ✅ done · 🟡 partial · ⬜ owed (not yet in egui)
 | License facet | ✅ | ✅ | left-rail Permissive/Attribution/Restricted/Unknown |
 | Advanced Search (structured attr + tag filters) | ✅ | ✅ | toolbar "Filters" popover: media-contextual enum/numEnum/bool dropdowns + numeric ranges + free tag filter, AND-ed onto the query |
 | Quick class facet (audio/image/model class) | ✅ | ✅ | contextual chips in the left rail when a media type is active |
-| Favorites / Recently added | ✅ | 🟡 | favourites facet done; "recently added" = the Newest sort |
+| Favorites / Recently added | ✅ | ✅ | favourites facet + a "Recently added" rail shortcut (newest-first sort) |
 | Collections & smart folders | ✅ | ✅ | list + browse-by + "+ New" create (manual / smart-from-search) + right-click rename/delete + inspector add/remove membership |
 | Grid ⇄ list view toggle | ✅ | ✅ | grid + a responsive multi-column table (Name·Format·License·Detail·Size); clickable Name/Size sort headers, columns drop as the panel narrows |
 | Sort control | ✅ | ✅ | toolbar combo (name/size/scanned, both directions) |
@@ -45,7 +45,7 @@ Legend: ✅ done · 🟡 partial · ⬜ owed (not yet in egui)
 | Live updates | ✅ | ✅ | subscribes to the engine event stream; coalesced/throttled refreshes |
 | Settings / admin | ✅ | ⬜ | flags, tokens, audit |
 | Duplicates page / blocklist page | ✅ | ✅ | Duplicate-review view + a Blocklist management view (unblock); remove / remove+block actions in the inspector & context menus |
-| Theme (light/dark) | ✅ | ✅ | dark/light toggle at the foot of the rail (System mode owed) |
+| Theme (light/dark) | ✅ | ✅ | rail selector cycles System / Dark / Light (`ThemePreference`; System follows the OS) |
 | Responsive / touch / a11y pass | ✅ | ⬜ | |
 | 3D viewer on-canvas controls (#65) | ✅ | ✅ | orbit/zoom + control bar: auto-orbit · wireframe · lighting cycle (studio/soft/flat) · reset |
 
