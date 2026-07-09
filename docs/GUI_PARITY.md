@@ -47,7 +47,7 @@ Legend: ✅ done · 🟡 partial · ⬜ owed (not yet in egui)
 | Duplicates page / blocklist page | ✅ | ✅ | Duplicate-review view + a Blocklist management view (unblock); remove / remove+block actions in the inspector & context menus |
 | Theme (light/dark) | ✅ | ✅ | rail selector cycles System / Dark / Light (`ThemePreference`; System follows the OS) |
 | Responsive / touch / a11y pass | ✅ | ⬜ | |
-| 3D viewer on-canvas controls (#65) | ✅ | ✅ | orbit/zoom + control bar: auto-orbit · wireframe · lighting cycle (studio/soft/flat) · reset |
+| 3D viewer on-canvas controls (#65) | ✅ | ✅ | orbit/zoom + control bar: auto-orbit · wireframe · lighting cycle (studio/soft/flat) · reset · fullscreen (Esc to exit) |
 
 ## Current egui slice
 

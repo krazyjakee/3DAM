@@ -618,6 +618,8 @@ pub struct DamGui {
     audio_error: Option<String>,
     /// Interactive 3D preview renderer (present only on the wgpu backend). `!Send`; UI-thread only.
     viewer3d: Option<crate::viewer3d::Viewer3d>,
+    /// When set, the 3D preview fills the window in a fullscreen overlay (issue #65).
+    viewer_fullscreen: bool,
 }
 
 impl DamGui {
@@ -714,6 +716,7 @@ impl DamGui {
                 .wgpu_render_state
                 .as_ref()
                 .map(crate::viewer3d::Viewer3d::new),
+            viewer_fullscreen: false,
         };
         // Kick the initial loads against the freshly opened library.
         let egctx = cc.egui_ctx.clone();
@@ -2335,6 +2338,8 @@ impl eframe::App for DamGui {
         let mut ctl_wire = false;
         let mut ctl_light = false;
         let mut ctl_reset = false;
+        let mut ctl_fullscreen = false;
+        let mut exit_fullscreen = false;
 
         // Render the interactive 3D preview into its off-screen texture when the selected asset is a
         // model whose mesh is loaded — the inspector then draws it in place of the turntable still.
@@ -2793,6 +2798,15 @@ impl eframe::App for DamGui {
                                     }
                                     if ui.button("Reset").on_hover_text("Reset view").clicked() {
                                         ctl_reset = true;
+                                    }
+                                    if ui
+                                        .button("Fullscreen")
+                                        .on_hover_text(
+                                            "Expand the viewer to fill the window (Esc to exit)",
+                                        )
+                                        .clicked()
+                                    {
+                                        ctl_fullscreen = true;
                                     }
                                 });
                                 ui.label(
@@ -3328,6 +3342,72 @@ impl eframe::App for DamGui {
         if audio_stop {
             self.stop_audio();
         }
+        // Fullscreen 3D-viewer overlay (#65, final part): the preview fills the window over the
+        // normal layout, with the same orbit/zoom and control bar. Esc or "Exit fullscreen" leaves.
+        if self.viewer_fullscreen {
+            if let Some(tex) = model_tex {
+                egui::Window::new("viewer-fullscreen")
+                    .title_bar(false)
+                    .fixed_rect(ctx.screen_rect())
+                    .frame(egui::Frame::default().fill(egui::Color32::from_rgb(0x0f, 0x17, 0x21)))
+                    .show(ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            if ui.selectable_label(v_auto, "Auto-orbit").clicked() {
+                                ctl_auto = true;
+                            }
+                            if ui.selectable_label(v_wire, "Wireframe").clicked() {
+                                ctl_wire = true;
+                            }
+                            let light_name = match v_light {
+                                0 => "Light: Studio",
+                                1 => "Light: Soft",
+                                _ => "Light: Flat",
+                            };
+                            if ui.button(light_name).clicked() {
+                                ctl_light = true;
+                            }
+                            if ui.button("Reset").clicked() {
+                                ctl_reset = true;
+                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.button("Exit fullscreen").clicked() {
+                                        exit_fullscreen = true;
+                                    }
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "drag to orbit · scroll to zoom · Esc to exit",
+                                        )
+                                        .small()
+                                        .weak(),
+                                    );
+                                },
+                            );
+                        });
+                        // A large centred square viewer filling the remaining space.
+                        let sz = ui.available_width().min(ui.available_height()).max(64.0);
+                        ui.vertical_centered(|ui| {
+                            let resp = ui.add(
+                                egui::Image::new((tex, egui::vec2(sz, sz)))
+                                    .sense(egui::Sense::drag()),
+                            );
+                            if resp.dragged() {
+                                orbit_drag = resp.drag_delta();
+                            }
+                            if resp.hovered() {
+                                orbit_scroll = ui.input(|i| i.raw_scroll_delta.y);
+                            }
+                        });
+                    });
+                if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    exit_fullscreen = true;
+                }
+            } else {
+                exit_fullscreen = true; // model went away → leave fullscreen
+            }
+        }
+
         // Apply an orbit/zoom to the 3D preview and repaint so it re-renders this interaction.
         if orbit_drag != egui::Vec2::ZERO || orbit_scroll != 0.0 {
             if let Some(v) = &mut self.viewer3d {
@@ -3353,6 +3433,13 @@ impl eframe::App for DamGui {
                 }
             }
             ctx.request_repaint();
+        }
+        // Fullscreen toggle / exit (#65). Also leave fullscreen if the selection is no longer a model.
+        if ctl_fullscreen {
+            self.viewer_fullscreen = !self.viewer_fullscreen;
+        }
+        if exit_fullscreen || !show_3d {
+            self.viewer_fullscreen = false;
         }
         match asset_action {
             Some(AssetAction::Reanalyze(id)) => self.submit_analyze_asset(id),
