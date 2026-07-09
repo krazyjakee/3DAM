@@ -44,7 +44,7 @@ Legend: ✅ done · 🟡 partial · ⬜ owed (not yet in egui)
 | Context menus | ✅ | ✅ | right-click grid/list → Analyze / Regen thumbnail / Convert / Export (media-aware) |
 | Live updates | ✅ | ✅ | subscribes to the engine event stream; coalesced/throttled refreshes |
 | Settings / admin | ✅ | ⬜ | flags, tokens, audit |
-| Duplicates page / blocklist page | ✅ | 🟡 | Duplicate-review view done; blocklist page owed |
+| Duplicates page / blocklist page | ✅ | ✅ | Duplicate-review view + a Blocklist management view (unblock); remove / remove+block actions in the inspector & context menus |
 | Theme (light/dark) | ✅ | ✅ | dark/light toggle at the foot of the rail (System mode owed) |
 | Responsive / touch / a11y pass | ✅ | ⬜ | |
 | 3D viewer on-canvas controls (#65) | ✅ | ✅ | orbit/zoom + control bar: auto-orbit · wireframe · lighting cycle (studio/soft/flat) · reset |
