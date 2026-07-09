@@ -3802,7 +3802,10 @@ fn inspector(
         );
         ui.add_space(6.0);
     }
-    ui.label(egui::RichText::new(&s.name).strong());
+    // Truncate a long name to the panel width (full name on hover) so it doesn't force the inspector
+    // wider — same reasoning as the Path row below.
+    ui.add(egui::Label::new(egui::RichText::new(&s.name).strong()).truncate())
+        .on_hover_text(&s.name);
 
     // Per-asset maintenance actions (mirrors the web context menu / inspector actions).
     ui.horizontal(|ui| {
@@ -3839,8 +3842,22 @@ fn inspector(
         row(ui, "Type", media_label(s.media));
         row(ui, "Format", &s.format.to_uppercase());
         row(ui, "Size", &human_bytes(s.size));
-        row(ui, "Path", &asset.path);
         ui.end_row();
+    });
+    // Path on its own line so a long path *truncates* to the panel width instead of forcing the
+    // inspector wider. Left-click copies the full path; hover shows it in a tooltip.
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Path").weak());
+        let resp = ui
+            .add(
+                egui::Label::new(&asset.path)
+                    .truncate()
+                    .sense(egui::Sense::click()),
+            )
+            .on_hover_text(format!("{}\n(click to copy)", asset.path));
+        if resp.clicked() {
+            ui.ctx().copy_text(asset.path.clone());
+        }
     });
 
     // Media-specific attributes (audio/image/model), including the analysis-pass extras when present.
