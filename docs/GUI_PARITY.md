@@ -24,7 +24,7 @@ Legend: ✅ done · 🟡 partial · ⬜ owed (not yet in egui)
 | Thumbnails | ✅ | ✅ | `read_thumbnail` → decode off-thread → egui texture cache; lazy, visible-only; incl. 3D turntable renders (Vulkan) |
 | Inspector: core metadata | ✅ | ✅ | name, type, format, size, path, tags |
 | Inspector: media attributes | ✅ | ✅ | audio/image/model attr rows + a FEATURES block: image seamlessness bar + tile-class badge, audio brightness/harmonicity 0–1 bars |
-| Inspector: preview (3D/audio/image) | ✅ | ✅ | image + interactive 3D viewer (egui-wgpu, orbit/zoom) + audio waveform + play/stop; 3D textures (lambert-only) owed |
+| Inspector: preview (3D/audio/image) | ✅ | ✅ | image + interactive 3D viewer (egui-wgpu, orbit/zoom, **base-colour-textured** lambert) + audio waveform + play/stop |
 | Library stats | ✅ | ✅ | totals + by-media counts in the left rail |
 | Sources list + manage | ✅ | ✅ | list/scope + add-local / remove (confirm) / rescan in the rail (SFTP/SMB owed) |
 | Folder-tree navigation (#66) | ✅ | ✅ | left-rail source tree, lazy `list_folders`, path-scoped browse (breadcrumb TBD) |
