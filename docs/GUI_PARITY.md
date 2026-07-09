@@ -13,7 +13,7 @@ is about UI surface, not engine work — the capability already exists behind th
 
 ## Status
 
-Legend: ✅ done · 🟡 partial · ⬜ owed (not yet in egui)
+Legend: ✅ done · 🟡 partial · ⬜ owed (not yet in egui) · ▫ n/a (out of scope for the native embedded desktop app)
 
 | Capability | Web | egui | Notes |
 |---|---|---|---|
@@ -43,19 +43,27 @@ Legend: ✅ done · 🟡 partial · ⬜ owed (not yet in egui)
 | Multi-select + batch actions | ✅ | ✅ | ctrl/shift-click selection + batch bar (analyze / export / clear) |
 | Context menus | ✅ | ✅ | right-click grid/list → Analyze / Regen thumbnail / Convert / Export (media-aware) |
 | Live updates | ✅ | ✅ | subscribes to the engine event stream; coalesced/throttled refreshes |
-| Settings / admin | ✅ | ⬜ | flags, tokens, audit |
+| Settings / admin | ✅ | ▫ | flags/tokens/audit live in `server.db` (owned by `dam-server`); the native GUI opens `Backend::Embedded` (library only, no server), so there is nothing to administer. Would apply only if the GUI gained a `--connect` mode against a running server. |
 | Duplicates page / blocklist page | ✅ | ✅ | Duplicate-review view + a Blocklist management view (unblock); remove / remove+block actions in the inspector & context menus |
 | Theme (light/dark) | ✅ | ✅ | rail selector cycles System / Dark / Light (`ThemePreference`; System follows the OS) |
 | Theme palette matches web (#68) | ✅ | ✅ | custom egui `Visuals` built from the web `@theme` tokens (`theme.rs`) — bg/surface ladder, sky accent, text tiers; visual tuning may follow the sweep |
-| Responsive / touch / a11y pass | ✅ | ⬜ | |
+| Responsive / touch / a11y pass | ✅ | ▫ | The web pass targets the mobile/`coarse:` case (single-column collapse, drawers, 44px touch targets) — not applicable to a resizable desktop window (the three-region layout uses resizable panels instead). a11y: eframe ships AccessKit screen-reader support (enable the `accesskit` feature to turn it on); widgets already carry text labels / hover text. |
 | 3D viewer on-canvas controls (#65) | ✅ | ✅ | orbit/zoom + control bar: auto-orbit · wireframe · lighting cycle (studio/soft/flat) · reset · fullscreen (Esc to exit) |
 
-## Current egui slice
+## State of the egui client
 
-`crates/3dam-gui` (issue #34): a real eframe window over the embedded `LibraryService` —
-**browse** (thumbnail grid or flat list, toggle in the toolbar), **search** (text + media-type
-filter, live re-query), **inspect** (per-asset detail), plus library stats and a sources list.
-Thumbnails load off-thread (`read_thumbnail` → PNG decode → egui texture), lazily and visible-only,
-falling back to a typed tile for audio / un-rendered 3D. The async service runs on a background Tokio
-runtime; results reach the frame loop over a channel (no I/O on the UI thread — golden rule 5).
-Everything marked ⬜/🟡 above is the follow-up backlog.
+`crates/3dam-gui` (issue #34) is now a comprehensive eframe client over the embedded
+`LibraryService`, at parity with the web app on every substantive surface: the three-region
+workspace (toolbar · left rail · browser · inspector), text/media/mode search, browse as a
+thumbnail grid **or** a sortable multi-column table, the full inspector (metadata + analysis
+feature bars + tags with reject/restore + an interactive **base-colour-textured** 3D viewer with
+orbit/zoom and the #65 control bar + audio waveform & playback), Advanced Search, license/class/
+favorites/recently-added facets, folder-tree navigation, Collections CRUD + membership, per-asset
+actions (reanalyze / regen-thumbnail / convert / export / remove / remove+block), multi-select +
+batch actions, context menus, a duplicate-review view + a blocklist view, live updates over the
+engine event stream, and a web-matched theme (`theme.rs`) with a System/Dark/Light selector.
+
+The async service runs on a background Tokio runtime; results reach the frame loop over a channel
+(no I/O on the UI thread — golden rule 5), and click-driven mutations are gathered under the panel
+borrow then applied after (collect-then-apply). The rows marked ▫ above are out of scope for the
+native embedded desktop app (server-admin, mobile-responsive/touch); everything else is ✅.
