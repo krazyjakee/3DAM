@@ -12,6 +12,7 @@
 //! land in both clients rather than silently diverging.
 
 mod app;
+mod theme;
 mod viewer3d;
 
 use std::sync::Arc;

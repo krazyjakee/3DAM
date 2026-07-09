@@ -381,6 +381,8 @@ fn license_label(status: LicenseStatus) -> &'static str {
 
 /// Paint a mirrored waveform (accent bars around a centre line) from normalised peaks.
 fn draw_waveform(ui: &mut egui::Ui, peaks: &[f32]) {
+    // The one accent, from the active (web-matched) theme — see theme.rs / issue #68.
+    let accent = ui.visuals().selection.stroke.color;
     let width = ui.available_width().min(300.0);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 56.0), egui::Sense::hover());
     let painter = ui.painter_at(rect);
@@ -388,7 +390,6 @@ fn draw_waveform(ui: &mut egui::Ui, peaks: &[f32]) {
     if peaks.is_empty() {
         return;
     }
-    let accent = egui::Color32::from_rgb(0x38, 0xbd, 0xf8); // sky #38bdf8
     let mid = rect.center().y;
     let half = rect.height() / 2.0 - 3.0;
     let slot = rect.width() / peaks.len() as f32;
@@ -512,6 +513,8 @@ pub struct DamGui {
     favorites: bool,
     /// Theme preference (dark-first, DESIGN_GUIDELINES §4). `System` follows the OS; egui resolves it.
     theme_pref: egui::ThemePreference,
+    /// The dark/light mode our web-matched visuals were last applied for (re-apply when it flips).
+    theme_applied: Option<bool>,
     source_filter: Option<SourceId>,
     /// Folder scope (issue #66): a source-relative path prefix, paired with `source_filter`.
     path: Option<String>,
@@ -629,7 +632,9 @@ impl DamGui {
         lib: Arc<dyn LibraryService>,
         auth: AuthContext,
     ) -> Self {
-        cc.egui_ctx.set_theme(egui::ThemePreference::Dark); // dark-first (DESIGN_GUIDELINES §4)
+        // Dark-first preference (DESIGN_GUIDELINES §4); `update` applies the web-matched visuals
+        // (issue #68) for whatever mode the preference resolves to.
+        cc.egui_ctx.set_theme(egui::ThemePreference::Dark);
         let (tx, rx) = std::sync::mpsc::channel();
         let mut app = Self {
             rt,
@@ -644,6 +649,7 @@ impl DamGui {
             license: None,
             favorites: false,
             theme_pref: egui::ThemePreference::Dark,
+            theme_applied: None,
             source_filter: None,
             path: None,
             collection: None,
@@ -2286,6 +2292,15 @@ fn indent_hint(ui: &mut egui::Ui, depth: usize, text: &str) {
 
 impl eframe::App for DamGui {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Apply the web-matched visuals (issue #68) for the theme the preference currently resolves
+        // to — re-applied only when the resolved dark/light mode flips (a toggle, or `System` tracking
+        // the OS), so it's a no-op most frames.
+        let dark = ctx.theme() == egui::Theme::Dark;
+        if self.theme_applied != Some(dark) {
+            ctx.set_visuals(crate::theme::visuals(dark));
+            self.theme_applied = Some(dark);
+        }
+
         // Drain everything the worker posted since the last frame.
         while let Ok(msg) = self.rx.try_recv() {
             self.apply(msg);
@@ -4094,6 +4109,8 @@ fn feature_bars(ui: &mut egui::Ui, attrs: &MediaAttributes) {
     if bars.is_empty() && badge.is_none() {
         return;
     }
+    // Fill the 0–1 bars with the active theme's accent (not egui's default selection tint).
+    let accent = ui.visuals().selection.stroke.color;
     ui.separator();
     ui.label(egui::RichText::new("FEATURES").small().weak());
     if let Some((label, color)) = badge {
@@ -4106,6 +4123,7 @@ fn feature_bars(ui: &mut egui::Ui, attrs: &MediaAttributes) {
         let v = val.clamp(0.0, 1.0);
         ui.add(
             egui::ProgressBar::new(v)
+                .fill(accent)
                 .desired_height(9.0)
                 .text(egui::RichText::new(format!("{label}  {:.0}%", v * 100.0)).small()),
         )

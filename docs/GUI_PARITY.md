@@ -46,6 +46,7 @@ Legend: ✅ done · 🟡 partial · ⬜ owed (not yet in egui)
 | Settings / admin | ✅ | ⬜ | flags, tokens, audit |
 | Duplicates page / blocklist page | ✅ | ✅ | Duplicate-review view + a Blocklist management view (unblock); remove / remove+block actions in the inspector & context menus |
 | Theme (light/dark) | ✅ | ✅ | rail selector cycles System / Dark / Light (`ThemePreference`; System follows the OS) |
+| Theme palette matches web (#68) | ✅ | ✅ | custom egui `Visuals` built from the web `@theme` tokens (`theme.rs`) — bg/surface ladder, sky accent, text tiers; visual tuning may follow the sweep |
 | Responsive / touch / a11y pass | ✅ | ⬜ | |
 | 3D viewer on-canvas controls (#65) | ✅ | ✅ | orbit/zoom + control bar: auto-orbit · wireframe · lighting cycle (studio/soft/flat) · reset · fullscreen (Esc to exit) |
 
