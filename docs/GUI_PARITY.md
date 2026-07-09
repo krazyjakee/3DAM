@@ -37,14 +37,14 @@ Legend: ✅ done · 🟡 partial · ⬜ owed (not yet in egui)
 | Grid ⇄ list view toggle | ✅ | ✅ | grid + a responsive multi-column table (Name·Format·License·Detail·Size); clickable Name/Size sort headers, columns drop as the panel narrows |
 | Sort control | ✅ | ✅ | toolbar combo (name/size/scanned, both directions) |
 | Tag review (reject/restore) | ✅ | ✅ | reject-only lifecycle in the inspector, refreshes on review |
-| Similar / duplicates | ✅ | 🟡 | "Find similar" + exact-dup group (keep marker) in the inspector; dedicated dedup page owed |
+| Similar / duplicates | ✅ | ✅ | "Find similar" + exact-dup group in the inspector, plus a dedicated Duplicate-review view (exact/near + media filters, per-group keep marker, member→library nav) |
 | Convert / export | ✅ | ✅ | export-manifest modal + per-asset convert modal (image/audio transcode) |
 | Per-asset actions (reanalyze, regen thumbnail) | ✅ | ✅ | inspector buttons over `submit_analyze` + `regenerate_thumbnails` |
 | Multi-select + batch actions | ✅ | ✅ | ctrl/shift-click selection + batch bar (analyze / export / clear) |
 | Context menus | ✅ | ✅ | right-click grid/list → Analyze / Regen thumbnail / Convert / Export (media-aware) |
 | Live updates | ✅ | ✅ | subscribes to the engine event stream; coalesced/throttled refreshes |
 | Settings / admin | ✅ | ⬜ | flags, tokens, audit |
-| Duplicates page / blocklist page | ✅ | ⬜ | |
+| Duplicates page / blocklist page | ✅ | 🟡 | Duplicate-review view done; blocklist page owed |
 | Theme (light/dark) | ✅ | ✅ | dark/light toggle at the foot of the rail (System mode owed) |
 | Responsive / touch / a11y pass | ✅ | ⬜ | |
 | 3D viewer on-canvas controls (#65) | ✅ | ✅ | orbit/zoom + control bar: auto-orbit · wireframe · lighting cycle (studio/soft/flat) · reset |

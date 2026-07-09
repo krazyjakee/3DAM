@@ -460,6 +460,9 @@ enum Msg {
     Collections(Result<Vec<Collection>, String>),
     Export(Result<ExportReport, String>),
     Duplicates(Result<Vec<DupGroup>, String>),
+    /// Groups for the dedicated duplicates view (filterable by kind/media; distinct from the
+    /// inspector's exact-only `duplicates` cache).
+    DupView(Result<Vec<DupGroup>, String>),
     Convert(Result<ConvertReport, String>),
     /// Raw bytes of an audio asset fetched for inspector playback.
     AudioBytes(AssetId, Result<Vec<u8>, String>),
@@ -513,6 +516,13 @@ pub struct DamGui {
     collection_rename: Option<(CollectionId, String)>,
     /// Exact (byte-identical) duplicate groups, cached for the inspector's per-asset dup section.
     duplicates: Vec<DupGroup>,
+    // ── dedicated duplicates view (issue #8) ──
+    /// When set, the central panel shows the dedupe review (groups) instead of the browse.
+    dup_view: bool,
+    dup_kind: DupKind,
+    dup_media: Option<MediaType>,
+    dup_groups: Vec<DupGroup>,
+    dup_loading: bool,
     sort: usize, // index into SORTS
     mode: SearchMode,
     view: View,
@@ -622,6 +632,11 @@ impl DamGui {
             collection_new_smart: false,
             collection_rename: None,
             duplicates: Vec::new(),
+            dup_view: false,
+            dup_kind: DupKind::Exact,
+            dup_media: None,
+            dup_groups: Vec::new(),
+            dup_loading: false,
             sort: 0,
             mode: SearchMode::Lexical,
             view: View::Grid,
@@ -1374,6 +1389,29 @@ impl DamGui {
         });
     }
 
+    /// Load groups for the dedicated duplicates view, honouring the view's kind/media filters.
+    fn load_dup_view(&self, egctx: &egui::Context) {
+        let (lib, auth, tx, egctx) = (
+            self.lib.clone(),
+            self.auth.clone(),
+            self.tx.clone(),
+            egctx.clone(),
+        );
+        let req = DupRequest {
+            kind: self.dup_kind,
+            media: self.dup_media,
+            limit: 10_000,
+        };
+        self.rt.spawn(async move {
+            let r = lib
+                .list_duplicates(&auth, req)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(Msg::DupView(r));
+            egctx.request_repaint();
+        });
+    }
+
     fn load_detail(&mut self, id: AssetId, egctx: &egui::Context) {
         self.detail = None;
         self.detail_loading = true;
@@ -1937,6 +1975,14 @@ impl DamGui {
             Msg::Export(Err(e)) => self.export_status = Some(Err(e)),
             Msg::Duplicates(Ok(g)) => self.duplicates = g,
             Msg::Duplicates(Err(_)) => {} // non-fatal; the dup section just won't show
+            Msg::DupView(Ok(g)) => {
+                self.dup_groups = g;
+                self.dup_loading = false;
+            }
+            Msg::DupView(Err(e)) => {
+                self.dup_loading = false;
+                self.error = Some(format!("Couldn't load duplicates: {e}"));
+            }
             Msg::Convert(Ok(rep)) => {
                 self.convert_status = Some(Ok(format!(
                     "{} done, {} failed, {} unsupported → {}",
@@ -2104,6 +2150,12 @@ impl eframe::App for DamGui {
         let mut grid_click: Option<(AssetId, ClickMods)> = None;
         // A table-header sort click (new SORTS index), applied post-panel to re-query.
         let mut sort_click: Option<usize> = None;
+        // Duplicates view: toggle request + a member click (selects it and returns to the library) +
+        // filter picks (kind/media) collected under the panel borrow, applied after.
+        let mut open_dup_view = false;
+        let mut dup_member_click: Option<AssetId> = None;
+        let mut pick_dup_kind: Option<DupKind> = None;
+        let mut pick_dup_media: Option<Option<MediaType>> = None;
         let mut nav = NavActions::default();
         let mut tag_review: Option<(AssetId, String, ReviewAction)> = None;
         let mut asset_action: Option<AssetAction> = None;
@@ -2324,6 +2376,21 @@ impl eframe::App for DamGui {
                 if ui.selectable_label(self.favorites, "★ Favorites").clicked() {
                     self.favorites = !self.favorites;
                     do_query = true;
+                }
+
+                // Duplicate review (issue #8) — a dedicated dedupe view over the linked groups.
+                let dup_count = self
+                    .duplicates
+                    .iter()
+                    .filter(|g| g.members.len() > 1)
+                    .count();
+                let dup_label = if dup_count > 0 {
+                    format!("Duplicates ({dup_count})")
+                } else {
+                    "Duplicates".to_string()
+                };
+                if ui.selectable_label(self.dup_view, dup_label).clicked() {
+                    open_dup_view = true;
                 }
 
                 // Analysis-class quick facet — contextual to a single active media type (the full
@@ -2755,7 +2822,15 @@ impl eframe::App for DamGui {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    if self.assets.is_empty() && !self.loading {
+                    if self.dup_view {
+                        self.dup_review(
+                            ui,
+                            &mut dup_member_click,
+                            &mut asset_action,
+                            &mut pick_dup_kind,
+                            &mut pick_dup_media,
+                        );
+                    } else if self.assets.is_empty() && !self.loading {
                         ui.add_space(12.0);
                         ui.label(egui::RichText::new("No assets match.").weak());
                     } else if self.view == View::Grid {
@@ -2974,6 +3049,36 @@ impl eframe::App for DamGui {
                 self.sort = idx;
                 do_query = true;
             }
+        }
+
+        // Duplicates view: toggle, filter changes, and member navigation.
+        if open_dup_view {
+            self.dup_view = !self.dup_view;
+            if self.dup_view {
+                self.dup_loading = true;
+                self.load_dup_view(ctx);
+            }
+        }
+        let mut dup_reload = false;
+        if let Some(k) = pick_dup_kind {
+            if k != self.dup_kind {
+                self.dup_kind = k;
+                dup_reload = true;
+            }
+        }
+        if let Some(m) = pick_dup_media {
+            if m != self.dup_media {
+                self.dup_media = m;
+                dup_reload = true;
+            }
+        }
+        if dup_reload {
+            self.dup_loading = true;
+            self.load_dup_view(ctx);
+        }
+        if let Some(id) = dup_member_click {
+            self.dup_view = false; // return to the library with the member selected
+            self.select_asset(id, ClickMods::default(), ctx);
         }
 
         // Advanced Search modal — returns true when the filter set changed (re-query).
@@ -3264,6 +3369,121 @@ impl DamGui {
                 &human_bytes(a.size),
                 dim,
             );
+        }
+    }
+
+    /// The dedicated duplicate-review surface (issue #8): kind (exact/near) + media filters, then a
+    /// card per linked group (media · count · signal) with a member tile row; the suggested "keep" is
+    /// marked. 3DAM only groups — nothing is deleted. Clicking a member opens it in the library;
+    /// right-click gives the same per-asset actions as the browser. Mirrors web `Duplicates.tsx`.
+    fn dup_review(
+        &self,
+        ui: &mut egui::Ui,
+        member_click: &mut Option<AssetId>,
+        menu: &mut Option<AssetAction>,
+        pick_kind: &mut Option<DupKind>,
+        pick_media: &mut Option<Option<MediaType>>,
+    ) {
+        ui.add_space(4.0);
+        ui.heading("Duplicate review");
+        ui.label(
+            egui::RichText::new(
+                "Groups the analysis pass linked. 3DAM only groups — nothing is deleted. Each \
+                 group marks a suggested Keep; click a member to inspect it.",
+            )
+            .small()
+            .weak(),
+        );
+        ui.add_space(4.0);
+
+        // Controls: kind (exact/near) toggle + media filter + group count.
+        ui.horizontal(|ui| {
+            for (k, label) in [(DupKind::Exact, "Exact"), (DupKind::Near, "Near")] {
+                if ui.selectable_label(self.dup_kind == k, label).clicked() {
+                    *pick_kind = Some(k);
+                }
+            }
+            ui.separator();
+            for (m, label) in [
+                (None, "All media"),
+                (Some(MediaType::Image), "Images"),
+                (Some(MediaType::Audio), "Audio"),
+                (Some(MediaType::Model), "3D"),
+            ] {
+                if ui.selectable_label(self.dup_media == m, label).clicked() {
+                    *pick_media = Some(m);
+                }
+            }
+            ui.separator();
+            ui.label(
+                egui::RichText::new(format!("{} groups", self.dup_groups.len()))
+                    .small()
+                    .weak(),
+            );
+        });
+        ui.separator();
+
+        if self.dup_loading {
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Scanning for duplicates…");
+            });
+            return;
+        }
+        if self.dup_groups.is_empty() {
+            ui.add_space(12.0);
+            ui.label(
+                egui::RichText::new(
+                    "No duplicates in this view. Run the analysis pass to populate near-duplicate \
+                     signals.",
+                )
+                .weak(),
+            );
+            return;
+        }
+
+        // One card per group.
+        for (gi, g) in self.dup_groups.iter().enumerate() {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} · {} items",
+                            media_label(g.media),
+                            g.members.len()
+                        ))
+                        .small()
+                        .weak(),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(egui::RichText::new(&g.signal).small().monospace().weak());
+                    });
+                });
+                ui.horizontal_wrapped(|ui| {
+                    for m in &g.members {
+                        let keep = m.id == g.suggested_keep;
+                        let label = format!(
+                            "{}{}  {}\n{}",
+                            if keep { "[keep] " } else { "" },
+                            media_tag(m.media),
+                            ellipsize(&m.name, 22),
+                            human_bytes(m.size),
+                        );
+                        let resp = ui.add_sized(
+                            egui::vec2(150.0, 40.0),
+                            egui::SelectableLabel::new(keep, label),
+                        );
+                        if resp.clicked() {
+                            *member_click = Some(m.id);
+                        }
+                        resp.context_menu(|ui| asset_context_menu(ui, m, menu));
+                    }
+                });
+            });
+            if gi + 1 < self.dup_groups.len() {
+                ui.add_space(4.0);
+            }
         }
     }
 
