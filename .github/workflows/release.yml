@@ -53,6 +53,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # `@stable` (>= MSRV) is fine for release builds. MSRV drift is guarded by the
+      # accurate `rust-version = "1.91"` in the workspace Cargo.toml: the resolver honors
+      # it and fails fast on an older toolchain. We deliberately do NOT add a separate
+      # `@1.91` MSRV-verification job — the tree compiles Assimp from source (cmake/C++),
+      # so a dedicated MSRV build would be costly for little gain over the Cargo check.
+      # When wiring real push-triggered CI, revisit whether a cheap `cargo +1.91 metadata`
+      # (or `cargo check` on a lighter feature set) is worth adding here.
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}

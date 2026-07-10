@@ -83,7 +83,7 @@ Packages are named `dam-*` (Cargo forbids leading digits); directories are brand
 
 ## Developer workflow
 
-MSRV **1.85**, edition 2021, resolver 2. No `rustfmt.toml`, `clippy.toml`, or `deny.toml` — Rust defaults apply. The one `.cargo/config.toml` exists solely to force Assimp's Draco decoder on at build time via `CMAKE_TOOLCHAIN_FILE` (see [ADR 0011](docs/adr/0011-assimp-import-backend.md)); it affects only the `russimp-sys-ng` cmake build.
+MSRV **1.91**, edition 2021, resolver 2. The floor is dictated by the locked dependency tree, not our own source — libsqlite3-sys 0.38's build script uses the `cfg_select!` macro (stable since 1.91), and image 0.25 / wgpu 30 / naga 30 want 1.87–1.88. Bump `rust-version` only after rebuilding to confirm the new floor, and keep this line + `Cargo.toml` + README in sync. No `rustfmt.toml`, `clippy.toml`, or `deny.toml` — Rust defaults apply. The one `.cargo/config.toml` exists solely to force Assimp's Draco decoder on at build time via `CMAKE_TOOLCHAIN_FILE` (see [ADR 0011](docs/adr/0011-assimp-import-backend.md)); it affects only the `russimp-sys-ng` cmake build.
 
 ### Build & run
 
