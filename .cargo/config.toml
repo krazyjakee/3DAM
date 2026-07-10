@@ -1,4 +1,10 @@
-# The repo otherwise runs on Rust defaults (no config), but Assimp's Draco decoder is a build-time
+# `cargo xtask …` is the repo's dev-automation entrypoint (CLAUDE.md / README: `ci`, `web`, `wasm`).
+# It resolves only through this alias — without it `cargo xtask` is "no such command" on a clean
+# checkout, which broke the container build (and any fresh clone / CI lacking a global alias).
+[alias]
+xtask = "run --package xtask --"
+
+# Otherwise the repo runs on Rust defaults, but Assimp's Draco decoder is a build-time
 # CMake option and there is no other reproducible hook: `russimp-sys-ng`'s build script hardcodes its
 # cmake defines and runs *before* any `dam-*` build script, so the flag must reach cmake via the
 # environment. The `cmake` crate reads CMAKE_TOOLCHAIN_FILE, and a toolchain file is loaded early
