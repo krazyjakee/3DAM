@@ -1,0 +1,81 @@
+# Build and publish the server container image to the GitHub Container Registry (GHCR).
+#
+# Produces ghcr.io/<owner>/3dam from deploy/Dockerfile — the headless `3dam serve` image
+# (issue #75). Runs on release tag pushes (`v*`) so a tagged release ships a matching image
+# alongside the native binaries built by release.yml, and on manual dispatch for testing.
+#
+# The image name is lowercased by docker/metadata-action, so the mixed-case repo
+# `krazyjakee/3DAM` publishes as `ghcr.io/krazyjakee/3dam`.
+#
+# Consume it with:
+#   docker pull ghcr.io/krazyjakee/3dam:latest
+#   docker run -p 7878:7878 -v 3dam-data:/var/lib/3dam ghcr.io/krazyjakee/3dam:latest
+name: container
+
+on:
+  push:
+    tags:
+      - "v*"
+  # Manual runs publish only the `edge` + sha tags (no `latest`, no semver) — safe for testing.
+  workflow_dispatch: {}
+
+env:
+  REGISTRY: ghcr.io
+  # Slash-qualified owner/name; metadata-action lowercases it for the registry.
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    name: build & push (linux/amd64)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # GITHUB_TOKEN with packages:write is enough to push to the repo's own GHCR namespace.
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Derive tags + OCI labels. On a `v1.2.3` tag this emits 1.2.3, 1.2, and `latest`;
+      # a manual dispatch emits `edge` + the short sha only.
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=branch
+            type=sha
+            type=raw,value=edge,enable=${{ github.event_name == 'workflow_dispatch' }}
+          labels: |
+            org.opencontainers.image.title=3DAM server
+            org.opencontainers.image.description=Headless 3DAM asset server (3dam serve)
+            org.opencontainers.image.documentation=https://github.com/krazyjakee/3DAM/blob/main/docs/DEPLOYMENT.md
+
+      # linux/amd64 only: the image builds Rust + Node + the Assimp/Draco (cmake/clang) toolchain,
+      # so a QEMU-emulated arm64 build would take hours. Add `platforms: linux/arm64` here (with
+      # docker/setup-qemu-action) if native arm images become worth the runtime.
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          platforms: linux/amd64
+          # Never push on PR-triggered runs; here that means tag pushes and manual dispatch push.
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

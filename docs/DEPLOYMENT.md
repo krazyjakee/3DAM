@@ -81,6 +81,23 @@ only when the server can actually serve.
 
 ## Container
 
+### Pull the published image
+
+Tagged releases publish a `linux/amd64` server image to the GitHub Container Registry (GHCR) via
+[`.github/workflows/container.yml`](../.github/workflows/container.yml). Pull and run it — no local
+build needed:
+
+```bash
+docker pull ghcr.io/krazyjakee/3dam:latest        # or a pinned tag, e.g. :1.2.3
+docker run -p 7878:7878 -v 3dam-data:/var/lib/3dam ghcr.io/krazyjakee/3dam:latest
+```
+
+Tags: `latest` tracks the newest release; `MAJOR.MINOR.PATCH` and `MAJOR.MINOR` pin a version;
+`edge`/`sha-…` come from manual/dispatch builds. The image runs the `serve` role as a non-root
+`3dam` user, binding `0.0.0.0:7878` with the data dir on the `/var/lib/3dam` volume.
+
+### Build the image yourself
+
 A server-focused multi-stage image ships at [`deploy/Dockerfile`](../deploy/Dockerfile):
 
 ```bash
@@ -88,8 +105,17 @@ docker build -f deploy/Dockerfile -t 3dam-server .
 docker run -p 7878:7878 -v 3dam-data:/var/lib/3dam 3dam-server
 ```
 
-Its `HEALTHCHECK` polls `/readyz`. Mount TLS material and add `--tls-cert/--tls-key` for HTTPS, or
-front it with a TLS-terminating proxy.
+Either way, the `HEALTHCHECK` polls `/readyz`. Mount TLS material and add `--tls-cert/--tls-key` for
+HTTPS, or front it with a TLS-terminating proxy:
+
+```bash
+docker run -p 7878:7878 \
+  -v 3dam-data:/var/lib/3dam \
+  -v /etc/3dam/tls:/etc/3dam/tls:ro \
+  ghcr.io/krazyjakee/3dam:latest \
+  serve --data /var/lib/3dam --addr 0.0.0.0:7878 \
+        --tls-cert /etc/3dam/tls/fullchain.pem --tls-key /etc/3dam/tls/privkey.pem
+```
 
 ## Startup posture logging
 

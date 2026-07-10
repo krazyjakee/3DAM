@@ -135,6 +135,16 @@ Remote access, auth, accounts, MCP, and analysis are **off-by-default runtime fe
 flags** stored in `server.db` — off means the surface disappears. Turn them on through
 `3dam admin` or the web Settings panel.
 
+### Self-hosting
+
+To run one authoritative server that thin clients (web + native GUI) connect to, see
+**[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)** — TLS, token auth, health probes, a systemd unit, and
+a container image published to GHCR:
+
+```sh
+docker run -p 7878:7878 -v 3dam-data:/var/lib/3dam ghcr.io/krazyjakee/3dam:latest
+```
+
 ### Web dev
 
 The web client lives in `web/` and uses **pnpm**:
