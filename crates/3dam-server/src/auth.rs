@@ -29,6 +29,33 @@ fn bearer(parts: &Parts) -> Option<String> {
     bearer_header(&parts.headers)
 }
 
+/// Pull a bearer secret from a `?token=` query param. Browsers can't set the `Authorization` header
+/// on `<img>`/`<audio>` element loads (thumbnails, content, previews), so a cross-origin token-gated
+/// web client (issue #74) carries the token in the URL for **read** GETs. Token secrets are
+/// `dam_`+hex (no reserved chars), so no percent-decoding is needed.
+fn query_bearer(parts: &Parts) -> Option<String> {
+    let q = parts.uri.query()?;
+    q.split('&')
+        .find_map(|pair| pair.strip_prefix("token="))
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_string())
+}
+
+/// Resolve auth for the live-event WebSocket (issue #74), which needs `Read`. A browser cannot set
+/// the `Authorization` header on a WebSocket, so the bearer secret is also accepted as a `?token=`
+/// query param; the header wins when both are present. (Tokens in a URL can reach access logs — the
+/// tradeoff of browser WS auth; keep `RUST_LOG` at info, which does not log query strings.)
+pub fn resolve_ws(
+    store: &ServerStore,
+    headers: &HeaderMap,
+    query_token: Option<String>,
+) -> Result<AuthContext, LibError> {
+    let token = bearer_header(headers).or(query_token);
+    let ctx = resolve(store, token)?;
+    ctx.require(Scope::Read)?;
+    Ok(ctx)
+}
+
 /// Resolve a request to its [`AuthContext`] under the current auth mode (tech-spec 10 §1.2).
 pub fn resolve(store: &ServerStore, token: Option<String>) -> Result<AuthContext, LibError> {
     let verify = |secret: &str| -> Result<AuthContext, LibError> {
@@ -59,7 +86,9 @@ pub struct Reader(pub AuthContext);
 impl FromRequestParts<AppState> for Reader {
     type Rejection = ApiError;
     async fn from_request_parts(parts: &mut Parts, st: &AppState) -> Result<Self, ApiError> {
-        let ctx = resolve(&st.store, bearer(parts))?;
+        // Reads (incl. browser `<img>`/`<audio>` GETs) accept the token from the header *or* a
+        // `?token=` query param (issue #74); the header wins. Writes stay header-only.
+        let ctx = resolve(&st.store, bearer(parts).or_else(|| query_bearer(parts)))?;
         ctx.require(Scope::Read)?;
         Ok(Reader(ctx))
     }

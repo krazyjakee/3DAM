@@ -14,7 +14,10 @@ mod image;
 mod mel;
 mod model;
 
-pub use audio_features::{decode_mono, extract_audio_features, AudioFeatures, LoopSource};
+pub use audio_features::{
+    compute_waveform_peaks, decode_mono, extract_audio_features, AudioFeatures, LoopSource,
+    WAVEFORM_BUCKETS,
+};
 pub use features::{extract_image_features, l2_normalise, ImageFeatures};
 pub use mel::{log_mel, mel_from_samples, MelConfig, MelSpectrogram};
 

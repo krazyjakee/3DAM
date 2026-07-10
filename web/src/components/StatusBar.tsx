@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState } from "react";
-import { ChevronUp, Loader2, X } from "lucide-react";
+import { ChevronUp, Loader2, Server, X } from "lucide-react";
 import { useCancelJob, useJobs, useStats, useVersion } from "@/api/queries";
 import { useConnection, type ConnState } from "@/api/connection";
 import type { JobStatus, MediaType } from "@/api/types";
+import { isRemote, serverLabel } from "@/lib/server";
+import { ConnectDialog } from "./ConnectDialog";
 
 /** Bottom status strip: active scan/analysis jobs with live progress, the live-connection state, and
  *  the server build. A single job shows inline; concurrent jobs condense into one aggregate bar with
@@ -32,8 +34,30 @@ export function StatusBar() {
       )}
       <MediaBreakdown />
       <ConnectionPill state={conn.state} />
+      <ServerChip />
       <span className="tabular-nums">{version.data?.server ?? ""}</span>
     </footer>
+  );
+}
+
+/** Connection target chip (hosted mode, issue #74): shows "Local" or the remote host, and opens the
+ *  Connect dialog to point the client at a different 3DAM server. Mirrors the native GUI chip (#70). */
+function ServerChip() {
+  const [open, setOpen] = useState(false);
+  return (
+    <>
+      <button
+        className={`flex items-center gap-1 rounded px-1.5 py-0.5 hover:text-fg ${
+          isRemote() ? "text-accent" : "text-fg-dim"
+        }`}
+        onClick={() => setOpen(true)}
+        title="Connect to a 3DAM server"
+      >
+        <Server size={11} />
+        <span className="max-w-[160px] truncate">{serverLabel()}</span>
+      </button>
+      {open && <ConnectDialog onClose={() => setOpen(false)} />}
+    </>
   );
 }
 

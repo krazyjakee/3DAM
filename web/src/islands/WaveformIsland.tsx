@@ -33,11 +33,34 @@ function toMono(buf: AudioBuffer): Float32Array {
   return out;
 }
 
-export function WaveformIsland({ src, progress = 0 }: { src: string; progress?: number }) {
+/** Expand server-side peaks (0–1 per bucket) into interleaved ±amplitude "samples" the island
+ *  reduces to symmetric bars — so a pre-computed waveform draws with no client-side decode (#73). */
+function peaksToSamples(peaks: number[]): Float32Array {
+  const out = new Float32Array(peaks.length * 2);
+  for (let i = 0; i < peaks.length; i++) {
+    const p = peaks[i];
+    out[i * 2] = -p;
+    out[i * 2 + 1] = p;
+  }
+  return out;
+}
+
+export function WaveformIsland({
+  src,
+  progress = 0,
+  peaks,
+}: {
+  src: string;
+  progress?: number;
+  peaks?: number[] | null;
+}) {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const handleRef = useRef<WaveformHandle | null>(null);
   const [status, setStatus] = useState<Status>("loading");
+  // Prefer server-provided peaks (hosted mode, issue #73): no re-download, no re-decode. Falls back
+  // to DOM decode only when the asset hasn't been analysed yet.
+  const hasServerPeaks = Array.isArray(peaks) && peaks.length > 0;
 
   useEffect(() => {
     const container = containerRef.current;
@@ -63,6 +86,13 @@ export function WaveformIsland({ src, progress = 0 }: { src: string; progress?: 
           return;
         }
         handleRef.current = h;
+        if (hasServerPeaks) {
+          // Draw straight from the server array — the whole point of #73.
+          h.setWaveform(peaksToSamples(peaks as number[]));
+          h.setProgress(progress);
+          setStatus("ready");
+          return;
+        }
         const res = await fetch(src);
         if (!res.ok) throw new Error(`content ${res.status}`);
         const bytes = await res.arrayBuffer();
@@ -90,7 +120,7 @@ export function WaveformIsland({ src, progress = 0 }: { src: string; progress?: 
       handleRef.current?.free();
       handleRef.current = null;
     };
-  }, [src]);
+  }, [src, hasServerPeaks]);
 
   // Playhead updates are cheap — a separate effect so changing `progress` doesn't rebuild the island.
   useEffect(() => {

@@ -68,6 +68,13 @@ struct ServeArgs {
     /// Allow binding beyond localhost without TLS (refused by default — ADR 0009 §4).
     #[arg(long)]
     insecure: bool,
+    /// PEM certificate chain for in-process TLS (issue #75). With `--tls-key`, serve HTTPS — and a
+    /// non-localhost bind then needs no `--insecure`.
+    #[arg(long, requires = "tls_key")]
+    tls_cert: Option<PathBuf>,
+    /// PEM private key paired with `--tls-cert`.
+    #[arg(long, requires = "tls_cert")]
+    tls_key: Option<PathBuf>,
 }
 
 /// Entry point for the `serve` role. Dispatches into `3dam-server`.
@@ -96,6 +103,8 @@ pub async fn serve(args: Vec<OsString>) -> ExitCode {
         data_dir: parsed.data.unwrap_or_else(default_data_dir),
         config: parsed.config,
         insecure: parsed.insecure,
+        tls_cert: parsed.tls_cert,
+        tls_key: parsed.tls_key,
     };
     match dam_server::serve(cfg).await {
         Ok(()) => ExitCode::SUCCESS,

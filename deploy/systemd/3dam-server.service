@@ -1,0 +1,42 @@
+[Unit]
+# 3DAM hosted-mode server (issue #75) — one authoritative `3dam serve`, thin clients over the API.
+Description=3DAM asset server
+Documentation=https://github.com/krazyjakee/3DAM/blob/main/docs/DEPLOYMENT.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Dedicated unprivileged user; create with:  useradd --system --home /var/lib/3dam --shell /usr/sbin/nologin 3dam
+User=3dam
+Group=3dam
+
+# The persistent data dir holds library.db, server.db, and the derivative caches. systemd creates
+# StateDirectory under /var/lib and chowns it to User=; --data points the engine at it.
+StateDirectory=3dam
+Environment=RUST_LOG=info
+
+# Bind on all interfaces over TLS (no --insecure needed once cert+key are set). For a localhost-only
+# deployment behind a reverse proxy, use  --addr 127.0.0.1:7878  and drop the --tls-* flags.
+ExecStart=/usr/local/bin/3dam serve \
+    --data /var/lib/3dam \
+    --addr 0.0.0.0:7878 \
+    --tls-cert /etc/3dam/tls/fullchain.pem \
+    --tls-key /etc/3dam/tls/privkey.pem \
+    --config /etc/3dam/3dam.toml
+
+# SIGTERM triggers the graceful drain (≤10s); give it headroom before SIGKILL.
+KillSignal=SIGTERM
+TimeoutStopSec=20
+Restart=on-failure
+RestartSec=3
+
+# Hardening: the server only needs its data dir and the read-only cert dir.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadOnlyPaths=/etc/3dam
+
+[Install]
+WantedBy=multi-user.target

@@ -10,6 +10,9 @@ description = "Native desktop shell (egui/eframe, ADR 0005) over the LibraryServ
 # internals nor the clap grammar (crate-map invariant; it goes through `dam-frontend::open_backend`).
 dam-api = { workspace = true }
 dam-frontend = { workspace = true }
+# Parse/validate the `--connect` endpoint and the in-app Connect dialog into the `Url` that
+# `dam_frontend::Backend::Connected` carries (issue #70, hosted mode).
+url = { workspace = true }
 # A background Tokio runtime owns the async `LibraryService`; the egui thread talks to it over
 # channels so I/O never blocks the frame (golden rule 5).
 tokio = { workspace = true }

@@ -190,6 +190,39 @@ fn classify(
     }
 }
 
+// --- Waveform peaks ----------------------------------------------------------------------------
+
+/// The fixed bar count of a server-computed inspector waveform (issue #73). Clients render whatever
+/// length the array actually is, but this is the canonical resolution the analysis pass produces.
+pub const WAVEFORM_BUCKETS: usize = 256;
+
+/// Reduce an audio file to [`WAVEFORM_BUCKETS`] normalised (0–1) peak values for the inspector
+/// waveform — the server-side counterpart of what both clients used to compute after re-downloading
+/// and re-decoding the audio (issue #73). Folds to mono absolute amplitude, takes the max per bucket,
+/// then normalises so the loudest slice fills the height.
+pub fn compute_waveform_peaks(path: &Path, format: &str) -> Result<Vec<f32>, HandlerError> {
+    let (mono, _sr) = decode_mono(path, format)?;
+    if mono.is_empty() {
+        return Err(HandlerError::Corrupt("no audio samples to peak".into()));
+    }
+    let n = mono.len();
+    let mut peaks = vec![0f32; WAVEFORM_BUCKETS];
+    for (i, &v) in mono.iter().enumerate() {
+        let b = (i * WAVEFORM_BUCKETS / n).min(WAVEFORM_BUCKETS - 1);
+        let a = v.abs();
+        if a > peaks[b] {
+            peaks[b] = a;
+        }
+    }
+    let max = peaks.iter().copied().fold(0f32, f32::max);
+    if max > 0.0 {
+        for p in &mut peaks {
+            *p /= max;
+        }
+    }
+    Ok(peaks)
+}
+
 // --- Decode ------------------------------------------------------------------------------------
 
 /// Decode any supported container to a single mono f32 channel (downmix by averaging), returning the

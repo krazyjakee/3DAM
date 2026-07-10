@@ -202,6 +202,15 @@ pub trait LibraryService: Send + Sync {
 
     async fn library_stats(&self, ctx: &AuthContext) -> Result<LibraryStats, LibError>;
 
+    /// Prefetch hint (issue #72): the client is about to render `req.assets`, so warm their
+    /// thumbnails (and model preview meshes) ahead of the HTTP fetch. Fire-and-forget and idempotent
+    /// — already-cached derivatives are a no-op, and a warm failure is swallowed (the on-demand GET
+    /// still generates it). The bytes themselves stay on HTTP/2 (ADR 0012); this only moves
+    /// generation ahead of render. Default: no-op, so a backend that doesn't warm is still valid.
+    async fn prefetch(&self, _ctx: &AuthContext, _req: PrefetchRequest) -> Result<(), LibError> {
+        Ok(())
+    }
+
     // ── convert (tech-spec 08) ───────────────────────────────────────────────
     /// Run a convert plan: dry-run (plan + estimate, no writes) or commit (encode + atomic write
     /// under `output_dir`). Non-destructive and source-safe by construction (§5.1). CLI-first in

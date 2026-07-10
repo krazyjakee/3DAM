@@ -24,16 +24,24 @@ pub struct FlagState {
     pub auth: AuthMode,
     pub mcp: McpMode,
     pub network_writes: bool,
+    /// Hosted-mode background pipeline toggles (issue #71). On by default so a serve deployment
+    /// proactively warms previews + analysis; these are workload flags, not exposure flags.
+    pub auto_thumbnail: bool,
+    pub auto_analyze: bool,
     versions: HashMap<FlagKey, u64>,
 }
 
 impl FlagState {
-    /// The built-in safe-by-default floor (ADR 0004 decision 1): no auth, MCP off, read-only.
+    /// The built-in safe-by-default floor (ADR 0004 decision 1): no auth, MCP off, read-only. The
+    /// hosted-mode pipeline defaults *on* — it's the "fat server" doing its job, and it exposes
+    /// nothing to the network (rule 4 governs exposure, not local workload).
     fn defaults() -> Self {
         FlagState {
             auth: AuthMode::Off,
             mcp: McpMode::Off,
             network_writes: false,
+            auto_thumbnail: true,
+            auto_analyze: true,
             versions: HashMap::new(),
         }
     }
@@ -42,13 +50,21 @@ impl FlagState {
             FlagKey::Authentication => FlagValue::Auth(self.auth),
             FlagKey::McpServer => FlagValue::Mcp(self.mcp),
             FlagKey::NetworkWrites => FlagValue::Bool(self.network_writes),
+            FlagKey::AutoThumbnail => FlagValue::Bool(self.auto_thumbnail),
+            FlagKey::AutoAnalyze => FlagValue::Bool(self.auto_analyze),
         }
     }
-    fn apply(&mut self, value: FlagValue) {
-        match value {
-            FlagValue::Auth(m) => self.auth = m,
-            FlagValue::Mcp(m) => self.mcp = m,
-            FlagValue::Bool(b) => self.network_writes = b,
+    /// Apply a typed value under its key. The key disambiguates the three `bool` flags, which the
+    /// value alone can't (network_writes vs the two pipeline toggles).
+    fn apply(&mut self, key: FlagKey, value: FlagValue) {
+        match (key, value) {
+            (FlagKey::Authentication, FlagValue::Auth(m)) => self.auth = m,
+            (FlagKey::McpServer, FlagValue::Mcp(m)) => self.mcp = m,
+            (FlagKey::NetworkWrites, FlagValue::Bool(b)) => self.network_writes = b,
+            (FlagKey::AutoThumbnail, FlagValue::Bool(b)) => self.auto_thumbnail = b,
+            (FlagKey::AutoAnalyze, FlagValue::Bool(b)) => self.auto_analyze = b,
+            // Type-mismatched pairs are rejected before this point (`FlagValue::matches`).
+            _ => {}
         }
     }
     fn version(&self, key: FlagKey) -> u64 {
@@ -58,14 +74,28 @@ impl FlagState {
 
 /// Whether applying `new` (over `old`) increases the server's exposure and so needs an explicit
 /// `confirm` (tech-spec 10 §5, DESIGN_GUIDELINES §3.6): removing auth, enabling MCP write tools, or
-/// opening network writes.
-pub fn is_exposure_increasing(new: FlagValue, old: FlagValue) -> bool {
-    match (new, old) {
-        (FlagValue::Auth(AuthMode::Off), FlagValue::Auth(o)) => o != AuthMode::Off,
-        (FlagValue::Mcp(McpMode::ReadWrite), FlagValue::Mcp(o)) => o != McpMode::ReadWrite,
-        (FlagValue::Bool(true), FlagValue::Bool(false)) => true,
+/// opening network writes. The `key` disambiguates the `bool` flags — the hosted-mode pipeline
+/// toggles are workload, never exposure, so they never require confirmation.
+pub fn is_exposure_increasing(key: FlagKey, new: FlagValue, old: FlagValue) -> bool {
+    match (key, new, old) {
+        (FlagKey::Authentication, FlagValue::Auth(AuthMode::Off), FlagValue::Auth(o)) => {
+            o != AuthMode::Off
+        }
+        (FlagKey::McpServer, FlagValue::Mcp(McpMode::ReadWrite), FlagValue::Mcp(o)) => {
+            o != McpMode::ReadWrite
+        }
+        (FlagKey::NetworkWrites, FlagValue::Bool(true), FlagValue::Bool(false)) => true,
         _ => false,
     }
+}
+
+/// Does flipping this flag ever increase exposure? A UI hint (`FlagInfo::exposure_increasing`) — true
+/// for the auth/MCP/network flags, false for the hosted-mode workload toggles.
+fn flag_can_increase_exposure(key: FlagKey) -> bool {
+    matches!(
+        key,
+        FlagKey::Authentication | FlagKey::McpServer | FlagKey::NetworkWrites
+    )
 }
 
 pub struct ServerStore {
@@ -123,7 +153,7 @@ impl ServerStore {
             };
             if let Ok(value) = serde_json::from_str::<FlagValue>(&val_s) {
                 if value.matches(key) {
-                    state.apply(value);
+                    state.apply(key, value);
                     state.versions.insert(key, version as u64);
                 }
             }
@@ -143,6 +173,14 @@ impl ServerStore {
     pub fn network_writes(&self) -> bool {
         self.flags.read().unwrap().network_writes
     }
+    /// Hosted-mode: auto-generate thumbnails/previews on ingest (issue #71).
+    pub fn auto_thumbnail(&self) -> bool {
+        self.flags.read().unwrap().auto_thumbnail
+    }
+    /// Hosted-mode: auto-run the analysis pass on ingest (issue #71).
+    pub fn auto_analyze(&self) -> bool {
+        self.flags.read().unwrap().auto_analyze
+    }
 
     pub fn flag_info(&self, key: FlagKey) -> FlagInfo {
         let f = self.flags.read().unwrap();
@@ -150,8 +188,8 @@ impl ServerStore {
             key,
             value: f.value(key),
             version: f.version(key),
-            live: true,                // every phase-5 flag applies live (ADR 0009 §2)
-            exposure_increasing: true, // all three can increase exposure — a UI hint (§5)
+            live: true, // every flag here applies live (ADR 0009 §2)
+            exposure_increasing: flag_can_increase_exposure(key),
         }
     }
     pub fn all_flags(&self) -> Vec<FlagInfo> {
@@ -201,8 +239,11 @@ impl ServerStore {
             Some(serde_json::json!({ "value": value })),
         )?;
         drop(conn);
-        self.flags.write().unwrap().apply(value);
-        self.flags.write().unwrap().versions.insert(key, 1);
+        {
+            let mut f = self.flags.write().unwrap();
+            f.apply(key, value);
+            f.versions.insert(key, 1);
+        }
         Ok(true)
     }
 
@@ -223,7 +264,7 @@ impl ServerStore {
                 )));
             }
         }
-        if is_exposure_increasing(req.value, old_value) && !req.confirm {
+        if is_exposure_increasing(key, req.value, old_value) && !req.confirm {
             return Err(LibError::BadRequest(format!(
                 "setting '{key}' increases exposure — resend with confirm=true"
             )));
@@ -250,7 +291,7 @@ impl ServerStore {
         }
         {
             let mut f = self.flags.write().unwrap();
-            f.apply(req.value);
+            f.apply(key, req.value);
             f.versions.insert(key, new_version);
         }
         Ok(self.flag_info(key))

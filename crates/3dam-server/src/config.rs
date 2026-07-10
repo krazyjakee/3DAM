@@ -24,6 +24,9 @@ pub struct ServeFile {
 pub struct ServerBlock {
     pub bind: Option<String>,
     pub port: Option<u16>,
+    /// PEM cert chain + key for in-process TLS (issue #75). Both together enable HTTPS.
+    pub tls_cert: Option<std::path::PathBuf>,
+    pub tls_key: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -33,6 +36,10 @@ pub struct FlagsBlock {
     /// `off | read_only | read-only | readonly | read_write | read-write | writes`.
     pub mcp: Option<String>,
     pub network_writes: Option<bool>,
+    /// Hosted-mode background pipeline (issue #71). Both default on in the store; set here to seed a
+    /// low-power host that wants to defer the render/analysis grind.
+    pub auto_thumbnail: Option<bool>,
+    pub auto_analyze: Option<bool>,
 }
 
 impl ServeFile {
@@ -63,6 +70,12 @@ impl ServeFile {
         }
         if let Some(w) = self.flags.network_writes {
             out.push((FlagKey::NetworkWrites, FlagValue::Bool(w)));
+        }
+        if let Some(t) = self.flags.auto_thumbnail {
+            out.push((FlagKey::AutoThumbnail, FlagValue::Bool(t)));
+        }
+        if let Some(a) = self.flags.auto_analyze {
+            out.push((FlagKey::AutoAnalyze, FlagValue::Bool(a)));
         }
         out
     }

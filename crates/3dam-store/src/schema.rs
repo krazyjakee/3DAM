@@ -276,4 +276,12 @@ pub const MIGRATIONS: &[&str] = &[
         UPDATE asset_fts SET filename = new.filename WHERE rowid = new.rowid;
     END;
     "#,
+    // ── V8: server-side waveform peaks (hosted mode, issue #73) ───────────────────────────────────
+    // The analysis pass now computes a fixed-bucket, normalised (0–1) peak array for each audio asset
+    // and stores it here as a JSON `[f32,…]` string, so every client draws the inspector waveform
+    // from server-provided data instead of re-downloading + re-decoding the audio just to size bars.
+    // NULL until the asset is analysed; full-content fetch remains only for actual playback.
+    r#"
+    ALTER TABLE audio_attr ADD COLUMN waveform_peaks TEXT;
+    "#,
 ];

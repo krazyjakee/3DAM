@@ -62,6 +62,11 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 
 # http / server / client
 axum = { version = "0.8", features = ["ws"] }
+# In-process TLS termination for a headless/hosted deployment (issue #75): serve HTTPS from a
+# cert/key so exposing the server needs no `--insecure`. rustls backend (matches reqwest's).
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+# Direct handle on rustls only to install the ring crypto provider for axum-server's TLS (issue #75).
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

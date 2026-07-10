@@ -182,6 +182,38 @@ export function Settings() {
             }}
           />
         </FlagCard>
+
+        <FlagCard
+          title="Auto-generate previews"
+          hint="Hosted mode: the server renders thumbnails + 3D previews on ingest so clients hit ready data. Off defers rendering to first request (lower-power hosts)."
+          flag={flag("auto_thumbnail")}
+        >
+          <Toggle
+            label="Auto-generate previews"
+            checked={flag("auto_thumbnail")?.value === true}
+            disabled={busyFlag !== null}
+            onChange={(v) => {
+              const f = flag("auto_thumbnail");
+              if (f) void setFlag(f.key, v, f.version);
+            }}
+          />
+        </FlagCard>
+
+        <FlagCard
+          title="Auto-analyze on ingest"
+          hint="Hosted mode: the server runs the analysis pass (embeddings, auto-tags, derived attributes) on ingest. Off leaves thumbnails-only."
+          flag={flag("auto_analyze")}
+        >
+          <Toggle
+            label="Auto-analyze on ingest"
+            checked={flag("auto_analyze")?.value === true}
+            disabled={busyFlag !== null}
+            onChange={(v) => {
+              const f = flag("auto_analyze");
+              if (f) void setFlag(f.key, v, f.version);
+            }}
+          />
+        </FlagCard>
       </section>
 
       <StorageSection usage={usage} onChange={refresh} />

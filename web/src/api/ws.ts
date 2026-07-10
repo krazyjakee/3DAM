@@ -6,10 +6,12 @@ import { useEffect, useSyncExternalStore } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import type { LibraryEvent } from "./types";
 import { qk } from "./queries";
+import { wsUrl as resolveWsUrl } from "@/lib/server";
 
+// The firehose URL, derived from the configured server base (same-origin by default) with the token
+// carried as a `?token=` query param — a browser can't set headers on a WebSocket (issue #74).
 function wsUrl(): string {
-  const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  return `${proto}//${location.host}/api/v1/ws`;
+  return resolveWsUrl("/api/v1/ws");
 }
 
 // Live-connection state, surfaced to the UI so a silent disconnect becomes visible (issue #25).

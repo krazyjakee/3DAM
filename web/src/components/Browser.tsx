@@ -24,6 +24,7 @@ import {
   useSetFavorite,
   useSources,
 } from "@/api/queries";
+import { api } from "@/api/client";
 import type { AssetSummary, DupGroup, SearchMode, SortField } from "@/api/types";
 import { useViewState } from "@/lib/view-state";
 import { useDebounced } from "@/lib/use-debounced";
@@ -111,6 +112,18 @@ export function Browser({ onOpenNav }: { onOpenNav?: () => void }) {
   );
   const total = assets.data?.pages[0]?.total ?? null;
   const byId = useMemo(() => new Map(items.map((a) => [a.id, a])), [items]);
+
+  // Prefetch hint (issue #72): as each page loads, ask the server to warm that page's thumbnails +
+  // preview meshes so the grid's HTTP fetches hit cache. Fire-and-forget — bytes still come over
+  // HTTP/2 (ADR 0012); this only moves generation ahead of render. Keyed on page count so it fires
+  // once per fetched page, not on every cache invalidation.
+  const pageCount = assets.data?.pages.length ?? 0;
+  useEffect(() => {
+    const page = assets.data?.pages[pageCount - 1];
+    if (!page || page.items.length === 0) return;
+    void api.prefetch({ assets: page.items.map((a) => a.id) }).catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pageCount]);
 
   // Collapse byte-identical duplicates into one row each, badged with the hidden-copy count; the
   // full group is listed in the Inspector. Whole-library groups, cached + shared with the Inspector

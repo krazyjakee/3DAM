@@ -125,6 +125,21 @@ impl Store {
         Ok(())
     }
 
+    /// Persist the server-computed inspector waveform peaks (issue #73) as a JSON `[f32,…]` string, so
+    /// both clients draw the bars without decoding the audio. Upsert (the cheap-tier row exists from
+    /// scan); a no-op-safe part of the analysis pass.
+    pub fn set_audio_peaks(&self, id: &AssetId, peaks: &[f32]) -> Result<(), LibError> {
+        let json = serde_json::to_string(peaks).map_err(internal)?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO audio_attr (asset_id, waveform_peaks) VALUES (?1, ?2)
+             ON CONFLICT(asset_id) DO UPDATE SET waveform_peaks=excluded.waveform_peaks",
+            params![id.as_bytes().to_vec(), json],
+        )
+        .map_err(internal)?;
+        Ok(())
+    }
+
     /// Upsert an asset's embedding for one space (§2.1, §3.1). `vec` must already be L2-normalised.
     pub fn set_embedding(
         &self,

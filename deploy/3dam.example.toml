@@ -1,0 +1,32 @@
+# Example 3DAM serve config (tech-spec 09 §A.1). Everything is optional — a missing file just uses
+# the safe built-in defaults. CLI flags (--addr, --tls-cert, --tls-key) override the matching keys
+# here. Flag values are *seed-only*: they set the initial value on first run; the admin UI/CLI owns
+# them thereafter (config_authority = seed-only, ADR 0009 §2).
+
+[server]
+# Bind address + port. For a public host use 0.0.0.0 with TLS below; for a reverse-proxy setup keep
+# this on 127.0.0.1 and terminate TLS in front.
+bind = "0.0.0.0"
+port = 7878
+
+# In-process TLS (issue #75). With both set, `serve` speaks HTTPS and needs no --insecure to bind
+# beyond localhost. PEM files: a full cert chain and its private key.
+tls_cert = "/etc/3dam/tls/fullchain.pem"
+tls_key  = "/etc/3dam/tls/privkey.pem"
+
+[flags]
+# Require a bearer token for the API/MCP/admin surface (issue tokens with `3dam admin token create`).
+# Off = the local owner has full trust (only safe on localhost).
+auth = "token"
+
+# Agent (MCP) endpoint: off | read_only | read_write.
+mcp = "off"
+
+# Allow writes from beyond localhost. Off = read-only to the network.
+network_writes = false
+
+# Hosted-mode background pipeline (issue #71). Both default on — the server proactively renders
+# thumbnails/previews and runs analysis on ingest so clients hit ready data. Set false on a
+# low-power host to defer that grind to on-demand generation.
+auto_thumbnail = true
+auto_analyze   = true

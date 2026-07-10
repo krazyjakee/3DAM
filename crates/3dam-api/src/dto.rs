@@ -234,6 +234,11 @@ pub struct AudioAttributes {
     /// Harmonic-vs-noise ratio, normalised 0–1 (0 = noisy, 1 = tonal/harmonic).
     #[serde(default)]
     pub harmonicity: Option<f32>,
+    /// Normalised (0–1) waveform peak buckets, computed server-side by the analysis pass (issue #73)
+    /// so clients draw the inspector waveform without decoding the audio themselves. `None` until
+    /// analysed; the bar count is whatever the server produced (clients render `peaks.len()` bars).
+    #[serde(default)]
+    pub peaks: Option<Vec<f32>>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -828,6 +833,17 @@ pub struct ThumbnailRegenRequest {
 pub struct ThumbnailRegenReport {
     pub assets: u64,
     pub files_deleted: u64,
+}
+
+/// A prefetch hint (hosted mode, issue #72): the assets a client is about to render, so the server
+/// warms their thumbnails (at `edge`) and — for models — preview meshes ahead of the HTTP fetch.
+/// Fire-and-forget; the bytes still travel on HTTP/2 (ADR 0012), this only moves generation earlier.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PrefetchRequest {
+    pub assets: Vec<AssetId>,
+    /// Thumbnail long-edge to warm. `None` → the server's default grid edge.
+    #[serde(default)]
+    pub edge: Option<u32>,
 }
 
 /// A "find similar" query. By-asset-id in v1 ("more like this"); the upload-a-reference entry point

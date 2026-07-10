@@ -45,13 +45,22 @@ pub enum FlagKey {
     McpServer,
     /// `bool` — server read-only vs writes-enabled to the network (the network-level write ceiling).
     NetworkWrites,
+    /// `bool` — the hosted-mode background pipeline auto-generates thumbnails + previews on ingest
+    /// (issue #71). On by default so a fresh client hits ready previews; off lets a low-power host
+    /// defer the render cost to on-demand generation.
+    AutoThumbnail,
+    /// `bool` — the hosted-mode background pipeline auto-runs the analysis pass (embeddings,
+    /// auto-tags, derived attrs) on ingest (issue #71). On by default; off leaves thumbnails-only.
+    AutoAnalyze,
 }
 
 impl FlagKey {
-    pub const ALL: [FlagKey; 3] = [
+    pub const ALL: [FlagKey; 5] = [
         FlagKey::Authentication,
         FlagKey::McpServer,
         FlagKey::NetworkWrites,
+        FlagKey::AutoThumbnail,
+        FlagKey::AutoAnalyze,
     ];
     /// The stable string used in the URL, the store, and the config file.
     pub fn as_str(self) -> &'static str {
@@ -59,6 +68,8 @@ impl FlagKey {
             FlagKey::Authentication => "authentication",
             FlagKey::McpServer => "mcp_server",
             FlagKey::NetworkWrites => "network_writes",
+            FlagKey::AutoThumbnail => "auto_thumbnail",
+            FlagKey::AutoAnalyze => "auto_analyze",
         }
     }
     pub fn parse(s: &str) -> Option<FlagKey> {
@@ -89,6 +100,8 @@ impl FlagValue {
             (FlagKey::Authentication, FlagValue::Auth(_))
                 | (FlagKey::McpServer, FlagValue::Mcp(_))
                 | (FlagKey::NetworkWrites, FlagValue::Bool(_))
+                | (FlagKey::AutoThumbnail, FlagValue::Bool(_))
+                | (FlagKey::AutoAnalyze, FlagValue::Bool(_))
         )
     }
 }

@@ -283,6 +283,17 @@ fn analyze_audio(
         .map_err(|e| e.to_string())?;
     extra.insert(0, (class, conf));
     suggest_all(store, &t.id, &extra);
+    // Waveform peaks for the inspector (issue #73): computed once here, server-side, so no client
+    // re-downloads + re-decodes the audio to draw the bars. Independent of feature extraction and
+    // fail-soft — a decode fault just leaves `peaks` null and the client falls back to its own decode.
+    match dam_media::compute_waveform_peaks(abs, &det.format) {
+        Ok(peaks) => {
+            if let Err(e) = store.set_audio_peaks(&t.id, &peaks) {
+                tracing::warn!(asset = %t.id, error = %e, "set_audio_peaks failed");
+            }
+        }
+        Err(e) => tracing::warn!(asset = %t.id, error = %e, "waveform peak computation failed"),
+    }
     Ok(())
 }
 
