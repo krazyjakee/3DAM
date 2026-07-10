@@ -37,3 +37,6 @@ eframe = { version = "0.31", default-features = false, features = [
     "wayland",
     "x11",
 ] }
+# Phosphor line-icons (the lucide-equivalent the web client uses) so the native GUI ships the same
+# iconography instead of emoji/text glyphs (issue #68 parity). 0.9 tracks egui 0.31.
+egui-phosphor = "0.9"

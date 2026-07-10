@@ -115,8 +115,9 @@ impl EmbeddedLibrary {
         let store = self.store.clone();
         let events = self.events.clone();
         let model = self.semantic.clone();
+        let pool = self.bg_pool.clone();
         let outcome = tokio::task::spawn_blocking(move || {
-            crate::analysis::run_analyze(store, events, job, targets, cancel, model);
+            crate::analysis::run_analyze(store, events, job, targets, cancel, model, &pool);
         })
         .await;
         self.cancels.lock().unwrap().remove(&job);

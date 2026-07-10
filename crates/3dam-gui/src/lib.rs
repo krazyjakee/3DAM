@@ -13,6 +13,7 @@
 
 mod app;
 mod theme;
+mod ui;
 mod viewer3d;
 
 use std::ffi::OsString;

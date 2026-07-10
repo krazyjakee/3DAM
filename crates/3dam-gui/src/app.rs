@@ -16,6 +16,8 @@ use std::sync::Arc;
 use eframe::egui;
 use url::Url;
 
+use crate::theme::colors;
+use crate::ui::{self, icon};
 use dam_frontend::{open_backend, Backend};
 
 use dam_api::service::{AuthContext, LibraryService};
@@ -721,6 +723,10 @@ impl DamGui {
         // Dark-first preference (DESIGN_GUIDELINES §4); `update` applies the web-matched visuals
         // (issue #68) for whatever mode the preference resolves to.
         cc.egui_ctx.set_theme(egui::ThemePreference::Dark);
+        // Register Inter + Phosphor and the web type scale/spacing once, up front, so the shell never
+        // renders a frame in egui's stock font at default metrics (issue #68).
+        crate::theme::install_fonts(&cc.egui_ctx);
+        crate::theme::install_style(&cc.egui_ctx);
         let (tx, rx) = std::sync::mpsc::channel();
         // A remote launch starts "Connecting" and turns Online on the first successful call; embedded
         // is always Local. Seed the recent-servers list with the launch endpoint if any.
@@ -2770,11 +2776,12 @@ impl eframe::App for DamGui {
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.label("🔍");
+                let dim = colors(ui.visuals().dark_mode).fg_dim;
+                ui.label(egui::RichText::new(icon::MAGNIFYING_GLASS).color(dim));
                 let resp = ui.add(
                     egui::TextEdit::singleline(&mut self.search)
                         .hint_text("Search assets…")
-                        .desired_width(260.0),
+                        .desired_width(240.0),
                 );
                 if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     do_query = true;
@@ -2782,22 +2789,8 @@ impl eframe::App for DamGui {
                 if ui.button("Search").clicked() {
                     do_query = true;
                 }
-                ui.separator();
-                for (label, val) in [
-                    ("All", None),
-                    ("Audio", Some(MediaType::Audio)),
-                    ("Images", Some(MediaType::Image)),
-                    ("3D", Some(MediaType::Model)),
-                ] {
-                    if ui
-                        .selectable_label(self.media_filter == val, label)
-                        .clicked()
-                    {
-                        self.media_filter = val;
-                        self.class = None; // class is media-specific
-                        do_query = true;
-                    }
-                }
+                // The media filter now lives in the nav LIBRARY section (web parity) — the toolbar
+                // stays focused on the query, sort, structured filters, view and export.
                 ui.separator();
 
                 // Sort preset (mirrors the web sort control).
@@ -2839,9 +2832,9 @@ impl eframe::App for DamGui {
                 ui.separator();
                 // Advanced Search: structured attribute + tag filters (contextual to the media type).
                 let adv_label = if self.adv.is_empty() {
-                    "Filters".to_string()
+                    format!("{}  Filters", icon::FUNNEL)
                 } else {
-                    format!("Filters ({})", self.adv.len())
+                    format!("{}  Filters ({})", icon::FUNNEL, self.adv.len())
                 };
                 if ui
                     .selectable_label(self.adv_open || !self.adv.is_empty(), adv_label)
@@ -2850,48 +2843,43 @@ impl eframe::App for DamGui {
                 {
                     self.adv_open = !self.adv_open;
                 }
-                ui.separator();
-                match self.total {
-                    Some(t) => ui.label(format!("{} of {}", self.assets.len(), t)),
-                    None => ui.label(format!("{}", self.assets.len())),
-                };
-                if self.loading {
-                    ui.spinner();
-                }
-                // View toggle (grid / list) — right-aligned like the web toolbar.
+                // View toggle, count and export — right-aligned like the web toolbar. (The connection
+                // status now lives in the bottom status bar, matching the web StatusBar.)
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // Connection status chip (hosted mode, issue #70): colour-coded reachability;
-                    // click to open the Connect dialog. First-added = far right.
-                    let (color, label) = self.status_chip();
-                    if ui
-                        .button(egui::RichText::new(format!("● {label}")).color(color))
-                        .on_hover_text("Connect to a 3DAM server")
-                        .clicked()
-                    {
-                        self.connect_url = self.conn.endpoint.clone().unwrap_or_default();
-                        self.connect_token = self.conn.token.clone().unwrap_or_default();
-                        self.connect_open = true;
-                    }
-                    ui.separator();
-                    if ui
-                        .selectable_label(self.view == View::List, "List")
-                        .clicked()
-                    {
-                        self.view = View::List;
-                    }
-                    if ui
-                        .selectable_label(self.view == View::Grid, "Grid")
-                        .clicked()
-                    {
-                        self.view = View::Grid;
-                    }
-                    ui.separator();
                     // Export the current view (collection or faceted query) as a manifest.
-                    if ui.button("Export").clicked() {
+                    if ui
+                        .button(format!("{}  Export", icon::EXPORT))
+                        .on_hover_text("Export this view as a manifest")
+                        .clicked()
+                    {
                         self.export_assets.clear(); // export the view, not a stale selection
                         self.export_status = None;
                         self.export_open = true;
                     }
+                    ui.separator();
+                    if ui
+                        .selectable_label(self.view == View::Grid, icon::GRID_FOUR)
+                        .on_hover_text("Grid")
+                        .clicked()
+                    {
+                        self.view = View::Grid;
+                    }
+                    if ui
+                        .selectable_label(self.view == View::List, icon::LIST)
+                        .on_hover_text("Table")
+                        .clicked()
+                    {
+                        self.view = View::List;
+                    }
+                    ui.separator();
+                    if self.loading {
+                        ui.spinner();
+                    }
+                    let count = match self.total {
+                        Some(t) => format!("{} of {}", self.assets.len(), t),
+                        None => format!("{}", self.assets.len()),
+                    };
+                    ui.label(egui::RichText::new(count).color(dim));
                 });
             });
             ui.add_space(4.0);
@@ -2906,20 +2894,24 @@ impl eframe::App for DamGui {
             egui::TopBottomPanel::top("batchbar").show(ctx, |ui| {
                 ui.add_space(3.0);
                 ui.horizontal(|ui| {
+                    let accent = colors(ui.visuals().dark_mode).accent;
                     ui.label(
-                        egui::RichText::new(format!("{} selected", self.selection.len())).strong(),
+                        egui::RichText::new(format!("{} selected", self.selection.len()))
+                            .color(accent)
+                            .strong(),
                     );
                     ui.separator();
-                    if ui.button("Analyze").clicked() {
+                    if ui.button(format!("{}  Analyze", icon::SPARKLE)).clicked() {
                         batch_analyze = true;
                     }
-                    if ui.button("Export").clicked() {
+                    if ui.button(format!("{}  Export", icon::EXPORT)).clicked() {
                         batch_export = true;
                     }
-                    ui.separator();
-                    if ui.button("Clear").clicked() {
-                        batch_clear = true;
-                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button(format!("{}  Clear", icon::X)).clicked() {
+                            batch_clear = true;
+                        }
+                    });
                 });
                 ui.add_space(3.0);
             });
@@ -2929,226 +2921,348 @@ impl eframe::App for DamGui {
             .resizable(true)
             .default_width(220.0)
             .show(ctx, |ui| {
-                ui.add_space(6.0);
-                ui.heading("3DAM");
-                if let Some(stats) = &self.stats {
-                    ui.label(format!("{} assets", stats.total));
-                    ui.separator();
-                    ui.label(egui::RichText::new("LIBRARY").small().weak());
-                    for (media, label) in [
-                        (MediaType::Audio, "Audio"),
-                        (MediaType::Image, "Images"),
-                        (MediaType::Model, "3D Models"),
-                    ] {
-                        let n = stats.by_media.get(media_value(media)).copied().unwrap_or(0);
-                        ui.label(format!("{label}: {n}"));
+                let c = colors(ui.visuals().dark_mode);
+                // ── Brand header: app mark + name, with the total-asset count on the right ──
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new(icon::STACK).size(18.0).color(c.accent));
+                    ui.label(egui::RichText::new("3DAM").size(15.0).strong().color(c.fg));
+                    if let Some(stats) = &self.stats {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add_space(2.0);
+                            ui.label(
+                                egui::RichText::new(format!("{} assets", stats.total))
+                                    .size(11.0)
+                                    .color(c.fg_dim),
+                            );
+                        });
                     }
-                }
+                });
+                ui.add_space(6.0);
 
-                // Favorites facet (composes with media/license/text).
-                if ui.selectable_label(self.favorites, "★ Favorites").clicked() {
-                    self.favorites = !self.favorites;
-                    do_query = true;
-                }
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
 
-                // Recently added — a shortcut that sorts by scan time, newest first (mirrors the web
-                // shortcut). Active when that sort is applied in the ordinary library view.
-                let recent_active =
-                    self.sort == NEWEST_SORT && !self.dup_view && !self.blocklist_view;
-                if ui
-                    .selectable_label(recent_active, "Recently added")
-                    .clicked()
-                {
-                    self.sort = NEWEST_SORT;
-                    self.dup_view = false;
-                    self.blocklist_view = false;
-                    do_query = true;
-                }
-
-                // Duplicate review (issue #8) — a dedicated dedupe view over the linked groups.
-                let dup_count = self
-                    .duplicates
-                    .iter()
-                    .filter(|g| g.members.len() > 1)
-                    .count();
-                let dup_label = if dup_count > 0 {
-                    format!("Duplicates ({dup_count})")
-                } else {
-                    "Duplicates".to_string()
-                };
-                if ui.selectable_label(self.dup_view, dup_label).clicked() {
-                    open_dup_view = true;
-                }
-
-                // Blocklist management (issue #21): the removed-and-blocked content hashes.
-                let bl_label = if self.blocklist.is_empty() {
-                    "Blocklist".to_string()
-                } else {
-                    format!("Blocklist ({})", self.blocklist.len())
-                };
-                if ui.selectable_label(self.blocklist_view, bl_label).clicked() {
-                    open_blocklist_view = true;
-                }
-
-                // Analysis-class quick facet — contextual to a single active media type (the full
-                // typed-attribute set is Advanced Search, still owed). Chips toggle a class filter.
-                if let Some(m) = self.media_filter {
-                    let (_, options) = class_facet(m);
-                    ui.horizontal_wrapped(|ui| {
-                        for (val, label) in options {
-                            let on = self.class.as_deref() == Some(*val);
-                            if ui.selectable_label(on, *label).clicked() {
-                                self.class = if on { None } else { Some((*val).to_string()) };
+                        // ── LIBRARY: the media filter (All / Audio / Images / 3D), each row a
+                        // colour-coded identity glyph + count, matching the web nav. ──
+                        ui::section_label(ui, "Library");
+                        let media_rows = [
+                            (None, "All assets", icon::STACK, None),
+                            (
+                                Some(MediaType::Audio),
+                                "Audio",
+                                icon::MUSIC_NOTES,
+                                Some(c.media_audio),
+                            ),
+                            (
+                                Some(MediaType::Image),
+                                "Images",
+                                icon::IMAGE,
+                                Some(c.media_image),
+                            ),
+                            (
+                                Some(MediaType::Model),
+                                "3D Models",
+                                icon::CUBE,
+                                Some(c.media_model),
+                            ),
+                        ];
+                        for (val, label, glyph, col) in media_rows {
+                            let count = self.stats.as_ref().map(|s| match val {
+                                None => s.total as i64,
+                                Some(m) => {
+                                    s.by_media.get(media_value(m)).copied().unwrap_or(0) as i64
+                                }
+                            });
+                            let active = self.media_filter == val
+                                && !self.favorites
+                                && !self.dup_view
+                                && !self.blocklist_view;
+                            if ui::nav_row(ui, glyph, label, count, active, col).clicked() {
+                                self.media_filter = val;
+                                self.class = None; // class is media-specific
+                                self.favorites = false;
+                                self.dup_view = false;
+                                self.blocklist_view = false;
                                 do_query = true;
                             }
                         }
-                    });
-                }
 
-                ui.separator();
-                ui.label(egui::RichText::new("LICENSE").small().weak());
-                for (lic, label) in LICENSES {
-                    let on = self.license == Some(*lic);
-                    if ui.selectable_label(on, *label).clicked() {
-                        self.license = if on { None } else { Some(*lic) };
-                        do_query = true;
-                    }
-                }
+                        // Favorites facet (composes with media/license/text).
+                        let fav_active = self.favorites && !self.dup_view && !self.blocklist_view;
+                        if ui::nav_row(ui, icon::HEART, "Favorites", None, fav_active, None)
+                            .clicked()
+                        {
+                            self.favorites = !self.favorites;
+                            self.dup_view = false;
+                            self.blocklist_view = false;
+                            do_query = true;
+                        }
 
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("SOURCES").small().weak());
-                    if ui.small_button("+").clicked() {
-                        nav.toggle_add = true;
-                    }
-                });
-                // Add-source input (local filesystem path). SFTP/SMB (credentials) stay owed.
-                if self.add_open {
-                    ui.horizontal(|ui| {
-                        let resp = ui.add(
-                            egui::TextEdit::singleline(&mut self.add_path)
-                                .hint_text("/path/to/assets")
-                                .desired_width(150.0),
-                        );
-                        let submit = ui.small_button("Add").clicked()
-                            || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
-                        if submit && !self.add_path.trim().is_empty() {
-                            nav.source =
-                                Some(SourceAction::AddLocal(self.add_path.trim().to_string()));
+                        // Recently added — a shortcut that sorts by scan time, newest first. Active
+                        // when that sort is applied in the ordinary library view.
+                        let recent_active =
+                            self.sort == NEWEST_SORT && !self.dup_view && !self.blocklist_view;
+                        if ui::nav_row(ui, icon::CLOCK, "Recently added", None, recent_active, None)
+                            .clicked()
+                        {
+                            self.sort = NEWEST_SORT;
+                            self.dup_view = false;
+                            self.blocklist_view = false;
+                            do_query = true;
                         }
-                    });
-                }
-                if self.sources.is_empty() {
-                    ui.label(egui::RichText::new("No sources yet — add one above.").weak());
-                }
-                // Each source is an expandable folder tree (issue #66): the disclosure loads its
-                // directory tree lazily; clicking the name scopes the browse to that source (or, for
-                // a folder, to its subtree via the path-prefix filter). Trailing controls rescan/remove.
-                for s in &self.sources {
-                    let sid = s.id;
-                    let open = self.expanded.contains(&(sid, String::new()));
-                    let scoped = self.source_filter == Some(sid) && self.path.is_none();
-                    ui.horizontal(|ui| {
-                        if ui.small_button(if open { "v" } else { ">" }).clicked() {
-                            nav.toggle.push((sid, String::new()));
+
+                        // Analysis-class quick facet — contextual to a single active media type (the
+                        // full typed-attribute set is Advanced Search). Chips toggle a class filter.
+                        if let Some(m) = self.media_filter {
+                            let (_, options) = class_facet(m);
+                            ui::section_label(ui, "Type");
+                            ui.horizontal_wrapped(|ui| {
+                                for (val, label) in options {
+                                    let on = self.class.as_deref() == Some(*val);
+                                    if ui.selectable_label(on, *label).clicked() {
+                                        self.class =
+                                            if on { None } else { Some((*val).to_string()) };
+                                        do_query = true;
+                                    }
+                                }
+                            });
                         }
-                        if ui
-                            .selectable_label(
-                                scoped,
-                                format!("{} ({})", s.name, s.stats.asset_count),
+
+                        // ── LICENSE: each class as a coloured dot + label + toggle ──
+                        ui::section_label(ui, "License");
+                        for (lic, label) in LICENSES {
+                            let on = self.license == Some(*lic);
+                            let col = ui::license_color(&c, label);
+                            if ui::nav_row(ui, icon::CIRCLE, label, None, on, Some(col)).clicked() {
+                                self.license = if on { None } else { Some(*lic) };
+                                do_query = true;
+                            }
+                        }
+
+                        // ── SOURCES ──
+                        ui.add_space(2.0);
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("SOURCES").size(10.0).color(c.fg_dim));
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .button(egui::RichText::new(icon::PLUS))
+                                        .on_hover_text("Add a source folder")
+                                        .clicked()
+                                    {
+                                        nav.toggle_add = true;
+                                    }
+                                },
+                            );
+                        });
+                        // Add-source input (local filesystem path). SFTP/SMB (credentials) stay owed.
+                        if self.add_open {
+                            ui.horizontal(|ui| {
+                                let resp = ui.add(
+                                    egui::TextEdit::singleline(&mut self.add_path)
+                                        .hint_text("/path/to/assets")
+                                        .desired_width(150.0),
+                                );
+                                let submit = ui.small_button("Add").clicked()
+                                    || (resp.lost_focus()
+                                        && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                                if submit && !self.add_path.trim().is_empty() {
+                                    nav.source = Some(SourceAction::AddLocal(
+                                        self.add_path.trim().to_string(),
+                                    ));
+                                }
+                            });
+                        }
+                        if self.sources.is_empty() {
+                            ui.label(egui::RichText::new("No sources yet — add one above.").weak());
+                        }
+                        // Each source is an expandable folder tree (issue #66): the disclosure loads its
+                        // directory tree lazily; clicking the name scopes the browse to that source (or, for
+                        // a folder, to its subtree via the path-prefix filter). Trailing controls rescan/remove.
+                        for s in &self.sources {
+                            let sid = s.id;
+                            let open = self.expanded.contains(&(sid, String::new()));
+                            let scoped = self.source_filter == Some(sid) && self.path.is_none();
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .small_button(if open {
+                                        icon::CARET_DOWN
+                                    } else {
+                                        icon::CARET_RIGHT
+                                    })
+                                    .clicked()
+                                {
+                                    nav.toggle.push((sid, String::new()));
+                                }
+                                if ui
+                                    .selectable_label(
+                                        scoped,
+                                        format!(
+                                            "{}  {} ({})",
+                                            icon::FOLDER,
+                                            s.name,
+                                            s.stats.asset_count
+                                        ),
+                                    )
+                                    .clicked()
+                                {
+                                    nav.scope = Some((sid, None));
+                                }
+                                if self.confirm_remove == Some(sid) {
+                                    ui.label(egui::RichText::new("remove?").small());
+                                    if ui.small_button("yes").clicked() {
+                                        nav.source = Some(SourceAction::Remove(sid));
+                                        nav.set_confirm = Some(None);
+                                    }
+                                    if ui.small_button("no").clicked() {
+                                        nav.set_confirm = Some(None);
+                                    }
+                                } else {
+                                    if ui
+                                        .small_button(icon::ARROWS_CLOCKWISE)
+                                        .on_hover_text("Rescan source")
+                                        .clicked()
+                                    {
+                                        nav.source = Some(SourceAction::Rescan(sid));
+                                    }
+                                    if ui
+                                        .small_button(icon::TRASH)
+                                        .on_hover_text("Remove source")
+                                        .clicked()
+                                    {
+                                        nav.set_confirm = Some(Some(sid));
+                                    }
+                                }
+                            });
+                            if open {
+                                self.folder_level(ui, sid, "", 1, &mut nav);
+                            }
+                        }
+
+                        // ── COLLECTIONS & smart folders — clicking one browses its members; the
+                        // header "+" creates one, right-click renames/deletes (web parity). ──
+                        ui.add_space(2.0);
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("COLLECTIONS")
+                                    .size(10.0)
+                                    .color(c.fg_dim),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .button(egui::RichText::new(icon::PLUS))
+                                        .on_hover_text("Create a collection")
+                                        .clicked()
+                                    {
+                                        self.collection_new_name.clear();
+                                        self.collection_new_smart = false;
+                                        self.collection_new_open = true;
+                                    }
+                                },
+                            );
+                        });
+                        if self.collections.is_empty() {
+                            ui.label(
+                                egui::RichText::new("Group assets into a collection")
+                                    .small()
+                                    .weak(),
+                            );
+                        }
+                        for col_item in &self.collections {
+                            let on = self.collection == Some(col_item.id);
+                            let smart = matches!(col_item.kind, CollectionKind::Smart);
+                            let glyph = if smart {
+                                icon::SPARKLE
+                            } else {
+                                icon::FOLDER_OPEN
+                            };
+                            let icon_col = if smart { Some(c.accent) } else { None };
+                            let resp = ui::nav_row(
+                                ui,
+                                glyph,
+                                &col_item.name,
+                                col_item.count.map(|n| n as i64),
+                                on,
+                                icon_col,
                             )
-                            .clicked()
-                        {
-                            nav.scope = Some((sid, None));
+                            .on_hover_text(if smart {
+                                "Smart collection"
+                            } else {
+                                "Collection"
+                            });
+                            if resp.clicked() {
+                                pick_collection = Some(if on { None } else { Some(col_item.id) });
+                            }
+                            resp.context_menu(|ui| {
+                                if ui
+                                    .button(format!("{}  Rename…", icon::PENCIL_SIMPLE))
+                                    .clicked()
+                                {
+                                    open_rename = Some((col_item.id, col_item.name.clone()));
+                                    ui.close_menu();
+                                }
+                                if ui.button(format!("{}  Delete", icon::TRASH)).clicked() {
+                                    collection_action = Some(CollectionAction::Delete(col_item.id));
+                                    ui.close_menu();
+                                }
+                            });
                         }
-                        if self.confirm_remove == Some(sid) {
-                            ui.label(egui::RichText::new("remove?").small());
-                            if ui.small_button("yes").clicked() {
-                                nav.source = Some(SourceAction::Remove(sid));
-                                nav.set_confirm = Some(None);
-                            }
-                            if ui.small_button("no").clicked() {
-                                nav.set_confirm = Some(None);
-                            }
-                        } else {
-                            if ui.small_button("scan").clicked() {
-                                nav.source = Some(SourceAction::Rescan(sid));
-                            }
-                            if ui.small_button("x").clicked() {
-                                nav.set_confirm = Some(Some(sid));
-                            }
-                        }
-                    });
-                    if open {
-                        self.folder_level(ui, sid, "", 1, &mut nav);
-                    }
-                }
 
-                // Collections & smart folders — clicking one browses its members (mutually exclusive
-                // with the facets); the header "+ New" creates one, and right-click renames/deletes
-                // (mirrors the web Collections section). Membership editing lives in the inspector.
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("COLLECTIONS").small().weak());
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .small_button("+ New")
-                            .on_hover_text("Create a collection")
-                            .clicked()
+                        // ── Footer: dedupe / blocklist views + the theme cycle (web parity). ──
+                        ui::hairline(ui);
+                        let dup_count = self
+                            .duplicates
+                            .iter()
+                            .filter(|g| g.members.len() > 1)
+                            .count();
+                        if ui::nav_row(
+                            ui,
+                            icon::COPY,
+                            "Duplicates",
+                            (dup_count > 0).then_some(dup_count as i64),
+                            self.dup_view,
+                            None,
+                        )
+                        .clicked()
                         {
-                            self.collection_new_name.clear();
-                            self.collection_new_smart = false;
-                            self.collection_new_open = true;
+                            open_dup_view = true;
                         }
+                        let bl_count = self.blocklist.len();
+                        if ui::nav_row(
+                            ui,
+                            icon::PROHIBIT,
+                            "Blocklist",
+                            (bl_count > 0).then_some(bl_count as i64),
+                            self.blocklist_view,
+                            None,
+                        )
+                        .clicked()
+                        {
+                            open_blocklist_view = true;
+                        }
+                        // Theme cycle System → Dark → Light (dark-first); egui resolves the concretes.
+                        let (tglyph, tlabel) = match self.theme_pref {
+                            egui::ThemePreference::System => (icon::MONITOR, "Theme: System"),
+                            egui::ThemePreference::Dark => (icon::MOON, "Theme: Dark"),
+                            egui::ThemePreference::Light => (icon::SUN, "Theme: Light"),
+                        };
+                        if ui::link_row(ui, tglyph, tlabel, false).clicked() {
+                            self.theme_pref = match self.theme_pref {
+                                egui::ThemePreference::System => egui::ThemePreference::Dark,
+                                egui::ThemePreference::Dark => egui::ThemePreference::Light,
+                                egui::ThemePreference::Light => egui::ThemePreference::System,
+                            };
+                            ui.ctx().set_theme(self.theme_pref);
+                        }
+                        ui.add_space(6.0);
                     });
-                });
-                if self.collections.is_empty() {
-                    ui.label(
-                        egui::RichText::new("Group assets into a collection")
-                            .small()
-                            .weak(),
-                    );
-                }
-                for c in &self.collections {
-                    let on = self.collection == Some(c.id);
-                    let smart = matches!(c.kind, CollectionKind::Smart);
-                    let suffix = if smart { " ~smart" } else { "" };
-                    let label = match c.count {
-                        Some(n) => format!("{} ({n}){suffix}", c.name),
-                        None => format!("{}{suffix}", c.name),
-                    };
-                    let resp = ui.selectable_label(on, label);
-                    if resp.clicked() {
-                        pick_collection = Some(if on { None } else { Some(c.id) });
-                    }
-                    resp.context_menu(|ui| {
-                        if ui.button("Rename…").clicked() {
-                            open_rename = Some((c.id, c.name.clone()));
-                            ui.close_menu();
-                        }
-                        if ui.button("Delete").clicked() {
-                            collection_action = Some(CollectionAction::Delete(c.id));
-                            ui.close_menu();
-                        }
-                    });
-                }
-
-                // Theme selector at the foot of the rail — cycles System → Dark → Light (dark-first).
-                // `System` follows the OS; egui resolves the preference to concrete visuals.
-                ui.separator();
-                let label = match self.theme_pref {
-                    egui::ThemePreference::System => "Theme: System",
-                    egui::ThemePreference::Dark => "Theme: Dark",
-                    egui::ThemePreference::Light => "Theme: Light",
-                };
-                if ui.button(label).clicked() {
-                    self.theme_pref = match self.theme_pref {
-                        egui::ThemePreference::System => egui::ThemePreference::Dark,
-                        egui::ThemePreference::Dark => egui::ThemePreference::Light,
-                        egui::ThemePreference::Light => egui::ThemePreference::System,
-                    };
-                    ui.ctx().set_theme(self.theme_pref);
-                }
             });
 
         egui::SidePanel::right("inspector")
@@ -3156,9 +3270,13 @@ impl eframe::App for DamGui {
             .default_width(320.0)
             .show(ctx, |ui| {
                 ui.add_space(6.0);
-                ui.heading("Inspector");
-                ui.separator();
+                ui.add_space(2.0);
+                ui.heading(format!("{}  Inspector", icon::SLIDERS_HORIZONTAL));
+                ui::hairline(ui);
+                // Key the scroll state to the selected asset so switching assets resets to the top
+                // (web parity) instead of inheriting the previous asset's offset and hiding the title.
                 egui::ScrollArea::vertical()
+                    .id_salt(self.selected)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         if self.detail_loading {
@@ -3186,36 +3304,46 @@ impl eframe::App for DamGui {
                                 }
                                 ui.horizontal_wrapped(|ui| {
                                     if ui
-                                        .selectable_label(v_auto, "Auto-orbit")
+                                        .selectable_label(
+                                            v_auto,
+                                            format!("{}  Auto-orbit", icon::ARROWS_CLOCKWISE),
+                                        )
                                         .on_hover_text("Spin the model continuously")
                                         .clicked()
                                     {
                                         ctl_auto = true;
                                     }
                                     if ui
-                                        .selectable_label(v_wire, "Wireframe")
+                                        .selectable_label(
+                                            v_wire,
+                                            format!("{}  Wireframe", icon::CUBE),
+                                        )
                                         .on_hover_text("Show mesh edges")
                                         .clicked()
                                     {
                                         ctl_wire = true;
                                     }
                                     let light_name = match v_light {
-                                        0 => "Light: Studio",
-                                        1 => "Light: Soft",
-                                        _ => "Light: Flat",
+                                        0 => "Studio",
+                                        1 => "Soft",
+                                        _ => "Flat",
                                     };
                                     if ui
-                                        .button(light_name)
+                                        .button(format!("{}  {light_name}", icon::SUN))
                                         .on_hover_text("Cycle lighting mode")
                                         .clicked()
                                     {
                                         ctl_light = true;
                                     }
-                                    if ui.button("Reset").on_hover_text("Reset view").clicked() {
+                                    if ui
+                                        .button(icon::ARROW_COUNTER_CLOCKWISE)
+                                        .on_hover_text("Reset view")
+                                        .clicked()
+                                    {
                                         ctl_reset = true;
                                     }
                                     if ui
-                                        .button("Fullscreen")
+                                        .button(icon::ARROWS_OUT)
                                         .on_hover_text(
                                             "Expand the viewer to fill the window (Esc to exit)",
                                         )
@@ -3253,15 +3381,15 @@ impl eframe::App for DamGui {
                                 let playing = self.audio_for == Some(aid);
                                 ui.horizontal(|ui| {
                                     if playing {
-                                        if ui.button("Stop").clicked() {
+                                        if ui.button(format!("{}  Stop", icon::STOP)).clicked() {
                                             audio_stop = true;
                                         }
-                                    } else if ui.button("Play").clicked() {
+                                    } else if ui.button(format!("{}  Play", icon::PLAY)).clicked() {
                                         audio_play = Some(aid);
                                     }
                                     if let Some(err) = &self.audio_error {
                                         ui.colored_label(
-                                            egui::Color32::from_rgb(0xef, 0x44, 0x44),
+                                            colors(ui.visuals().dark_mode).danger,
                                             err,
                                         );
                                     }
@@ -3273,7 +3401,7 @@ impl eframe::App for DamGui {
                             {
                                 let aid = asset.summary.id;
                                 ui.separator();
-                                ui.label(egui::RichText::new("COLLECTIONS").small().weak());
+                                ui::section_label(ui, "Collections");
                                 ui.horizontal_wrapped(|ui| {
                                     for cid in &asset.collections {
                                         let name = self
@@ -3327,14 +3455,9 @@ impl eframe::App for DamGui {
                             if let Some(g) = self.duplicates.iter().find(|g| {
                                 g.members.len() > 1 && g.members.iter().any(|m| m.id == id)
                             }) {
-                                ui.separator();
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "DUPLICATES ({})",
-                                        g.members.len() - 1
-                                    ))
-                                    .small()
-                                    .weak(),
+                                ui::section_label(
+                                    ui,
+                                    &format!("Duplicates ({})", g.members.len() - 1),
                                 );
                                 ui.label(
                                     egui::RichText::new(format!(
@@ -3374,7 +3497,7 @@ impl eframe::App for DamGui {
                             // "Find similar" (tech-spec 05 §3): opt-in nearest-neighbour ranking. Un-analyzed
                             // assets have no vector, so we point at Analyze instead of querying into the void.
                             ui.separator();
-                            ui.label(egui::RichText::new("SIMILAR").small().weak());
+                            ui::section_label(ui, "Similar");
                             if asset.timestamps.analyzed.is_none() {
                                 ui.label(
                                     egui::RichText::new("Analyze this asset to find similar ones.")
@@ -3417,13 +3540,78 @@ impl eframe::App for DamGui {
                     });
             });
 
+        // ── Bottom status bar (web StatusBar parity): live job pulse + per-media breakdown on the
+        // left; connection pill, server and version on the right. Must precede the CentralPanel. ──
+        egui::TopBottomPanel::bottom("statusbar").show(ctx, |ui| {
+            let c = colors(ui.visuals().dark_mode);
+            ui.add_space(3.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.add_space(2.0);
+                if self.loading {
+                    ui.spinner();
+                    ui.label(egui::RichText::new("Working…").size(11.0).color(c.fg_dim));
+                    ui.label(egui::RichText::new("·").size(11.0).color(c.border_strong));
+                }
+                if let Some(stats) = &self.stats {
+                    // Per-media counts, each in its identity hue (matches the web breakdown).
+                    let mut first = true;
+                    for (mv, col) in [
+                        ("model", c.media_model),
+                        ("image", c.media_image),
+                        ("audio", c.media_audio),
+                    ] {
+                        if !first {
+                            ui.label(egui::RichText::new("·").size(11.0).color(c.border_strong));
+                        }
+                        first = false;
+                        let n = stats.by_media.get(mv).copied().unwrap_or(0);
+                        ui.label(
+                            egui::RichText::new(format!("{} {}", ui::media_tag(mv), n))
+                                .size(11.0)
+                                .color(col),
+                        );
+                    }
+                }
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(2.0);
+                    ui.label(
+                        egui::RichText::new(concat!("v", env!("CARGO_PKG_VERSION")))
+                            .size(11.0)
+                            .color(c.fg_dim),
+                    );
+                    ui.label(egui::RichText::new("·").size(11.0).color(c.border_strong));
+                    // Connection pill: coloured dot + label; click to open the Connect dialog.
+                    let (col, label) = self.status_chip();
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new(format!("● {label}"))
+                                    .size(11.0)
+                                    .color(col),
+                            )
+                            .frame(false),
+                        )
+                        .on_hover_text("Connect to a 3DAM server")
+                        .clicked()
+                    {
+                        self.connect_url = self.conn.endpoint.clone().unwrap_or_default();
+                        self.connect_token = self.conn.token.clone().unwrap_or_default();
+                        self.connect_open = true;
+                    }
+                });
+            });
+            ui.add_space(3.0);
+        });
+
         // Assets whose thumbnails are worth fetching this frame (visible + not yet requested),
         // gathered under the immutable render borrow and kicked off afterwards.
         let mut to_load: Vec<AssetId> = Vec::new();
 
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(err) = &self.error {
-                ui.colored_label(egui::Color32::from_rgb(0xef, 0x44, 0x44), err);
+                ui.colored_label(colors(ui.visuals().dark_mode).danger, err);
                 ui.separator();
             }
             egui::ScrollArea::vertical()
@@ -3495,11 +3683,11 @@ impl eframe::App for DamGui {
                     });
                     match &self.export_status {
                         Some(Ok(msg)) => {
-                            ui.colored_label(egui::Color32::from_rgb(0x4a, 0xde, 0x80), msg);
+                            ui.colored_label(colors(ui.visuals().dark_mode).ok, msg);
                         }
                         Some(Err(msg)) => {
                             ui.colored_label(
-                                egui::Color32::from_rgb(0xef, 0x44, 0x44),
+                                colors(ui.visuals().dark_mode).danger,
                                 format!("Export failed: {msg}"),
                             );
                         }
@@ -3573,11 +3761,11 @@ impl eframe::App for DamGui {
                         });
                         match &self.convert_status {
                             Some(Ok(msg)) => {
-                                ui.colored_label(egui::Color32::from_rgb(0x4a, 0xde, 0x80), msg);
+                                ui.colored_label(colors(ui.visuals().dark_mode).ok, msg);
                             }
                             Some(Err(msg)) => {
                                 ui.colored_label(
-                                    egui::Color32::from_rgb(0xef, 0x44, 0x44),
+                                    colors(ui.visuals().dark_mode).danger,
                                     format!("Convert failed: {msg}"),
                                 );
                             }
@@ -3946,18 +4134,35 @@ impl DamGui {
         let font = egui::FontId::proportional(11.0);
         let name_chars = ((name_w - 34.0) / 6.2).max(6.0) as usize; // media tag + ellipsised name
 
-        // Sort state → header arrows (ASCII; the egui default font lacks ↑/↓ glyphs).
+        // Sort state → header carets (Phosphor).
         let name_active = self.sort <= 1;
         let size_active = self.sort == 2 || self.sort == 3;
-        let arrow = |asc_idx: usize| if self.sort == asc_idx { " ^" } else { " v" };
-        let name_hdr = format!("NAME{}", if name_active { arrow(0) } else { "" });
-        let size_hdr = format!("SIZE{}", if size_active { arrow(3) } else { "" });
-        let dim = ui.visuals().weak_text_color();
-        let fg = ui.visuals().text_color();
+        let arrow = |asc_idx: usize| {
+            if self.sort == asc_idx {
+                icon::CARET_UP
+            } else {
+                icon::CARET_DOWN
+            }
+        };
+        let name_hdr = if name_active {
+            format!("NAME  {}", arrow(0))
+        } else {
+            "NAME".to_string()
+        };
+        let size_hdr = if size_active {
+            format!("SIZE  {}", arrow(3))
+        } else {
+            "SIZE".to_string()
+        };
+        let c = colors(ui.visuals().dark_mode);
+        let dim = c.fg_dim;
+        let fg = c.fg;
 
         // Paint one table row's cells into `rect` (shared by the header and data rows).
         let paint_row = |p: &egui::Painter,
                          rect: egui::Rect,
+                         tag: &str,
+                         tag_col: egui::Color32,
                          name: &str,
                          name_col: egui::Color32,
                          format: &str,
@@ -3967,8 +4172,16 @@ impl DamGui {
                          size_col: egui::Color32| {
             let y = rect.center().y;
             let l = rect.left();
+            // Colour-coded media tag, then the name after it.
+            let mut name_x = l + 4.0;
+            if !tag.is_empty() {
+                let tg = p.layout_no_wrap(tag.to_owned(), font.clone(), tag_col);
+                let adv = tg.size().x + 6.0;
+                p.galley(egui::pos2(l + 4.0, y - tg.size().y / 2.0), tg, tag_col);
+                name_x += adv;
+            }
             p.text(
-                egui::pos2(l + 4.0, y),
+                egui::pos2(name_x, y),
                 egui::Align2::LEFT_CENTER,
                 name,
                 font.clone(),
@@ -4017,6 +4230,8 @@ impl DamGui {
         paint_row(
             &ui.painter_at(hrect),
             hrect,
+            "",
+            dim,
             &name_hdr,
             if name_active { fg } else { dim },
             "FORMAT",
@@ -4070,7 +4285,9 @@ impl DamGui {
             paint_row(
                 &p,
                 rect,
-                &format!("{}  {}", media_tag(a.media), ellipsize(&a.name, name_chars)),
+                media_tag(a.media),
+                ui::media_color(&c, media_value(a.media)),
+                &ellipsize(&a.name, name_chars),
                 fg,
                 &a.format.to_uppercase(),
                 license_label(a.license.status),
@@ -4086,7 +4303,7 @@ impl DamGui {
     /// blocklist page.
     fn blocklist_review(&self, ui: &mut egui::Ui, unblock: &mut Option<ContentHash>) {
         ui.add_space(4.0);
-        ui.heading("Blocklist");
+        ui.heading(format!("{}  Blocklist", icon::PROHIBIT));
         ui.label(
             egui::RichText::new(
                 "Content hashes of assets you removed with \"block\". A scan / watch / auto-rescan \
@@ -4147,7 +4364,7 @@ impl DamGui {
         pick_media: &mut Option<Option<MediaType>>,
     ) {
         ui.add_space(4.0);
-        ui.heading("Duplicate review");
+        ui.heading(format!("{}  Duplicate review", icon::COPY));
         ui.label(
             egui::RichText::new(
                 "Groups the analysis pass linked. 3DAM only groups — nothing is deleted. Each \
@@ -4208,18 +4425,21 @@ impl DamGui {
         // One card per group.
         for (gi, g) in self.dup_groups.iter().enumerate() {
             egui::Frame::group(ui.style()).show(ui, |ui| {
+                let c = colors(ui.visuals().dark_mode);
                 ui.horizontal(|ui| {
+                    ui::media_badge(ui, media_value(g.media));
                     ui.label(
-                        egui::RichText::new(format!(
-                            "{} · {} items",
-                            media_label(g.media),
-                            g.members.len()
-                        ))
-                        .small()
-                        .weak(),
+                        egui::RichText::new(format!("{} items", g.members.len()))
+                            .size(11.0)
+                            .color(c.fg_muted),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(egui::RichText::new(&g.signal).small().monospace().weak());
+                        ui.label(
+                            egui::RichText::new(&g.signal)
+                                .size(10.0)
+                                .monospace()
+                                .color(c.fg_dim),
+                        );
                     });
                 });
                 ui.horizontal_wrapped(|ui| {
@@ -4258,11 +4478,13 @@ impl DamGui {
         to_load: &mut Vec<AssetId>,
         menu: &mut Option<AssetAction>,
     ) {
-        const TILE: f32 = 128.0;
-        const CARD_W: f32 = TILE;
-        const CARD_H: f32 = TILE + 26.0; // tile + a two-ish-line label strip
+        const CARD_W: f32 = 150.0;
+        const FOOTER_H: f32 = 40.0;
+        const CARD_H: f32 = 150.0;
+        const TILE_H: f32 = CARD_H - FOOTER_H; // thumbnail area
+        let c = colors(ui.visuals().dark_mode);
         ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+            ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
             for a in &self.assets {
                 let (rect, resp) =
                     ui.allocate_exact_size(egui::vec2(CARD_W, CARD_H), egui::Sense::click());
@@ -4280,32 +4502,94 @@ impl DamGui {
 
                 let painter = ui.painter_at(rect);
                 let selected = self.selected == Some(a.id) || self.selection.contains(&a.id);
-                if selected {
-                    painter.rect_filled(rect, 4.0, ui.visuals().selection.bg_fill);
+                // Bordered surface card (web GridCell): accent border when selected, strong on hover.
+                let border = if selected {
+                    c.accent
                 } else if resp.hovered() {
-                    painter.rect_filled(rect, 4.0, ui.visuals().widgets.hovered.bg_fill);
-                }
+                    c.border_strong
+                } else {
+                    c.border
+                };
+                painter.rect(
+                    rect,
+                    egui::CornerRadius::same(4),
+                    c.surface,
+                    egui::Stroke::new(1.0, border),
+                    egui::StrokeKind::Inside,
+                );
 
-                let tile = egui::Rect::from_min_size(rect.min, egui::vec2(TILE, TILE));
+                // Thumbnail (or a typed placeholder), inset 1px so the card border stays crisp.
+                let tile = egui::Rect::from_min_size(
+                    rect.min + egui::vec2(1.0, 1.0),
+                    egui::vec2(CARD_W - 2.0, TILE_H - 1.0),
+                );
                 match self.thumbs.get(&a.id) {
                     Some(Thumb::Ready(tex)) => {
                         let img = egui::Image::new(egui::load::SizedTexture::from_handle(tex))
                             .maintain_aspect_ratio(true)
-                            .fit_to_exact_size(egui::vec2(TILE, TILE));
+                            .fit_to_exact_size(tile.size());
                         img.paint_at(ui, tile);
                     }
                     _ => placeholder_tile(&painter, tile, a.media, ui.visuals()),
                 }
 
-                // One-line, ellipsised name under the tile.
-                let name_pos = rect.min + egui::vec2(2.0, TILE + 3.0);
-                painter.text(
-                    name_pos,
-                    egui::Align2::LEFT_TOP,
-                    ellipsize(&a.name, 18),
-                    egui::FontId::proportional(11.0),
-                    ui.visuals().text_color(),
+                // Media badge overlay (top-left) — a legible dark chip with the identity-hue tag.
+                let mv = media_value(a.media);
+                let mcol = ui::media_color(&c, mv);
+                let bfont = egui::FontId::new(10.0, egui::FontFamily::Proportional);
+                let bg = painter.layout_no_wrap(ui::media_tag(mv).to_owned(), bfont, mcol);
+                let bpad = egui::vec2(5.0, 2.0);
+                let brect = egui::Rect::from_min_size(
+                    tile.min + egui::vec2(5.0, 5.0),
+                    bg.size() + bpad * 2.0,
                 );
+                painter.rect_filled(
+                    brect,
+                    egui::CornerRadius::same(3),
+                    egui::Color32::from_black_alpha(160),
+                );
+                painter.galley(brect.min + bpad, bg, mcol);
+
+                // ── Footer: name line, then favourite star + license dot + size ──
+                let fx = rect.min.x + 7.0;
+                let name_y = rect.min.y + TILE_H + 5.0;
+                painter.text(
+                    egui::pos2(fx, name_y),
+                    egui::Align2::LEFT_TOP,
+                    ellipsize(&a.name, 20),
+                    egui::FontId::new(12.0, egui::FontFamily::Proportional),
+                    c.fg,
+                );
+                let line2_y = rect.min.y + TILE_H + 22.0;
+                let small = egui::FontId::new(10.0, egui::FontFamily::Proportional);
+                // Size, right-aligned.
+                painter.text(
+                    egui::pos2(rect.right() - 7.0, line2_y),
+                    egui::Align2::RIGHT_TOP,
+                    human_bytes(a.size),
+                    small.clone(),
+                    c.fg_dim,
+                );
+                // License dot + label, left.
+                let licol = ui::license_color(&c, license_label(a.license.status));
+                painter.circle_filled(egui::pos2(fx + 3.0, line2_y + 6.0), 3.0, licol);
+                painter.text(
+                    egui::pos2(fx + 10.0, line2_y),
+                    egui::Align2::LEFT_TOP,
+                    license_label(a.license.status),
+                    small,
+                    c.fg_dim,
+                );
+                // Favourite star tucked at the far right of the name line.
+                if a.favorite {
+                    painter.text(
+                        egui::pos2(rect.right() - 7.0, name_y),
+                        egui::Align2::RIGHT_TOP,
+                        icon::STAR,
+                        egui::FontId::new(11.0, egui::FontFamily::Proportional),
+                        c.warn,
+                    );
+                }
             }
         });
     }
@@ -4320,6 +4604,7 @@ fn inspector(
     action: &mut Option<AssetAction>,
 ) {
     let s = &asset.summary;
+    let c = colors(ui.visuals().dark_mode);
     // Preview: the asset's thumbnail (reuses the grid texture) scaled to the panel width. Absent for
     // audio / un-rendered 3D — those just show the metadata below.
     if let Some(tex) = thumb {
@@ -4327,39 +4612,60 @@ fn inspector(
         ui.add(
             egui::Image::new(egui::load::SizedTexture::from_handle(tex))
                 .maintain_aspect_ratio(true)
+                .corner_radius(4)
                 .max_width(w),
         );
-        ui.add_space(6.0);
+        ui.add_space(8.0);
     }
-    // Truncate a long name to the panel width (full name on hover) so it doesn't force the inspector
-    // wider — same reasoning as the Path row below.
-    ui.add(egui::Label::new(egui::RichText::new(&s.name).strong()).truncate())
-        .on_hover_text(&s.name);
+    // Title: media badge + name (+ favourite star), then the license badge underneath.
+    ui.horizontal(|ui| {
+        ui::media_badge(ui, media_value(s.media));
+        if s.favorite {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(egui::RichText::new(icon::STAR).color(c.warn));
+            });
+        }
+    });
+    ui.add(
+        egui::Label::new(egui::RichText::new(&s.name).strong().color(c.fg).size(14.0)).truncate(),
+    )
+    .on_hover_text(&s.name);
+    ui.add_space(3.0);
+    ui::license_badge(ui, license_label(s.license.status));
+    ui.add_space(6.0);
 
     // Per-asset maintenance actions (mirrors the web context menu / inspector actions).
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         let analyzed = asset.timestamps.analyzed.is_some();
         if ui
-            .button(if analyzed { "Reanalyze" } else { "Analyze" })
+            .button(format!(
+                "{}  {}",
+                icon::SPARKLE,
+                if analyzed { "Reanalyze" } else { "Analyze" }
+            ))
             .clicked()
         {
             *action = Some(AssetAction::Reanalyze(s.id));
         }
         // Only media with a server thumbnail can be regenerated.
         if matches!(s.media, MediaType::Image | MediaType::Model)
-            && ui.button("Regenerate thumbnail").clicked()
+            && ui
+                .button(format!("{}  Thumbnail", icon::IMAGE))
+                .on_hover_text("Regenerate thumbnail")
+                .clicked()
         {
             *action = Some(AssetAction::RegenThumb(s.id));
         }
         // Convert (transcode) — image/audio only; 3D can't transcode in v1.
-        if matches!(s.media, MediaType::Image | MediaType::Audio) && ui.button("Convert").clicked()
+        if matches!(s.media, MediaType::Image | MediaType::Audio)
+            && ui.button(format!("{}  Convert", icon::SWAP)).clicked()
         {
             *action = Some(AssetAction::Convert(s.id, s.media));
         }
         // Remove from the catalog (non-destructive to the file; confirms first). Block is offered in
         // the right-click menu.
         if ui
-            .button("Remove")
+            .button(format!("{}  Remove", icon::TRASH))
             .on_hover_text("Remove from the catalog (the file is untouched)")
             .clicked()
         {
@@ -4367,39 +4673,38 @@ fn inspector(
         }
     });
 
-    egui::Grid::new("detail").num_columns(2).show(ui, |ui| {
-        row(ui, "Type", media_label(s.media));
-        row(ui, "Format", &s.format.to_uppercase());
-        row(ui, "Size", &human_bytes(s.size));
-        ui.end_row();
-    });
-    // Path on its own line so a long path *truncates* to the panel width instead of forcing the
-    // inspector wider. Left-click copies the full path; hover shows it in a tooltip.
+    // ── DETAILS ──
+    ui::section_label(ui, "Details");
+    ui::meta_row(ui, "Type", media_label(s.media));
+    ui::meta_row(ui, "Format", &s.format.to_uppercase());
+    ui::meta_row(ui, "Size", &human_bytes(s.size));
+    // Path: dim label left, truncated path right (full path on hover; left-click copies).
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Path").weak());
-        let resp = ui
-            .add(
-                egui::Label::new(&asset.path)
-                    .truncate()
-                    .sense(egui::Sense::click()),
-            )
-            .on_hover_text(format!("{}\n(click to copy)", asset.path));
-        if resp.clicked() {
-            ui.ctx().copy_text(asset.path.clone());
-        }
+        ui.add(
+            egui::Label::new(egui::RichText::new("Path").color(c.fg_dim).size(12.0))
+                .selectable(false),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let resp = ui
+                .add(
+                    egui::Label::new(egui::RichText::new(&asset.path).color(c.fg).size(12.0))
+                        .truncate()
+                        .sense(egui::Sense::click()),
+                )
+                .on_hover_text(format!("{}\n(click to copy)", asset.path));
+            if resp.clicked() {
+                ui.ctx().copy_text(asset.path.clone());
+            }
+        });
     });
 
     // Media-specific attributes (audio/image/model), including the analysis-pass extras when present.
     let media = media_rows(&asset.attributes);
     if !media.is_empty() {
-        ui.separator();
-        ui.label(egui::RichText::new("MEDIA").small().weak());
-        egui::Grid::new("media").num_columns(2).show(ui, |ui| {
-            for (k, v) in &media {
-                row(ui, k, v);
-            }
-            ui.end_row();
-        });
+        ui::section_label(ui, "Media");
+        for (k, v) in &media {
+            ui::meta_row(ui, k, v);
+        }
     }
 
     // Continuous analysis features as 0–1 bars (image seamlessness; audio brightness/harmonicity) —
@@ -4407,35 +4712,41 @@ fn inspector(
     feature_bars(ui, &asset.attributes);
 
     if !asset.tags.is_empty() {
-        ui.separator();
-        ui.label(
-            egui::RichText::new(format!("TAGS ({})", asset.tags.len()))
-                .small()
-                .weak(),
-        );
+        ui::section_label(ui, &format!("Tags ({})", asset.tags.len()));
         // Reject-only lifecycle (tech-spec 05): an auto tag is active (powers search) unless rejected.
-        // Active auto tags offer "reject"; rejected ones show struck-through with "restore". User tags
-        // are static.
-        for t in &asset.tags {
-            let auto = t.source == "auto";
-            let rejected = t.state == "rejected";
-            ui.horizontal(|ui| {
-                let mut label = egui::RichText::new(&t.name).small();
-                if rejected {
-                    label = label.strikethrough().weak();
-                }
-                ui.label(label);
+        // Active auto tags are accent pills with an × to reject; rejected ones are dim with a restore.
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+            for t in &asset.tags {
+                let auto = t.source == "auto";
+                let rejected = t.state == "rejected";
+                let (fg, bg) = if rejected {
+                    (c.fg_dim, c.surface2)
+                } else if auto {
+                    (c.accent, ui::tint(c.accent, 0.14))
+                } else {
+                    (c.fg, c.surface2)
+                };
+                ui::pill(ui, &t.name, fg, bg);
                 if auto {
                     if rejected {
-                        if ui.small_button("restore").clicked() {
+                        if ui
+                            .small_button(icon::ARROW_COUNTER_CLOCKWISE)
+                            .on_hover_text("Restore tag")
+                            .clicked()
+                        {
                             *tag_review = Some((s.id, t.name.clone(), ReviewAction::Accept));
                         }
-                    } else if ui.small_button("reject").clicked() {
+                    } else if ui
+                        .small_button(icon::X)
+                        .on_hover_text("Reject tag")
+                        .clicked()
+                    {
                         *tag_review = Some((s.id, t.name.clone(), ReviewAction::Reject));
                     }
                 }
-            });
-        }
+            }
+        });
     }
 }
 
@@ -4447,13 +4758,21 @@ fn placeholder_tile(
     media: MediaType,
     visuals: &egui::Visuals,
 ) {
-    painter.rect_filled(rect, 3.0, visuals.extreme_bg_color);
+    let c = colors(visuals.dark_mode);
+    painter.rect_filled(rect, egui::CornerRadius::same(3), c.bg);
+    // A large media-identity glyph in a faint tint, so audio / un-rendered 3D still read at a glance.
+    let glyph = match media {
+        MediaType::Audio => icon::MUSIC_NOTES,
+        MediaType::Image => icon::IMAGE,
+        MediaType::Model => icon::CUBE,
+    };
+    let col = ui::media_color(&c, media_value(media));
     painter.text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
-        media_tag(media),
-        egui::FontId::proportional(13.0),
-        visuals.weak_text_color(),
+        glyph,
+        egui::FontId::new(34.0, egui::FontFamily::Proportional),
+        ui::tint(col, 0.55),
     );
 }
 
@@ -4465,12 +4784,6 @@ fn ellipsize(s: &str, max: usize) -> String {
         let head: String = s.chars().take(max.saturating_sub(1)).collect();
         format!("{head}…")
     }
-}
-
-fn row(ui: &mut egui::Ui, label: &str, value: &str) {
-    ui.label(egui::RichText::new(label).weak());
-    ui.label(value);
-    ui.end_row();
 }
 
 /// The store's `media_type` facet value (matches `MediaType`'s lowercase serde name).
@@ -4495,12 +4808,13 @@ fn feature_bars(ui: &mut egui::Ui, attrs: &MediaAttributes) {
             if let Some(t) = a.tileability {
                 bars.push(("Seamlessness", t));
             }
+            let tc_colors = colors(ui.visuals().dark_mode);
             badge = a.tile_class.as_deref().map(|tc| {
                 let (label, color) = match tc {
-                    "seamless" => ("Seamless", egui::Color32::from_rgb(0x22, 0xc5, 0x5e)),
-                    "tiled" => ("Tiled", egui::Color32::from_rgb(0x38, 0xbd, 0xf8)),
-                    "non_tiling" => ("Non-tiling", egui::Color32::GRAY),
-                    other => (other, egui::Color32::GRAY),
+                    "seamless" => ("Seamless", tc_colors.ok),
+                    "tiled" => ("Tiled", tc_colors.accent),
+                    "non_tiling" => ("Non-tiling", tc_colors.fg_dim),
+                    other => (other, tc_colors.fg_dim),
                 };
                 (label.to_string(), color)
             });
@@ -4518,25 +4832,21 @@ fn feature_bars(ui: &mut egui::Ui, attrs: &MediaAttributes) {
     if bars.is_empty() && badge.is_none() {
         return;
     }
-    // Fill the 0–1 bars with the active theme's accent (not egui's default selection tint).
-    let accent = ui.visuals().selection.stroke.color;
-    ui.separator();
-    ui.label(egui::RichText::new("FEATURES").small().weak());
+    ui::section_label(ui, "Features");
     if let Some((label, color)) = badge {
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Tiling").small().weak());
-            ui.colored_label(color, egui::RichText::new(label).small());
+            let c = colors(ui.visuals().dark_mode);
+            ui.add(
+                egui::Label::new(egui::RichText::new("Tiling").color(c.fg_dim).size(11.0))
+                    .selectable(false),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui::pill(ui, &label, color, ui::tint(color, 0.16));
+            });
         });
     }
     for (label, val) in bars {
-        let v = val.clamp(0.0, 1.0);
-        ui.add(
-            egui::ProgressBar::new(v)
-                .fill(accent)
-                .desired_height(9.0)
-                .text(egui::RichText::new(format!("{label}  {:.0}%", v * 100.0)).small()),
-        )
-        .on_hover_text(format!("{val:.3}"));
+        ui::feature_bar(ui, label, val.clamp(0.0, 1.0));
     }
 }
 
