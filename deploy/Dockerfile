@@ -72,4 +72,15 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=20s \
     CMD curl -fsS http://127.0.0.1:7878/readyz || exit 1
 
 ENV RUST_LOG=info
-ENTRYPOINT ["/usr/local/bin/3dam", "serve", "--data", "/var/lib/3dam", "--addr", "0.0.0.0:7878"]
+
+# ENTRYPOINT is the binary; CMD is the default (overridable) serve invocation. The container must
+# bind 0.0.0.0 for the published port to be reachable, and `serve` refuses a plaintext non-localhost
+# bind unless TLS is configured or --insecure is passed. Here the Docker network boundary + port
+# mapping is the trust boundary, so we default to --insecure; the server still logs a warning when
+# it is exposed without auth/TLS. HARDEN for production: enable token auth (`3dam admin flags
+# authentication --set token`) and either terminate TLS in a reverse proxy, or override CMD to pass
+# TLS directly, e.g.:
+#   docker run … 3dam-server serve --data /var/lib/3dam --addr 0.0.0.0:7878 \
+#     --tls-cert /etc/3dam/tls/fullchain.pem --tls-key /etc/3dam/tls/privkey.pem
+ENTRYPOINT ["/usr/local/bin/3dam"]
+CMD ["serve", "--data", "/var/lib/3dam", "--addr", "0.0.0.0:7878", "--insecure"]

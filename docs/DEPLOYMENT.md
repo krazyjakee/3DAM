@@ -96,6 +96,14 @@ Tags: `latest` tracks the newest release; `MAJOR.MINOR.PATCH` and `MAJOR.MINOR` 
 `edge`/`sha-…` come from manual/dispatch builds. The image runs the `serve` role as a non-root
 `3dam` user, binding `0.0.0.0:7878` with the data dir on the `/var/lib/3dam` volume.
 
+> **Exposure.** A container must bind `0.0.0.0` for its published port to be reachable, so the
+> default command passes `--insecure` (plaintext, no auth) — the Docker network + port mapping is the
+> trust boundary, and the server logs an `exposed beyond localhost with no auth and no TLS` warning
+> on start. **Before exposing it publicly**, turn on token auth (`3dam admin flags authentication
+> --set token`) and add TLS — either front it with a TLS-terminating proxy, or override the command
+> to pass `--tls-cert/--tls-key` directly (see the run example below). Supplying TLS replaces the
+> `--insecure` default.
+
 ### Build the image yourself
 
 A server-focused multi-stage image ships at [`deploy/Dockerfile`](../deploy/Dockerfile):
