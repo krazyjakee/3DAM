@@ -9,10 +9,11 @@
 # TLS in a reverse proxy and keep the container on localhost.
 
 # ---- builder ------------------------------------------------------------------------------------
-# Rust >= 1.88: the locked deps have drifted past the workspace's nominal 1.85 MSRV — image@0.25.10
-# needs rustc 1.88 and wgpu/naga@30 need 1.87 (they compile in both the wasm island build and the
-# native binary). CI elsewhere uses @stable so never pinned; this image must not lag behind.
-FROM rust:1.90-bookworm AS builder
+# Recent stable required: the locked deps have drifted well past the workspace's nominal 1.85 MSRV —
+# image@0.25.10 needs rustc 1.88, wgpu/naga@30 need 1.87, and libsqlite3-sys's build script uses
+# `std::cfg_select` (stable since 1.91). 1.95 clears all of these with headroom. CI elsewhere uses
+# @stable so it never noticed; this pinned image must track a recent stable, not lag behind.
+FROM rust:1.95-bookworm AS builder
 
 # Native deps: egui/eframe (GTK/xcb/wayland — the unified binary links the GUI), audio (ALSA), TLS
 # (openssl/pkg-config), and the Assimp/Draco 3D toolchain (cmake + clang, ADR 0011).
