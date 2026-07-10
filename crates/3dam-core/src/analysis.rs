@@ -53,6 +53,7 @@ pub(crate) fn run_analyze(
     targets: Vec<AnalysisTarget>,
     cancel: Arc<AtomicBool>,
     model: Option<Arc<dyn crate::semantic::SemanticModel>>,
+    pool: &rayon::ThreadPool,
 ) {
     let total = targets.len() as u64;
     let _ = store.update_job_progress(&job, JobState::Running, 0, Some(total), None);
@@ -60,7 +61,10 @@ pub(crate) fn run_analyze(
     let done = AtomicU64::new(0);
     let warnings = AtomicU64::new(0);
 
-    targets.par_iter().for_each(|t| {
+    // Run on the bounded background pool (not the global rayon pool) so a whole-library pass leaves
+    // cores free for interactive inspector reads instead of pinning every core (tech-spec 14).
+    pool.install(|| {
+        targets.par_iter().for_each(|t| {
         // Cooperative cancel: in-flight items finish; still-queued ones fall through as cheap no-ops.
         if cancel.load(Ordering::Relaxed) {
             return;
@@ -85,6 +89,7 @@ pub(crate) fn run_analyze(
                 store.update_job_progress(&job, JobState::Running, n, Some(total), Some(&t.path));
             emit_progress(&store, &events, &job);
         }
+    });
     });
 
     let done = done.load(Ordering::Relaxed);

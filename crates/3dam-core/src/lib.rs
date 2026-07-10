@@ -43,29 +43,54 @@ const MAX_CONTENT_BYTES: u64 = 256 * 1024 * 1024;
 const THUMB_MIN_EDGE: u32 = 16;
 const THUMB_MAX_EDGE: u32 = 1024;
 
+/// Thread count for the bounded background-CPU pool (`bg_pool`): every core bar two, never zero.
+/// Heavy *background* work — grid-thumbnail generation and the analysis pass — shares this budget,
+/// so a burst can't pin every core. Interactive inspector reads (`read_model_preview`, audio
+/// content, `get_asset`) stay off it and thus always have headroom to preempt when the user selects
+/// an asset. This is the engine-side inspector-priority lane (golden rule 5, tech-spec 14).
+fn background_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(2).max(1))
+        .unwrap_or(1)
+}
+
+/// Content-keyed cache path for an asset's thumbnail derivative. The cache lives under
+/// `<data_dir>/cache/thumbnails/<key>-<edge>[<variant>].png`, keyed by content hash (falling back to
+/// the asset id) so identical bytes share one derivative. Model thumbnails carry a renderer-version
+/// suffix so a shader/framing bump invalidates only that slice; images keep the bare `{key}-{edge}`.
+fn thumb_cache_path(data_dir: &Path, asset: &Asset, max_edge: u32) -> PathBuf {
+    let key = asset
+        .hash
+        .map(|h| h.to_hex())
+        .unwrap_or_else(|| asset.summary.id.to_string());
+    let variant = thumbnail_variant(asset.summary.media);
+    data_dir
+        .join("cache")
+        .join("thumbnails")
+        .join(format!("{key}-{max_edge}{variant}.png"))
+}
+
+/// A cheap thumbnail cache probe — a plain file read, no source access. `Some` is the fast path
+/// that lets an already-rendered thumbnail skip the bounded background pool entirely.
+fn thumb_cache_lookup(data_dir: &Path, asset: &Asset, max_edge: u32) -> Option<AssetContent> {
+    std::fs::read(thumb_cache_path(data_dir, asset, max_edge))
+        .ok()
+        .map(png_content)
+}
+
 /// Render (or read from cache) a downscaled PNG thumbnail for an asset — a raster downscale for
 /// images, a wgpu turntable render for 3D models (when the `render` feature is on). Pure/blocking —
-/// runs inside `spawn_blocking`. The cache lives under
-/// `<data_dir>/cache/thumbnails/<key>-<edge>[<variant>].png`, keyed by content hash (falling back to
-/// the asset id) so identical bytes share one derivative.
+/// runs inside a blocking closure (the bounded `bg_pool` on a cache miss).
 fn gen_thumbnail(
     data_dir: &Path,
     store: &Store,
     asset: &Asset,
     max_edge: u32,
 ) -> Result<AssetContent, LibError> {
-    let key = asset
-        .hash
-        .map(|h| h.to_hex())
-        .unwrap_or_else(|| asset.summary.id.to_string());
-    let cache_dir = data_dir.join("cache").join("thumbnails");
-    // Model thumbnails carry a renderer-version suffix so a shader/framing bump invalidates only
-    // that slice; images keep the bare `{key}-{edge}` name.
-    let variant = thumbnail_variant(asset.summary.media);
-    let cache_path = cache_dir.join(format!("{key}-{max_edge}{variant}.png"));
-    if let Ok(bytes) = std::fs::read(&cache_path) {
-        return Ok(png_content(bytes)); // cache hit → no source access at all
+    if let Some(hit) = thumb_cache_lookup(data_dir, asset, max_edge) {
+        return Ok(hit); // cache hit → no source access at all
     }
+    let cache_path = thumb_cache_path(data_dir, asset, max_edge);
 
     // Cache miss: resolve the source file (in place for local, downloaded for remote). `fetch`
     // guards `..` traversal out of the source root.
@@ -366,6 +391,9 @@ pub struct EmbeddedLibrary {
     cancels: Mutex<HashMap<JobId, Arc<AtomicBool>>>,
     /// Auto-rescan watchers for `watch`-enabled sources (tech-spec 07 §3.1).
     watchers: watch::WatchManager,
+    /// Bounded pool for heavy *background* CPU work (thumbnail generation + the analysis pass),
+    /// sized to leave cores free so interactive inspector reads preempt it (see [`background_threads`]).
+    bg_pool: Arc<rayon::ThreadPool>,
     /// Model-backed semantic embedder (semantic-search M4), or `None` when no weights ship — the
     /// default. When present, the analysis pass also writes its space and text search can encode a
     /// query into it. Held behind the [`semantic::SemanticModel`] seam.
@@ -393,12 +421,18 @@ impl EmbeddedLibrary {
         // Load the semantic model if this build ships one (M4). `None` by default — the model-free
         // embeddings stand in — so this is a cheap, always-safe call.
         let semantic = semantic::load(data_dir).map(Arc::from);
+        let bg_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(background_threads())
+            .thread_name(|i| format!("dam-bg-{i}"))
+            .build()
+            .map_err(|e| LibError::Internal(e.to_string()))?;
         Ok(EmbeddedLibrary {
             store,
             events,
             data_dir: data_dir.to_path_buf(),
             cancels: Mutex::new(HashMap::new()),
             watchers,
+            bg_pool: Arc::new(bg_pool),
             semantic,
         })
     }
@@ -426,6 +460,23 @@ impl EmbeddedLibrary {
         tokio::task::spawn_blocking(move || f(&store))
             .await
             .map_err(|e| LibError::Internal(e.to_string()))?
+    }
+
+    /// Like [`Self::db`], but runs the closure on the bounded background pool (`bg_pool`) instead of
+    /// the unbounded blocking pool. Use for heavy *background* generation (thumbnails) so a burst
+    /// can't saturate every core — interactive inspector reads stay on `db()` and preempt it. The
+    /// hand-off is a one-shot async→CPU hop (golden rule 5); the caller awaits the result.
+    async fn run_bg<T, F>(&self, f: F) -> Result<T, LibError>
+    where
+        F: FnOnce(&Store) -> Result<T, LibError> + Send + 'static,
+        T: Send + 'static,
+    {
+        let store = self.store.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.bg_pool.spawn(move || {
+            let _ = tx.send(f(&store));
+        });
+        rx.await.map_err(|e| LibError::Internal(e.to_string()))?
     }
 
     // ── storage & maintenance (Settings §Storage, tech-spec 10 §5) ────────────
@@ -637,7 +688,21 @@ impl LibraryService for EmbeddedLibrary {
         let id = *id;
         let edge = max_edge.clamp(THUMB_MIN_EDGE, THUMB_MAX_EDGE);
         let data_dir = self.data_dir.clone();
-        self.db(move |s| {
+        // Fast path: a cheap cache probe on the unbounded pool, so an already-rendered thumbnail is
+        // never stuck behind background generation.
+        let probe_dir = data_dir.clone();
+        if let Some(hit) = self
+            .db(move |s| {
+                let asset = s.get_asset(&id)?;
+                Ok(thumb_cache_lookup(&probe_dir, &asset, edge))
+            })
+            .await?
+        {
+            return Ok(hit);
+        }
+        // Cache miss: the expensive render/decode runs on the bounded background pool so a grid
+        // burst can't starve an interactive inspector read (preview / waveform / detail).
+        self.run_bg(move |s| {
             let asset = s.get_asset(&id)?;
             gen_thumbnail(&data_dir, s, &asset, edge)
         })
@@ -947,8 +1012,9 @@ impl LibraryService for EmbeddedLibrary {
         let store = self.store.clone();
         let events = self.events.clone();
         let model = self.semantic.clone();
+        let pool = self.bg_pool.clone();
         tokio::task::spawn_blocking(move || {
-            analysis::run_analyze(store, events, job, targets, cancel, model);
+            analysis::run_analyze(store, events, job, targets, cancel, model, &pool);
         });
         Ok(job)
     }
