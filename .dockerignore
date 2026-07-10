@@ -1,0 +1,10 @@
+# Keep the build context lean and reproducible: never ship local build output into the image.
+# The builder regenerates web/dist and web/src/wasm from source, so a stale local copy must not
+# leak in. CI checks out clean, but this matters for local `docker build`.
+.git/
+target/
+**/target/
+web/node_modules/
+web/dist/
+web/src/wasm/
+**/*.tsbuildinfo
