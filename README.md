@@ -60,7 +60,7 @@ See [`docs/ROADMAP.md`](docs/ROADMAP.md) for status against the spec.
 
 ### Build from source
 
-Requires a recent stable Rust toolchain (MSRV **1.85**).
+Requires a recent stable Rust toolchain (MSRV **1.91** — set by the dependency tree, notably libsqlite3-sys 0.38's `cfg_select!` build script).
 
 ```sh
 git clone https://github.com/krazyjakee/3DAM.git

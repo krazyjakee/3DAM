@@ -22,7 +22,12 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/krazyjakee/3DAM"
-rust-version = "1.85"
+# MSRV floor is set by the locked dependency tree, not our own source: libsqlite3-sys
+# 0.38's build.rs uses the `cfg_select!` macro (stable since 1.91), and image 0.25 / wgpu 30
+# / naga 30 declare 1.87–1.88. Setting this makes `cargo build` fail fast with a clear
+# message on older toolchains instead of a cryptic `cfg_select` error. Bump only after
+# rebuilding to confirm the new floor; keep CLAUDE.md / README.md in sync.
+rust-version = "1.91"
 
 # One place for third-party versions; crates opt in with `dep.workspace = true`.
 [workspace.dependencies]
