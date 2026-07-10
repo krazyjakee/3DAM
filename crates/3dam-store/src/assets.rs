@@ -163,9 +163,11 @@ impl Store {
             MediaType::Audio => conn
                 .query_row(
                     "SELECT duration_ms, sample_rate, bit_depth, channels, codec, container, class,
-                            loudness_lufs, brightness, harmonicity FROM audio_attr WHERE asset_id = ?1",
+                            loudness_lufs, brightness, harmonicity, waveform_peaks
+                     FROM audio_attr WHERE asset_id = ?1",
                     params![id_blob],
                     |r| {
+                        let peaks_json: Option<String> = r.get(10)?;
                         Ok(AudioAttributes {
                             duration_ms: r.get(0)?,
                             sample_rate: r.get(1)?,
@@ -175,8 +177,9 @@ impl Store {
                             container: r.get(5)?,
                             class: r.get(6)?,
                             loudness_lufs: r.get(7)?,
-                            brightness: r.get(8)?,
                             harmonicity: r.get(9)?,
+                            brightness: r.get(8)?,
+                            peaks: peaks_json.and_then(|j| serde_json::from_str(&j).ok()),
                         })
                     },
                 )

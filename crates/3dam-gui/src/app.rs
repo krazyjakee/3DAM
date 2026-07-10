@@ -9,10 +9,14 @@
 //! there's something new to show rather than polling.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 
 use eframe::egui;
+use url::Url;
+
+use dam_frontend::{open_backend, Backend};
 
 use dam_api::service::{AuthContext, LibraryService};
 use dam_api::{
@@ -21,9 +25,10 @@ use dam_api::{
     ConvertTarget, DupGroup, DupKind, DupRequest, EventTopic, ExportFormat, ExportReport,
     ExportRequest, FacetField, Filter, FilterOp, FilterValue, FolderEntry, FolderListing, JobState,
     LibraryEvent, LibraryStats, LicenseStatus, MediaAttributes, MediaType, NewCollection, Page,
-    PageParams, QueryRequest, RemoveAsset, RemoveSource, ReviewAction, ScanMode, ScanRequest,
-    SearchMode, SimilarHit, SimilarRequest, Sort, SortDir, SortField, SourceId, SourceInfo,
-    SourceKind, SubscribeRequest, SuggestionReview, ThumbnailRegenRequest, UpdateCollection,
+    PageParams, PrefetchRequest, QueryRequest, RemoveAsset, RemoveSource, ReviewAction, ScanMode,
+    ScanRequest, SearchMode, SimilarHit, SimilarRequest, Sort, SortDir, SortField, SourceId,
+    SourceInfo, SourceKind, SubscribeRequest, SuggestionReview, ThumbnailRegenRequest,
+    UpdateCollection,
 };
 use futures::StreamExt;
 
@@ -485,6 +490,9 @@ enum Msg {
     ModelMesh(AssetId, Result<Vec<u8>, String>),
     /// A collection create/rename/delete/membership mutation finished (reload on success).
     CollectionMutated(Result<(), String>),
+    /// A backend switch (Connect/Disconnect) finished building the new service (issue #70). On `Ok`
+    /// the app rebinds `lib`, resets browse state, and re-subscribes to the event stream.
+    BackendSwitched(Conn, Result<Arc<dyn LibraryService>, String>),
 }
 
 /// A collection CRUD / membership action gathered while rendering, applied after the panels.
@@ -496,10 +504,86 @@ enum CollectionAction {
     RemoveMember { id: CollectionId, asset: AssetId },
 }
 
+/// Which backend the GUI is currently bound to (issue #70, hosted mode). The embedded engine runs
+/// in-process; a remote `3dam serve` is reached over HTTP/WS through the same `LibraryService` seam.
+/// The endpoint is kept as a string for display and for rebuilding the client on a reconnect.
+#[derive(Clone)]
+pub struct Conn {
+    /// Remote server URL, or `None` for the in-process embedded engine.
+    pub endpoint: Option<String>,
+    /// Bearer token presented to a token-gated server.
+    pub token: Option<String>,
+}
+
+impl Conn {
+    /// The in-process embedded engine — always local, never "offline".
+    pub fn embedded() -> Self {
+        Self {
+            endpoint: None,
+            token: None,
+        }
+    }
+
+    /// A remote `3dam serve` endpoint (optionally token-gated).
+    pub fn remote(endpoint: Url, token: Option<String>) -> Self {
+        Self {
+            endpoint: Some(endpoint.to_string()),
+            token,
+        }
+    }
+
+    fn is_remote(&self) -> bool {
+        self.endpoint.is_some()
+    }
+}
+
+/// Live reachability of the current backend, surfaced as a toolbar chip. The embedded engine is
+/// always `Local`; a remote backend moves Connecting → Online, and flips to `Offline` when calls
+/// start failing (the `ApiClient` event subscription reconnects with backoff, so it recovers).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConnStatus {
+    /// In-process embedded engine.
+    Local,
+    /// Remote backend just selected; first calls in flight.
+    Connecting,
+    /// Remote backend answering.
+    Online,
+    /// Remote backend unreachable (transient) — auto-recovers on the next successful call.
+    Offline,
+}
+
+/// A compact `host[:port]` label for the connection chip (falls back to the raw string).
+fn short_host(endpoint: &str) -> String {
+    Url::parse(endpoint)
+        .ok()
+        .and_then(|u| {
+            u.host_str().map(|h| match u.port() {
+                Some(p) => format!("{h}:{p}"),
+                None => h.to_string(),
+            })
+        })
+        .unwrap_or_else(|| endpoint.to_string())
+}
+
 pub struct DamGui {
     rt: Arc<tokio::runtime::Runtime>,
     lib: Arc<dyn LibraryService>,
     auth: AuthContext,
+    /// The backend the GUI is bound to (embedded or a remote endpoint), for the status chip and the
+    /// Connect dialog. `data_dir` is retained so "Disconnect" can rebuild the embedded engine.
+    conn: Conn,
+    data_dir: PathBuf,
+    status: ConnStatus,
+    /// A backend switch (Connect/Disconnect) is building the new service off-thread.
+    switching: bool,
+    /// The live-event pump task; aborted when the backend switches so the old client's reconnect
+    /// loop doesn't linger against the previous server.
+    event_task: Option<tokio::task::JoinHandle<()>>,
+    /// Connect-dialog state: open flag, URL + token input buffers, and recently-used servers.
+    connect_open: bool,
+    connect_url: String,
+    connect_token: String,
+    recent_servers: Vec<String>,
     egui_ctx: egui::Context,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
@@ -631,15 +715,36 @@ impl DamGui {
         rt: Arc<tokio::runtime::Runtime>,
         lib: Arc<dyn LibraryService>,
         auth: AuthContext,
+        conn: Conn,
+        data_dir: PathBuf,
     ) -> Self {
         // Dark-first preference (DESIGN_GUIDELINES §4); `update` applies the web-matched visuals
         // (issue #68) for whatever mode the preference resolves to.
         cc.egui_ctx.set_theme(egui::ThemePreference::Dark);
         let (tx, rx) = std::sync::mpsc::channel();
+        // A remote launch starts "Connecting" and turns Online on the first successful call; embedded
+        // is always Local. Seed the recent-servers list with the launch endpoint if any.
+        let status = if conn.is_remote() {
+            ConnStatus::Connecting
+        } else {
+            ConnStatus::Local
+        };
+        let recent_servers = conn.endpoint.iter().cloned().collect();
+        let connect_url = conn.endpoint.clone().unwrap_or_default();
+        let connect_token = conn.token.clone().unwrap_or_default();
         let mut app = Self {
             rt,
             lib,
             auth,
+            conn,
+            data_dir,
+            status,
+            switching: false,
+            event_task: None,
+            connect_open: false,
+            connect_url,
+            connect_token,
+            recent_servers,
             egui_ctx: cc.egui_ctx.clone(),
             tx,
             rx,
@@ -732,14 +837,16 @@ impl DamGui {
         app.load_collections(&egctx);
         app.load_duplicates(&egctx);
         app.load_blocklist(&egctx);
-        app.spawn_events();
+        app.event_task = Some(app.spawn_events());
         app
     }
 
     /// Subscribe to the engine's event stream and forward each change to the UI thread (live
     /// updates). The events are coalesced into throttled refreshes in `update` — this task just
-    /// pumps them across the channel and wakes the frame loop.
-    fn spawn_events(&self) {
+    /// pumps them across the channel and wakes the frame loop. The returned handle is retained so a
+    /// backend switch can abort the old subscription (otherwise a remote client keeps trying to
+    /// reconnect to the previous server).
+    fn spawn_events(&self) -> tokio::task::JoinHandle<()> {
         let (lib, auth, tx, egctx) = (
             self.lib.clone(),
             self.auth.clone(),
@@ -764,7 +871,220 @@ impl DamGui {
                 }
                 egctx.request_repaint();
             }
+        })
+    }
+
+    /// Begin switching to a different backend (a remote server or back to embedded). The new service
+    /// is built off the UI thread — `open_backend` for a remote endpoint only constructs the HTTP
+    /// client (no handshake), so this never blocks — and posts back a [`Msg::BackendSwitched`].
+    fn switch_backend(&mut self, conn: Conn) {
+        self.switching = true;
+        self.status = if conn.is_remote() {
+            ConnStatus::Connecting
+        } else {
+            ConnStatus::Local
+        };
+        let (tx, egctx, data_dir) = (
+            self.tx.clone(),
+            self.egui_ctx.clone(),
+            self.data_dir.clone(),
+        );
+        let conn_for_task = conn.clone();
+        self.rt.spawn(async move {
+            let backend = match &conn_for_task.endpoint {
+                Some(url) => match Url::parse(url) {
+                    Ok(endpoint) => Backend::Connected {
+                        endpoint,
+                        token: conn_for_task.token.clone(),
+                    },
+                    Err(e) => {
+                        let _ = tx.send(Msg::BackendSwitched(
+                            conn_for_task.clone(),
+                            Err(format!("invalid URL: {e}")),
+                        ));
+                        egctx.request_repaint();
+                        return;
+                    }
+                },
+                None => Backend::Embedded { data_dir },
+            };
+            let res = open_backend(backend)
+                .await
+                .map(Arc::from)
+                .map_err(|e| e.to_string());
+            let _ = tx.send(Msg::BackendSwitched(conn_for_task, res));
+            egctx.request_repaint();
         });
+    }
+
+    /// Rebind the app to a freshly-built backend: abort the old event pump, swap `lib`, reset all
+    /// browse/inspect caches, then re-run the initial loads and re-subscribe (issue #70).
+    fn rebind_backend(&mut self, conn: Conn, lib: Arc<dyn LibraryService>) {
+        if let Some(task) = self.event_task.take() {
+            task.abort();
+        }
+        self.lib = lib;
+        self.status = if conn.is_remote() {
+            ConnStatus::Online
+        } else {
+            ConnStatus::Local
+        };
+        // Remember the endpoint for quick reconnection (most-recent first, de-duplicated).
+        if let Some(ep) = &conn.endpoint {
+            self.recent_servers.retain(|s| s != ep);
+            self.recent_servers.insert(0, ep.clone());
+            self.recent_servers.truncate(8);
+        }
+        self.conn = conn;
+        self.switching = false;
+        self.error = None;
+
+        // Drop everything tied to the old backend so nothing stale renders against the new one.
+        self.assets.clear();
+        self.total = None;
+        self.thumbs.clear();
+        self.folders.clear();
+        self.expanded.clear();
+        self.detail = None;
+        self.selected = None;
+        self.selection.clear();
+        self.anchor = None;
+        self.collections.clear();
+        self.duplicates.clear();
+        self.dup_groups.clear();
+        self.blocklist.clear();
+        self.similar.clear();
+        self.similar_for = None;
+        self.waveform = None;
+        self.audio_for = None;
+        self.stats = None;
+
+        let egctx = self.egui_ctx.clone();
+        self.load_assets(&egctx);
+        self.load_sources(&egctx);
+        self.load_stats(&egctx);
+        self.load_collections(&egctx);
+        self.load_duplicates(&egctx);
+        self.load_blocklist(&egctx);
+        self.event_task = Some(self.spawn_events());
+    }
+
+    /// Note the outcome of a remote call so the status chip tracks reachability: a success means the
+    /// server is answering (Online), an error means it's (transiently) unreachable (Offline). No-op
+    /// for the embedded engine or while a switch is mid-flight.
+    fn note_conn(&mut self, ok: bool) {
+        if !self.conn.is_remote() || self.switching {
+            return;
+        }
+        self.status = if ok {
+            ConnStatus::Online
+        } else {
+            ConnStatus::Offline
+        };
+    }
+
+    /// Colour + short label for the toolbar connection chip.
+    fn status_chip(&self) -> (egui::Color32, String) {
+        match self.status {
+            ConnStatus::Local => (
+                egui::Color32::from_rgb(0x8a, 0x8a, 0x8a),
+                "Local".to_string(),
+            ),
+            ConnStatus::Connecting => (
+                egui::Color32::from_rgb(0xf5, 0xa6, 0x23),
+                "Connecting…".to_string(),
+            ),
+            ConnStatus::Online => (
+                egui::Color32::from_rgb(0x38, 0xbd, 0xf8),
+                short_host(self.conn.endpoint.as_deref().unwrap_or("server")),
+            ),
+            ConnStatus::Offline => (
+                egui::Color32::from_rgb(0xef, 0x44, 0x44),
+                "Offline".to_string(),
+            ),
+        }
+    }
+
+    /// The Connect dialog (issue #70): choose the in-process embedded engine, pick a recent server,
+    /// or enter a URL + token. Returns the [`Conn`] to switch to when the user commits — applied by
+    /// the caller after the panels so it doesn't fight the panels' mutable self-borrow.
+    fn connect_dialog(&mut self, ctx: &egui::Context) -> Option<Conn> {
+        if !self.connect_open {
+            return None;
+        }
+        let mut open = true;
+        let mut close = false;
+        let mut request: Option<Conn> = None;
+        egui::Window::new("Connect to server")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.set_min_width(360.0);
+                ui.label("Bind this client to a remote 3DAM server, or use the local library.");
+                ui.add_space(6.0);
+
+                ui.horizontal(|ui| {
+                    ui.label("Server URL");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.connect_url)
+                            .hint_text("http://host:7878")
+                            .desired_width(240.0),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Token");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.connect_token)
+                            .password(true)
+                            .hint_text("optional — required for token-gated servers")
+                            .desired_width(240.0),
+                    );
+                });
+
+                if !self.recent_servers.is_empty() {
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("Recent").weak());
+                    for srv in self.recent_servers.clone() {
+                        if ui.selectable_label(false, &srv).clicked() {
+                            self.connect_url = srv;
+                        }
+                    }
+                }
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let can_connect = !self.connect_url.trim().is_empty();
+                    if ui
+                        .add_enabled(can_connect, egui::Button::new("Connect"))
+                        .clicked()
+                    {
+                        let token = self.connect_token.trim();
+                        request = Some(Conn {
+                            endpoint: Some(self.connect_url.trim().to_string()),
+                            token: (!token.is_empty()).then(|| token.to_string()),
+                        });
+                    }
+                    // Only offer "Use local library" when currently remote.
+                    if self.conn.is_remote() && ui.button("Use local library").clicked() {
+                        request = Some(Conn::embedded());
+                    }
+                    if ui.button("Cancel").clicked() {
+                        close = true;
+                    }
+                });
+                if self.switching {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Switching backend…");
+                    });
+                }
+            });
+        // Commit or Cancel closes the dialog; the window's own X button clears `open`.
+        self.connect_open = open && !close && request.is_none();
+        request
     }
 
     fn build_query(&self) -> QueryRequest {
@@ -1983,6 +2303,27 @@ impl DamGui {
     /// Fetch + decode one asset's thumbnail off-thread. PNG decode happens on the worker; only the
     /// GPU texture upload (which must be on the UI thread) is deferred to `apply`. Audio and (feature-
     /// off) 3D assets have no raster thumbnail — those resolve to `Thumb::None` → the typed tile.
+    /// Fire-and-forget prefetch of the currently-loaded page's thumbnails/previews (issue #72), at
+    /// the edge the grid tiles request — so the server warms the cache ahead of the per-tile reads.
+    fn prefetch_page(&self) {
+        if self.assets.is_empty() {
+            return;
+        }
+        let assets: Vec<AssetId> = self.assets.iter().map(|a| a.id).collect();
+        let (lib, auth) = (self.lib.clone(), self.auth.clone());
+        self.rt.spawn(async move {
+            let _ = lib
+                .prefetch(
+                    &auth,
+                    PrefetchRequest {
+                        assets,
+                        edge: Some(THUMB_EDGE),
+                    },
+                )
+                .await;
+        });
+    }
+
     fn load_thumb(&self, id: AssetId) {
         let (lib, auth, tx, egctx) = (
             self.lib.clone(),
@@ -2007,14 +2348,41 @@ impl DamGui {
         });
     }
 
+    /// Inspect a transport-bearing result to keep the remote reachability chip current (issue #70).
+    fn note_conn_for(&mut self, msg: &Msg) {
+        match msg {
+            Msg::Assets(r) => self.note_conn(r.is_ok()),
+            Msg::Stats(r) => self.note_conn(r.is_ok()),
+            Msg::Sources(r) => self.note_conn(r.is_ok()),
+            Msg::Detail(r) => self.note_conn(r.is_ok()),
+            _ => {}
+        }
+    }
+
     /// Fold a posted result into view state.
     fn apply(&mut self, msg: Msg) {
         match msg {
+            Msg::BackendSwitched(conn, Ok(lib)) => self.rebind_backend(conn, lib),
+            Msg::BackendSwitched(conn, Err(e)) => {
+                self.switching = false;
+                self.status = if conn.is_remote() {
+                    ConnStatus::Offline
+                } else {
+                    ConnStatus::Local
+                };
+                self.error = Some(format!(
+                    "Couldn't connect to {}: {e}",
+                    conn.endpoint.as_deref().unwrap_or("embedded")
+                ));
+            }
             Msg::Assets(Ok(page)) => {
                 self.total = page.total;
                 self.assets = page.items;
                 self.loading = false;
                 self.error = None;
+                // Prefetch hint (issue #72): warm this page's thumbnails/previews server-side ahead of
+                // the per-tile reads. Fire-and-forget; the tile fetch still generates on a miss.
+                self.prefetch_page();
             }
             Msg::Assets(Err(e)) => {
                 self.loading = false;
@@ -2030,6 +2398,12 @@ impl DamGui {
                         "blend" | "usd" | "usdz" | "usdc" | "usda"
                     );
                 let is_audio = asset.summary.media == MediaType::Audio;
+                // Server-computed waveform peaks (issue #73): prefer them so the inspector draws the
+                // waveform without re-downloading + re-decoding the audio. `None` until analysed.
+                let server_peaks = match &asset.attributes {
+                    MediaAttributes::Audio(a) => a.peaks.clone(),
+                    _ => None,
+                };
                 self.detail = Some(asset);
                 self.detail_loading = false;
                 if previewable_model
@@ -2040,11 +2414,20 @@ impl DamGui {
                 {
                     self.load_model_mesh(id);
                 }
-                // Kick the inspector waveform for a newly-selected audio asset.
+                // Set up the inspector waveform for a newly-selected audio asset: from server peaks
+                // when present, else fall back to a client-side decode.
                 if is_audio && self.waveform.as_ref().map(|(w, _)| *w) != Some(id) {
-                    self.waveform = None;
-                    self.waveform_loading = true;
-                    self.load_waveform(id);
+                    match server_peaks {
+                        Some(peaks) if !peaks.is_empty() => {
+                            self.waveform = Some((id, peaks));
+                            self.waveform_loading = false;
+                        }
+                        _ => {
+                            self.waveform = None;
+                            self.waveform_loading = true;
+                            self.load_waveform(id);
+                        }
+                    }
                 }
             }
             Msg::Detail(Err(e)) => {
@@ -2303,6 +2686,7 @@ impl eframe::App for DamGui {
 
         // Drain everything the worker posted since the last frame.
         while let Ok(msg) = self.rx.try_recv() {
+            self.note_conn_for(&msg);
             self.apply(msg);
         }
         // Fold any live-update events into throttled refreshes.
@@ -2340,6 +2724,9 @@ impl eframe::App for DamGui {
         let mut open_rename: Option<(CollectionId, String)> = None;
         let mut audio_play: Option<AssetId> = None;
         let mut audio_stop = false;
+        // Backend switch requested from the Connect dialog (issue #70) — applied after the panels so
+        // it doesn't collide with the mutable self-borrow the panels hold.
+        let mut connect_request: Option<Conn> = None;
         let mut orbit_drag = egui::Vec2::ZERO;
         let mut orbit_scroll = 0.0f32;
         // 3D-viewer control-bar actions (issue #65), collected under the panel's immutable borrow
@@ -2473,6 +2860,19 @@ impl eframe::App for DamGui {
                 }
                 // View toggle (grid / list) — right-aligned like the web toolbar.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Connection status chip (hosted mode, issue #70): colour-coded reachability;
+                    // click to open the Connect dialog. First-added = far right.
+                    let (color, label) = self.status_chip();
+                    if ui
+                        .button(egui::RichText::new(format!("● {label}")).color(color))
+                        .on_hover_text("Connect to a 3DAM server")
+                        .clicked()
+                    {
+                        self.connect_url = self.conn.endpoint.clone().unwrap_or_default();
+                        self.connect_token = self.conn.token.clone().unwrap_or_default();
+                        self.connect_open = true;
+                    }
+                    ui.separator();
                     if ui
                         .selectable_label(self.view == View::List, "List")
                         .clicked()
@@ -3319,6 +3719,11 @@ impl eframe::App for DamGui {
         self.collection_modals(ctx);
         self.confirm_remove_modal(ctx);
 
+        // Connect dialog (hosted mode, issue #70): pick/enter a server or return to embedded.
+        if let Some(c) = self.connect_dialog(ctx) {
+            connect_request = Some(c);
+        }
+
         // Collection selection (mutually exclusive with the facets, mirroring the web).
         if let Some(sel) = pick_collection {
             self.collection = sel;
@@ -3356,6 +3761,10 @@ impl eframe::App for DamGui {
         }
         if audio_stop {
             self.stop_audio();
+        }
+        // Switch backend last (embedded ↔ remote) — rebuilds the service and re-subscribes.
+        if let Some(conn) = connect_request {
+            self.switch_backend(conn);
         }
         // Fullscreen 3D-viewer overlay (#65, final part): the preview fills the window over the
         // normal layout, with the same orbit/zoom and control bar. Esc or "Exit fullscreen" leaves.

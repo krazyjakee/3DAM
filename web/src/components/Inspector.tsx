@@ -210,9 +210,13 @@ function Preview({ asset }: { asset: Asset }) {
   if (summary.media === "audio") {
     // Playable inline: waveform + transport, with the playhead driven by real progress (issues
     // #16, #14). Keyed by id so switching assets resets playback + the decoded waveform.
+    // Peaks come from the server analysis pass (issue #73), so the waveform draws with no client-side
+    // audio decode; null (not yet analysed) falls back to DOM decode inside the island.
+    const peaks =
+      asset.attributes?.media === "audio" ? (asset.attributes.peaks ?? null) : null;
     return (
       <div className="border-b border-border">
-        <AudioPlayer key={summary.id} src={src} assetId={summary.id} />
+        <AudioPlayer key={summary.id} src={src} assetId={summary.id} peaks={peaks} />
       </div>
     );
   }

@@ -91,14 +91,50 @@ async fn defaults_are_safe_and_admin_reachable_under_off() {
     assert_eq!(body["network_writes"], false);
     assert_eq!(body["exposed_without_auth"], false);
 
-    // Three live flags, all at version 0 (unset → defaults).
+    // Five live flags, all at version 0 (unset → defaults): the three exposure flags plus the two
+    // hosted-mode pipeline toggles (issue #71), which default *on*.
     let (st, flags) = call(&app, "GET", "/admin/api/flags", None, None).await;
     assert_eq!(st, StatusCode::OK);
-    assert_eq!(flags.as_array().unwrap().len(), 3);
+    let flags = flags.as_array().unwrap();
+    assert_eq!(flags.len(), 5);
+    let flag = |key: &str| flags.iter().find(|f| f["key"] == key).unwrap();
+    assert_eq!(flag("auto_thumbnail")["value"], true);
+    assert_eq!(flag("auto_analyze")["value"], true);
+    // Workload toggles never raise exposure, so they need no confirm.
+    assert_eq!(flag("auto_thumbnail")["exposure_increasing"], false);
 
     // Reads work under Off (owner holds Read).
     let (st, _) = call(&app, "GET", "/api/v1/stats", None, None).await;
     assert_eq!(st, StatusCode::OK);
+}
+
+// ── ops health probes (issue #75) ────────────────────────────────────────────
+
+#[tokio::test]
+async fn health_probes_are_unauthenticated_and_ready() {
+    // Token mode gates the API, but the ops probes must answer with no credential (for a load
+    // balancer / systemd watchdog) and are distinct from the versioned API surface.
+    let (app, store, _lib) = harness(true).await;
+    store
+        .set_flag(
+            dam_api::admin::FlagKey::Authentication,
+            dam_api::admin::SetFlag {
+                value: dam_api::admin::FlagValue::Auth(dam_api::admin::AuthMode::Token),
+                expected_version: None,
+                confirm: true,
+            },
+            "test",
+        )
+        .unwrap();
+
+    let (st, _) = call(&app, "GET", "/healthz", None, None).await;
+    assert_eq!(st, StatusCode::OK, "liveness needs no token");
+    let (st, _) = call(&app, "GET", "/readyz", None, None).await;
+    assert_eq!(st, StatusCode::OK, "readiness needs no token and is ready");
+
+    // A gated API route still refuses the anonymous caller — the probes are the only open surface.
+    let (st, _) = call(&app, "GET", "/api/v1/stats", None, None).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
 }
 
 // ── token auth ───────────────────────────────────────────────────────────────
@@ -153,6 +189,20 @@ async fn token_mode_gates_reads_and_scopes_gate_writes() {
 
     // A bogus token → 401.
     let (st, _) = call(&app, "GET", "/api/v1/stats", Some("dam_nope"), None).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+
+    // Browser media path (issue #74): a read GET authenticates via `?token=` when the header can't
+    // be set (`<img>`/`<audio>` loads). Valid → 200, bogus → 401.
+    let (st, _) = call(
+        &app,
+        "GET",
+        &format!("/api/v1/stats?token={secret}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "query-param token authenticates a read");
+    let (st, _) = call(&app, "GET", "/api/v1/stats?token=dam_nope", None, None).await;
     assert_eq!(st, StatusCode::UNAUTHORIZED);
 }
 

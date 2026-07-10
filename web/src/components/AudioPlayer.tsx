@@ -17,7 +17,15 @@ function fmtTime(sec: number): string {
   return `${m}:${String(s).padStart(2, "0")}`;
 }
 
-export function AudioPlayer({ src, assetId }: { src: string; assetId?: string }) {
+export function AudioPlayer({
+  src,
+  assetId,
+  peaks,
+}: {
+  src: string;
+  assetId?: string;
+  peaks?: number[] | null;
+}) {
   const audioRef = useRef<HTMLAudioElement>(null);
   const [playing, setPlaying] = useState(false);
   const [time, setTime] = useState(0);
@@ -60,7 +68,7 @@ export function AudioPlayer({ src, assetId }: { src: string; assetId?: string })
           seekToFraction((e.clientX - r.left) / r.width);
         }}
       >
-        <WaveformIsland src={src} progress={progress} />
+        <WaveformIsland src={src} progress={progress} peaks={peaks} />
       </div>
 
       <div className="flex items-center gap-2 px-2 py-1.5">

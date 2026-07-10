@@ -72,6 +72,15 @@ export interface AudioAttributes {
   brightness?: number | null;
   /** Harmonic-vs-noise ratio, normalised 0–1. */
   harmonicity?: number | null;
+  /** Normalised (0–1) waveform peak buckets computed server-side (issue #73); draw the inspector
+   *  waveform from these instead of decoding the audio. Null until analysed. */
+  peaks?: number[] | null;
+}
+
+/** Prefetch hint (issue #72): warm these assets' thumbnails/previews ahead of render. */
+export interface PrefetchRequest {
+  assets: AssetId[];
+  edge?: number | null;
 }
 export interface ImageAttributes {
   width: number | null;

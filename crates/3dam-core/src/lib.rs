@@ -3,6 +3,7 @@
 //! This is the standalone, no-network path; `3dam-server` serves the same object over HTTP/WS.
 
 mod analysis;
+mod background;
 mod convert;
 mod export;
 mod paths;
@@ -10,6 +11,7 @@ mod scan;
 pub mod semantic;
 mod watch;
 
+pub use background::PipelinePolicy;
 pub use paths::default_data_dir;
 
 use async_trait::async_trait;
@@ -59,11 +61,28 @@ fn background_threads() -> usize {
 /// the asset id) so identical bytes share one derivative. Model thumbnails carry a renderer-version
 /// suffix so a shader/framing bump invalidates only that slice; images keep the bare `{key}-{edge}`.
 fn thumb_cache_path(data_dir: &Path, asset: &Asset, max_edge: u32) -> PathBuf {
-    let key = asset
-        .hash
-        .map(|h| h.to_hex())
-        .unwrap_or_else(|| asset.summary.id.to_string());
-    let variant = thumbnail_variant(asset.summary.media);
+    thumbnail_cache_path(
+        data_dir,
+        &asset.summary.id,
+        asset.hash,
+        asset.summary.media,
+        max_edge,
+    )
+}
+
+/// The content-keyed cache path for an asset's thumbnail at `max_edge`, built from its parts. Model
+/// thumbnails carry a renderer-version suffix so a shader/framing bump invalidates only that slice;
+/// images keep the bare `{key}-{edge}` name. Shared by [`thumb_cache_path`] and the background
+/// pipeline's "is this already warm?" check (issue #71), so the two never drift.
+pub(crate) fn thumbnail_cache_path(
+    data_dir: &Path,
+    id: &AssetId,
+    hash: Option<ContentHash>,
+    media: MediaType,
+    max_edge: u32,
+) -> PathBuf {
+    let key = hash.map(|h| h.to_hex()).unwrap_or_else(|| id.to_string());
+    let variant = thumbnail_variant(media);
     data_dir
         .join("cache")
         .join("thumbnails")
@@ -721,6 +740,34 @@ impl LibraryService for EmbeddedLibrary {
             gen_model_preview(&data_dir, s, &asset)
         })
         .await
+    }
+
+    async fn prefetch(&self, _ctx: &AuthContext, req: PrefetchRequest) -> Result<(), LibError> {
+        if req.assets.is_empty() {
+            return Ok(());
+        }
+        // Warm the exact thumbnail edge the client will request (the grid uses a variable edge the
+        // background pipeline can't all pre-render), plus model preview meshes. Runs off the request
+        // path on the blocking pool; fire-and-forget so the caller returns immediately (issue #72).
+        let edge = req
+            .edge
+            .unwrap_or(background::PREGEN_THUMB_EDGE)
+            .clamp(THUMB_MIN_EDGE, THUMB_MAX_EDGE);
+        let store = self.store.clone();
+        let data_dir = self.data_dir.clone();
+        let assets = req.assets;
+        tokio::task::spawn_blocking(move || {
+            for id in assets {
+                let Ok(asset) = store.get_asset(&id) else {
+                    continue; // vanished — fail-soft
+                };
+                let _ = gen_thumbnail(&data_dir, &store, &asset, edge);
+                if asset.summary.media == MediaType::Model {
+                    let _ = gen_model_preview(&data_dir, &store, &asset);
+                }
+            }
+        });
+        Ok(())
     }
 
     async fn library_stats(&self, _ctx: &AuthContext) -> Result<LibraryStats, LibError> {

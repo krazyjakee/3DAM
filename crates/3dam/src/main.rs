@@ -16,7 +16,7 @@ const RUNTIME_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
 fn main() -> ExitCode {
     match classify(std::env::args_os()) {
-        Role::Gui => ExitCode::from(dam_gui::run()),
+        Role::Gui(argv) => ExitCode::from(dam_gui::run(argv)),
         Role::Cli(argv) => on_runtime(dam_cli::run(argv)),
         Role::Serve(argv) => on_runtime(dam_cli::serve(argv)),
         Role::Mcp(argv) => on_runtime(dam_cli::mcp(argv)),

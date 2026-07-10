@@ -395,6 +395,19 @@ impl LibraryService for ApiClient {
         })
     }
 
+    async fn prefetch(&self, _ctx: &AuthContext, req: PrefetchRequest) -> Result<(), LibError> {
+        // A lightweight hint (the assets + edge), not the bytes — those stay on HTTP/2 (ADR 0012).
+        // The server warms the derivatives; we don't wait on the render.
+        let resp = self
+            .http
+            .post(self.url("/api/v1/prefetch")?)
+            .json(&req)
+            .send()
+            .await
+            .map_err(|e| LibError::SourceUnavailable(e.to_string()))?;
+        Self::expect_no_content(resp).await
+    }
+
     async fn read_thumbnail(
         &self,
         _ctx: &AuthContext,

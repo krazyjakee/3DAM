@@ -212,12 +212,22 @@ fn confirm_or_bail(confirm: bool, what: &str) -> anyhow::Result<()> {
 
 fn parse_flag_key(key: &str) -> anyhow::Result<FlagKey> {
     FlagKey::parse(key).ok_or_else(|| {
-        anyhow::anyhow!("unknown flag '{key}' (authentication | mcp_server | network_writes)")
+        anyhow::anyhow!(
+            "unknown flag '{key}' (authentication | mcp_server | network_writes | \
+             auto_thumbnail | auto_analyze)"
+        )
     })
 }
 
 fn parse_flag_value(key: FlagKey, s: &str) -> anyhow::Result<FlagValue> {
     let v = s.trim().to_ascii_lowercase();
+    let parse_bool = |name: &str| -> anyhow::Result<bool> {
+        match v.as_str() {
+            "true" | "on" | "yes" | "1" => Ok(true),
+            "false" | "off" | "no" | "0" => Ok(false),
+            _ => anyhow::bail!("{name} must be true|false"),
+        }
+    };
     Ok(match key {
         FlagKey::Authentication => FlagValue::Auth(match v.as_str() {
             "off" => AuthMode::Off,
@@ -231,11 +241,9 @@ fn parse_flag_value(key: FlagKey, s: &str) -> anyhow::Result<FlagValue> {
             "read_write" | "readwrite" | "writes" => McpMode::ReadWrite,
             _ => anyhow::bail!("mcp_server must be off|read_only|read_write"),
         }),
-        FlagKey::NetworkWrites => FlagValue::Bool(match v.as_str() {
-            "true" | "on" | "yes" | "1" => true,
-            "false" | "off" | "no" | "0" => false,
-            _ => anyhow::bail!("network_writes must be true|false"),
-        }),
+        FlagKey::NetworkWrites => FlagValue::Bool(parse_bool("network_writes")?),
+        FlagKey::AutoThumbnail => FlagValue::Bool(parse_bool("auto_thumbnail")?),
+        FlagKey::AutoAnalyze => FlagValue::Bool(parse_bool("auto_analyze")?),
     })
 }
 

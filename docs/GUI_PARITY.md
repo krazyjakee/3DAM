@@ -43,7 +43,10 @@ Legend: ✅ done · 🟡 partial · ⬜ owed (not yet in egui) · ▫ n/a (out o
 | Multi-select + batch actions | ✅ | ✅ | ctrl/shift-click selection + batch bar (analyze / export / clear) |
 | Context menus | ✅ | ✅ | right-click grid/list → Analyze / Regen thumbnail / Convert / Export (media-aware) |
 | Live updates | ✅ | ✅ | subscribes to the engine event stream; coalesced/throttled refreshes |
-| Settings / admin | ✅ | ▫ | flags/tokens/audit live in `server.db` (owned by `dam-server`); the native GUI opens `Backend::Embedded` (library only, no server), so there is nothing to administer. Would apply only if the GUI gained a `--connect` mode against a running server. |
+| Connect to a remote server (hosted mode, #70/#74) | ✅ | ✅ | both clients can point at an arbitrary `3dam serve`: native via `--connect`/`--token` **and** an in-app Connect dialog (status chip, recent servers, runtime backend switch, offline/reconnect); web via the status-bar Connect dialog (base URL + token, persisted). Same-origin / embedded defaults unchanged. |
+| Server-provided waveform peaks (#73) | ✅ | ✅ | both draw the inspector waveform from the analysis pass's stored peak array (no client-side audio decode); fall back to a local decode when an asset isn't analysed yet |
+| Prefetch hint (#72) | ✅ | ✅ | each loaded grid page calls `LibraryService::prefetch` to warm the server's thumbnail/preview cache ahead of the per-tile HTTP fetch (ADR 0012) |
+| Settings / admin | ✅ | ▫ | flags/tokens/audit live in `server.db` (owned by `dam-server`). With hosted-mode connect (#70) the native GUI *can* now reach a running server, so a connected-mode admin surface is a genuine follow-up — but in the default embedded mode there is still nothing to administer. |
 | Duplicates page / blocklist page | ✅ | ✅ | Duplicate-review view + a Blocklist management view (unblock); remove / remove+block actions in the inspector & context menus |
 | Theme (light/dark) | ✅ | ✅ | rail selector cycles System / Dark / Light (`ThemePreference`; System follows the OS) |
 | Theme palette matches web (#68) | ✅ | ✅ | custom egui `Visuals` built from the web `@theme` tokens (`theme.rs`) — bg/surface ladder, sky accent, text tiers; visual tuning may follow the sweep |

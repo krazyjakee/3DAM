@@ -26,6 +26,7 @@ import type {
   NewCollection,
   Page,
   PageParams,
+  PrefetchRequest,
   AssetSummary,
   FavoriteRequest,
   FolderEntry,
@@ -44,6 +45,8 @@ import type {
   UpdateCollection,
   ErrorBody,
 } from "./types";
+
+import { authHeaders, mediaUrl, resolveUrl } from "@/lib/server";
 
 const API = "/api/v1";
 
@@ -75,14 +78,22 @@ async function decode<T>(res: Response): Promise<T> {
 }
 
 async function get<T>(path: string): Promise<T> {
-  return decode<T>(await fetch(path, { headers: { accept: "application/json" } }));
+  return decode<T>(
+    await fetch(resolveUrl(path), {
+      headers: { accept: "application/json", ...authHeaders() },
+    }),
+  );
 }
 
 async function send<T>(method: string, path: string, body?: unknown): Promise<T> {
   return decode<T>(
-    await fetch(path, {
+    await fetch(resolveUrl(path), {
       method,
-      headers: { "content-type": "application/json", accept: "application/json" },
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json",
+        ...authHeaders(),
+      },
       body: body === undefined ? undefined : JSON.stringify(body),
     }),
   );
@@ -99,6 +110,10 @@ export const api = {
 
   // browse / search
   query: (req: QueryRequest) => send<Page<AssetSummary>>("POST", `${API}/query`, req),
+
+  /** Prefetch hint (issue #72): ask the server to warm these assets' thumbnails/previews ahead of
+   *  the grid's HTTP fetches. Fire-and-forget — the bytes still come over HTTP/2. */
+  prefetch: (req: PrefetchRequest) => send<void>("POST", `${API}/prefetch`, req),
   getAsset: (id: AssetId) => get<Asset>(`${API}/assets/${id}`),
   stats: () => get<LibraryStats>(`${API}/stats`),
 
@@ -133,17 +148,17 @@ export const api = {
 
   /** URL for an asset's raw bytes — fed to the WASM viewer islands (tech-spec 09 §B.3). The DOM
    *  fetches this and hands it across the wasm-bindgen boundary; the island does no networking. */
-  assetContentUrl: (id: AssetId) => `${API}/assets/${id}/content`,
+  assetContentUrl: (id: AssetId) => mediaUrl(`${API}/assets/${id}/content`),
 
   /** URL for a model asset's interactive 3D preview: the server-decoded, self-contained `DMSH` mesh
    *  blob (geometry + PBR materials + textures) the 3D island uploads directly. One Assimp decode
    *  server-side covers every format with textures, so the DOM never resolves external buffers. */
-  assetPreviewMeshUrl: (id: AssetId) => `${API}/assets/${id}/preview-mesh`,
+  assetPreviewMeshUrl: (id: AssetId) => mediaUrl(`${API}/assets/${id}/preview-mesh`),
 
   /** URL for a file referenced *relative to* an asset — a loose `.gltf`'s external `.bin`/textures
    *  (issue #56). `rel` is the glTF URI, resolved server-side against the asset's directory. */
   assetRelatedUrl: (id: AssetId, rel: string) =>
-    `${API}/assets/${id}/related?path=${encodeURIComponent(rel)}`,
+    mediaUrl(`${API}/assets/${id}/related?path=${encodeURIComponent(rel)}`),
 
   /** URL for a server-rendered PNG thumbnail (tech-spec 04 §6.4): a raster downscale for images, a
    *  wgpu turntable render for 3D models. Audio (and any render that fails) returns an error and the
@@ -151,7 +166,7 @@ export const api = {
    *  epoch (see thumbnail-cache.ts): bumping it after a forced regenerate defeats the browser + `Cache-Control`
    *  cache, whose key (content hash) is otherwise unchanged, so the fresh render is fetched. */
   assetThumbnailUrl: (id: AssetId, edge = 256, v = 0) =>
-    `${API}/assets/${id}/thumbnail?edge=${edge}${v ? `&v=${v}` : ""}`,
+    mediaUrl(`${API}/assets/${id}/thumbnail?edge=${edge}${v ? `&v=${v}` : ""}`),
 
   // collections / smart folders (tech-spec: phase 4 Reach)
   listCollections: () => get<Collection[]>(`${API}/collections`),

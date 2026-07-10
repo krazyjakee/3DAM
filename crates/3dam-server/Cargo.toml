@@ -12,6 +12,9 @@ dam-api.workspace = true
 # while dam-core itself stays GPU-free by default for pure-library consumers.
 dam-core = { workspace = true, features = ["render"] }
 axum.workspace = true
+# In-process TLS (issue #75): HTTPS from a cert/key for a hosted deployment (no `--insecure`).
+axum-server = { workspace = true }
+rustls = { workspace = true }
 tower-http.workspace = true
 rust-embed.workspace = true
 tokio.workspace = true

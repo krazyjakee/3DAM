@@ -61,6 +61,11 @@ pub struct ServeConfig {
     pub config: Option<PathBuf>,
     /// Allow binding beyond localhost without TLS (ADR 0009 §4 — refused unless overridden).
     pub insecure: bool,
+    /// PEM certificate chain for in-process TLS (issue #75). With `tls_key`, `serve` speaks HTTPS and
+    /// may bind beyond localhost with no `--insecure`. `None` → plaintext (localhost-only by default).
+    pub tls_cert: Option<PathBuf>,
+    /// PEM private key paired with `tls_cert`.
+    pub tls_key: Option<PathBuf>,
 }
 
 /// The one state every handler and auth extractor reads. Cheap to clone (two `Arc`s + small fields).
@@ -74,6 +79,25 @@ pub(crate) struct AppState {
     /// Flips `false → true` once when shutdown begins, so long-lived handlers (the `/api/v1/ws`
     /// loop) can stop awaiting and close cleanly instead of pinning the graceful drain open.
     pub shutdown: watch::Receiver<bool>,
+    /// Readiness for `/readyz` (issue #75): `false` until the engine, stores, and background job
+    /// pipeline are fully wired, then `true`. A load balancer routes traffic only once this holds.
+    pub ready: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Bridges the server's live feature flags to the engine's background pipeline (issue #71). The
+/// engine asks, on each drain, whether it should auto-generate — we answer from the flag store, so a
+/// runtime admin toggle changes behaviour on the next scan with no restart.
+struct ServerPipelinePolicy {
+    store: Arc<ServerStore>,
+}
+
+impl dam_core::PipelinePolicy for ServerPipelinePolicy {
+    fn auto_thumbnail(&self) -> bool {
+        self.store.auto_thumbnail()
+    }
+    fn auto_analyze(&self) -> bool {
+        self.store.auto_analyze()
+    }
 }
 
 /// Full-scope context for the in-process engine call (the engine trusts its caller; the boundary is
@@ -106,6 +130,10 @@ fn parse_id<T: std::str::FromStr>(s: &str, what: &str) -> Result<T, ApiError> {
 pub(crate) fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/api/version", get(version))
+        // Ops health probes (issue #75), unauthenticated + distinct from the versioned API so a load
+        // balancer / systemd watchdog can poll them without a token: liveness vs readiness.
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .route("/api/v1/query", post(query))
         .route("/api/v1/assets/{id}", get(get_asset).delete(remove_asset))
         .route("/api/v1/assets/{id}/content", get(asset_content))
@@ -120,6 +148,8 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/api/v1/assets/favorite", post(set_favorite))
         .route("/api/v1/jobs/analyze", post(submit_analyze))
         .route("/api/v1/thumbnails/regenerate", post(regenerate_thumbnails))
+        // Prefetch hint (issue #72): warm thumbnails/preview meshes ahead of the client's HTTP fetch.
+        .route("/api/v1/prefetch", post(prefetch))
         .route("/api/v1/sources", get(list_sources).post(add_source))
         .route("/api/v1/folders", post(list_folders))
         .route(
@@ -179,6 +209,8 @@ pub fn router(
         localhost_only,
         tls: false,
         shutdown,
+        // The test seam is ready the moment it's built (no async pipeline warm-up to await).
+        ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
     })
 }
 
@@ -195,13 +227,24 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
         .or_else(|| file.socket_addr())
         .unwrap_or(default_addr);
     let localhost_only = addr.ip().is_loopback();
-    let tls = false; // static rustls cert/key is a phase-6 follow-up (ADR 0009 §4).
+    // In-process TLS (issue #75): CLI flags win over the config file; both cert *and* key must be
+    // present to enable HTTPS. With TLS on, exposing beyond localhost needs no `--insecure`.
+    let tls_paths: Option<(PathBuf, PathBuf)> = match (
+        cfg.tls_cert
+            .clone()
+            .or_else(|| file.server.tls_cert.clone()),
+        cfg.tls_key.clone().or_else(|| file.server.tls_key.clone()),
+    ) {
+        (Some(cert), Some(key)) => Some((cert, key)),
+        _ => None,
+    };
+    let tls = tls_paths.is_some();
 
     // Refuse to expose beyond localhost without TLS unless explicitly overridden (ADR 0009 §4).
     if !localhost_only && !tls && !cfg.insecure {
         anyhow::bail!(
-            "refusing to bind {addr} (beyond localhost) without TLS. Pass --insecure to override \
-             for a trusted network, or terminate TLS in front."
+            "refusing to bind {addr} (beyond localhost) without TLS. Provide --tls-cert/--tls-key \
+             for HTTPS, pass --insecure to override for a trusted network, or terminate TLS in front."
         );
     }
 
@@ -213,8 +256,19 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
         store.seed_flag(key, value)?;
     }
 
+    // Hosted-mode background pipeline (issue #71): proactively drain thumbnails + analysis on ingest
+    // so a freshly-connected client hits ready data instead of paying first-look render latency.
+    // Flag-gated through the server store (`auto_thumbnail` / `auto_analyze`), read fresh on every
+    // drain so a live admin toggle takes effect on the next scan.
+    lib.start_background_pipeline(Arc::new(ServerPipelinePolicy {
+        store: store.clone(),
+    }));
+
     // Shutdown fan-out: the signal task flips this once, and every long-lived handler watches it.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    // Readiness (issue #75): the engine, stores, and background pipeline are wired; flip to ready
+    // just before we start accepting so `/readyz` only goes 200 once the server can actually serve.
+    let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let state = AppState {
         lib: lib.clone(),
         store: store.clone(),
@@ -222,19 +276,24 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
         localhost_only,
         tls,
         shutdown: shutdown_rx,
+        ready: ready.clone(),
     };
     let app = build_router(state);
 
     // 3. Bind + log the posture so an operator sees "am I safe to expose?" at a glance (tech-spec 15).
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    let actual = listener.local_addr()?;
+    // Bind a std listener up front so the actual addr (and any :0 port) is known for logging, then
+    // hand it to whichever server the TLS posture selects.
+    let std_listener = std::net::TcpListener::bind(addr)?;
+    std_listener.set_nonblocking(true)?;
+    let actual = std_listener.local_addr()?;
+    let scheme = if tls { "https" } else { "http" };
     let s = store.status(&actual.to_string(), localhost_only, tls);
     tracing::info!(
-        %actual, auth = ?s.auth, mcp = ?s.mcp, network_writes = s.network_writes,
+        %actual, tls, scheme, auth = ?s.auth, mcp = ?s.mcp, network_writes = s.network_writes,
         exposed_without_auth = s.exposed_without_auth, "3dam serve listening"
     );
     eprintln!(
-        "3dam serve → http://{actual}  (auth: {:?}, mcp: {:?}, writes: {})  data: {}",
+        "3dam serve → {scheme}://{actual}  (tls: {tls}, auth: {:?}, mcp: {:?}, writes: {})  data: {}",
         s.auth,
         s.mcp,
         s.network_writes,
@@ -245,6 +304,15 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
             "  ⚠ exposed beyond localhost with no auth and no TLS — set the authentication flag"
         );
     }
+    ready.store(true, std::sync::atomic::Ordering::Relaxed);
+
+    // TLS deployment: serve HTTPS via axum-server (its own graceful-shutdown handle), still flipping
+    // the WS watch so idle sockets close. Plaintext keeps the axum::serve path below.
+    if let Some((cert, key)) = tls_paths {
+        return serve_tls(std_listener, app, cert, key, shutdown_tx, actual).await;
+    }
+
+    let listener = tokio::net::TcpListener::from_std(std_listener)?;
     // Graceful shutdown, in three moves:
     //   1. `wait_for_signal()` resolves on Ctrl-C / SIGTERM,
     //   2. we flip the watch so the WS loops send a Close frame and return (otherwise an idle
@@ -273,6 +341,51 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+/// Serve HTTPS from a PEM cert/key over an already-bound listener (issue #75). Uses `axum-server`'s
+/// rustls integration and its `Handle` for graceful shutdown, mirroring the plaintext path: on a
+/// stop signal we flip the WS watch (so idle sockets close) then drain within [`SHUTDOWN_GRACE`].
+async fn serve_tls(
+    std_listener: std::net::TcpListener,
+    app: Router,
+    cert: PathBuf,
+    key: PathBuf,
+    shutdown_tx: watch::Sender<bool>,
+    actual: SocketAddr,
+) -> anyhow::Result<()> {
+    // rustls 0.23 needs a process-level crypto provider; install ring's (idempotent — ignore if a
+    // provider is already set, e.g. by a linked reqwest).
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "failed to load TLS cert '{}' / key '{}': {e}",
+                cert.display(),
+                key.display()
+            )
+        })?;
+
+    let handle = axum_server::Handle::new();
+    let handle_for_signal = handle.clone();
+    tokio::spawn(async move {
+        wait_for_signal().await;
+        tracing::info!("shutdown signal received; draining TLS connections");
+        eprintln!(
+            "3dam serve → shutting down (draining connections, ≤{}s)",
+            SHUTDOWN_GRACE.as_secs()
+        );
+        let _ = shutdown_tx.send(true); // close idle WS loops
+        handle_for_signal.graceful_shutdown(Some(SHUTDOWN_GRACE));
+    });
+
+    axum_server::from_tcp_rustls(std_listener, config)
+        .handle(handle)
+        .serve(app.into_make_service())
+        .await?;
+    tracing::info!(%actual, "TLS shutdown complete; all connections drained");
     Ok(())
 }
 
@@ -382,6 +495,22 @@ async fn version() -> Json<serde_json::Value> {
                          "analyze", "similar", "duplicates", "suggestions", "collections", "export",
                          "auth", "flags", "mcp"],
     }))
+}
+
+/// Liveness probe (issue #75): the process is up and the axum stack is answering. Always `200 ok`
+/// once the listener is bound — deliberately does no work, so it never false-negatives under load.
+async fn healthz() -> &'static str {
+    "ok"
+}
+
+/// Readiness probe (issue #75): `200 ready` once the engine, stores, and background job pipeline are
+/// fully wired; `503` before that. A load balancer should route traffic only when this returns 200.
+async fn readyz(State(st): State<AppState>) -> Response {
+    if st.ready.load(std::sync::atomic::Ordering::Relaxed) {
+        (StatusCode::OK, "ready").into_response()
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "starting").into_response()
+    }
 }
 
 async fn query(
@@ -533,6 +662,18 @@ async fn set_favorite(
     Json(req): Json<FavoriteRequest>,
 ) -> Result<StatusCode, ApiError> {
     st.lib.set_favorite(&ctx, req).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Prefetch hint (issue #72): a read-scoped client names the assets it's about to render; the server
+/// warms their thumbnails + preview meshes so the following HTTP GETs are cache hits. Fire-and-forget
+/// — returns as soon as the warm is scheduled, not when it finishes.
+async fn prefetch(
+    Reader(ctx): Reader,
+    State(st): State<AppState>,
+    Json(req): Json<PrefetchRequest>,
+) -> Result<StatusCode, ApiError> {
+    st.lib.prefetch(&ctx, req).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -720,7 +861,23 @@ async fn cancel_job(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn ws_handler(_r: Reader, ws: WebSocketUpgrade, State(st): State<AppState>) -> Response {
+/// Auth for the WebSocket firehose: a browser can't set the `Authorization` header on a WS, so we
+/// also accept the bearer secret as `?token=` (issue #74).
+#[derive(serde::Deserialize)]
+struct WsAuthQuery {
+    #[serde(default)]
+    token: Option<String>,
+}
+
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    Query(q): Query<WsAuthQuery>,
+    headers: HeaderMap,
+    State(st): State<AppState>,
+) -> Response {
+    if let Err(e) = auth::resolve_ws(&st.store, &headers, q.token) {
+        return ApiError(e).into_response();
+    }
     ws.on_upgrade(move |socket| ws_loop(socket, st))
 }
 
