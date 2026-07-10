@@ -9,7 +9,10 @@
 # TLS in a reverse proxy and keep the container on localhost.
 
 # ---- builder ------------------------------------------------------------------------------------
-FROM rust:1.85-bookworm AS builder
+# Rust >= 1.88: the locked deps have drifted past the workspace's nominal 1.85 MSRV — image@0.25.10
+# needs rustc 1.88 and wgpu/naga@30 need 1.87 (they compile in both the wasm island build and the
+# native binary). CI elsewhere uses @stable so never pinned; this image must not lag behind.
+FROM rust:1.90-bookworm AS builder
 
 # Native deps: egui/eframe (GTK/xcb/wayland — the unified binary links the GUI), audio (ALSA), TLS
 # (openssl/pkg-config), and the Assimp/Draco 3D toolchain (cmake + clang, ADR 0011).
@@ -29,8 +32,7 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
 
 # wasm-pack for the viewer islands. web/src/wasm/ is a build artifact (not committed), so it must be
 # generated here before the web build. Install the PREBUILT binary rather than `cargo install
-# wasm-pack`: building it from source needs a newer rustc than this image's pinned toolchain, which
-# is what broke the first container build (exit 101). The prebuilt musl binary is static + fast.
+# wasm-pack` — the static musl binary is toolchain-independent and avoids a slow from-source build.
 ARG WASM_PACK_VERSION=0.13.1
 RUN curl -fsSL "https://github.com/rustwasm/wasm-pack/releases/download/v${WASM_PACK_VERSION}/wasm-pack-v${WASM_PACK_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
       | tar -xz --strip-components=1 -C /usr/local/bin --wildcards '*/wasm-pack' \
