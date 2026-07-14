@@ -8,12 +8,14 @@ mod convert;
 mod export;
 mod federation;
 mod paths;
+mod resources;
 mod scan;
 pub mod semantic;
 mod watch;
 
 pub use background::PipelinePolicy;
 pub use paths::default_data_dir;
+pub use resources::ResourceOptions;
 
 use async_trait::async_trait;
 use dam_api::admin::{
@@ -45,17 +47,6 @@ const MAX_CONTENT_BYTES: u64 = 256 * 1024 * 1024;
 /// and the cache stays compact; large enough for a crisp inspector preview.
 const THUMB_MIN_EDGE: u32 = 16;
 const THUMB_MAX_EDGE: u32 = 1024;
-
-/// Thread count for the bounded background-CPU pool (`bg_pool`): every core bar two, never zero.
-/// Heavy *background* work — grid-thumbnail generation and the analysis pass — shares this budget,
-/// so a burst can't pin every core. Interactive inspector reads (`read_model_preview`, audio
-/// content, `get_asset`) stay off it and thus always have headroom to preempt when the user selects
-/// an asset. This is the engine-side inspector-priority lane (golden rule 5, tech-spec 14).
-fn background_threads() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get().saturating_sub(2).max(1))
-        .unwrap_or(1)
-}
 
 /// Content-keyed cache path for an asset's thumbnail derivative. The cache lives under
 /// `<data_dir>/cache/thumbnails/<key>-<edge>[<variant>].png`, keyed by content hash (falling back to
@@ -421,11 +412,26 @@ pub struct EmbeddedLibrary {
     /// Federated peers (phase 6, issue #39): the TTL-cached registry the query fan-out reads,
     /// rebuilt from the source table and invalidated on source add/remove.
     fed: federation::PeerRegistry,
+    /// Host-pressure governor (tech-spec 14 §3.4): background loops pace themselves against it so a
+    /// whole-library pass yields when the host runs short on memory or CPU.
+    governor: Arc<resources::Governor>,
 }
 
 impl EmbeddedLibrary {
-    /// Open (creating if needed) the library rooted at `data_dir`.
+    /// Open (creating if needed) the library rooted at `data_dir`, with default resource options
+    /// (environment overrides honoured — see [`ResourceOptions::from_env`]).
     pub async fn open(data_dir: &Path) -> Result<EmbeddedLibrary, LibError> {
+        EmbeddedLibrary::open_with(data_dir, ResourceOptions::default()).await
+    }
+
+    /// Open with explicit resource knobs (the server passes its `[resources]` config through
+    /// here). Unset knobs fall back to the `3DAM_BG_THREADS` / `3DAM_MIN_FREE_MEMORY_MB`
+    /// environment variables, then to host-derived defaults.
+    pub async fn open_with(
+        data_dir: &Path,
+        resources: ResourceOptions,
+    ) -> Result<EmbeddedLibrary, LibError> {
+        let resources = resources.or_env();
         let dir = data_dir.to_path_buf();
         let store = tokio::task::spawn_blocking(move || Store::open(&dir))
             .await
@@ -444,9 +450,20 @@ impl EmbeddedLibrary {
         // Load the semantic model if this build ships one (M4). `None` by default — the model-free
         // embeddings stand in — so this is a cheap, always-safe call.
         let semantic = semantic::load(data_dir).map(Arc::from);
+        // The background pool is a guest on the host: sized from the *effective* CPU budget
+        // (cgroup-aware), hard-capped by default, and its workers run reniced at the idle I/O
+        // class so co-tenant workloads and interactive reads preempt them (tech-spec 14 §3.4).
+        let bg_threads = resources::background_thread_count(resources.background_threads);
+        tracing::info!(
+            bg_threads,
+            effective_cpus = resources::effective_cpus(),
+            containerised = resources::is_resource_limited(),
+            "background pool sized"
+        );
         let bg_pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(background_threads())
+            .num_threads(bg_threads)
             .thread_name(|i| format!("dam-bg-{i}"))
+            .start_handler(|_| resources::deprioritize_current_thread())
             .build()
             .map_err(|e| LibError::Internal(e.to_string()))?;
         Ok(EmbeddedLibrary {
@@ -458,6 +475,7 @@ impl EmbeddedLibrary {
             bg_pool: Arc::new(bg_pool),
             semantic,
             fed: federation::PeerRegistry::new(),
+            governor: Arc::new(resources::Governor::new(resources.min_free_memory_mb)),
         })
     }
 
@@ -1209,8 +1227,9 @@ impl LibraryService for EmbeddedLibrary {
         let events = self.events.clone();
         let model = self.semantic.clone();
         let pool = self.bg_pool.clone();
+        let governor = self.governor.clone();
         tokio::task::spawn_blocking(move || {
-            analysis::run_analyze(store, events, job, targets, cancel, model, &pool);
+            analysis::run_analyze(store, events, job, targets, cancel, model, &pool, &governor);
         });
         Ok(job)
     }

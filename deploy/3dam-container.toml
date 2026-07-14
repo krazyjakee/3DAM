@@ -25,3 +25,9 @@ network_writes = true
 # posture is "the server everyone points at", so the advertise surface ships on; the reads a peer
 # performs are the same read API every browser on the published port already has.
 federation = true
+
+# NB: the background pipeline the two auto_* flags drive is host-governed (tech-spec 14 §5): at
+# most 4 worker threads (fewer under a container CPU quota), reniced to yield to co-tenants, and
+# automatically PAUSED while the host is short on memory or overloaded. Tune with a `[resources]`
+# block here or the 3DAM_BG_THREADS / 3DAM_MIN_FREE_MEMORY_MB environment variables — and prefer
+# also giving the container an explicit budget (`--memory 4g --cpus 2`) on a shared box.

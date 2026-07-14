@@ -46,6 +46,7 @@ const PROGRESS_EVERY: u64 = 8;
 /// async caller already handed off via `spawn_blocking`, so this stays a one-shot async→CPU hop. The
 /// store's writes still serialise on its single connection mutex (no `SQLITE_BUSY` — one guarded
 /// connection), but the expensive compute overlaps, which is where the time goes.
+#[allow(clippy::too_many_arguments)] // the job runner's full context; a struct would just rename it
 pub(crate) fn run_analyze(
     store: Arc<Store>,
     events: broadcast::Sender<LibraryEvent>,
@@ -54,6 +55,7 @@ pub(crate) fn run_analyze(
     cancel: Arc<AtomicBool>,
     model: Option<Arc<dyn crate::semantic::SemanticModel>>,
     pool: &rayon::ThreadPool,
+    governor: &crate::resources::Governor,
 ) {
     let total = targets.len() as u64;
     let _ = store.update_job_progress(&job, JobState::Running, 0, Some(total), None);
@@ -66,6 +68,13 @@ pub(crate) fn run_analyze(
     pool.install(|| {
         targets.par_iter().for_each(|t| {
         // Cooperative cancel: in-flight items finish; still-queued ones fall through as cheap no-ops.
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        // Good-neighbour pacing (tech-spec 14 §3.4): when the *host* runs short on memory or CPU,
+        // every worker parks here between items until pressure clears — a whole-library pass must
+        // never swap a shared box to death. Cancel still exits promptly.
+        governor.pace(&cancel);
         if cancel.load(Ordering::Relaxed) {
             return;
         }

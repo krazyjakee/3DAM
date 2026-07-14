@@ -43,3 +43,14 @@ auto_analyze   = true
 # off means the surface disappears (ADR 0004). Peer reads ride the normal auth gate above, so in
 # token mode a peer needs a read-scoped bearer token (`--password` on `sources add`).
 federation = false
+
+[resources]
+# Good-neighbour limits (tech-spec 14 §5) for the background grind (thumbnail pre-render + the
+# analysis pass). 3DAM already self-governs with no config: the background pool is sized from the
+# *effective* CPU budget (container cgroup quota respected), hard-capped at 4 threads, reniced to
+# yield to anything else on the box, and it PAUSES automatically whenever host available memory
+# drops below a floor (default 10% of RAM, clamped 256 MiB – 2 GiB) or the 1-min load runs beyond
+# the CPU budget. These knobs tune that governor; the same pair is honoured as environment
+# variables (3DAM_BG_THREADS / 3DAM_MIN_FREE_MEMORY_MB) for container/systemd deployments.
+#background_threads = 2
+#min_free_memory_mb = 2048

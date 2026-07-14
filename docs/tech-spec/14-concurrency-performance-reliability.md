@@ -149,6 +149,17 @@ Federated fan-out ([07](07-sources-and-federation.md)) is bounded per-peer and d
 
 Channel depth alone bounds *item count*, not *bytes* — one 8K texture or a dense mesh dwarfs a thousand small SFX. So the expensive lane additionally holds a **byte-budget semaphore**: a decode acquires permits proportional to the decoded size it is about to allocate, and releases them when the buffer is freed. This caps *in-flight decoded bytes* independently of item count, so a burst of huge assets throttles itself instead of OOMing. The budget is a config knob ([15](15-observability-config-testing-packaging.md)); its default is a fraction of available RAM, not a fixed number.
 
+### 3.4 Host-resource governance (the good-neighbour layer)
+
+Bounding our own pools is not enough on a **shared host**: sizing "cores − 2" from the machine's core count still assumes the whole machine is ours, and no thread bound prevents a whole-library pass from consuming all *memory* and swapping the box to death while co-tenant services (a media server, CI runners) starve. Background work — the hosted-mode pipeline's analysis + thumbnail pre-render — is opportunistic by definition, so it defers to everything else. Implemented in `dam-core/src/resources.rs`:
+
+- **Effective budget, not machine size.** The background pool is sized from the *effective* CPU count — `available_parallelism` clamped by the cgroup v2/v1 CPU quota when containerised — minus the two interactive-headroom cores, and hard-capped at **4 threads** by default. Operators raise it explicitly (`[resources] background_threads`, or `3DAM_BG_THREADS`); an override still clamps to the effective budget.
+- **Deprioritised workers.** On Linux every background worker runs at nice +10 and the idle I/O scheduling class, so any co-tenant workload (and any interactive 3DAM read) preempts the grind for both CPU and disk.
+- **The pressure governor.** Between work items, background loops consult a cached (2 s) sample of host state and **pause** while the host is under pressure: available memory (host `MemAvailable`, or cgroup headroom, whichever is smaller) below a floor — default 10% of the memory ceiling, clamped to [256 MiB, 2 GiB], configurable via `[resources] min_free_memory_mb` / `3DAM_MIN_FREE_MEMORY_MB` — or 1-minute load beyond 1.5× the CPU budget. Work resumes when pressure clears; job cancellation still exits promptly. Transitions are logged so an operator can see the engine yielding.
+- **Fail-soft probes.** All probes are best-effort reads of `/proc` and `/sys/fs/cgroup`; on platforms without them every probe returns `None` and the governor never pauses.
+
+The interactive lane (inspector reads, queries, the HTTP surface) is *not* governed — the point is precisely that user-facing latency survives background pressure, and the paused pipeline keeps the host healthy enough for the health probes to answer.
+
 ---
 
 ## 4. The incremental, non-blocking pipeline

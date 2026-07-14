@@ -45,6 +45,11 @@ image = { workspace = true, optional = true }
 # front-end it consumes is pure `dam-media` DSP.
 ort = { version = "=2.0.0-rc.10", default-features = false, features = ["load-dynamic"], optional = true }
 
+# Host-resource awareness (tech-spec 14 §5): renice + idle-ioprio the background workers on Linux
+# so co-tenant workloads preempt 3DAM's grind. Linux-only; other platforms skip the calls.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [features]
 # 3D model thumbnails via the wgpu renderer. Pulls wgpu in transitively — enabled by `serve`, kept
 # off for lean CLI/GUI builds where the honest typed tile is the intended 3D grid affordance.

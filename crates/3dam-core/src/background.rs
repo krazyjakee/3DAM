@@ -116,8 +116,11 @@ impl EmbeddedLibrary {
         let events = self.events.clone();
         let model = self.semantic.clone();
         let pool = self.bg_pool.clone();
+        let governor = self.governor.clone();
         let outcome = tokio::task::spawn_blocking(move || {
-            crate::analysis::run_analyze(store, events, job, targets, cancel, model, &pool);
+            crate::analysis::run_analyze(
+                store, events, job, targets, cancel, model, &pool, &governor,
+            );
         })
         .await;
         self.cancels.lock().unwrap().remove(&job);
@@ -139,9 +142,14 @@ impl EmbeddedLibrary {
         }
         let data_dir = self.data_dir.clone();
         let store = self.store.clone();
+        let governor = self.governor.clone();
         let generated = tokio::task::spawn_blocking(move || {
+            let never_cancelled = AtomicBool::new(false);
             let mut generated = 0u64;
             for t in targets {
+                // Good-neighbour pacing (tech-spec 14 §3.4): pre-rendering is pure opportunism — it
+                // parks whenever the host is short on memory or CPU and resumes on recovery.
+                governor.pace(&never_cancelled);
                 let thumb = thumbnail_cache_path(
                     &data_dir,
                     &t.id,

@@ -18,6 +18,21 @@ pub struct ServeFile {
     pub server: ServerBlock,
     #[serde(default)]
     pub flags: FlagsBlock,
+    #[serde(default)]
+    pub resources: ResourcesBlock,
+}
+
+/// `[resources]` — the good-neighbour knobs (tech-spec 14 §5). Unset values fall back to the
+/// `3DAM_BG_THREADS` / `3DAM_MIN_FREE_MEMORY_MB` environment variables, then host-derived defaults
+/// (cgroup-aware CPU budget, 10% memory floor). Plain config, not runtime flags: resource limits
+/// are an operator/deployment property, not a live exposure toggle.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct ResourcesBlock {
+    /// Background pool size (thumbnail/analysis grind). Default: effective CPUs − 2, capped at 4.
+    pub background_threads: Option<usize>,
+    /// Pause background work while host available memory is below this floor (MiB).
+    /// Default: 10% of the memory ceiling, clamped to [256 MiB, 2 GiB].
+    pub min_free_memory_mb: Option<u64>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]

@@ -253,7 +253,12 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
     }
 
     // 2. Stores: open the engine and the server store; seed flags from the config file (seed-only).
-    let lib = Arc::new(EmbeddedLibrary::open(&cfg.data_dir).await?);
+    // The `[resources]` block bounds the engine's background appetite (tech-spec 14 §5).
+    let resources = dam_core::ResourceOptions {
+        background_threads: file.resources.background_threads,
+        min_free_memory_mb: file.resources.min_free_memory_mb,
+    };
+    let lib = Arc::new(EmbeddedLibrary::open_with(&cfg.data_dir, resources).await?);
     lib.start_watchers(); // long-running role: resume auto-rescan for watch-enabled sources.
     let store = Arc::new(ServerStore::open(&cfg.data_dir.join("server.db"))?);
     for (key, value) in file.flag_seeds() {
