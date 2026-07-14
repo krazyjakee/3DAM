@@ -27,6 +27,11 @@ const fn rgb(r: u8, g: u8, b: u8) -> Color32 {
 /// the native shell is not at the mercy of a system font; rendered at its default (Regular) instance.
 const INTER: &[u8] = include_bytes!("../assets/fonts/InterVariable.ttf");
 
+/// Mode-independent surface behind media previews (3D viewer, waveform trough). Like the web's WASM
+/// islands — which clear to a fixed dark neutral in both themes — preview surfaces stay dark so the
+/// rendered content reads the same regardless of the shell theme.
+pub const VIEWER_BG: Color32 = rgb(0x0f, 0x17, 0x21);
+
 /// One mode's design tokens (names mirror the web `--color-*` custom properties). This is the full
 /// token set — the subset egui's `Visuals` can hold is copied into it in [`visuals`]; the rest
 /// (media + license hues) is read directly through [`colors`].

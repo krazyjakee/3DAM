@@ -393,7 +393,7 @@ fn draw_waveform(ui: &mut egui::Ui, peaks: &[f32]) {
     let width = ui.available_width().min(300.0);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 56.0), egui::Sense::hover());
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 3.0, egui::Color32::from_rgb(0x0f, 0x17, 0x21)); // dark trough
+    painter.rect_filled(rect, 3.0, crate::theme::VIEWER_BG); // mode-independent dark trough
     if peaks.is_empty() {
         return;
     }
@@ -989,25 +989,19 @@ impl DamGui {
         };
     }
 
-    /// Colour + short label for the toolbar connection chip.
-    fn status_chip(&self) -> (egui::Color32, String) {
+    /// Colour + short label for the toolbar connection chip. Colours come from the active theme's
+    /// tokens (web `ServerChip`/`ConnectionPill` semantics: local → dim, remote/online → accent,
+    /// trouble → warn/danger) so the chip follows dark/light like everything else.
+    fn status_chip(&self, dark: bool) -> (egui::Color32, String) {
+        let c = colors(dark);
         match self.status {
-            ConnStatus::Local => (
-                egui::Color32::from_rgb(0x8a, 0x8a, 0x8a),
-                "Local".to_string(),
-            ),
-            ConnStatus::Connecting => (
-                egui::Color32::from_rgb(0xf5, 0xa6, 0x23),
-                "Connecting…".to_string(),
-            ),
+            ConnStatus::Local => (c.fg_dim, "Local".to_string()),
+            ConnStatus::Connecting => (c.warn, "Connecting…".to_string()),
             ConnStatus::Online => (
-                egui::Color32::from_rgb(0x38, 0xbd, 0xf8),
+                c.accent,
                 short_host(self.conn.endpoint.as_deref().unwrap_or("server")),
             ),
-            ConnStatus::Offline => (
-                egui::Color32::from_rgb(0xef, 0x44, 0x44),
-                "Offline".to_string(),
-            ),
+            ConnStatus::Offline => (c.danger, "Offline".to_string()),
         }
     }
 
@@ -3583,7 +3577,7 @@ impl eframe::App for DamGui {
                     );
                     ui.label(egui::RichText::new("·").size(11.0).color(c.border_strong));
                     // Connection pill: coloured dot + label; click to open the Connect dialog.
-                    let (col, label) = self.status_chip();
+                    let (col, label) = self.status_chip(ui.visuals().dark_mode);
                     if ui
                         .add(
                             egui::Button::new(
@@ -3961,7 +3955,7 @@ impl eframe::App for DamGui {
                 egui::Window::new("viewer-fullscreen")
                     .title_bar(false)
                     .fixed_rect(ctx.screen_rect())
-                    .frame(egui::Frame::default().fill(egui::Color32::from_rgb(0x0f, 0x17, 0x21)))
+                    .frame(egui::Frame::default().fill(crate::theme::VIEWER_BG))
                     .show(ctx, |ui| {
                         ui.horizontal(|ui| {
                             if ui.selectable_label(v_auto, "Auto-orbit").clicked() {
