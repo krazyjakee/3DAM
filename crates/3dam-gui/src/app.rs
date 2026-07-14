@@ -1026,21 +1026,23 @@ impl DamGui {
                 ui.add_space(6.0);
 
                 ui.horizontal(|ui| {
-                    ui.label("Server URL");
+                    let l = ui.label("Server URL");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.connect_url)
                             .hint_text("http://host:7878")
                             .desired_width(240.0),
-                    );
+                    )
+                    .labelled_by(l.id);
                 });
                 ui.horizontal(|ui| {
-                    ui.label("Token");
+                    let l = ui.label("Token");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.connect_token)
                             .password(true)
                             .hint_text("optional — required for token-gated servers")
                             .desired_width(240.0),
-                    );
+                    )
+                    .labelled_by(l.id);
                 });
 
                 if !self.recent_servers.is_empty() {
@@ -1277,7 +1279,7 @@ impl DamGui {
             .and_then(|c| opts.iter().find(|(v, _)| *v == c).map(|(_, l)| *l))
             .unwrap_or("Any");
         let mut pick: Option<Option<String>> = None;
-        egui::ComboBox::from_id_salt(("adve", label))
+        let combo = egui::ComboBox::from_id_salt(("adve", label))
             .selected_text(sel)
             .width(150.0)
             .show_ui(ui, |ui| {
@@ -1293,6 +1295,7 @@ impl DamGui {
                     }
                 }
             });
+        ui::access_combo(&combo.response, label, sel);
         ui.end_row();
         match pick {
             Some(None) => self.adv_remove(field),
@@ -1321,7 +1324,7 @@ impl DamGui {
             .and_then(|c| opts.iter().find(|(v, _)| *v == c).map(|(_, l)| *l))
             .unwrap_or("Any");
         let mut pick: Option<Option<f64>> = None;
-        egui::ComboBox::from_id_salt(("advn", label))
+        let combo = egui::ComboBox::from_id_salt(("advn", label))
             .selected_text(sel)
             .width(150.0)
             .show_ui(ui, |ui| {
@@ -1334,6 +1337,7 @@ impl DamGui {
                     }
                 }
             });
+        ui::access_combo(&combo.response, label, sel);
         ui.end_row();
         match pick {
             Some(None) => self.adv_remove(field),
@@ -1358,7 +1362,7 @@ impl DamGui {
             Some(false) => "No",
         };
         let mut pick: Option<Option<bool>> = None;
-        egui::ComboBox::from_id_salt(("advb", label))
+        let combo = egui::ComboBox::from_id_salt(("advb", label))
             .selected_text(sel)
             .width(150.0)
             .show_ui(ui, |ui| {
@@ -1372,6 +1376,7 @@ impl DamGui {
                     pick = Some(Some(false));
                 }
             });
+        ui::access_combo(&combo.response, label, sel);
         ui.end_row();
         match pick {
             Some(None) => self.adv_remove(field),
@@ -1402,7 +1407,7 @@ impl DamGui {
         }
         let (mut lo, mut hi) = self.adv_range_bufs.get(label).cloned().unwrap_or_default();
 
-        ui.label(if unit.is_empty() {
+        let range_label = ui.label(if unit.is_empty() {
             label.to_string()
         } else {
             format!("{label} ({unit})")
@@ -1410,17 +1415,21 @@ impl DamGui {
         // Commit when either box loses focus (tab/click away/Enter) — the standard egui pattern.
         let mut commit = false;
         ui.horizontal(|ui| {
-            let r1 = ui.add(
-                egui::TextEdit::singleline(&mut lo)
-                    .desired_width(56.0)
-                    .hint_text("min"),
-            );
+            let r1 = ui
+                .add(
+                    egui::TextEdit::singleline(&mut lo)
+                        .desired_width(56.0)
+                        .hint_text("min"),
+                )
+                .labelled_by(range_label.id);
             ui.label("–");
-            let r2 = ui.add(
-                egui::TextEdit::singleline(&mut hi)
-                    .desired_width(56.0)
-                    .hint_text("max"),
-            );
+            let r2 = ui
+                .add(
+                    egui::TextEdit::singleline(&mut hi)
+                        .desired_width(56.0)
+                        .hint_text("max"),
+                )
+                .labelled_by(range_label.id);
             commit = r1.lost_focus() || r2.lost_focus();
         });
         ui.end_row();
@@ -1459,14 +1468,16 @@ impl DamGui {
     /// now that they've left the sidebar). Returns true if a tag was added/removed.
     fn adv_tags(&mut self, ui: &mut egui::Ui) -> bool {
         let mut changed = false;
-        ui.label(egui::RichText::new("Tags").weak());
+        let tags_label = ui.label(egui::RichText::new("Tags").weak());
         let mut add = false;
         ui.horizontal(|ui| {
-            let r = ui.add(
-                egui::TextEdit::singleline(&mut self.adv_tag_input)
-                    .hint_text("Add a tag filter, then Enter")
-                    .desired_width(200.0),
-            );
+            let r = ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.adv_tag_input)
+                        .hint_text("Add a tag filter, then Enter")
+                        .desired_width(200.0),
+                )
+                .labelled_by(tags_label.id);
             if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                 add = true;
             }
@@ -1642,12 +1653,14 @@ impl DamGui {
                 .resizable(false)
                 .open(&mut open)
                 .show(ctx, |ui| {
-                    ui.label("Name");
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(&mut self.collection_new_name)
-                            .hint_text("Collection name")
-                            .desired_width(220.0),
-                    );
+                    let l = ui.label("Name");
+                    let resp = ui
+                        .add(
+                            egui::TextEdit::singleline(&mut self.collection_new_name)
+                                .hint_text("Collection name")
+                                .desired_width(220.0),
+                        )
+                        .labelled_by(l.id);
                     if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         submit = true;
                     }
@@ -1693,6 +1706,7 @@ impl DamGui {
                             .hint_text("Collection name")
                             .desired_width(220.0),
                     );
+                    ui::access_edit_label(&resp, "Collection name");
                     if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         submit = true;
                     }
@@ -2646,7 +2660,16 @@ impl DamGui {
                         && self.path.as_deref() == Some(full.as_str());
                     ui.horizontal(|ui| {
                         ui.add_space(depth as f32 * 10.0);
-                        if ui.small_button(if open { "v" } else { ">" }).clicked() {
+                        let disclose = ui.small_button(if open { "v" } else { ">" });
+                        ui::access_label(
+                            &disclose,
+                            &format!(
+                                "{} folder {}",
+                                if open { "Collapse" } else { "Expand" },
+                                e.name
+                            ),
+                        );
+                        if disclose.clicked() {
                             acts.toggle.push((source, full.clone()));
                         }
                         if ui
@@ -2700,6 +2723,9 @@ impl eframe::App for DamGui {
         // Actions gathered while rendering (immutable borrows of self), applied after the panels.
         let mut do_query = false;
         let mut grid_click: Option<(AssetId, ClickMods)> = None;
+        // Double-click / activate on a grid card or table row (issue #52): the click part already
+        // focuses the asset in the inspector; audio additionally starts playing, mirroring the web.
+        let mut grid_activate: Option<(AssetId, MediaType)> = None;
         // A table-header sort click (new SORTS index), applied post-panel to re-query.
         let mut sort_click: Option<usize> = None;
         // Duplicates view: toggle request + a member click (selects it and returns to the library) +
@@ -2771,12 +2797,15 @@ impl eframe::App for DamGui {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 let dim = colors(ui.visuals().dark_mode).fg_dim;
-                ui.label(egui::RichText::new(icon::MAGNIFYING_GLASS).color(dim));
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut self.search)
-                        .hint_text("Search assets…")
-                        .desired_width(240.0),
-                );
+                let sicon = ui.label(egui::RichText::new(icon::MAGNIFYING_GLASS).color(dim));
+                ui::access_text(&sicon, "Search assets");
+                let resp = ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.search)
+                            .hint_text("Search assets…")
+                            .desired_width(240.0),
+                    )
+                    .labelled_by(sicon.id);
                 if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     do_query = true;
                 }
@@ -2788,7 +2817,7 @@ impl eframe::App for DamGui {
                 ui.separator();
 
                 // Sort preset (mirrors the web sort control).
-                egui::ComboBox::from_id_salt("sort")
+                let sort_combo = egui::ComboBox::from_id_salt("sort")
                     .selected_text(SORTS[self.sort].0)
                     .show_ui(ui, |ui| {
                         for (i, (label, _, _)) in SORTS.iter().enumerate() {
@@ -2798,6 +2827,7 @@ impl eframe::App for DamGui {
                             }
                         }
                     });
+                ui::access_combo(&sort_combo.response, "Sort order", SORTS[self.sort].0);
 
                 // Search-mode selector — only meaningful with a text query, so it appears with one
                 // (semantic-search M5: hybrid/semantic widen with embedding neighbours of the hits).
@@ -2807,7 +2837,7 @@ impl eframe::App for DamGui {
                         SearchMode::Hybrid => "Keywords + similar",
                         SearchMode::Semantic => "Most similar",
                     };
-                    egui::ComboBox::from_id_salt("mode")
+                    let mode_combo = egui::ComboBox::from_id_salt("mode")
                         .selected_text(mode_label)
                         .show_ui(ui, |ui| {
                             for (m, label) in [
@@ -2821,6 +2851,7 @@ impl eframe::App for DamGui {
                                 }
                             }
                         });
+                    ui::access_combo(&mode_combo.response, "Search mode", mode_label);
                 }
 
                 ui.separator();
@@ -2851,18 +2882,18 @@ impl eframe::App for DamGui {
                         self.export_open = true;
                     }
                     ui.separator();
-                    if ui
+                    let grid_toggle = ui
                         .selectable_label(self.view == View::Grid, icon::GRID_FOUR)
-                        .on_hover_text("Grid")
-                        .clicked()
-                    {
+                        .on_hover_text("Grid");
+                    ui::access_toggle(&grid_toggle, self.view == View::Grid, "Grid view");
+                    if grid_toggle.clicked() {
                         self.view = View::Grid;
                     }
-                    if ui
+                    let table_toggle = ui
                         .selectable_label(self.view == View::List, icon::LIST)
-                        .on_hover_text("Table")
-                        .clicked()
-                    {
+                        .on_hover_text("Table");
+                    ui::access_toggle(&table_toggle, self.view == View::List, "Table view");
+                    if table_toggle.clicked() {
                         self.view = View::List;
                     }
                     ui.separator();
@@ -3062,6 +3093,7 @@ impl eframe::App for DamGui {
                                         .hint_text("/path/to/assets")
                                         .desired_width(150.0),
                                 );
+                                ui::access_edit_label(&resp, "Source path");
                                 let submit = ui.small_button("Add").clicked()
                                     || (resp.lost_focus()
                                         && ui.input(|i| i.key_pressed(egui::Key::Enter)));
@@ -3083,14 +3115,20 @@ impl eframe::App for DamGui {
                             let open = self.expanded.contains(&(sid, String::new()));
                             let scoped = self.source_filter == Some(sid) && self.path.is_none();
                             ui.horizontal(|ui| {
-                                if ui
-                                    .small_button(if open {
-                                        icon::CARET_DOWN
-                                    } else {
-                                        icon::CARET_RIGHT
-                                    })
-                                    .clicked()
-                                {
+                                let disclose = ui.small_button(if open {
+                                    icon::CARET_DOWN
+                                } else {
+                                    icon::CARET_RIGHT
+                                });
+                                ui::access_label(
+                                    &disclose,
+                                    &format!(
+                                        "{} source {}",
+                                        if open { "Collapse" } else { "Expand" },
+                                        s.name
+                                    ),
+                                );
+                                if disclose.clicked() {
                                     nav.toggle.push((sid, String::new()));
                                 }
                                 if ui
@@ -3117,18 +3155,17 @@ impl eframe::App for DamGui {
                                         nav.set_confirm = Some(None);
                                     }
                                 } else {
-                                    if ui
+                                    let rescan = ui
                                         .small_button(icon::ARROWS_CLOCKWISE)
-                                        .on_hover_text("Rescan source")
-                                        .clicked()
-                                    {
+                                        .on_hover_text("Rescan source");
+                                    ui::access_label(&rescan, &format!("Rescan source {}", s.name));
+                                    if rescan.clicked() {
                                         nav.source = Some(SourceAction::Rescan(sid));
                                     }
-                                    if ui
-                                        .small_button(icon::TRASH)
-                                        .on_hover_text("Remove source")
-                                        .clicked()
-                                    {
+                                    let remove =
+                                        ui.small_button(icon::TRASH).on_hover_text("Remove source");
+                                    ui::access_label(&remove, &format!("Remove source {}", s.name));
+                                    if remove.clicked() {
                                         nav.set_confirm = Some(Some(sid));
                                     }
                                 }
@@ -3329,20 +3366,18 @@ impl eframe::App for DamGui {
                                     {
                                         ctl_light = true;
                                     }
-                                    if ui
+                                    let reset = ui
                                         .button(icon::ARROW_COUNTER_CLOCKWISE)
-                                        .on_hover_text("Reset view")
-                                        .clicked()
-                                    {
+                                        .on_hover_text("Reset view");
+                                    ui::access_label(&reset, "Reset view");
+                                    if reset.clicked() {
                                         ctl_reset = true;
                                     }
-                                    if ui
-                                        .button(icon::ARROWS_OUT)
-                                        .on_hover_text(
-                                            "Expand the viewer to fill the window (Esc to exit)",
-                                        )
-                                        .clicked()
-                                    {
+                                    let fullscreen = ui.button(icon::ARROWS_OUT).on_hover_text(
+                                        "Expand the viewer to fill the window (Esc to exit)",
+                                    );
+                                    ui::access_label(&fullscreen, "Fullscreen viewer");
+                                    if fullscreen.clicked() {
                                         ctl_fullscreen = true;
                                     }
                                 });
@@ -3602,11 +3637,60 @@ impl eframe::App for DamGui {
         // Assets whose thumbnails are worth fetching this frame (visible + not yet requested),
         // gathered under the immutable render borrow and kicked off afterwards.
         let mut to_load: Vec<AssetId> = Vec::new();
+        // A breadcrumb crumb click re-scopes the folder browse: `Some(prefix)` for a parent folder,
+        // `Some(None)` for the source root (issue #66, web Breadcrumb parity).
+        let mut breadcrumb_to: Option<Option<String>> = None;
 
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(err) = &self.error {
                 ui.colored_label(colors(ui.visuals().dark_mode).danger, err);
                 ui.separator();
+            }
+            // ── Breadcrumb (issue #66): source + folder segments over the Browser, click to
+            // re-scope up — mirrors the web Breadcrumb (hidden in collection/dup/blocklist views). ──
+            if self.collection.is_none() && !self.blocklist_view && !self.dup_view {
+                if let Some(sid) = self.source_filter {
+                    let c = colors(ui.visuals().dark_mode);
+                    let src_name = self
+                        .sources
+                        .iter()
+                        .find(|s| s.id == sid)
+                        .map(|s| s.name.clone())
+                        .unwrap_or_else(|| "Source".to_string());
+                    let segs: Vec<&str> = self
+                        .path
+                        .as_deref()
+                        .unwrap_or("")
+                        .split('/')
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        if segs.is_empty() {
+                            ui.label(egui::RichText::new(&src_name).size(11.0).color(c.fg_muted));
+                        } else if ui
+                            .link(egui::RichText::new(&src_name).size(11.0).color(c.fg_dim))
+                            .clicked()
+                        {
+                            breadcrumb_to = Some(None);
+                        }
+                        let mut acc = String::new();
+                        for (i, seg) in segs.iter().enumerate() {
+                            acc.push_str(seg);
+                            acc.push('/');
+                            ui.label(egui::RichText::new("›").size(11.0).color(c.border_strong));
+                            if i + 1 == segs.len() {
+                                ui.label(egui::RichText::new(*seg).size(11.0).color(c.fg_muted));
+                            } else if ui
+                                .link(egui::RichText::new(*seg).size(11.0).color(c.fg_dim))
+                                .clicked()
+                            {
+                                breadcrumb_to = Some(Some(acc.clone()));
+                            }
+                        }
+                    });
+                    ui.separator();
+                }
             }
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
@@ -3625,9 +3709,21 @@ impl eframe::App for DamGui {
                         ui.add_space(12.0);
                         ui.label(egui::RichText::new("No assets match.").weak());
                     } else if self.view == View::Grid {
-                        self.grid(ui, &mut grid_click, &mut to_load, &mut asset_action);
+                        self.grid(
+                            ui,
+                            &mut grid_click,
+                            &mut grid_activate,
+                            &mut to_load,
+                            &mut asset_action,
+                        );
                     } else {
-                        self.list(ui, &mut grid_click, &mut asset_action, &mut sort_click);
+                        self.list(
+                            ui,
+                            &mut grid_click,
+                            &mut grid_activate,
+                            &mut asset_action,
+                            &mut sort_click,
+                        );
                     }
                 });
         });
@@ -3657,10 +3753,11 @@ impl eframe::App for DamGui {
                         }
                     });
                     ui.horizontal(|ui| {
-                        ui.label("Output:");
+                        let l = ui.label("Output:");
                         ui.add(
                             egui::TextEdit::singleline(&mut self.export_path).desired_width(320.0),
-                        );
+                        )
+                        .labelled_by(l.id);
                     });
                     ui.checkbox(
                         &mut self.export_attribution,
@@ -3738,11 +3835,12 @@ impl eframe::App for DamGui {
                             }
                         });
                         ui.horizontal(|ui| {
-                            ui.label("Output dir:");
+                            let l = ui.label("Output dir:");
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.convert_output)
                                     .desired_width(300.0),
-                            );
+                            )
+                            .labelled_by(l.id);
                         });
                         ui.separator();
                         ui.horizontal(|ui| {
@@ -3831,6 +3929,11 @@ impl eframe::App for DamGui {
                 self.source_filter = Some(sid);
                 self.path = p;
             }
+            do_query = true;
+        }
+        // A breadcrumb click re-scopes the folder browse up the tree (source stays as-is).
+        if let Some(target) = breadcrumb_to {
+            self.path = target;
             do_query = true;
         }
 
@@ -3933,6 +4036,14 @@ impl eframe::App for DamGui {
         }
         if let Some((id, mods)) = grid_click {
             self.select_asset(id, mods, ctx);
+        }
+        // Double-click = activate (issue #52): audio starts playing right away; other media just
+        // opens in the inspector, which the click above already did.
+        if let Some((id, media)) = grid_activate {
+            if media == MediaType::Audio {
+                self.audio_error = None;
+                self.load_audio(id);
+            }
         }
         if let Some((id, tag, action)) = tag_review {
             self.review_tag(id, tag, action);
@@ -4092,6 +4203,7 @@ impl DamGui {
         &self,
         ui: &mut egui::Ui,
         click: &mut Option<(AssetId, ClickMods)>,
+        activate: &mut Option<(AssetId, MediaType)>,
         menu: &mut Option<AssetAction>,
         sort_click: &mut Option<usize>,
     ) {
@@ -4244,16 +4356,14 @@ impl DamGui {
             egui::pos2(hrect.left() + size_col_x, hrect.top()),
             hrect.right_bottom(),
         );
-        if ui
-            .interact(name_rect, ui.id().with("sort-name"), egui::Sense::click())
-            .clicked()
-        {
+        let sort_name = ui.interact(name_rect, ui.id().with("sort-name"), egui::Sense::click());
+        ui::access_label(&sort_name, "Sort by name");
+        if sort_name.clicked() {
             *sort_click = Some(if self.sort == 0 { 1 } else { 0 }); // Name A-Z ⇄ Z-A
         }
-        if ui
-            .interact(size_rect, ui.id().with("sort-size"), egui::Sense::click())
-            .clicked()
-        {
+        let sort_size = ui.interact(size_rect, ui.id().with("sort-size"), egui::Sense::click());
+        ui::access_label(&sort_size, "Sort by size");
+        if sort_size.clicked() {
             *sort_click = Some(if self.sort == 2 { 3 } else { 2 }); // Largest ⇄ Smallest
         }
         ui.separator();
@@ -4261,20 +4371,36 @@ impl DamGui {
         // ── rows ──
         for a in &self.assets {
             let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, ROW_H), egui::Sense::click());
+            let selected = self.selected == Some(a.id) || self.selection.contains(&a.id);
+            // Name/type/size (+ favourite) for the AccessKit tree — the web row's aria-label.
+            ui::access_toggle(
+                &resp,
+                selected,
+                &format!(
+                    "{}, {}, {}{}",
+                    a.name,
+                    media_tag(a.media),
+                    human_bytes(a.size),
+                    if a.favorite { ", favorite" } else { "" }
+                ),
+            );
             if resp.clicked() {
                 *click = Some((a.id, click_mods(ui)));
+            }
+            if resp.double_clicked() {
+                *activate = Some((a.id, a.media));
             }
             resp.context_menu(|ui| asset_context_menu(ui, a, menu));
             if !ui.is_rect_visible(rect) {
                 continue;
             }
-            let selected = self.selected == Some(a.id) || self.selection.contains(&a.id);
             let p = ui.painter_at(rect);
             if selected {
                 p.rect_filled(rect, 3.0, ui.visuals().selection.bg_fill);
             } else if resp.hovered() {
                 p.rect_filled(rect, 3.0, ui.visuals().widgets.hovered.bg_fill);
             }
+            ui::focus_ring(ui, &resp, rect);
             let detail = detail_attr(a).map(|d| ellipsize(&d, 20));
             paint_row(
                 &p,
@@ -4469,6 +4595,7 @@ impl DamGui {
         &self,
         ui: &mut egui::Ui,
         click: &mut Option<(AssetId, ClickMods)>,
+        activate: &mut Option<(AssetId, MediaType)>,
         to_load: &mut Vec<AssetId>,
         menu: &mut Option<AssetAction>,
     ) {
@@ -4482,8 +4609,24 @@ impl DamGui {
             for a in &self.assets {
                 let (rect, resp) =
                     ui.allocate_exact_size(egui::vec2(CARD_W, CARD_H), egui::Sense::click());
+                let selected = self.selected == Some(a.id) || self.selection.contains(&a.id);
+                // Name/type/size (+ favourite) for the AccessKit tree — the web cell's aria-label.
+                ui::access_toggle(
+                    &resp,
+                    selected,
+                    &format!(
+                        "{}, {}, {}{}",
+                        a.name,
+                        media_tag(a.media),
+                        human_bytes(a.size),
+                        if a.favorite { ", favorite" } else { "" }
+                    ),
+                );
                 if resp.clicked() {
                     *click = Some((a.id, click_mods(ui)));
+                }
+                if resp.double_clicked() {
+                    *activate = Some((a.id, a.media));
                 }
                 resp.context_menu(|ui| asset_context_menu(ui, a, menu));
                 if !ui.is_rect_visible(rect) {
@@ -4495,9 +4638,9 @@ impl DamGui {
                 }
 
                 let painter = ui.painter_at(rect);
-                let selected = self.selected == Some(a.id) || self.selection.contains(&a.id);
-                // Bordered surface card (web GridCell): accent border when selected, strong on hover.
-                let border = if selected {
+                // Bordered surface card (web GridCell): accent border when selected, strong on
+                // hover — and the keyboard-focus ring (web `:focus-visible`) doubles as accent.
+                let border = if selected || resp.has_focus() {
                     c.accent
                 } else if resp.hovered() {
                     c.border_strong
@@ -4599,9 +4742,40 @@ fn inspector(
 ) {
     let s = &asset.summary;
     let c = colors(ui.visuals().dark_mode);
+    // "Preview not available" (issue #18): the USD family has no decode path yet, so make the absent
+    // preview explicit instead of a silent tile — mirrors the web NoModelPreview card. Metadata is
+    // still catalogued below.
+    let no_preview = s.media == MediaType::Model
+        && matches!(s.format.as_str(), "usd" | "usda" | "usdc" | "usdz");
+    if no_preview {
+        egui::Frame::group(ui.style())
+            .fill(c.surface2)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width().min(300.0));
+                ui.vertical_centered(|ui| {
+                    ui.add_space(18.0);
+                    ui.label(egui::RichText::new(icon::CUBE).size(24.0).color(c.fg_dim));
+                    ui.label(
+                        egui::RichText::new("Preview not available")
+                            .size(12.0)
+                            .color(c.fg_muted),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "3DAM can't render .{} yet — its metadata is still catalogued below.",
+                            s.format
+                        ))
+                        .size(11.0)
+                        .color(c.fg_dim),
+                    );
+                    ui.add_space(18.0);
+                });
+            });
+        ui.add_space(8.0);
+    }
     // Preview: the asset's thumbnail (reuses the grid texture) scaled to the panel width. Absent for
     // audio / un-rendered 3D — those just show the metadata below.
-    if let Some(tex) = thumb {
+    if let Some(tex) = thumb.filter(|_| !no_preview) {
         let w = ui.available_width().min(300.0);
         ui.add(
             egui::Image::new(egui::load::SizedTexture::from_handle(tex))
@@ -4616,7 +4790,8 @@ fn inspector(
         ui::media_badge(ui, media_value(s.media));
         if s.favorite {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(egui::RichText::new(icon::STAR).color(c.warn));
+                let star = ui.label(egui::RichText::new(icon::STAR).color(c.warn));
+                ui::access_text(&star, "Favorite");
             });
         }
     });
@@ -4686,6 +4861,7 @@ fn inspector(
                         .sense(egui::Sense::click()),
                 )
                 .on_hover_text(format!("{}\n(click to copy)", asset.path));
+            ui::access_label(&resp, &format!("Copy path {}", asset.path));
             if resp.clicked() {
                 ui.ctx().copy_text(asset.path.clone());
             }
@@ -4724,19 +4900,19 @@ fn inspector(
                 ui::pill(ui, &t.name, fg, bg);
                 if auto {
                     if rejected {
-                        if ui
+                        let restore = ui
                             .small_button(icon::ARROW_COUNTER_CLOCKWISE)
-                            .on_hover_text("Restore tag")
-                            .clicked()
-                        {
+                            .on_hover_text("Restore tag");
+                        ui::access_label(&restore, &format!("Restore tag {}", t.name));
+                        if restore.clicked() {
                             *tag_review = Some((s.id, t.name.clone(), ReviewAction::Accept));
                         }
-                    } else if ui
-                        .small_button(icon::X)
-                        .on_hover_text("Reject tag")
-                        .clicked()
-                    {
-                        *tag_review = Some((s.id, t.name.clone(), ReviewAction::Reject));
+                    } else {
+                        let reject = ui.small_button(icon::X).on_hover_text("Reject tag");
+                        ui::access_label(&reject, &format!("Reject tag {}", t.name));
+                        if reject.clicked() {
+                            *tag_review = Some((s.id, t.name.clone(), ReviewAction::Reject));
+                        }
                     }
                 }
             }

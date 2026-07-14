@@ -24,10 +24,11 @@ Legend: ✅ done · 🟡 partial · ⬜ owed (not yet in egui) · ▫ n/a (out o
 | Thumbnails | ✅ | ✅ | `read_thumbnail` → decode off-thread → egui texture cache; lazy, visible-only; incl. 3D turntable renders (Vulkan) |
 | Inspector: core metadata | ✅ | ✅ | name, type, format, size, path, tags |
 | Inspector: media attributes | ✅ | ✅ | audio/image/model attr rows + a FEATURES block: image seamlessness bar + tile-class badge, audio brightness/harmonicity 0–1 bars |
-| Inspector: preview (3D/audio/image) | ✅ | ✅ | image + interactive 3D viewer (egui-wgpu, orbit/zoom, **base-colour-textured** lambert) + audio waveform + play/stop |
+| Inspector: preview (3D/audio/image) | ✅ | 🟡 | image + interactive 3D viewer (egui-wgpu, orbit/zoom, **base-colour-textured** lambert) + audio waveform + play/stop. Owed vs web: audio pause/seek/playhead/time readout (egui is play/stop only, no position tracking); full-res image zoom/pan viewer (#17 — egui paints the cached thumbnail, no zoom/1:1); tile preview cube/grid (#58) |
+| Double-click to activate / play audio (#52) | ✅ | ✅ | double-click a grid card or table row → inspector focus; audio starts playing immediately |
 | Library stats | ✅ | ✅ | totals + by-media counts in the left rail |
 | Sources list + manage | ✅ | ✅ | list/scope + add-local / remove (confirm) / rescan in the rail (SFTP/SMB owed) |
-| Folder-tree navigation (#66) | ✅ | ✅ | left-rail source tree, lazy `list_folders`, path-scoped browse (breadcrumb TBD) |
+| Folder-tree navigation (#66) | ✅ | ✅ | left-rail source tree, lazy `list_folders`, path-scoped browse + breadcrumb over the Browser (click to re-scope up) |
 | Search mode (lexical/hybrid/semantic) | ✅ | ✅ | toolbar combo, shown with a text query |
 | License facet | ✅ | ✅ | left-rail Permissive/Attribution/Restricted/Unknown |
 | Advanced Search (structured attr + tag filters) | ✅ | ✅ | toolbar "Filters" popover: media-contextual enum/numEnum/bool dropdowns + numeric ranges + free tag filter, AND-ed onto the query |
@@ -50,7 +51,8 @@ Legend: ✅ done · 🟡 partial · ⬜ owed (not yet in egui) · ▫ n/a (out o
 | Duplicates page / blocklist page | ✅ | ✅ | Duplicate-review view + a Blocklist management view (unblock); remove / remove+block actions in the inspector & context menus |
 | Theme (light/dark) | ✅ | ✅ | rail selector cycles System / Dark / Light (`ThemePreference`; System follows the OS) |
 | Theme palette matches web (#68) | ✅ | ✅ | custom egui `Visuals` built from the web `@theme` tokens (`theme.rs`) — bg/surface ladder, sky accent, text tiers; visual tuning may follow the sweep |
-| Responsive / touch / a11y pass | ✅ | ▫ | The web pass targets the mobile/`coarse:` case (single-column collapse, drawers, 44px touch targets) — not applicable to a resizable desktop window (the three-region layout uses resizable panels instead). a11y: eframe ships AccessKit screen-reader support (enable the `accesskit` feature to turn it on); widgets already carry text labels / hover text. |
+| Responsive / touch pass | ✅ | ▫ | The web pass targets the mobile/`coarse:` case (single-column collapse, drawers, 44px touch targets) — not applicable to a resizable desktop window (the three-region layout uses resizable panels instead). |
+| Accessibility (#44) | ✅ | ✅ | AccessKit enabled (`accesskit` eframe feature → AT-SPI/UIA/NSAccessibility): custom-painted rows/cards/badges report name+role+state via `widget_info`, icon-glyph buttons carry explicit names, selects/inputs are labelled, painted widgets draw the accent focus ring. See `docs/a11y-contrast.md` §Native GUI. |
 | 3D viewer on-canvas controls (#65) | ✅ | ✅ | orbit/zoom + control bar: auto-orbit · wireframe · lighting cycle (studio/soft/flat) · reset · fullscreen (Esc to exit) |
 
 ## State of the egui client

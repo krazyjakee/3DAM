@@ -1,12 +1,14 @@
-# Accessibility report — web client
+# Accessibility report
 
 Part of the accessibility hardening epic ([#44](https://github.com/krazyjakee/3DAM/issues/44),
-PRODUCT_SPEC §9 phase 7). Three checks:
+PRODUCT_SPEC §9 phase 7). Four checks — three on the web client, one on the native GUI:
 
 1. **Contrast audit** — the colour tokens in [`web/src/index.css`](../web/src/index.css) against
    WCAG 2.1 §1.4.3 (AA). (below)
 2. **axe-core scan** — every route against WCAG 2 A/AA rules. ([jump ↓](#automated-axe-core-scan))
 3. **Keyboard-only walkthrough** — browse → inspect → act with no mouse. ([jump ↓](#keyboard-only-walkthrough))
+4. **Native GUI (egui) — AccessKit** — screen-reader tree + keyboard parity for the desktop
+   client. ([jump ↓](#native-gui--egui--accesskit))
 
 ---
 
@@ -98,12 +100,9 @@ contrast-tuned and carried most of the failures.
   does not apply. The *functional* boundary — the keyboard focus ring — uses `--color-accent`
   (≥7.5:1 in both themes) and passes comfortably. Left unchanged by design (low-chrome aesthetic).
 
-## Not yet covered by this report (remaining #44 scope)
-
-- Automated axe pass on the live workspace (dynamic states, ARIA wiring).
-- Documented keyboard-only walkthrough (browse → inspect → act).
-- egui / AccessKit parity once the native GUI ([#34](https://github.com/krazyjakee/3DAM/issues/34))
-  is built.
+The other three #44 checks — the axe pass, the keyboard walkthrough, and the native GUI's
+AccessKit wiring — are covered in their own sections below; nothing on the epic remains
+outside this report.
 
 ## Reproduce
 
@@ -218,7 +217,40 @@ document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowR
 // → document.activeElement is now the next cell; Enter (or .click()) selects it.
 ```
 
-### Not yet covered (remaining #44 scope)
+---
 
-- egui / AccessKit keyboard + screen-reader parity, once the native GUI
-  ([#34](https://github.com/krazyjakee/3DAM/issues/34)) is built.
+## Native GUI — egui / AccessKit
+
+The desktop client ([#34](https://github.com/krazyjakee/3DAM/issues/34),
+`crates/3dam-gui`) exposes a platform accessibility tree via
+[AccessKit](https://accesskit.dev/) — AT-SPI on Linux, UIA on Windows, NSAccessibility on
+macOS. eframe's `accesskit` feature is enabled in `crates/3dam-gui/Cargo.toml`; the adapter
+activates on demand when a screen reader connects, and costs nothing otherwise.
+
+egui derives a widget's accessible name from its visible text, which is right for the stock
+text buttons but leaves two gaps this pass closed (mirroring the web axe fixes):
+
+- **Custom-painted widgets** (`painter()`-drawn, previously absent from the tree) now report
+  name / role / state through `Response::widget_info`: the sidebar `nav_row`s (name + selected
+  state), badge `pill`s (static text), grid cards and table rows (asset name, media type,
+  size, favourite — with selection state, the web cell's `aria-label`/`aria-pressed`), and
+  the sortable Name/Size table headers. Helpers live in `crates/3dam-gui/src/ui.rs`
+  (`access_label` / `access_toggle` / `access_text` / `access_combo` / `access_edit_label`).
+- **Icon-glyph controls** (phosphor icons, which otherwise read as a bare codepoint) carry
+  explicit names: the grid/table view toggle (with pressed state), source expand/collapse,
+  rescan and remove, folder disclosure, 3D-viewer reset/fullscreen, and the tag
+  restore/reject buttons. Unlabelled selects (sort order, search mode, Advanced-Search
+  filters) are named while keeping their current selection as the value; text inputs are
+  associated with their visible labels via `labelled_by` (or named directly where only
+  placeholder text exists).
+
+**Keyboard.** egui gives every `Sense::click()` widget a Tab stop and activates the focused
+widget on Enter/Space, so browse → inspect → act is keyboard-operable natively. The painted
+rows/cards, which draw their own chrome, now also draw the accent **focus ring**
+(`ui::focus_ring`, the web `:focus-visible` equivalent); stock widgets get theirs from egui.
+
+### Reproduce
+
+Run `3dam` under a screen reader (Orca on Linux, Narrator on Windows, VoiceOver on macOS), or
+inspect the AT-SPI tree directly with Accerciser — the workspace exposes the toolbar controls,
+the source/collection rows, and each asset cell by name with its selected state.

@@ -32,6 +32,7 @@ bytemuck = { version = "1", features = ["derive", "extern_crate_alloc"] }
 # egui/eframe (ADR 0005). wgpu backend — enables egui-wgpu paint callbacks for the interactive 3D
 # viewer, and (unlike glow's OpenGL context) coexists with dam-render's wgpu without an EGL clash.
 eframe = { version = "0.31", default-features = false, features = [
+    "accesskit",
     "default_fonts",
     "wgpu",
     "wayland",

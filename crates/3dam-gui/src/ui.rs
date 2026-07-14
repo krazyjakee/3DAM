@@ -5,7 +5,7 @@
 
 use eframe::egui::{
     self, Align, Color32, CornerRadius, FontFamily, FontId, Rect, Response, Sense, Stroke,
-    TextStyle, Vec2,
+    StrokeKind, TextStyle, Vec2, WidgetInfo, WidgetType,
 };
 
 use crate::theme::{colors, Colors};
@@ -18,6 +18,61 @@ pub use egui_phosphor::regular as icon;
 /// transparent)` used for tinted badge backgrounds.
 pub fn tint(fg: Color32, pct: f32) -> Color32 {
     Color32::from_rgba_unmultiplied(fg.r(), fg.g(), fg.b(), (pct * 255.0) as u8)
+}
+
+/// Name a glyph-only or custom-painted interactive widget in the accessibility tree (AccessKit,
+/// issue #44) — the egui counterpart of the web client's `aria-label` fixes. egui derives a
+/// widget's accessible name from its text, so phosphor-glyph buttons and `painter()`-drawn rows
+/// otherwise read as a bare icon codepoint (or nothing at all) to a screen reader.
+pub fn access_label(resp: &Response, label: &str) {
+    resp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, label));
+}
+
+/// Like [`access_label`] for toggle/selected controls — also conveys the pressed state (the web
+/// `aria-pressed` equivalent on the view toggle and grid cells).
+pub fn access_toggle(resp: &Response, selected: bool, label: &str) {
+    resp.widget_info(|| WidgetInfo::selected(WidgetType::SelectableLabel, true, selected, label));
+}
+
+/// Expose a painted glyph/graphic as static text (`Role::Label`) so assistive tech reads `text`
+/// instead of the raw glyph.
+pub fn access_text(resp: &Response, text: &str) {
+    resp.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, text));
+}
+
+/// Attach an accessible name to a text edit that has only placeholder text — the web
+/// `aria-label` on unlabelled inputs. Sets the label only; the edit keeps its own value,
+/// selection and text-run nodes.
+pub fn access_edit_label(resp: &Response, label: &str) {
+    resp.widget_info(|| WidgetInfo {
+        label: Some(label.to_owned()),
+        ..WidgetInfo::new(WidgetType::TextEdit)
+    });
+}
+
+/// Name a combo box while keeping its current selection as the value — the web `aria-label` on
+/// unlabelled `<select>`s (sort order, search mode, …).
+pub fn access_combo(resp: &Response, label: &str, value: &str) {
+    resp.widget_info(|| WidgetInfo {
+        label: Some(label.to_owned()),
+        current_text_value: Some(value.to_owned()),
+        ..WidgetInfo::new(WidgetType::ComboBox)
+    });
+}
+
+/// Paint the keyboard-focus ring (the web's `:focus-visible` accent outline) around a
+/// custom-painted widget. egui's stock widgets draw their own focus stroke; `painter()`-drawn
+/// rows and cards must opt in.
+pub fn focus_ring(ui: &egui::Ui, resp: &Response, rect: Rect) {
+    if resp.has_focus() {
+        let c = colors(ui.visuals().dark_mode);
+        ui.painter().rect_stroke(
+            rect,
+            CornerRadius::same(4),
+            Stroke::new(1.0, c.accent),
+            StrokeKind::Inside,
+        );
+    }
 }
 
 /// An uppercase, letter-spaced, dim section label (web `text-[10px] tracking-wider uppercase
@@ -49,6 +104,7 @@ pub fn pill(ui: &mut egui::Ui, text: &str, fg: Color32, bg: Color32) -> Response
     let p = ui.painter();
     p.rect_filled(rect, CornerRadius::same(3), bg);
     p.galley(rect.min + pad, galley, fg);
+    access_text(&resp, text);
     resp
 }
 
@@ -133,7 +189,8 @@ pub fn nav_row(
     let c = colors(ui.visuals().dark_mode);
     let full_w = ui.available_width();
     let (rect, resp) = ui.allocate_at_least(Vec2::new(full_w, 24.0), Sense::click());
-    let hovered = resp.hovered();
+    resp.widget_info(|| WidgetInfo::selected(WidgetType::SelectableLabel, true, active, label));
+    let hovered = resp.hovered() || resp.has_focus();
 
     let p = ui.painter();
     if active {
@@ -175,6 +232,7 @@ pub fn nav_row(
     let lg = p.layout(label.to_owned(), lf, fg, avail);
     let ly = rect.center().y - lg.size().y / 2.0;
     p.galley(egui::pos2(x, ly), lg, fg);
+    focus_ring(ui, &resp, rect);
 
     resp
 }
