@@ -13,6 +13,10 @@ dam-media.workspace = true
 # native/CLI build stays GPU-free (crate-map invariant); `serve` opts in via the `render` feature.
 dam-render = { workspace = true, optional = true }
 dam-sources = { workspace = true, features = ["sftp", "smb"] }
+# Federated peers (phase 6, issue #39): the engine's query fan-out is a *client* of a peer's HTTP
+# read API, and `ApiClient` is exactly that client — one transport, DTOs in lockstep by construction.
+dam-client.workspace = true
+url.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 futures.workspace = true

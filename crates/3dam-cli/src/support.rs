@@ -180,13 +180,23 @@ pub(crate) fn resolve_source_kind(kind: Option<&str>, target: &str) -> anyhow::R
             "local" | "local_fs" | "localfs" | "fs" => Ok(SourceKind::LocalFs),
             "sftp" | "ssh" => Ok(SourceKind::Sftp),
             "smb" | "cifs" => Ok(SourceKind::Smb),
-            other => Err(anyhow::anyhow!("invalid --kind '{other}' (local|sftp|smb)")),
+            "federated" | "peer" | "3dam" => Ok(SourceKind::Federated),
+            other => Err(anyhow::anyhow!(
+                "invalid --kind '{other}' (local|sftp|smb|federated)"
+            )),
         };
     }
     if target.starts_with("sftp://") {
         Ok(SourceKind::Sftp)
     } else if target.starts_with("smb://") {
         Ok(SourceKind::Smb)
+    } else if target.starts_with("3dam://")
+        || target.starts_with("3dams://")
+        || target.starts_with("http://")
+        || target.starts_with("https://")
+    {
+        // A peer 3DAM server (phase 6): the only source kind addressed over HTTP.
+        Ok(SourceKind::Federated)
     } else {
         Ok(SourceKind::LocalFs)
     }
@@ -240,8 +250,13 @@ pub(crate) fn print_search(page: &dam_api::page::Page<AssetSummary>) {
         return;
     }
     for a in &page.items {
+        // Attribute merged federated hits to their peer (phase 6); local rows stay clean.
+        let origin = match &a.origin {
+            dam_api::dto::Origin::Local => String::new(),
+            dam_api::dto::Origin::Peer(p) => format!("  @{p}"),
+        };
         println!(
-            "{}  {:<6} {:<5} {:>10}  {}",
+            "{}  {:<6} {:<5} {:>10}  {}{origin}",
             a.id,
             a.media.as_str(),
             a.format,
@@ -252,7 +267,22 @@ pub(crate) fn print_search(page: &dam_api::page::Page<AssetSummary>) {
     let shown = page.items.len();
     match page.total {
         Some(t) if t as usize > shown => println!("… {shown} of {t}"),
+        // Under federated fan-out no true total exists (ADR 0009 §5) — say what we know.
+        None if page.cursor.is_some() => println!("{shown}+ result(s)"),
         _ => println!("{shown} result(s)"),
+    }
+    if !page.partial.complete {
+        let dropped: Vec<&str> = page
+            .partial
+            .warnings
+            .iter()
+            .filter(|w| w.code == "peer_dropped")
+            .map(|w| w.subject.as_str())
+            .collect();
+        eprintln!(
+            "warning: partial results — source(s) did not answer: {}",
+            dropped.join(", ")
+        );
     }
 }
 

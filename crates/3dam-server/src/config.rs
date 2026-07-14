@@ -40,6 +40,9 @@ pub struct FlagsBlock {
     /// low-power host that wants to defer the render/analysis grind.
     pub auto_thumbnail: Option<bool>,
     pub auto_analyze: Option<bool>,
+    /// Serve as a federation peer (phase 6, issue #39): mounts `GET /api/v1/advertise` so other
+    /// 3DAM instances can register this one as a federated source. Off by default.
+    pub federation: Option<bool>,
 }
 
 impl ServeFile {
@@ -76,6 +79,9 @@ impl ServeFile {
         }
         if let Some(a) = self.flags.auto_analyze {
             out.push((FlagKey::AutoAnalyze, FlagValue::Bool(a)));
+        }
+        if let Some(f) = self.flags.federation {
+            out.push((FlagKey::Federation, FlagValue::Bool(f)));
         }
         out
     }

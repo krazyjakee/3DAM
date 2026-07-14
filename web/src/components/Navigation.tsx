@@ -605,6 +605,9 @@ function SourceRow({
 }) {
   const scanning = source.state === "scanning";
   const errored = typeof source.state === "object";
+  // A federated peer (issue #39) is another 3DAM instance, not a file tree: no folders to expand,
+  // nothing to rescan (its catalog is queried live via the fan-out), and its asset_count stays 0.
+  const peer = source.kind === "federated";
   // Folder navigation (issue #66): a source row is expandable to reveal its directory tree, lazily
   // loaded. Kept local — the choice is transient UI, not part of the linkable view state.
   const [open, setOpen] = useState(false);
@@ -619,18 +622,22 @@ function SourceRow({
     >
       {/* Disclosure — expand the source's folder tree (issue #66). Separate from selecting the
           source, so a user can browse into folders without first scoping to the whole source. */}
-      <button
-        onClick={() => setOpen((o) => !o)}
-        aria-expanded={open}
-        aria-label={open ? `Collapse ${source.name} folders` : `Expand ${source.name} folders`}
-        className="flex items-center justify-center text-fg-dim hover:text-fg coarse:min-h-11 coarse:min-w-11"
-      >
-        <ChevronRight
-          size={12}
-          className="transition-transform"
-          style={{ transform: open ? "rotate(90deg)" : "none" }}
-        />
-      </button>
+      {peer ? (
+        <span className="w-3 shrink-0" aria-hidden="true" />
+      ) : (
+        <button
+          onClick={() => setOpen((o) => !o)}
+          aria-expanded={open}
+          aria-label={open ? `Collapse ${source.name} folders` : `Expand ${source.name} folders`}
+          className="flex items-center justify-center text-fg-dim hover:text-fg coarse:min-h-11 coarse:min-w-11"
+        >
+          <ChevronRight
+            size={12}
+            className="transition-transform"
+            style={{ transform: open ? "rotate(90deg)" : "none" }}
+          />
+        </button>
+      )}
       <button
         className="flex min-w-0 flex-1 items-center gap-2 text-left coarse:min-h-11"
         onClick={onSelect}
@@ -656,18 +663,31 @@ function SourceRow({
         <span className="truncate" title={source.uri}>
           {source.name}
         </span>
-        <span className="text-[10px] text-fg-dim tabular-nums">{source.stats.asset_count}</span>
+        {/* kind tag — a federated source is a live peer, not scanned files, so mark it and skip
+            the (always-0) asset count that would misread as an empty source. */}
+        {peer ? (
+          <span
+            className="shrink-0 rounded bg-surface-2 px-1 text-[10px] tracking-wide text-fg-dim uppercase"
+            title="Federated peer — searched live"
+          >
+            peer
+          </span>
+        ) : (
+          <span className="text-[10px] text-fg-dim tabular-nums">{source.stats.asset_count}</span>
+        )}
       </button>
       {/* Hover-reveal under a mouse; always visible on touch, where there is no hover. */}
       <div className="hidden items-center gap-1 group-hover:flex coarse:flex">
-        <button
-          className="flex items-center justify-center text-fg-dim hover:text-accent coarse:min-h-11 coarse:min-w-11"
-          title="Quick rescan — changed files only (full re-scan lives in Settings)"
-          aria-label="Quick rescan this source (changed files only)"
-          onClick={onRescan}
-        >
-          <RefreshCw size={12} className={scanning ? "animate-spin" : ""} />
-        </button>
+        {!peer && (
+          <button
+            className="flex items-center justify-center text-fg-dim hover:text-accent coarse:min-h-11 coarse:min-w-11"
+            title="Quick rescan — changed files only (full re-scan lives in Settings)"
+            aria-label="Quick rescan this source (changed files only)"
+            onClick={onRescan}
+          >
+            <RefreshCw size={12} className={scanning ? "animate-spin" : ""} />
+          </button>
+        )}
         <button
           className="flex items-center justify-center text-fg-dim hover:text-danger disabled:opacity-40 coarse:min-h-11 coarse:min-w-11"
           title="Remove"

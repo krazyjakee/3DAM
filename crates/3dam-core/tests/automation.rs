@@ -162,6 +162,7 @@ async fn analyze_similar_dedup_and_review() {
                 asset: id_a,
                 k: 4,
                 filters: Vec::new(),
+                local_only: false,
             },
         )
         .await
@@ -355,6 +356,7 @@ async fn similar_on_unembedded_is_empty() {
                 asset: id,
                 k: 8,
                 filters: Vec::new(),
+                local_only: false,
             },
         )
         .await
@@ -429,6 +431,7 @@ async fn maintenance_clear_analysis_and_wipe() {
                 asset: id_a,
                 k: 4,
                 filters: Vec::new(),
+                local_only: false,
             },
         )
         .await
@@ -449,6 +452,7 @@ async fn maintenance_clear_analysis_and_wipe() {
                 asset: id_a,
                 k: 4,
                 filters: Vec::new(),
+                local_only: false,
             },
         )
         .await

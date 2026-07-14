@@ -3,6 +3,7 @@ import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "rea
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   ChevronRight,
+  CloudOff,
   FileCog,
   FileDown,
   Layers,
@@ -33,6 +34,7 @@ import { requestAutoplay } from "@/lib/audio-intent";
 import { Thumbnail } from "./Thumbnail";
 import { LicenseBadge } from "./LicenseBadge";
 import { MediaBadge } from "./MediaBadge";
+import { PeerBadge } from "./PeerBadge";
 import { ContextMenu, useLongPress, type MenuState } from "./ContextMenu";
 import { ExportDialog } from "./ExportDialog";
 import { ConvertDialog } from "./ConvertDialog";
@@ -112,6 +114,23 @@ export function Browser({ onOpenNav }: { onOpenNav?: () => void }) {
   );
   const total = assets.data?.pages[0]?.total ?? null;
   const byId = useMemo(() => new Map(items.map((a) => [a.id, a])), [items]);
+
+  // Federation fan-out (issue #39): a query page comes back `partial.complete === false` when a
+  // peer missed the merge deadline — the list under-represents the federated library, a degradation
+  // rather than an error. Any loaded page being partial flags the view; the dropped peer names come
+  // from the per-page `peer_dropped` warnings. Null ⇒ every page was complete, no notice.
+  const droppedPeers = useMemo(() => {
+    let incomplete = false;
+    const names = new Set<string>();
+    for (const p of assets.data?.pages ?? []) {
+      if (p.partial?.complete === false) {
+        incomplete = true;
+        for (const w of p.partial.warnings ?? [])
+          if (w.code === "peer_dropped") names.add(w.subject);
+      }
+    }
+    return incomplete ? [...names] : null;
+  }, [assets.data]);
 
   // Prefetch hint (issue #72): as each page loads, ask the server to warm that page's thumbnails +
   // preview meshes so the grid's HTTP fetches hit cache. Fire-and-forget — bytes still come over
@@ -230,6 +249,22 @@ export function Browser({ onOpenNav }: { onOpenNav?: () => void }) {
       {/* Folder breadcrumb (issue #66) — the current source + path segments, each clickable to jump
           up the tree. Only shown when browsing a source (not a collection view). */}
       <Breadcrumb />
+      {/* Partial-results strip (issue #39): one warn-tinted line, non-blocking — the results below
+          are real, just possibly missing a slow peer's contribution. */}
+      {droppedPeers && (
+        <div
+          role="status"
+          className="flex items-center gap-2 border-b border-warn/40 bg-warn/10 px-3 py-1 text-[11px] text-warn"
+        >
+          <CloudOff size={12} className="shrink-0" />
+          <span className="truncate">
+            Some sources didn’t answer — results may be partial
+            {droppedPeers.length > 0 && (
+              <span className="opacity-80"> ({droppedPeers.join(", ")})</span>
+            )}
+          </span>
+        </div>
+      )}
       {selection.size > 1 && (
         <SelectionBar
           assets={selectedAssets}
@@ -1030,6 +1065,8 @@ function TableRow({
         <span className="truncate text-fg" title={asset.name}>
           {asset.name}
         </span>
+        {/* federated-origin attribution (issue #39) — renders nothing for local assets */}
+        <PeerBadge origin={asset.origin} />
         {/* collapsed-duplicate count — a row has no "top right", so the red badge sits by the name */}
         {dupCount != null && dupCount > 0 && <DupBadge count={dupCount} className="shrink-0" />}
         <FavoriteStar asset={asset} />

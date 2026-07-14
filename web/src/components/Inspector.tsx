@@ -44,6 +44,7 @@ import { ImageViewer } from "./ImageViewer";
 import { TilePreview } from "./TilePreview";
 import { Thumbnail } from "./Thumbnail";
 import { MediaIcon } from "./MediaIcon";
+import { PeerBadge } from "./PeerBadge";
 import { Drawer } from "./Drawer";
 
 /** Inspector — a persistent right rail on `lg`, an overlay drawer below it (responsive + touch pass). Both
@@ -281,6 +282,8 @@ function Body({ asset }: { asset: Asset }) {
           <h1 className="min-w-0 flex-1 text-sm font-semibold break-words text-fg">
             {summary.name}
           </h1>
+          {/* federated-origin chip (issue #39) — renders nothing for local assets */}
+          <PeerBadge origin={summary.origin} className="mt-0.5" />
           <FavoriteButton asset={asset} />
         </div>
 

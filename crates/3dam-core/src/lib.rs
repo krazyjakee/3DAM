@@ -6,6 +6,7 @@ mod analysis;
 mod background;
 mod convert;
 mod export;
+mod federation;
 mod paths;
 mod scan;
 pub mod semantic;
@@ -417,6 +418,9 @@ pub struct EmbeddedLibrary {
     /// default. When present, the analysis pass also writes its space and text search can encode a
     /// query into it. Held behind the [`semantic::SemanticModel`] seam.
     semantic: Option<Arc<dyn semantic::SemanticModel>>,
+    /// Federated peers (phase 6, issue #39): the TTL-cached registry the query fan-out reads,
+    /// rebuilt from the source table and invalidated on source add/remove.
+    fed: federation::PeerRegistry,
 }
 
 impl EmbeddedLibrary {
@@ -453,6 +457,7 @@ impl EmbeddedLibrary {
             watchers,
             bg_pool: Arc::new(bg_pool),
             semantic,
+            fed: federation::PeerRegistry::new(),
         })
     }
 
@@ -479,6 +484,45 @@ impl EmbeddedLibrary {
         tokio::task::spawn_blocking(move || f(&store))
             .await
             .map_err(|e| LibError::Internal(e.to_string()))?
+    }
+
+    /// The local-index query path — the pre-federation body of [`LibraryService::query`], shared
+    /// by the plain path and the fan-out engine (which merges this page with the peers').
+    pub(crate) async fn local_query(
+        &self,
+        req: QueryRequest,
+    ) -> Result<Page<AssetSummary>, LibError> {
+        let model = self.semantic.clone();
+        self.db(move |s| {
+            // Model-backed text→asset search (semantic-search M4): when a semantic model is loaded and
+            // this is a Hybrid/Semantic text query, encode the query string into the model's shared
+            // space so assets that match the *meaning* (not the filename) rank in. Encoding is
+            // CPU-bound and runs here on the blocking DB thread. No model ⇒ `None` ⇒ model-free path.
+            let text_vec = match (&model, req.mode, req.text.as_deref()) {
+                (Some(m), SearchMode::Hybrid | SearchMode::Semantic, Some(t)) if !t.is_empty() => m
+                    .encode_text(MediaType::Image, t)
+                    .map(|v| (m.space_id(MediaType::Image), v)),
+                _ => None,
+            };
+            s.query_assets_semantic(&req, text_vec)
+        })
+        .await
+    }
+
+    /// The `media type → EmbeddingSpace id` map this instance ranks similarity in — what
+    /// `advertise()` publishes so peers can gate cross-peer similarity on an exact space match
+    /// (phase 6, issue #40). Model-free v1 spaces by default; a loaded semantic model overrides
+    /// its media with the model-backed space id.
+    pub fn embedding_spaces(&self) -> std::collections::BTreeMap<String, String> {
+        let mut spaces = std::collections::BTreeMap::new();
+        for media in [MediaType::Audio, MediaType::Image, MediaType::Model] {
+            let id = match &self.semantic {
+                Some(m) => m.space_id(media),
+                None => format!("{}-stats-v1", media.as_str()),
+            };
+            spaces.insert(media.as_str().to_string(), id);
+        }
+        spaces
     }
 
     /// Like [`Self::db`], but runs the closure on the bounded background pool (`bg_pool`) instead of
@@ -648,26 +692,25 @@ impl LibraryService for EmbeddedLibrary {
         _ctx: &AuthContext,
         req: QueryRequest,
     ) -> Result<Page<AssetSummary>, LibError> {
-        let model = self.semantic.clone();
-        self.db(move |s| {
-            // Model-backed text→asset search (semantic-search M4): when a semantic model is loaded and
-            // this is a Hybrid/Semantic text query, encode the query string into the model's shared
-            // space so assets that match the *meaning* (not the filename) rank in. Encoding is
-            // CPU-bound and runs here on the blocking DB thread. No model ⇒ `None` ⇒ model-free path.
-            let text_vec = match (&model, req.mode, req.text.as_deref()) {
-                (Some(m), SearchMode::Hybrid | SearchMode::Semantic, Some(t)) if !t.is_empty() => m
-                    .encode_text(MediaType::Image, t)
-                    .map(|v| (m.space_id(MediaType::Image), v)),
-                _ => None,
-            };
-            s.query_assets_semantic(&req, text_vec)
-        })
-        .await
+        // Federated fan-out (phase 6, issue #39): merge local + peer pages when federated sources
+        // are registered. `local_only` marks a peer-bound call — one hop, never transitive.
+        if !req.local_only {
+            if let Some(page) = federation::federated_query(self, &req).await? {
+                return Ok(page);
+            }
+        }
+        self.local_query(req).await
     }
 
     async fn get_asset(&self, _ctx: &AuthContext, id: &AssetId) -> Result<Asset, LibError> {
         let id = *id;
-        self.db(move |s| s.get_asset(&id)).await
+        match self.db(move |s| s.get_asset(&id)).await {
+            // A merged result can name a peer-owned asset: proxy the detail read (phase 6).
+            Err(LibError::NotFound(_)) => federation::proxy_get_asset(self, &id)
+                .await
+                .ok_or_else(|| LibError::NotFound(format!("asset {id}"))),
+            r => r,
+        }
     }
 
     async fn read_content(
@@ -676,11 +719,18 @@ impl LibraryService for EmbeddedLibrary {
         id: &AssetId,
     ) -> Result<AssetContent, LibError> {
         let id = *id;
-        self.db(move |s| {
-            let asset = s.get_asset(&id)?;
-            read_asset_content(s, &asset)
-        })
-        .await
+        let local = self
+            .db(move |s| {
+                let asset = s.get_asset(&id)?;
+                read_asset_content(s, &asset)
+            })
+            .await;
+        match local {
+            Err(LibError::NotFound(_)) => federation::proxy_read_content(self, &id)
+                .await
+                .ok_or_else(|| LibError::NotFound(format!("asset {id}"))),
+            r => r,
+        }
     }
 
     async fn read_related_content(
@@ -691,11 +741,19 @@ impl LibraryService for EmbeddedLibrary {
     ) -> Result<AssetContent, LibError> {
         let id = *id;
         let rel = rel.to_string();
-        self.db(move |s| {
-            let asset = s.get_asset(&id)?;
-            read_related_content(s, &asset, &rel)
-        })
-        .await
+        let rel2 = rel.clone();
+        let local = self
+            .db(move |s| {
+                let asset = s.get_asset(&id)?;
+                read_related_content(s, &asset, &rel2)
+            })
+            .await;
+        match local {
+            Err(LibError::NotFound(_)) => federation::proxy_read_related(self, &id, &rel)
+                .await
+                .ok_or_else(|| LibError::NotFound(format!("asset {id}"))),
+            r => r,
+        }
     }
 
     async fn read_thumbnail(
@@ -710,14 +768,23 @@ impl LibraryService for EmbeddedLibrary {
         // Fast path: a cheap cache probe on the unbounded pool, so an already-rendered thumbnail is
         // never stuck behind background generation.
         let probe_dir = data_dir.clone();
-        if let Some(hit) = self
+        let probe = self
             .db(move |s| {
                 let asset = s.get_asset(&id)?;
                 Ok(thumb_cache_lookup(&probe_dir, &asset, edge))
             })
-            .await?
-        {
-            return Ok(hit);
+            .await;
+        match probe {
+            Ok(Some(hit)) => return Ok(hit),
+            Ok(None) => {}
+            // Peer-owned asset: fetch its remote-owned preview — the one sanctioned federated byte
+            // transfer (tech-spec 07 §4) — through the 7-day local peer cache.
+            Err(LibError::NotFound(_)) => {
+                return federation::proxy_thumbnail(self, &id, edge)
+                    .await
+                    .ok_or_else(|| LibError::NotFound(format!("asset {id}")))
+            }
+            Err(e) => return Err(e),
         }
         // Cache miss: the expensive render/decode runs on the bounded background pool so a grid
         // burst can't starve an interactive inspector read (preview / waveform / detail).
@@ -735,11 +802,18 @@ impl LibraryService for EmbeddedLibrary {
     ) -> Result<AssetContent, LibError> {
         let id = *id;
         let data_dir = self.data_dir.clone();
-        self.db(move |s| {
-            let asset = s.get_asset(&id)?;
-            gen_model_preview(&data_dir, s, &asset)
-        })
-        .await
+        let local = self
+            .db(move |s| {
+                let asset = s.get_asset(&id)?;
+                gen_model_preview(&data_dir, s, &asset)
+            })
+            .await;
+        match local {
+            Err(LibError::NotFound(_)) => federation::proxy_model_preview(self, &id)
+                .await
+                .ok_or_else(|| LibError::NotFound(format!("asset {id}"))),
+            r => r,
+        }
     }
 
     async fn prefetch(&self, _ctx: &AuthContext, req: PrefetchRequest) -> Result<(), LibError> {
@@ -755,11 +829,11 @@ impl LibraryService for EmbeddedLibrary {
             .clamp(THUMB_MIN_EDGE, THUMB_MAX_EDGE);
         let store = self.store.clone();
         let data_dir = self.data_dir.clone();
-        let assets = req.assets;
+        let assets = req.assets.clone();
         tokio::task::spawn_blocking(move || {
             for id in assets {
                 let Ok(asset) = store.get_asset(&id) else {
-                    continue; // vanished — fail-soft
+                    continue; // vanished (or peer-owned) — fail-soft
                 };
                 let _ = gen_thumbnail(&data_dir, &store, &asset, edge);
                 if asset.summary.media == MediaType::Model {
@@ -767,6 +841,19 @@ impl LibraryService for EmbeddedLibrary {
                 }
             }
         });
+        // Merged grids can hold peer assets: forward the same hint so each peer warms its own
+        // derivatives (phase 6). Fire-and-forget, same as the local pass — ids a peer doesn't own
+        // are its no-ops.
+        for peer in self.fed_peers().await.iter() {
+            let peer = peer.clone();
+            let req = req.clone();
+            tokio::spawn(async move {
+                let _ = peer
+                    .client
+                    .prefetch(&dam_api::service::AuthContext::embedded(), req)
+                    .await;
+            });
+        }
         Ok(())
     }
 
@@ -842,12 +929,49 @@ impl LibraryService for EmbeddedLibrary {
             default_name = conn.display_uri();
         }
 
+        // Federated peer: handshake up front (phase 6, issue #39) — verify the peer serves
+        // federation and speaks a compatible protocol version, so a typo'd endpoint or a
+        // flag-off peer fails here with a clear message, not silently at first query.
+        if let dam_sources::SourceConnection::Federated(cfg) = &conn {
+            let client = federation::connect_peer(&cfg.endpoint, cfg.token.clone()).await?;
+            let ad = tokio::time::timeout(federation::ADD_HANDSHAKE_TIMEOUT, client.advertise())
+                .await
+                .map_err(|_| {
+                    LibError::BadRequest(format!(
+                        "peer {} did not answer advertise in time",
+                        cfg.endpoint
+                    ))
+                })?
+                .map_err(|e| match e {
+                    LibError::NotFound(_) => LibError::BadRequest(format!(
+                        "peer {} is not serving federation — enable its 'federation' flag",
+                        cfg.endpoint
+                    )),
+                    e => LibError::BadRequest(format!("peer {} unreachable: {e}", cfg.endpoint)),
+                })?;
+            if !dam_api::protocol_compatible(
+                &ad.protocol_version,
+                dam_api::FEDERATION_PROTOCOL_VERSION,
+            ) {
+                return Err(LibError::BadRequest(format!(
+                    "peer {} speaks federation protocol {} but this build speaks {}",
+                    cfg.endpoint,
+                    ad.protocol_version,
+                    dam_api::FEDERATION_PROTOCOL_VERSION
+                )));
+            }
+        }
+
         let name = req.name.clone().unwrap_or(default_name);
         let watch = req.options.watch;
+        let is_federated = matches!(conn, dam_sources::SourceConnection::Federated(_));
         let id = self.db(move |s| s.add_source(&conn, &name, watch)).await?;
         // Start watching immediately if requested (tech-spec 07 §3.1).
         if watch {
             self.watchers.ensure(id);
+        }
+        if is_federated {
+            self.fed.invalidate().await; // participate in the very next query
         }
         Ok(id)
     }
@@ -860,7 +984,9 @@ impl LibraryService for EmbeddedLibrary {
     ) -> Result<(), LibError> {
         let id = *id;
         self.db(move |s| s.remove_source(&id, req.keep_metadata))
-            .await
+            .await?;
+        self.fed.invalidate().await;
+        Ok(())
     }
 
     // ── remove / blocklist (issue #21) ───────────────────────────────────────
@@ -1093,10 +1219,11 @@ impl LibraryService for EmbeddedLibrary {
 
     async fn find_similar(
         &self,
-        _ctx: &AuthContext,
+        ctx: &AuthContext,
         req: SimilarRequest,
     ) -> Result<Page<SimilarHit>, LibError> {
-        let SimilarRequest { asset, k, filters } = req;
+        let (asset, k) = (req.asset, req.k);
+        let filters = req.filters.clone();
         let hits = self
             .db(move |s| s.similar(&asset, k, &filters))
             .await?
@@ -1104,6 +1231,78 @@ impl LibraryService for EmbeddedLibrary {
             // Tag each hit with the media space it was ranked in (the explanation, §3.2).
             .map(|(asset, score)| SimilarHit {
                 space: format!("{}-stats-v1", asset.media.as_str()),
+                asset,
+                score,
+            })
+            .collect::<Vec<_>>();
+        if req.local_only {
+            return Ok(Page::new(hits, None));
+        }
+        // Cross-peer similarity (phase 6, issue #40): ship the query asset's own vector to every
+        // matched-space peer and merge one globally-ranked list. No vector yet (or a source-pinned
+        // query) degrades to the local page. A peer-owned query asset is instead forwarded whole —
+        // the owning peer ranks it in its index (`local_only` keeps that a single hop).
+        if self.fed_peers().await.is_empty()
+            || req.filters.iter().any(|f| f.field == FacetField::Source)
+        {
+            return Ok(Page::new(hits, None));
+        }
+        let embedding = self.db(move |s| s.embedding_for(&asset)).await?;
+        match embedding {
+            Some((space, vector)) => {
+                let media = self.get_asset(ctx, &req.asset).await?.summary.media;
+                Ok(federation::federated_similar(self, &req, media, space, vector, hits).await)
+            }
+            None => {
+                let local_has = !hits.is_empty()
+                    || self
+                        .db(move |s| s.get_asset(&asset).map(|_| ()))
+                        .await
+                        .is_ok();
+                if local_has {
+                    return Ok(Page::new(hits, None));
+                }
+                for peer in self.fed_peers().await.iter() {
+                    let mut fwd = req.clone();
+                    fwd.local_only = true;
+                    if let Ok(Ok(mut page)) = tokio::time::timeout(
+                        federation::QUERY_DEADLINE,
+                        peer.client.find_similar(ctx, fwd),
+                    )
+                    .await
+                    {
+                        for hit in &mut page.items {
+                            hit.asset.origin = Origin::Peer(peer.name.clone());
+                        }
+                        return Ok(page);
+                    }
+                }
+                Ok(Page::new(hits, None))
+            }
+        }
+    }
+
+    async fn find_similar_by_vector(
+        &self,
+        _ctx: &AuthContext,
+        req: dam_api::VectorSimilarRequest,
+    ) -> Result<Page<SimilarHit>, LibError> {
+        // The serving side of cross-peer similarity (issue #40): rank the shipped vector against
+        // this catalog's own index. Strictly local by construction — never re-fans-out.
+        let dam_api::VectorSimilarRequest {
+            media: _,
+            space,
+            vector,
+            k,
+            filters,
+        } = req;
+        let space_for_hits = space.clone();
+        let hits = self
+            .db(move |s| s.similar_by_vector(&space, &vector, k, &filters))
+            .await?
+            .into_iter()
+            .map(|(asset, score)| SimilarHit {
+                space: space_for_hits.clone(),
                 asset,
                 score,
             })

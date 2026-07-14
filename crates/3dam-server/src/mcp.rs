@@ -366,6 +366,7 @@ impl McpAdapter {
                     asset: parse_asset(&a.id)?,
                     k: a.limit.unwrap_or(12),
                     filters: Vec::new(),
+                    local_only: false,
                 };
                 to_value(&lib.find_similar(ctx, req).await?)
             }

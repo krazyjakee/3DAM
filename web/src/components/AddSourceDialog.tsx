@@ -5,13 +5,13 @@ import { ApiError } from "@/api/client";
 import { Modal } from "@/lib/dialogs";
 import type { SourceKind, SourceOptions } from "@/api/types";
 
-// local_fs, sftp and smb are all backed by the phase-4 engine; federated peers are not built yet, so
-// they stay disabled rather than offering a dead option.
+// local_fs, sftp and smb are backed by the phase-4 engine; federated peers by the phase-6
+// query fan-out (issue #39).
 const KINDS: { value: SourceKind; label: string; enabled: boolean }[] = [
   { value: "local_fs", label: "Local folder", enabled: true },
   { value: "sftp", label: "SFTP", enabled: true },
   { value: "smb", label: "SMB / Samba", enabled: true },
-  { value: "federated", label: "Federated peer (soon)", enabled: false },
+  { value: "federated", label: "Federated peer", enabled: true },
 ];
 
 // Per-kind copy for the primary URI/path input.
@@ -19,7 +19,10 @@ const URI_FIELD: Record<SourceKind, { label: string; placeholder: string }> = {
   local_fs: { label: "Path", placeholder: "/mnt/assets/sfx" },
   sftp: { label: "SFTP URI", placeholder: "sftp://user@host:22/path/to/assets" },
   smb: { label: "SMB URI", placeholder: "smb://host/share/path" },
-  federated: { label: "Peer", placeholder: "" },
+  federated: {
+    label: "Peer endpoint",
+    placeholder: "3dam://host:7878 or https://assets.example.com",
+  },
 };
 
 export function AddSourceDialog({ onClose }: { onClose: () => void }) {
@@ -41,12 +44,17 @@ export function AddSourceDialog({ onClose }: { onClose: () => void }) {
   const [port, setPort] = useState("");
 
   const remote = kind === "sftp" || kind === "smb";
+  const federated = kind === "federated";
 
   const submit = async () => {
     setErr(null);
     if (!uri.trim()) return setErr(`A ${URI_FIELD[kind].label.toLowerCase()} is required.`);
 
-    const options: SourceOptions = { watch };
+    const options: SourceOptions = { watch: !federated && watch };
+    if (federated && password) {
+      // The peer bearer token rides in the same secret slot the other network kinds use.
+      options.password = password;
+    }
     if (remote) {
       // Only attach the credentials that were actually filled in — the backend prefers these over
       // anything parsed from the URI and ignores empties.
@@ -77,7 +85,8 @@ export function AddSourceDialog({ onClose }: { onClose: () => void }) {
       // and forget: the scan is a background job, so the modal must NOT wait for it to finish before
       // closing. Awaiting it here serialised the UI — a second source couldn't be queued until the
       // first had fully scanned (issue #1). Any scan-submit failure surfaces as a toast (#23).
-      scan.mutate({ sources: [id], mode: "full" });
+      // A federated peer is never scanned — its catalog is queried live via the fan-out (issue #39).
+      if (!federated) scan.mutate({ sources: [id], mode: "full" });
       onClose();
     } catch (e) {
       setErr(e instanceof ApiError ? e.message : String(e));
@@ -115,6 +124,25 @@ export function AddSourceDialog({ onClose }: { onClose: () => void }) {
           autoFocus
           onKeyDown={(e) => e.key === "Enter" && submit()}
         />
+
+        {federated && (
+          <>
+            <Field label="Bearer token (optional)">
+              <input
+                className="field"
+                type="password"
+                placeholder="peer API token, if it requires one"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                autoComplete="new-password"
+              />
+            </Field>
+            <p className="mb-3 text-[11px] text-fg-dim">
+              The peer is another 3DAM server with its <code className="font-mono">federation</code>{" "}
+              flag enabled; its assets appear in searches here, fetched live.
+            </p>
+          </>
+        )}
 
         {remote && (
           <>
@@ -189,15 +217,18 @@ export function AddSourceDialog({ onClose }: { onClose: () => void }) {
           onChange={(e) => setName(e.target.value)}
         />
 
-        <label className="mb-3 flex items-center gap-2 text-xs text-fg-muted select-none coarse:min-h-11">
-          <input
-            type="checkbox"
-            className="coarse:h-5 coarse:w-5"
-            checked={watch}
-            onChange={(e) => setWatch(e.target.checked)}
-          />
-          Watch for changes and re-scan deltas
-        </label>
+        {/* A peer isn't a file tree — there is nothing to watch or rescan, so the toggle hides. */}
+        {!federated && (
+          <label className="mb-3 flex items-center gap-2 text-xs text-fg-muted select-none coarse:min-h-11">
+            <input
+              type="checkbox"
+              className="coarse:h-5 coarse:w-5"
+              checked={watch}
+              onChange={(e) => setWatch(e.target.checked)}
+            />
+            Watch for changes and re-scan deltas
+          </label>
+        )}
 
         {err && <p className="mb-3 text-xs text-danger">{err}</p>}
 
@@ -210,7 +241,7 @@ export function AddSourceDialog({ onClose }: { onClose: () => void }) {
             onClick={submit}
             disabled={add.isPending}
           >
-            {add.isPending ? "Adding…" : "Add & scan"}
+            {add.isPending ? "Adding…" : federated ? "Add peer" : "Add & scan"}
           </button>
         </div>
     </Modal>

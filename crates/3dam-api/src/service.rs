@@ -8,6 +8,7 @@
 use crate::dto::*;
 use crate::error::LibError;
 use crate::event::{LibraryEvent, SubscribeRequest};
+use crate::federation::VectorSimilarRequest;
 use crate::id::{AssetId, CollectionId, ContentHash, JobId, SourceId};
 use crate::page::{Page, PageParams};
 use async_trait::async_trait;
@@ -289,6 +290,20 @@ pub trait LibraryService: Send + Sync {
         ctx: &AuthContext,
         req: SimilarRequest,
     ) -> Result<Page<SimilarHit>, LibError>;
+
+    /// "Find similar" **by vector** — the federated entry point (phase 6, issue #40): a peer embeds
+    /// locally, ships the vector, and this instance ranks it against its own index in the named
+    /// space. Never merges across spaces: a `space` this instance doesn't serve for `media` is a
+    /// `BadRequest`, not an empty page. Default: `Unsupported`, so non-serving backends opt out.
+    async fn find_similar_by_vector(
+        &self,
+        _ctx: &AuthContext,
+        _req: VectorSimilarRequest,
+    ) -> Result<Page<SimilarHit>, LibError> {
+        Err(LibError::Unsupported(
+            "similar-by-vector is not served by this backend".into(),
+        ))
+    }
 
     /// The duplicate groups for the review view — exact (content hash) or near (perceptual/embedding),
     /// each carrying its linking signal + a suggested keep (§4). Grouping only; nothing is deleted.

@@ -184,6 +184,22 @@ export function Settings() {
         </FlagCard>
 
         <FlagCard
+          title="Federation peer"
+          hint="Serve this instance's catalog to other 3DAM instances (advertise endpoint)."
+          flag={flag("federation")}
+        >
+          <Toggle
+            label="Federation peer"
+            checked={flag("federation")?.value === true}
+            disabled={busyFlag !== null}
+            onChange={(v) => {
+              const f = flag("federation");
+              if (f) void setFlag(f.key, v, f.version);
+            }}
+          />
+        </FlagCard>
+
+        <FlagCard
           title="Auto-generate previews"
           hint="Hosted mode: the server renders thumbnails + 3D previews on ingest so clients hit ready data. Off defers rendering to first request (lower-power hosts)."
           flag={flag("auto_thumbnail")}

@@ -143,6 +143,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/api/v1/stats", get(stats))
         .route("/api/v1/convert", post(convert))
         .route("/api/v1/similar", post(find_similar))
+        // Federation surface (phase 6, issue #39): statically mounted, 404 while the `federation`
+        // flag is off — the same route-level-guard mechanism as `/mcp` ("off ⇒ absent", ADR 0004).
+        .route("/api/v1/advertise", get(advertise))
+        .route("/api/v1/similar-by-vector", post(similar_by_vector))
         .route("/api/v1/duplicates", post(list_duplicates))
         .route("/api/v1/suggestions/review", post(review_suggestion))
         .route("/api/v1/assets/favorite", post(set_favorite))
@@ -637,6 +641,42 @@ async fn find_similar(
     Json(req): Json<SimilarRequest>,
 ) -> Result<Json<dam_api::page::Page<SimilarHit>>, ApiError> {
     Ok(Json(st.lib.find_similar(&ctx, req).await?))
+}
+
+/// Peer self-description (phase 6, issue #39): federation protocol version, catalog weight, and the
+/// embedding space per media type — what a caller needs to register this instance as a federated
+/// source and gate cross-peer similarity (issue #40). 404 while the `federation` flag is off.
+async fn advertise(
+    Reader(ctx): Reader,
+    State(st): State<AppState>,
+) -> Result<Json<dam_api::PeerAdvertise>, ApiError> {
+    if !st.store.federation() {
+        return Err(ApiError(LibError::NotFound(
+            "federation is disabled".into(),
+        )));
+    }
+    let stats = st.lib.library_stats(&ctx).await?;
+    Ok(Json(dam_api::PeerAdvertise {
+        protocol_version: dam_api::FEDERATION_PROTOCOL_VERSION.to_string(),
+        instance: st.bind.clone(),
+        assets: stats.total,
+        spaces: st.lib.embedding_spaces(),
+    }))
+}
+
+/// The federated form of `/similar`: rank a caller-supplied vector against this instance's own
+/// index (issue #40). Part of the federation surface, so it shares the flag gate.
+async fn similar_by_vector(
+    Reader(ctx): Reader,
+    State(st): State<AppState>,
+    Json(req): Json<dam_api::VectorSimilarRequest>,
+) -> Result<Json<dam_api::page::Page<SimilarHit>>, ApiError> {
+    if !st.store.federation() {
+        return Err(ApiError(LibError::NotFound(
+            "federation is disabled".into(),
+        )));
+    }
+    Ok(Json(st.lib.find_similar_by_vector(&ctx, req).await?))
 }
 
 async fn list_duplicates(

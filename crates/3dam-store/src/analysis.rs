@@ -367,6 +367,72 @@ impl Store {
         Ok(out)
     }
 
+    /// The stored embedding for one asset — `(space_id, vector)`, or `None` when not yet analysed.
+    /// The federated fan-out ships this vector to matched-space peers (phase 6, issue #40).
+    pub fn embedding_for(&self, id: &AssetId) -> Result<Option<(String, Vec<f32>)>, LibError> {
+        let conn = self.conn.lock().unwrap();
+        let row: Option<(String, Vec<u8>)> = conn
+            .query_row(
+                "SELECT space_id, vec FROM embedding WHERE asset_id = ?1",
+                params![id.as_bytes().to_vec()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(internal)?;
+        Ok(row.map(|(s, v)| (s, bytes_to_f32(&v))))
+    }
+
+    /// Cosine-nearest neighbours of an arbitrary query vector in `space_id` — the serving side of
+    /// cross-peer similarity (phase 6, issue #40). A space this catalog has no vectors in — or a
+    /// dimension mismatch — is a `BadRequest`, not a silent empty page, so the caller's exact-match
+    /// space gate stays honest. Same over-fetch + facet post-filter as [`Self::similar`]; no
+    /// self-drop (the query vector has no local identity).
+    pub fn similar_by_vector(
+        &self,
+        space_id: &str,
+        qvec: &[f32],
+        k: u32,
+        filters: &[Filter],
+    ) -> Result<Vec<(AssetSummary, f32)>, LibError> {
+        let conn = self.conn.lock().unwrap();
+        let dim: Option<i64> = conn
+            .query_row(
+                "SELECT LENGTH(vec) / 4 FROM embedding WHERE space_id = ?1 LIMIT 1",
+                params![space_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(internal)?;
+        match dim {
+            None => {
+                return Err(LibError::BadRequest(format!(
+                    "embedding space {space_id:?} is not served by this catalog"
+                )))
+            }
+            Some(d) if d as usize != qvec.len() => {
+                return Err(LibError::BadRequest(format!(
+                    "query vector has {} dims; space {space_id:?} has {d}",
+                    qvec.len()
+                )))
+            }
+            Some(_) => {}
+        }
+        let overfetch = (k as usize * 4).max(k as usize + 16);
+        let scored = self.nearest_in_space(&conn, space_id, qvec, overfetch)?;
+        let candidate_ids: Vec<AssetId> = scored.iter().map(|(a, _)| *a).collect();
+        let summaries = Self::summaries_for_ids(&conn, &candidate_ids, filters)?;
+        let mut out = Vec::new();
+        for (aid, score) in scored {
+            if out.len() >= k as usize {
+                break;
+            }
+            if let Some(sum) = summaries.get(&aid) {
+                out.push((sum.clone(), score));
+            }
+        }
+        Ok(out)
+    }
+
     /// Nearest neighbours of an arbitrary query vector in `space_id`, `(id, cosine)` desc, capped at
     /// `k`. This is the text→asset entry point (semantic-search M4/M5): the engine encodes a query
     /// string into the model's shared space, then this finds the closest assets — no reference asset

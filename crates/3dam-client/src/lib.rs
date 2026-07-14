@@ -15,7 +15,7 @@ use dam_api::event::{LibraryEvent, SubscribeRequest};
 use dam_api::id::{AssetId, CollectionId, ContentHash, JobId, SourceId};
 use dam_api::page::{Page, PageParams};
 use dam_api::service::{AuthContext, EventStream, LibraryService};
-use dam_api::{ErrorBody, LibError};
+use dam_api::{ErrorBody, LibError, PeerAdvertise};
 use futures::StreamExt;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -255,6 +255,15 @@ impl ApiClient {
             .await
             .map_err(|e| LibError::SourceUnavailable(e.to_string()))?;
         Self::decode(resp).await
+    }
+
+    // ── federation (phase 6, issue #39) — this client is also the peer transport ──
+
+    /// `GET /api/v1/advertise` — the peer's self-description (protocol version, catalog weight,
+    /// embedding spaces). 404 while the peer's `federation` flag is off, which callers surface as
+    /// "this instance is not serving federation".
+    pub async fn advertise(&self) -> Result<PeerAdvertise, LibError> {
+        self.get("/api/v1/advertise").await
     }
 
     // ── admin API (tech-spec 10 §5) — the CLI's `--connect` admin path ────────
@@ -550,6 +559,14 @@ impl LibraryService for ApiClient {
         req: SimilarRequest,
     ) -> Result<Page<SimilarHit>, LibError> {
         self.post("/api/v1/similar", &req).await
+    }
+
+    async fn find_similar_by_vector(
+        &self,
+        _ctx: &AuthContext,
+        req: dam_api::VectorSimilarRequest,
+    ) -> Result<Page<SimilarHit>, LibError> {
+        self.post("/api/v1/similar-by-vector", &req).await
     }
 
     async fn list_duplicates(

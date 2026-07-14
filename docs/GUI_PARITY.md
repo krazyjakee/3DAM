@@ -54,6 +54,9 @@ Legend: ✅ done · 🟡 partial · ⬜ owed (not yet in egui) · ▫ n/a (out o
 | Responsive / touch pass | ✅ | ▫ | The web pass targets the mobile/`coarse:` case (single-column collapse, drawers, 44px touch targets) — not applicable to a resizable desktop window (the three-region layout uses resizable panels instead). |
 | Accessibility (#44) | ✅ | ✅ | AccessKit enabled (`accesskit` eframe feature → AT-SPI/UIA/NSAccessibility): custom-painted rows/cards/badges report name+role+state via `widget_info`, icon-glyph buttons carry explicit names, selects/inputs are labelled, painted widgets draw the accent focus ring. See `docs/a11y-contrast.md` §Native GUI. |
 | 3D viewer on-canvas controls (#65) | ✅ | ✅ | orbit/zoom + control bar: auto-orbit · wireframe · lighting cycle (studio/soft/flat) · reset · fullscreen (Esc to exit) |
+| Federation (#39): add a federated peer source | ✅ | ✅ | web AddSourceDialog kind + native rail add form (Folder/Peer toggle): endpoint (`3dam://host:7878` or `http(s)://…`) + optional bearer token (rides in `options.password`); engine validates the peer at add time, errors surface inline. No scan/rescan/folder-tree for peers — they contribute merged catalog rows, not bytes; the sources list renders them with a globe glyph + neutral "peer" chip |
+| Federation (#39): peer-origin attribution | ✅ | ✅ | small neutral chip naming the peer on table rows (web `PeerBadge` / native painted chip in the name column) + inspector title chip and an "Origin" detail row; local assets stay chrome-free. Grid tiles skipped in both clients (too noisy) |
+| Federation (#39): partial-results notice | ✅ | ✅ | when a query page comes back `partial.complete == false`, a slim warn-tinted strip above the browser — "Some sources didn't answer — results may be partial", naming the `peer_dropped` peers. A degradation notice, not an error |
 
 ## State of the egui client
 

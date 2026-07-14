@@ -1848,6 +1848,7 @@ dependencies = [
  "candle-transformers",
  "csv",
  "dam-api",
+ "dam-client",
  "dam-media",
  "dam-render",
  "dam-sources",
@@ -1865,6 +1866,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -1933,6 +1935,7 @@ dependencies = [
  "dam-api",
  "dam-core",
  "futures",
+ "image",
  "rusqlite",
  "rust-embed",
  "rustls",

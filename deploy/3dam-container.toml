@@ -19,3 +19,9 @@ auth = "off"
 # ceiling (network_writes = false) would leave the web UI read-only out of the box, unable even to
 # add a source. Inside the container's trust boundary that gate serves no one, so open it.
 network_writes = true
+
+# Serve this instance as a federation peer (phase 6, issue #39): another 3DAM instance can add it
+# as a `3dam://host:7878` source and browse/search its catalog merged into its own. The appliance
+# posture is "the server everyone points at", so the advertise surface ships on; the reads a peer
+# performs are the same read API every browser on the published port already has.
+federation = true

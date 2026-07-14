@@ -34,3 +34,5 @@ toml.workspace = true
 [dev-dependencies]
 # drive the router in-process (no port bind) via `ServiceExt::oneshot` (phase-5 integration tests).
 tower = { workspace = true, features = ["util"] }
+# analyzable PNG fixtures for the federation similarity tests (phase 6, issue #40).
+image.workspace = true

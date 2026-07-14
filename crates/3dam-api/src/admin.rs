@@ -52,15 +52,21 @@ pub enum FlagKey {
     /// `bool` — the hosted-mode background pipeline auto-runs the analysis pass (embeddings,
     /// auto-tags, derived attrs) on ingest (issue #71). On by default; off leaves thumbnails-only.
     AutoAnalyze,
+    /// `bool` — serve this instance as a federation peer (phase 6, issue #39): mounts
+    /// `GET /api/v1/advertise` so other 3DAM instances can register this one as a federated
+    /// source. Off by default; off means the surface disappears (ADR 0004). The read queries a
+    /// peer then issues are the ordinary read API under the ordinary auth gate.
+    Federation,
 }
 
 impl FlagKey {
-    pub const ALL: [FlagKey; 5] = [
+    pub const ALL: [FlagKey; 6] = [
         FlagKey::Authentication,
         FlagKey::McpServer,
         FlagKey::NetworkWrites,
         FlagKey::AutoThumbnail,
         FlagKey::AutoAnalyze,
+        FlagKey::Federation,
     ];
     /// The stable string used in the URL, the store, and the config file.
     pub fn as_str(self) -> &'static str {
@@ -70,6 +76,7 @@ impl FlagKey {
             FlagKey::NetworkWrites => "network_writes",
             FlagKey::AutoThumbnail => "auto_thumbnail",
             FlagKey::AutoAnalyze => "auto_analyze",
+            FlagKey::Federation => "federation",
         }
     }
     pub fn parse(s: &str) -> Option<FlagKey> {
@@ -102,6 +109,7 @@ impl FlagValue {
                 | (FlagKey::NetworkWrites, FlagValue::Bool(_))
                 | (FlagKey::AutoThumbnail, FlagValue::Bool(_))
                 | (FlagKey::AutoAnalyze, FlagValue::Bool(_))
+                | (FlagKey::Federation, FlagValue::Bool(_))
         )
     }
 }

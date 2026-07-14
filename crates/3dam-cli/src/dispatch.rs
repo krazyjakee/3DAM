@@ -449,6 +449,7 @@ pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                         asset,
                         k: limit,
                         filters: Vec::new(),
+                        local_only: false,
                     },
                 )
                 .await?;

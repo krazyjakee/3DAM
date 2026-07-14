@@ -297,22 +297,24 @@ pub(crate) enum BlocklistCmd {
 
 #[derive(Subcommand)]
 pub(crate) enum SourceCmd {
-    /// Add a file source: a local path, or `sftp://user@host/path` / `smb://host/share/path`.
+    /// Add a source: a local path, `sftp://user@host/path`, `smb://host/share/path`, or a
+    /// federated 3DAM peer (`3dam://host:7878` / `https://…`) whose catalog merges into queries.
     Add {
-        /// Local directory path, or an `sftp://` / `smb://` URL.
+        /// Local directory path, an `sftp://` / `smb://` URL, or a `3dam://` / `http(s)://` peer.
         target: String,
         #[arg(long)]
         name: Option<String>,
         /// Auto-rescan on change (local: filesystem events; remote: polling).
         #[arg(long)]
         watch: bool,
-        /// Force the source kind: `local`|`sftp`|`smb` (default: inferred from the URL scheme).
+        /// Force the source kind: `local`|`sftp`|`smb`|`federated` (default: inferred from the
+        /// URL scheme).
         #[arg(long)]
         kind: Option<String>,
         /// Login user (SFTP/SMB); overrides any `user@` in the URL.
         #[arg(long)]
         username: Option<String>,
-        /// Password (SFTP/SMB).
+        /// Password (SFTP/SMB) — or the bearer token for a federated peer.
         #[arg(long)]
         password: Option<String>,
         /// Private key file for SFTP key auth.

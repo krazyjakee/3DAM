@@ -37,3 +37,9 @@ network_writes = false
 # low-power host to defer that grind to on-demand generation.
 auto_thumbnail = true
 auto_analyze   = true
+
+# Federation peer mode (phase 6, issue #39): serve `GET /api/v1/advertise` so other 3DAM instances
+# can add this one as a `3dam://` source and merge its catalog into their queries. Off by default —
+# off means the surface disappears (ADR 0004). Peer reads ride the normal auth gate above, so in
+# token mode a peer needs a read-scoped bearer token (`--password` on `sources add`).
+federation = false

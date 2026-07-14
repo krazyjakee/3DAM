@@ -26,11 +26,11 @@ use dam_api::{
     CollectionKind, CollectionMembers, CollisionRule, ContentHash, ConvertReport, ConvertRequest,
     ConvertTarget, DupGroup, DupKind, DupRequest, EventTopic, ExportFormat, ExportReport,
     ExportRequest, FacetField, Filter, FilterOp, FilterValue, FolderEntry, FolderListing, JobState,
-    LibraryEvent, LibraryStats, LicenseStatus, MediaAttributes, MediaType, NewCollection, Page,
-    PageParams, PrefetchRequest, QueryRequest, RemoveAsset, RemoveSource, ReviewAction, ScanMode,
-    ScanRequest, SearchMode, SimilarHit, SimilarRequest, Sort, SortDir, SortField, SourceId,
-    SourceInfo, SourceKind, SubscribeRequest, SuggestionReview, ThumbnailRegenRequest,
-    UpdateCollection,
+    LibraryEvent, LibraryStats, LicenseStatus, MediaAttributes, MediaType, NewCollection, Origin,
+    Page, PageParams, PrefetchRequest, QueryRequest, RemoveAsset, RemoveSource, ReviewAction,
+    ScanMode, ScanRequest, SearchMode, SimilarHit, SimilarRequest, Sort, SortDir, SortField,
+    SourceId, SourceInfo, SourceKind, SourceOptions, SubscribeRequest, SuggestionReview,
+    ThumbnailRegenRequest, UpdateCollection,
 };
 use futures::StreamExt;
 
@@ -82,6 +82,9 @@ enum FolderState {
 enum SourceAction {
     /// Add a local-filesystem source at this path (then scan it).
     AddLocal(String),
+    /// Add a federated 3DAM peer (issue #39): endpoint + optional bearer token. Peers yield merged
+    /// catalog rows, not bytes — no scan follows.
+    AddFederated(String, Option<String>),
     Remove(SourceId),
     Rescan(SourceId),
 }
@@ -468,6 +471,9 @@ enum Msg {
     Stats(Result<LibraryStats, String>),
     Thumb(AssetId, Option<ThumbPixels>),
     Folders(FolderKey, Result<Vec<FolderEntry>, String>),
+    /// An add-source finished — `Err` carries the engine's BadRequest message (e.g. a federated
+    /// peer that failed its add-time handshake) so the rail surfaces it instead of dropping it.
+    SourceAdded(Result<(), String>),
     /// A live change from the engine's event stream (scan/analyze/convert, source state, …).
     Event(LibraryEvent),
     Similar(AssetId, Result<Vec<SimilarHit>, String>),
@@ -639,6 +645,10 @@ pub struct DamGui {
     folders: HashMap<FolderKey, FolderState>,
     assets: Vec<AssetSummary>,
     total: Option<u64>,
+    /// Federation fan-out (issue #39): `Some(dropped peer names)` when the last result page came
+    /// back `partial.complete == false` — the browse under-represents the federated library, a
+    /// degradation rather than an error. `None` ⇒ the page was complete, no notice.
+    dropped_peers: Option<Vec<String>>,
     loading: bool,
     selected: Option<AssetId>,
     /// Multi-selection for batch actions (issue #10) — distinct from the single inspector focus.
@@ -685,7 +695,12 @@ pub struct DamGui {
     export_status: Option<Result<String, String>>,
     // ── source management ──
     add_open: bool,
+    /// Which kind the add-source form is offering (LocalFs folder or a Federated peer, #39).
+    add_kind: SourceKind,
     add_path: String,
+    /// Federated-peer inputs: endpoint (`3dam://host:7878` or `http(s)://…`) + optional bearer token.
+    add_endpoint: String,
+    add_token: String,
     /// The source pending a remove confirmation (two-step to guard against accidental drops).
     confirm_remove: Option<SourceId>,
     // ── convert modal ──
@@ -786,6 +801,7 @@ impl DamGui {
             folders: HashMap::new(),
             assets: Vec::new(),
             total: None,
+            dropped_peers: None,
             loading: false,
             selected: None,
             selection: HashSet::new(),
@@ -815,7 +831,10 @@ impl DamGui {
             export_assets: Vec::new(),
             export_status: None,
             add_open: false,
+            add_kind: SourceKind::LocalFs,
             add_path: String::new(),
+            add_endpoint: String::new(),
+            add_token: String::new(),
             confirm_remove: None,
             convert_open: false,
             convert_asset: None,
@@ -948,6 +967,7 @@ impl DamGui {
         // Drop everything tied to the old backend so nothing stale renders against the new one.
         self.assets.clear();
         self.total = None;
+        self.dropped_peers = None;
         self.thumbs.clear();
         self.folders.clear();
         self.expanded.clear();
@@ -1149,6 +1169,7 @@ impl DamGui {
             },
             include_facets: false,
             mode: self.mode,
+            local_only: false,
         }
     }
 
@@ -2130,6 +2151,7 @@ impl DamGui {
                 asset: id,
                 k: 12,
                 filters: Vec::new(),
+                local_only: false,
             };
             let r = lib
                 .find_similar(&auth, req)
@@ -2240,9 +2262,15 @@ impl DamGui {
     }
 
     /// Add a local-filesystem source, then kick a full scan so it ingests. Source/asset events from
-    /// the scan refresh the rail + grid live.
+    /// the scan refresh the rail + grid live. The add outcome is posted back so a rejected path
+    /// surfaces in the rail rather than vanishing.
     fn add_local_source(&self, path: String) {
-        let (lib, auth) = (self.lib.clone(), self.auth.clone());
+        let (lib, auth, tx, egctx) = (
+            self.lib.clone(),
+            self.auth.clone(),
+            self.tx.clone(),
+            self.egui_ctx.clone(),
+        );
         self.rt.spawn(async move {
             let req = AddSource {
                 kind: SourceKind::LocalFs,
@@ -2250,17 +2278,52 @@ impl DamGui {
                 name: None,
                 options: Default::default(),
             };
-            if let Ok(id) = lib.add_source(&auth, req).await {
-                let _ = lib
-                    .submit_scan(
-                        &auth,
-                        ScanRequest {
-                            sources: vec![id],
-                            mode: ScanMode::Full,
-                        },
-                    )
-                    .await;
-            }
+            let r = match lib.add_source(&auth, req).await {
+                Ok(id) => {
+                    let _ = lib
+                        .submit_scan(
+                            &auth,
+                            ScanRequest {
+                                sources: vec![id],
+                                mode: ScanMode::Full,
+                            },
+                        )
+                        .await;
+                    Ok(())
+                }
+                Err(e) => Err(e.to_string()),
+            };
+            let _ = tx.send(Msg::SourceAdded(r));
+            egctx.request_repaint();
+        });
+    }
+
+    /// Register a federated 3DAM peer (issue #39). No scan follows — peers contribute merged
+    /// catalog rows at query time, not bytes. The engine validates the endpoint at add time
+    /// (advertise handshake + protocol check), so a typo'd endpoint or a flag-off peer comes back
+    /// as a clear `Err` here and is surfaced in the rail.
+    fn add_federated_source(&self, endpoint: String, token: Option<String>) {
+        let (lib, auth, tx, egctx) = (
+            self.lib.clone(),
+            self.auth.clone(),
+            self.tx.clone(),
+            self.egui_ctx.clone(),
+        );
+        self.rt.spawn(async move {
+            let req = AddSource {
+                kind: SourceKind::Federated,
+                uri: endpoint,
+                name: None,
+                options: SourceOptions {
+                    // The peer's bearer token rides in `password`, like SFTP/SMB credentials —
+                    // stored in the source's connection blob, never returned to clients.
+                    password: token,
+                    ..Default::default()
+                },
+            };
+            let r = lib.add_source(&auth, req).await.map(|_| ());
+            let _ = tx.send(Msg::SourceAdded(r.map_err(|e| e.to_string())));
+            egctx.request_repaint();
         });
     }
 
@@ -2391,6 +2454,20 @@ impl DamGui {
             }
             Msg::Assets(Ok(page)) => {
                 self.total = page.total;
+                // Federation fan-out (issue #39): an incomplete page means a peer missed the merge
+                // deadline — remember which, so the browser shows a partial-results notice.
+                self.dropped_peers = if page.partial.complete {
+                    None
+                } else {
+                    Some(
+                        page.partial
+                            .warnings
+                            .iter()
+                            .filter(|w| w.code == "peer_dropped")
+                            .map(|w| w.subject.clone())
+                            .collect(),
+                    )
+                };
                 self.assets = page.items;
                 self.loading = false;
                 self.error = None;
@@ -2400,6 +2477,7 @@ impl DamGui {
             }
             Msg::Assets(Err(e)) => {
                 self.loading = false;
+                self.dropped_peers = None;
                 self.error = Some(format!("Search failed: {e}"));
             }
             Msg::Detail(Ok(asset)) => {
@@ -2450,6 +2528,14 @@ impl DamGui {
             }
             Msg::Sources(Ok(s)) => self.sources = s,
             Msg::Sources(Err(e)) => self.error = Some(format!("Couldn't list sources: {e}")),
+            Msg::SourceAdded(Ok(())) => {
+                self.dirty_sources = true;
+                self.dirty_stats = true;
+            }
+            Msg::SourceAdded(Err(e)) => {
+                self.dirty_sources = true;
+                self.error = Some(format!("Couldn't add source: {e}"));
+            }
             Msg::Stats(Ok(s)) => self.stats = Some(s),
             Msg::Stats(Err(e)) => self.error = Some(format!("Couldn't load stats: {e}")),
             Msg::Thumb(id, Some(px)) => {
@@ -3077,7 +3163,7 @@ impl eframe::App for DamGui {
                                 |ui| {
                                     if ui
                                         .button(egui::RichText::new(icon::PLUS))
-                                        .on_hover_text("Add a source folder")
+                                        .on_hover_text("Add a source")
                                         .clicked()
                                     {
                                         nav.toggle_add = true;
@@ -3085,24 +3171,64 @@ impl eframe::App for DamGui {
                                 },
                             );
                         });
-                        // Add-source input (local filesystem path). SFTP/SMB (credentials) stay owed.
+                        // Add-source form: a local folder or a federated 3DAM peer (issue #39).
+                        // SFTP/SMB (credentials) stay owed.
                         if self.add_open {
                             ui.horizontal(|ui| {
-                                let resp = ui.add(
-                                    egui::TextEdit::singleline(&mut self.add_path)
-                                        .hint_text("/path/to/assets")
-                                        .desired_width(150.0),
-                                );
-                                ui::access_edit_label(&resp, "Source path");
-                                let submit = ui.small_button("Add").clicked()
-                                    || (resp.lost_focus()
-                                        && ui.input(|i| i.key_pressed(egui::Key::Enter)));
-                                if submit && !self.add_path.trim().is_empty() {
-                                    nav.source = Some(SourceAction::AddLocal(
-                                        self.add_path.trim().to_string(),
-                                    ));
+                                for (kind, label) in [
+                                    (SourceKind::LocalFs, "Folder"),
+                                    (SourceKind::Federated, "Peer"),
+                                ] {
+                                    if ui.selectable_label(self.add_kind == kind, label).clicked() {
+                                        self.add_kind = kind;
+                                    }
                                 }
                             });
+                            if self.add_kind == SourceKind::Federated {
+                                // Federated peer: endpoint + optional bearer token (rides in
+                                // `options.password`; the engine validates the peer at add time).
+                                let ep = ui.add(
+                                    egui::TextEdit::singleline(&mut self.add_endpoint)
+                                        .hint_text("3dam://host:7878")
+                                        .desired_width(150.0),
+                                );
+                                ui::access_edit_label(&ep, "Peer endpoint");
+                                let tok = ui.add(
+                                    egui::TextEdit::singleline(&mut self.add_token)
+                                        .hint_text("token (optional)")
+                                        .password(true)
+                                        .desired_width(150.0),
+                                );
+                                ui::access_edit_label(&tok, "Peer token");
+                                let submit = ui.small_button("Add peer").clicked()
+                                    || ((ep.lost_focus() || tok.lost_focus())
+                                        && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                                if submit && !self.add_endpoint.trim().is_empty() {
+                                    let token = (!self.add_token.is_empty())
+                                        .then(|| self.add_token.clone());
+                                    nav.source = Some(SourceAction::AddFederated(
+                                        self.add_endpoint.trim().to_string(),
+                                        token,
+                                    ));
+                                }
+                            } else {
+                                ui.horizontal(|ui| {
+                                    let resp = ui.add(
+                                        egui::TextEdit::singleline(&mut self.add_path)
+                                            .hint_text("/path/to/assets")
+                                            .desired_width(150.0),
+                                    );
+                                    ui::access_edit_label(&resp, "Source path");
+                                    let submit = ui.small_button("Add").clicked()
+                                        || (resp.lost_focus()
+                                            && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                                    if submit && !self.add_path.trim().is_empty() {
+                                        nav.source = Some(SourceAction::AddLocal(
+                                            self.add_path.trim().to_string(),
+                                        ));
+                                    }
+                                });
+                            }
                         }
                         if self.sources.is_empty() {
                             ui.label(egui::RichText::new("No sources yet — add one above.").weak());
@@ -3112,38 +3238,58 @@ impl eframe::App for DamGui {
                         // a folder, to its subtree via the path-prefix filter). Trailing controls rescan/remove.
                         for s in &self.sources {
                             let sid = s.id;
-                            let open = self.expanded.contains(&(sid, String::new()));
+                            // Federated peers (issue #39) are catalog rows, not local bytes: no
+                            // folder tree to expand, no scan/rescan, and the local asset count
+                            // doesn't describe them — render a "peer" row instead.
+                            let federated = s.kind == SourceKind::Federated;
+                            let open = !federated && self.expanded.contains(&(sid, String::new()));
                             let scoped = self.source_filter == Some(sid) && self.path.is_none();
                             ui.horizontal(|ui| {
-                                let disclose = ui.small_button(if open {
-                                    icon::CARET_DOWN
+                                if federated {
+                                    let peer = ui.label(
+                                        egui::RichText::new(format!(
+                                            "{}  {}",
+                                            icon::GLOBE_HEMISPHERE_WEST,
+                                            s.name
+                                        ))
+                                        .color(c.fg_muted),
+                                    );
+                                    peer.on_hover_text(format!(
+                                        "Federated peer — {} (results merge into the library)",
+                                        s.uri
+                                    ));
+                                    ui::pill(ui, "peer", c.fg_muted, ui::tint(c.fg_muted, 0.14));
                                 } else {
-                                    icon::CARET_RIGHT
-                                });
-                                ui::access_label(
-                                    &disclose,
-                                    &format!(
-                                        "{} source {}",
-                                        if open { "Collapse" } else { "Expand" },
-                                        s.name
-                                    ),
-                                );
-                                if disclose.clicked() {
-                                    nav.toggle.push((sid, String::new()));
-                                }
-                                if ui
-                                    .selectable_label(
-                                        scoped,
-                                        format!(
-                                            "{}  {} ({})",
-                                            icon::FOLDER,
-                                            s.name,
-                                            s.stats.asset_count
+                                    let disclose = ui.small_button(if open {
+                                        icon::CARET_DOWN
+                                    } else {
+                                        icon::CARET_RIGHT
+                                    });
+                                    ui::access_label(
+                                        &disclose,
+                                        &format!(
+                                            "{} source {}",
+                                            if open { "Collapse" } else { "Expand" },
+                                            s.name
                                         ),
-                                    )
-                                    .clicked()
-                                {
-                                    nav.scope = Some((sid, None));
+                                    );
+                                    if disclose.clicked() {
+                                        nav.toggle.push((sid, String::new()));
+                                    }
+                                    if ui
+                                        .selectable_label(
+                                            scoped,
+                                            format!(
+                                                "{}  {} ({})",
+                                                icon::FOLDER,
+                                                s.name,
+                                                s.stats.asset_count
+                                            ),
+                                        )
+                                        .clicked()
+                                    {
+                                        nav.scope = Some((sid, None));
+                                    }
                                 }
                                 if self.confirm_remove == Some(sid) {
                                     ui.label(egui::RichText::new("remove?").small());
@@ -3155,12 +3301,17 @@ impl eframe::App for DamGui {
                                         nav.set_confirm = Some(None);
                                     }
                                 } else {
-                                    let rescan = ui
-                                        .small_button(icon::ARROWS_CLOCKWISE)
-                                        .on_hover_text("Rescan source");
-                                    ui::access_label(&rescan, &format!("Rescan source {}", s.name));
-                                    if rescan.clicked() {
-                                        nav.source = Some(SourceAction::Rescan(sid));
+                                    if !federated {
+                                        let rescan = ui
+                                            .small_button(icon::ARROWS_CLOCKWISE)
+                                            .on_hover_text("Rescan source");
+                                        ui::access_label(
+                                            &rescan,
+                                            &format!("Rescan source {}", s.name),
+                                        );
+                                        if rescan.clicked() {
+                                            nav.source = Some(SourceAction::Rescan(sid));
+                                        }
                                     }
                                     let remove =
                                         ui.small_button(icon::TRASH).on_hover_text("Remove source");
@@ -3646,6 +3797,35 @@ impl eframe::App for DamGui {
                 ui.colored_label(colors(ui.visuals().dark_mode).danger, err);
                 ui.separator();
             }
+            // ── Partial-results strip (issue #39): one slim warn-tinted line, non-blocking — the
+            // results below are real, just possibly missing a slow peer's contribution. Mirrors the
+            // web Browser strip. Hidden in the dup/blocklist views (they aren't federated queries).
+            if !self.blocklist_view && !self.dup_view {
+                if let Some(peers) = &self.dropped_peers {
+                    let c = colors(ui.visuals().dark_mode);
+                    let mut text =
+                        "Some sources didn't answer — results may be partial".to_string();
+                    if !peers.is_empty() {
+                        text.push_str(&format!(" ({})", peers.join(", ")));
+                    }
+                    egui::Frame::new()
+                        .fill(ui::tint(c.warn, 0.10))
+                        .corner_radius(3)
+                        .inner_margin(egui::Margin::symmetric(8, 3))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(icon::CLOUD_SLASH)
+                                        .size(12.0)
+                                        .color(c.warn),
+                                );
+                                ui.label(egui::RichText::new(text).size(11.0).color(c.warn));
+                            });
+                        });
+                    ui.add_space(4.0);
+                }
+            }
             // ── Breadcrumb (issue #66): source + folder segments over the Browser, click to
             // re-scope up — mirrors the web Breadcrumb (hidden in collection/dup/blocklist views). ──
             if self.collection.is_none() && !self.blocklist_view && !self.dup_view {
@@ -3905,6 +4085,14 @@ impl eframe::App for DamGui {
                 self.add_path.clear();
                 self.add_open = false;
                 self.dirty_sources = true;
+            }
+            Some(SourceAction::AddFederated(endpoint, token)) => {
+                self.add_federated_source(endpoint, token);
+                self.add_endpoint.clear();
+                self.add_token.clear();
+                self.add_open = false;
+                // The rail refresh rides on `Msg::SourceAdded` — the engine validates the peer
+                // first, so an eager reload here would race the handshake.
             }
             Some(SourceAction::Remove(id)) => {
                 self.remove_source_svc(id);
@@ -4264,13 +4452,15 @@ impl DamGui {
         let dim = c.fg_dim;
         let fg = c.fg;
 
-        // Paint one table row's cells into `rect` (shared by the header and data rows).
+        // Paint one table row's cells into `rect` (shared by the header and data rows). `peer`
+        // paints a small neutral origin chip after the name for federated results (issue #39).
         let paint_row = |p: &egui::Painter,
                          rect: egui::Rect,
                          tag: &str,
                          tag_col: egui::Color32,
                          name: &str,
                          name_col: egui::Color32,
+                         peer: Option<&str>,
                          format: &str,
                          license: &str,
                          detail: Option<&str>,
@@ -4286,13 +4476,24 @@ impl DamGui {
                 p.galley(egui::pos2(l + 4.0, y - tg.size().y / 2.0), tg, tag_col);
                 name_x += adv;
             }
-            p.text(
-                egui::pos2(name_x, y),
-                egui::Align2::LEFT_CENTER,
-                name,
-                font.clone(),
-                name_col,
-            );
+            let ng = p.layout_no_wrap(name.to_owned(), font.clone(), name_col);
+            let name_adv = ng.size().x;
+            p.galley(egui::pos2(name_x, y - ng.size().y / 2.0), ng, name_col);
+            // Peer-origin chip (web PeerBadge parity): tinted pill in the neutral text tone —
+            // information, not exposure risk. Skipped when the name column can't fit it.
+            if let Some(peer) = peer {
+                let pf = egui::FontId::proportional(10.0);
+                let pg = p.layout_no_wrap(peer.to_owned(), pf, dim);
+                let px = name_x + name_adv + 6.0;
+                if px + pg.size().x + 10.0 <= l + name_end {
+                    let chip = egui::Rect::from_min_size(
+                        egui::pos2(px, y - pg.size().y / 2.0 - 1.0),
+                        pg.size() + egui::vec2(10.0, 2.0),
+                    );
+                    p.rect_filled(chip, 3.0, ui::tint(dim, 0.14));
+                    p.galley(egui::pos2(px + 5.0, y - pg.size().y / 2.0), pg, dim);
+                }
+            }
             if show_format {
                 p.text(
                     egui::pos2(l + format_x, y),
@@ -4340,6 +4541,7 @@ impl DamGui {
             dim,
             &name_hdr,
             if name_active { fg } else { dim },
+            None,
             "FORMAT",
             "LICENSE",
             Some("DETAIL"),
@@ -4373,15 +4575,21 @@ impl DamGui {
             let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, ROW_H), egui::Sense::click());
             let selected = self.selected == Some(a.id) || self.selection.contains(&a.id);
             // Name/type/size (+ favourite) for the AccessKit tree — the web row's aria-label.
+            // Federated-origin attribution (issue #39) — `None` (no chip) for local assets.
+            let peer = match &a.origin {
+                Origin::Peer(p) => Some(p.as_str()),
+                Origin::Local => None,
+            };
             ui::access_toggle(
                 &resp,
                 selected,
                 &format!(
-                    "{}, {}, {}{}",
+                    "{}, {}, {}{}{}",
                     a.name,
                     media_tag(a.media),
                     human_bytes(a.size),
-                    if a.favorite { ", favorite" } else { "" }
+                    if a.favorite { ", favorite" } else { "" },
+                    peer.map(|p| format!(", from peer {p}")).unwrap_or_default()
                 ),
             );
             if resp.clicked() {
@@ -4407,8 +4615,16 @@ impl DamGui {
                 rect,
                 media_tag(a.media),
                 ui::media_color(&c, media_value(a.media)),
-                &ellipsize(&a.name, name_chars),
+                // Leave the peer chip room in the fixed name column (chip glyphs are ~10px vs 11px).
+                &ellipsize(
+                    &a.name,
+                    match peer {
+                        Some(p) => name_chars.saturating_sub(p.chars().count() + 3).max(6),
+                        None => name_chars,
+                    },
+                ),
                 fg,
+                peer,
                 &a.format.to_uppercase(),
                 license_label(a.license.status),
                 detail.as_deref(),
@@ -4785,9 +5001,16 @@ fn inspector(
         );
         ui.add_space(8.0);
     }
-    // Title: media badge + name (+ favourite star), then the license badge underneath.
+    // Title: media badge (+ peer-origin chip, + favourite star), then the name and the license
+    // badge underneath.
     ui.horizontal(|ui| {
         ui::media_badge(ui, media_value(s.media));
+        // Federated-origin attribution (issue #39): a small neutral chip naming the peer — web
+        // PeerBadge parity. Local assets get nothing (the common case stays chrome-free).
+        if let Origin::Peer(peer) = &s.origin {
+            ui::pill(ui, peer, c.fg_muted, ui::tint(c.fg_muted, 0.14))
+                .on_hover_text(format!("From federated peer \u{201c}{peer}\u{201d}"));
+        }
         if s.favorite {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let star = ui.label(egui::RichText::new(icon::STAR).color(c.warn));
@@ -4847,6 +5070,12 @@ fn inspector(
     ui::meta_row(ui, "Type", media_label(s.media));
     ui::meta_row(ui, "Format", &s.format.to_uppercase());
     ui::meta_row(ui, "Size", &human_bytes(s.size));
+    // Origin (issue #39): local vs the federated peer that owns the row — web Inspector parity.
+    let origin_label = match &s.origin {
+        Origin::Local => "Local".to_string(),
+        Origin::Peer(p) => format!("Peer: {p}"),
+    };
+    ui::meta_row(ui, "Origin", &origin_label);
     // Path: dim label left, truncated path right (full path on hover; left-click copies).
     ui.horizontal(|ui| {
         ui.add(

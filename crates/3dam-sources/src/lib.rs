@@ -79,6 +79,7 @@ pub enum SourceConnection {
     LocalFs { root: String },
     Sftp(SftpConfig),
     Smb(SmbConfig),
+    Federated(FederatedConfig),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -115,6 +116,20 @@ pub struct SmbConfig {
     pub domain: Option<String>,
 }
 
+/// A peer 3DAM server (phase 6, issue #39). Yields **catalog rows, not bytes** — it satisfies the
+/// source *record* model (persisted connection + secret) but is deliberately not a [`FileSource`]:
+/// the query fan-out in `dam-core` talks to it over the peer's HTTP read API, and the only byte
+/// transfer it ever does is fetching remote-owned previews (tech-spec 07 §4).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FederatedConfig {
+    /// Peer base endpoint, `http(s)://host:port` (no trailing slash, no path).
+    pub endpoint: String,
+    /// Bearer token for the peer, when its auth mode requires one. Held server-side in the
+    /// connection blob like every other source secret; never returned to clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+}
+
 fn default_sftp_port() -> u16 {
     22
 }
@@ -144,6 +159,7 @@ impl SourceConnection {
             SourceConnection::LocalFs { .. } => "local_fs",
             SourceConnection::Sftp(_) => "sftp",
             SourceConnection::Smb(_) => "smb",
+            SourceConnection::Federated(_) => "federated",
         }
     }
 
@@ -163,6 +179,7 @@ impl SourceConnection {
                 };
                 format!("smb://{}/{}{}", c.host, c.share.trim_matches('/'), base)
             }
+            SourceConnection::Federated(c) => c.endpoint.clone(),
         }
     }
 
@@ -175,6 +192,7 @@ impl SourceConnection {
             }),
             "sftp" => parse_sftp(uri, opts),
             "smb" => parse_smb(uri, opts),
+            "federated" => parse_federated(uri, opts),
             other => Err(LibError::Unsupported(format!(
                 "source kind {other:?} is not a file source"
             ))),
@@ -197,6 +215,11 @@ pub fn open_source(conn: &SourceConnection) -> Result<Box<dyn FileSource>, LibEr
         #[cfg(not(feature = "smb"))]
         SourceConnection::Smb(_) => Err(LibError::Unsupported(
             "SMB support is not compiled into this build".into(),
+        )),
+        // Structurally cannot leak byte I/O: a peer yields catalog rows, never a file reader
+        // (tech-spec 07 §1 "federate, don't reprocess"). The fan-out engine owns this kind.
+        SourceConnection::Federated(_) => Err(LibError::Unsupported(
+            "a federated peer yields catalog rows, not bytes".into(),
         )),
     }
 }
@@ -276,6 +299,34 @@ fn parse_smb(uri: &str, opts: &ConnOptions) -> Result<SourceConnection, LibError
         username: opts.username.clone().unwrap_or_default(),
         password: opts.password.clone(),
         domain: opts.domain.clone(),
+    }))
+}
+
+/// `3dam://host[:port][/]` (plain HTTP), `3dams://…` (HTTPS), or a literal `http(s)://…` endpoint.
+/// The bearer token rides in `opts.password` — the same slot every other network source's secret
+/// uses, so the CLI/API surface stays one shape.
+fn parse_federated(uri: &str, opts: &ConnOptions) -> Result<SourceConnection, LibError> {
+    let endpoint = if let Some(rest) = uri.strip_prefix("3dam://") {
+        format!("http://{rest}")
+    } else if let Some(rest) = uri.strip_prefix("3dams://") {
+        format!("https://{rest}")
+    } else if uri.starts_with("http://") || uri.starts_with("https://") {
+        uri.to_string()
+    } else {
+        return Err(LibError::BadRequest(
+            "federated source uri must be 3dam://host:port or http(s)://host:port".into(),
+        ));
+    };
+    let endpoint = endpoint.trim_end_matches('/').to_string();
+    let host = endpoint.split("://").nth(1).unwrap_or("");
+    if host.is_empty() {
+        return Err(LibError::BadRequest(
+            "federated source uri is missing a host".into(),
+        ));
+    }
+    Ok(SourceConnection::Federated(FederatedConfig {
+        endpoint,
+        token: opts.password.clone(),
     }))
 }
 

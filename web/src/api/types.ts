@@ -246,6 +246,8 @@ export interface QueryRequest {
   scope?: QueryScope;
   page?: PageParams;
   mode?: SearchMode;
+  /** Federation (phase 6): skip the peer fan-out and answer from this instance's catalog only. */
+  local_only?: boolean;
 }
 
 export interface ItemWarning {
@@ -409,6 +411,8 @@ export interface SimilarRequest {
   asset: AssetId;
   k?: number; // neighbours to return (post self-drop); server default 24
   filters?: Filter[];
+  /** Federation (phase 6): skip the peer fan-out and rank against local embeddings only. */
+  local_only?: boolean;
 }
 /** One neighbour: the asset plus its cosine score and the embedding space it was ranked in. */
 export interface SimilarHit {

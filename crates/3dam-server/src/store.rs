@@ -28,6 +28,10 @@ pub struct FlagState {
     /// proactively warms previews + analysis; these are workload flags, not exposure flags.
     pub auto_thumbnail: bool,
     pub auto_analyze: bool,
+    /// Serve as a federation peer (phase 6, issue #39): mounts `GET /api/v1/advertise`. The reads a
+    /// peer then performs ride the ordinary `/api/v1` surface under the ordinary auth gate, so this
+    /// flag adds discovery, not exposure.
+    pub federation: bool,
     versions: HashMap<FlagKey, u64>,
 }
 
@@ -42,6 +46,7 @@ impl FlagState {
             network_writes: false,
             auto_thumbnail: true,
             auto_analyze: true,
+            federation: false,
             versions: HashMap::new(),
         }
     }
@@ -52,6 +57,7 @@ impl FlagState {
             FlagKey::NetworkWrites => FlagValue::Bool(self.network_writes),
             FlagKey::AutoThumbnail => FlagValue::Bool(self.auto_thumbnail),
             FlagKey::AutoAnalyze => FlagValue::Bool(self.auto_analyze),
+            FlagKey::Federation => FlagValue::Bool(self.federation),
         }
     }
     /// Apply a typed value under its key. The key disambiguates the three `bool` flags, which the
@@ -63,6 +69,7 @@ impl FlagState {
             (FlagKey::NetworkWrites, FlagValue::Bool(b)) => self.network_writes = b,
             (FlagKey::AutoThumbnail, FlagValue::Bool(b)) => self.auto_thumbnail = b,
             (FlagKey::AutoAnalyze, FlagValue::Bool(b)) => self.auto_analyze = b,
+            (FlagKey::Federation, FlagValue::Bool(b)) => self.federation = b,
             // Type-mismatched pairs are rejected before this point (`FlagValue::matches`).
             _ => {}
         }
@@ -180,6 +187,10 @@ impl ServerStore {
     /// Hosted-mode: auto-run the analysis pass on ingest (issue #71).
     pub fn auto_analyze(&self) -> bool {
         self.flags.read().unwrap().auto_analyze
+    }
+    /// Federation peer mode (phase 6, issue #39): serve `GET /api/v1/advertise`.
+    pub fn federation(&self) -> bool {
+        self.flags.read().unwrap().federation
     }
 
     pub fn flag_info(&self, key: FlagKey) -> FlagInfo {

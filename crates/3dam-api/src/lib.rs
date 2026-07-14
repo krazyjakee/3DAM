@@ -9,6 +9,7 @@ pub mod admin;
 pub mod dto;
 pub mod error;
 pub mod event;
+pub mod federation;
 pub mod id;
 pub mod page;
 pub mod service;
@@ -26,6 +27,9 @@ pub fn now_ms() -> i64 {
 pub use dto::*;
 pub use error::{internal, ErrorBody, LibError};
 pub use event::{ChangeKind, EventTopic, JobEvent, LibraryEvent, SubscribeRequest};
+pub use federation::{
+    protocol_compatible, PeerAdvertise, VectorSimilarRequest, FEDERATION_PROTOCOL_VERSION,
+};
 pub use id::{AssetId, CollectionId, ContentHash, JobId, SourceId, TagId};
 pub use page::{Cursor, ItemWarning, Page, PageParams, PartialStatus};
 pub use service::{AuthContext, EventStream, LibraryService, Scope, Scopes};

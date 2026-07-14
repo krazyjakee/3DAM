@@ -322,6 +322,11 @@ pub struct QueryRequest {
     /// neighbours of the lexical hits.
     #[serde(default)]
     pub mode: SearchMode,
+    /// Answer from the local catalog only — no federated fan-out. Set on every peer-bound call so
+    /// a peer never re-fans-out to *its* peers (federation is one hop, never transitive — ADR 0009
+    /// §5). Old peers that predate the field simply ignore it, which is the same thing.
+    #[serde(default)]
+    pub local_only: bool,
 }
 
 /// Text-search strategy (semantic-search M5). `Lexical` is the FTS/synonym path (M1–M3). `Hybrid`
@@ -857,6 +862,10 @@ pub struct SimilarRequest {
     /// Compose with the same faceted filters as text search (§3.3).
     #[serde(default)]
     pub filters: Vec<Filter>,
+    /// Answer from the local index only — no federated fan-out or peer forwarding (phase 6). Set
+    /// on every peer-bound call so federation stays one hop, never transitive (ADR 0009 §5).
+    #[serde(default)]
+    pub local_only: bool,
 }
 
 fn default_k() -> u32 {
