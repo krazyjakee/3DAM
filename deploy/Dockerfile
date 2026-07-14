@@ -61,6 +61,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && mkdir -p /var/lib/3dam && chown 3dam:3dam /var/lib/3dam
 
 COPY --from=builder /src/target/release/3dam /usr/local/bin/3dam
+# First-run flag seeds for the container posture (see the file's comments): auth off +
+# network_writes on, so the web UI is fully functional the moment the container is up.
+COPY deploy/3dam-container.toml /etc/3dam/3dam.toml
 
 USER 3dam
 WORKDIR /var/lib/3dam
@@ -76,11 +79,17 @@ ENV RUST_LOG=info
 # ENTRYPOINT is the binary; CMD is the default (overridable) serve invocation. The container must
 # bind 0.0.0.0 for the published port to be reachable, and `serve` refuses a plaintext non-localhost
 # bind unless TLS is configured or --insecure is passed. Here the Docker network boundary + port
-# mapping is the trust boundary, so we default to --insecure; the server still logs a warning when
-# it is exposed without auth/TLS. HARDEN for production: enable token auth (`3dam admin flags
-# authentication --set token`) and either terminate TLS in a reverse proxy, or override CMD to pass
-# TLS directly, e.g.:
+# mapping is the trust boundary, so we default to --insecure, and /etc/3dam/3dam.toml seeds
+# `auth = off` + `network_writes = true` on first run so the web UI works out of the box — no tokens,
+# no flag flipping. Authentication exists only once the operator configures it; the server still logs
+# a warning while exposed without auth/TLS.
+#
+# HARDEN for production (untrusted network): enable token auth —
+#   docker exec <name> 3dam admin flag authentication --set token --confirm --data /var/lib/3dam
+# (note --data: without it, admin commands hit a fresh $HOME database, not the server's) — then mint
+# tokens with `3dam admin token add`, and either terminate TLS in a reverse proxy or override CMD:
 #   docker run … 3dam-server serve --data /var/lib/3dam --addr 0.0.0.0:7878 \
-#     --tls-cert /etc/3dam/tls/fullchain.pem --tls-key /etc/3dam/tls/privkey.pem
+#     --config /etc/3dam/3dam.toml --tls-cert /etc/3dam/tls/fullchain.pem --tls-key /etc/3dam/tls/privkey.pem
+# Or mount deploy/3dam.example.toml (the hardened template) over /etc/3dam/3dam.toml before first run.
 ENTRYPOINT ["/usr/local/bin/3dam"]
-CMD ["serve", "--data", "/var/lib/3dam", "--addr", "0.0.0.0:7878", "--insecure"]
+CMD ["serve", "--data", "/var/lib/3dam", "--addr", "0.0.0.0:7878", "--insecure", "--config", "/etc/3dam/3dam.toml"]

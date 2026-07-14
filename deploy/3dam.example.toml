@@ -1,7 +1,14 @@
-# Example 3DAM serve config (tech-spec 09 §A.1). Everything is optional — a missing file just uses
-# the safe built-in defaults. CLI flags (--addr, --tls-cert, --tls-key) override the matching keys
-# here. Flag values are *seed-only*: they set the initial value on first run; the admin UI/CLI owns
-# them thereafter (config_authority = seed-only, ADR 0009 §2).
+# Example 3DAM serve config (tech-spec 09 §A.1) — the HARDENED template for a public or untrusted
+# network: token auth required for everything, network read-only, TLS in-process. This is NOT what
+# the container ships by default (that is deploy/3dam-container.toml: auth off + network writes on,
+# trusting the Docker network boundary) — start from this file when the network is not trusted.
+#
+# Everything is optional — a missing file just uses the built-in defaults. CLI flags (--addr,
+# --tls-cert, --tls-key) override the matching keys here. Flag values are *seed-only*: they set the
+# initial value on first run; the admin UI/CLI owns them thereafter (config_authority = seed-only,
+# ADR 0009 §2). Note: with `auth = "token"` no client — including the served web UI — can do anything
+# until you mint a token (`3dam admin token add <label> --scope read,write`) and paste it into the
+# client's Connect dialog.
 
 [server]
 # Bind address + port. For a public host use 0.0.0.0 with TLS below; for a reverse-proxy setup keep

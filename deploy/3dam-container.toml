@@ -1,0 +1,21 @@
+# Flag seeds baked into the container image (deploy/Dockerfile) — the out-of-the-box "appliance"
+# posture: spin up the container, open the web UI, and everything works with no tokens and no flag
+# flipping. The Docker network boundary (which ports you publish, to whom) is the trust boundary,
+# consistent with the image's default `--insecure` bind.
+#
+# Seeds apply on FIRST RUN only (config_authority = seed-only, ADR 0009 §2); after that the admin
+# UI/CLI owns the flags, so opting into auth later sticks across restarts. To harden, use the web
+# Settings page or `docker exec <name> 3dam admin flag … --data /var/lib/3dam`, or start from
+# deploy/3dam.example.toml (the hardened template) instead.
+
+[flags]
+# No authentication until the operator configures it: every client on the published port has full
+# owner trust, exactly like a fresh localhost `3dam serve`. (This is also the built-in default —
+# stated here so the container's posture is explicit.)
+auth = "off"
+
+# The container must bind 0.0.0.0 for the published port to be reachable, which makes every client —
+# including the operator's own browser — a "network" caller. Without this seed the core off-by-default
+# ceiling (network_writes = false) would leave the web UI read-only out of the box, unable even to
+# add a source. Inside the container's trust boundary that gate serves no one, so open it.
+network_writes = true
