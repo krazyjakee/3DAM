@@ -437,7 +437,7 @@ async fn maintenance_clear_analysis_and_wipe() {
         .await
         .unwrap();
     assert!(!before.items.is_empty(), "embeddings present before clear");
-    assert_eq!(lib.library_stats(&ctx).await.unwrap().unanalyzed, 0);
+    assert_eq!(lib.library_stats(&ctx, None).await.unwrap().unanalyzed, 0);
 
     // ── clear_analysis ───────────────────────────────────────────────────────
     let report = lib.clear_analysis().await.unwrap();
@@ -458,7 +458,7 @@ async fn maintenance_clear_analysis_and_wipe() {
         .await
         .unwrap();
     assert!(after.items.is_empty(), "embeddings cleared → no neighbours");
-    let stats = lib.library_stats(&ctx).await.unwrap();
+    let stats = lib.library_stats(&ctx, None).await.unwrap();
     assert_eq!(stats.unanalyzed, stats.total, "all assets marked due again");
 
     // The confirmed tag survived; the suggestions did not.
@@ -480,7 +480,7 @@ async fn maintenance_clear_analysis_and_wipe() {
     let wipe = lib.wipe_catalog().await.unwrap();
     assert_eq!(wipe.assets_removed, 2);
     assert_eq!(wipe.sources_removed, 1);
-    let stats = lib.library_stats(&ctx).await.unwrap();
+    let stats = lib.library_stats(&ctx, None).await.unwrap();
     assert_eq!(stats.total, 0, "catalog emptied");
     assert_eq!(stats.sources, 0, "sources emptied");
     // The source files themselves are untouched (non-destructive invariant).

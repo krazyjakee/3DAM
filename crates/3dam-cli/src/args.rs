@@ -103,7 +103,11 @@ pub(crate) enum Cmd {
         attribution_only: bool,
     },
     /// Show library statistics.
-    Stats,
+    Stats {
+        /// Scope the numbers to one source id; a federated source reports the peer's own counts.
+        #[arg(long)]
+        source: Option<String>,
+    },
     /// Show one asset's full record.
     Get {
         /// Asset id (UUID).

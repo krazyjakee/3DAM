@@ -375,7 +375,7 @@ impl McpAdapter {
                 to_value(&lib.get_asset(ctx, &parse_asset(&a.id)?).await?)
             }
             "list_sources" => to_value(&lib.list_sources(ctx).await?),
-            "library_stats" => to_value(&lib.library_stats(ctx).await?),
+            "library_stats" => to_value(&lib.library_stats(ctx, None).await?),
             "find_duplicates" => {
                 let a: DupArgs = parse_args(args)?;
                 let media = match a.media.as_deref() {

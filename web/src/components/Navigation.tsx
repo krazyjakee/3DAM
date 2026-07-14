@@ -179,8 +179,12 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
     patch(next);
     onNavigate?.();
   };
-  const stats = useStats();
   const sources = useSources();
+  // Sidebar counts follow the browsed source (phase 6): a scoped local source counts its own
+  // assets; a federated source reports the peer's live numbers (polled — no WS across peers).
+  const isPeer =
+    sources.data?.some((s) => s.id === state.source && s.kind === "federated") ?? false;
+  const stats = useStats(state.source, { isPeer });
   const scan = useScan();
   const analyze = useAnalyze();
   const removeSource = useRemoveSource();

@@ -75,8 +75,15 @@ export function useAsset(id: AssetId | null) {
   });
 }
 
-export function useStats() {
-  return useQuery({ queryKey: qk.stats, queryFn: api.stats });
+/** Library aggregates, scoped to `source` when set (per-source sidebar counts, phase 6). A
+ *  federated source's numbers come live from the peer, so they're polled — local WS events can't
+ *  announce the peer's catalog changes. Keyed under `qk.stats` so WS invalidation still hits. */
+export function useStats(source?: string | null, opts?: { isPeer?: boolean }) {
+  return useQuery({
+    queryKey: [...qk.stats, source ?? "all"],
+    queryFn: () => api.stats(source),
+    refetchInterval: opts?.isPeer ? 30_000 : false,
+  });
 }
 
 /** "Find similar" for one asset — cosine over embeddings (phase 3). Opt-in (`enabled`) so the

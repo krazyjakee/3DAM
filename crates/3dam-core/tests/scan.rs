@@ -98,7 +98,7 @@ async fn scan_indexes_files_and_emits_events() {
     assert_eq!(page.total, Some(3));
     assert_eq!(page.items.len(), 3);
 
-    let stats = lib.library_stats(&ctx).await.unwrap();
+    let stats = lib.library_stats(&ctx, None).await.unwrap();
     assert_eq!(stats.total, 3);
     assert_eq!(stats.by_media.get("audio"), Some(&1));
     assert_eq!(stats.by_media.get("image"), Some(&1));
@@ -122,7 +122,7 @@ async fn scan_indexes_files_and_emits_events() {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let stats2 = lib.library_stats(&ctx).await.unwrap();
+    let stats2 = lib.library_stats(&ctx, None).await.unwrap();
     assert_eq!(stats2.total, 3, "re-scan is idempotent");
 
     std::fs::remove_dir_all(&tmp).ok();
@@ -205,12 +205,12 @@ async fn remove_and_block_survives_rescan() {
         .await
         .unwrap();
     assert_eq!(lib.list_blocklist(&ctx).await.unwrap().len(), 1);
-    assert_eq!(lib.library_stats(&ctx).await.unwrap().total, 1);
+    assert_eq!(lib.library_stats(&ctx, None).await.unwrap().total, 1);
 
     // A full re-scan must NOT re-import the blocked bytes (they're still on disk).
     scan(ScanMode::Full).await;
     assert_eq!(
-        lib.library_stats(&ctx).await.unwrap().total,
+        lib.library_stats(&ctx, None).await.unwrap().total,
         1,
         "blocked hash is skipped on rescan"
     );
@@ -220,7 +220,7 @@ async fn remove_and_block_survives_rescan() {
     lib.unblock(&ctx, &blocked[0].hash).await.unwrap();
     scan(ScanMode::Full).await;
     assert_eq!(
-        lib.library_stats(&ctx).await.unwrap().total,
+        lib.library_stats(&ctx, None).await.unwrap().total,
         2,
         "unblocked content is re-imported"
     );
@@ -304,7 +304,7 @@ async fn remove_and_block_purges_all_identical_copies() {
 
     // All three byte-identical copies are gone; the distinct file remains.
     assert_eq!(
-        lib.library_stats(&ctx).await.unwrap().total,
+        lib.library_stats(&ctx, None).await.unwrap().total,
         1,
         "the whole exact-duplicate group is purged, not just the clicked copy"
     );

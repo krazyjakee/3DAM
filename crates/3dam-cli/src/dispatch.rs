@@ -294,8 +294,14 @@ pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             }
         }
 
-        Cmd::Stats => {
-            let stats = lib.library_stats(&ctx).await?;
+        Cmd::Stats { source } => {
+            let source = source
+                .map(|s| {
+                    s.parse()
+                        .map_err(|_| anyhow::anyhow!("invalid source id: {s}"))
+                })
+                .transpose()?;
+            let stats = lib.library_stats(&ctx, source).await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&stats)?);
             } else {

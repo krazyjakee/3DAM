@@ -115,7 +115,10 @@ export const api = {
    *  the grid's HTTP fetches. Fire-and-forget — the bytes still come over HTTP/2. */
   prefetch: (req: PrefetchRequest) => send<void>("POST", `${API}/prefetch`, req),
   getAsset: (id: AssetId) => get<Asset>(`${API}/assets/${id}`),
-  stats: () => get<LibraryStats>(`${API}/stats`),
+  /** Library aggregates. `source` scopes the counts to one source — a federated source reports
+   *  the peer's own live numbers (the server proxies the read, phase 6). */
+  stats: (source?: string | null) =>
+    get<LibraryStats>(source ? `${API}/stats?source=${source}` : `${API}/stats`),
 
   /** Remove an asset from the catalog (source file untouched); `block` also blocks its content hash
    *  from any future scan (issue #21). */

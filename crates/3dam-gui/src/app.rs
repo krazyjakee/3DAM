@@ -2254,8 +2254,14 @@ impl DamGui {
             self.tx.clone(),
             egctx.clone(),
         );
+        // Scope the sidebar counts to the browsed source; a federated source reports the peer's
+        // own live numbers (the engine proxies the read, phase 6).
+        let source = self.source_filter;
         self.rt.spawn(async move {
-            let r = lib.library_stats(&auth).await.map_err(|e| e.to_string());
+            let r = lib
+                .library_stats(&auth, source)
+                .await
+                .map_err(|e| e.to_string());
             let _ = tx.send(Msg::Stats(r));
             egctx.request_repaint();
         });
@@ -3246,18 +3252,26 @@ impl eframe::App for DamGui {
                             let scoped = self.source_filter == Some(sid) && self.path.is_none();
                             ui.horizontal(|ui| {
                                 if federated {
-                                    let peer = ui.label(
-                                        egui::RichText::new(format!(
-                                            "{}  {}",
-                                            icon::GLOBE_HEMISPHERE_WEST,
-                                            s.name
-                                        ))
-                                        .color(c.fg_muted),
-                                    );
-                                    peer.on_hover_text(format!(
-                                        "Federated peer — {} (results merge into the library)",
-                                        s.uri
-                                    ));
+                                    // Selectable like a local source: scoping to the peer browses
+                                    // its catalog (the engine routes the query to it, phase 6).
+                                    let peer = ui
+                                        .selectable_label(
+                                            scoped,
+                                            egui::RichText::new(format!(
+                                                "{}  {}",
+                                                icon::GLOBE_HEMISPHERE_WEST,
+                                                s.name
+                                            ))
+                                            .color(c.fg_muted),
+                                        )
+                                        .on_hover_text(format!(
+                                            "Federated peer — {} (results merge into the library)",
+                                            s.uri
+                                        ));
+                                    ui::access_label(&peer, &format!("Browse peer {}", s.name));
+                                    if peer.clicked() {
+                                        nav.scope = Some((sid, None));
+                                    }
                                     ui::pill(ui, "peer", c.fg_muted, ui::tint(c.fg_muted, 0.14));
                                 } else {
                                     let disclose = ui.small_button(if open {
@@ -4118,6 +4132,8 @@ impl eframe::App for DamGui {
                 self.path = p;
             }
             do_query = true;
+            // Sidebar counts follow the scope (a peer scope shows the peer's own numbers).
+            self.dirty_stats = true;
         }
         // A breadcrumb click re-scopes the folder browse up the tree (source stays as-is).
         if let Some(target) = breadcrumb_to {

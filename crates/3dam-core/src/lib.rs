@@ -551,7 +551,7 @@ impl EmbeddedLibrary {
     /// Report on-disk usage: `library.db` + `server.db` sizes, both cache tiers, and catalog counts.
     /// Read-only. File sizing runs off the async runtime.
     pub async fn storage_usage(&self) -> Result<StorageUsage, LibError> {
-        let stats = self.db(|s| s.stats()).await?;
+        let stats = self.db(|s| s.stats(None)).await?;
         let data_dir = self.data_dir.clone();
         tokio::task::spawn_blocking(move || {
             let file_len = |p: PathBuf| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
@@ -857,8 +857,31 @@ impl LibraryService for EmbeddedLibrary {
         Ok(())
     }
 
-    async fn library_stats(&self, _ctx: &AuthContext) -> Result<LibraryStats, LibError> {
-        self.db(|s| s.stats()).await
+    async fn library_stats(
+        &self,
+        _ctx: &AuthContext,
+        source: Option<SourceId>,
+    ) -> Result<LibraryStats, LibError> {
+        let Some(sid) = source else {
+            return self.db(|s| s.stats(None)).await;
+        };
+        // A federated source's counts live on the peer — proxy the read so the sidebar shows the
+        // peer's own numbers, as fresh as the call (phase 6). Local kinds scope the local catalog.
+        if let Some(peer) = self
+            .fed_peers()
+            .await
+            .iter()
+            .find(|p| p.source_id == sid)
+            .cloned()
+        {
+            return tokio::time::timeout(
+                federation::QUERY_DEADLINE,
+                peer.client.library_stats(&AuthContext::embedded(), None),
+            )
+            .await
+            .map_err(|_| LibError::SourceUnavailable(format!("peer '{}' timed out", peer.name)))?;
+        }
+        self.db(move |s| s.stats(Some(&sid))).await
     }
 
     async fn convert(

@@ -603,11 +603,18 @@ struct ThumbQuery {
     edge: Option<u32>,
 }
 
+#[derive(serde::Deserialize)]
+struct StatsQuery {
+    /// Scope the aggregates to one source; a federated source proxies to the peer (phase 6).
+    source: Option<dam_api::id::SourceId>,
+}
+
 async fn stats(
     Reader(ctx): Reader,
     State(st): State<AppState>,
+    Query(q): Query<StatsQuery>,
 ) -> Result<Json<LibraryStats>, ApiError> {
-    Ok(Json(st.lib.library_stats(&ctx).await?))
+    Ok(Json(st.lib.library_stats(&ctx, q.source).await?))
 }
 
 async fn convert(
@@ -655,7 +662,7 @@ async fn advertise(
             "federation is disabled".into(),
         )));
     }
-    let stats = st.lib.library_stats(&ctx).await?;
+    let stats = st.lib.library_stats(&ctx, None).await?;
     Ok(Json(dam_api::PeerAdvertise {
         protocol_version: dam_api::FEDERATION_PROTOCOL_VERSION.to_string(),
         instance: st.bind.clone(),

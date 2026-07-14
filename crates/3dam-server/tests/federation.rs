@@ -228,6 +228,27 @@ async fn source_filter_routes_to_the_peer_alone() {
         ["remote.wav"],
         "selecting the federated source browses the peer's catalog"
     );
+
+    // Stats scoped to the peer source come from the peer itself, live — the sidebar counts show
+    // the peer's library, not the local catalog (which holds zero of its rows).
+    let peer_stats = local.library_stats(&ctx, Some(fed_sid)).await.unwrap();
+    assert_eq!(peer_stats.total, 1, "the peer's own total");
+    assert_eq!(peer_stats.by_media.get("audio"), Some(&1));
+
+    // Scoped to the local source: only the local folder's rows.
+    let local_sid = local
+        .list_sources(&ctx)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.kind == SourceKind::LocalFs)
+        .unwrap()
+        .id;
+    let local_stats = local.library_stats(&ctx, Some(local_sid)).await.unwrap();
+    assert_eq!(local_stats.total, 1);
+    // Unscoped stays the local library (peers merge into queries, not local aggregates).
+    let all = local.library_stats(&ctx, None).await.unwrap();
+    assert_eq!(all.total, 1);
 }
 
 // ── partial results on a dead/slow peer (issue #39 acceptance) ───────────────

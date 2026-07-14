@@ -201,7 +201,14 @@ pub trait LibraryService: Send + Sync {
         id: &AssetId,
     ) -> Result<AssetContent, LibError>;
 
-    async fn library_stats(&self, ctx: &AuthContext) -> Result<LibraryStats, LibError>;
+    /// Library aggregates (totals, media/source/tag counts). `source` scopes the numbers to one
+    /// source; for a **federated** source the engine proxies the call to the peer, so the counts
+    /// are the peer's own, live (phase 6). `None` = the whole local library.
+    async fn library_stats(
+        &self,
+        ctx: &AuthContext,
+        source: Option<SourceId>,
+    ) -> Result<LibraryStats, LibError>;
 
     /// Prefetch hint (issue #72): the client is about to render `req.assets`, so warm their
     /// thumbnails (and model preview meshes) ahead of the HTTP fetch. Fire-and-forget and idempotent

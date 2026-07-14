@@ -9,15 +9,9 @@
     },
     {
       "name": "3dam-serve",
-      "runtimeExecutable": "target/debug/3dam",
-      "runtimeArgs": [
-        "serve",
-        "--addr",
-        "127.0.0.1:7333",
-        "--data",
-        "/tmp/claude-1000/-home-krazy-Documents-GitHub-3DAM/2f3b5a8d-dd64-41c3-b04d-8305798b2da4/scratchpad/data"
-      ],
-      "port": 7333
+      "runtimeExecutable": "target/release/3dam",
+      "runtimeArgs": ["serve"],
+      "port": 7878
     },
     {
       "name": "web",

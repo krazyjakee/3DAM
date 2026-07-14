@@ -457,8 +457,15 @@ impl LibraryService for ApiClient {
         })
     }
 
-    async fn library_stats(&self, _ctx: &AuthContext) -> Result<LibraryStats, LibError> {
-        self.get("/api/v1/stats").await
+    async fn library_stats(
+        &self,
+        _ctx: &AuthContext,
+        source: Option<SourceId>,
+    ) -> Result<LibraryStats, LibError> {
+        match source {
+            Some(sid) => self.get(&format!("/api/v1/stats?source={sid}")).await,
+            None => self.get("/api/v1/stats").await,
+        }
     }
 
     async fn convert(

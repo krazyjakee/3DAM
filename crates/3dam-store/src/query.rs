@@ -337,29 +337,59 @@ impl Store {
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(internal)
     }
 
-    pub fn stats(&self) -> Result<LibraryStats, LibError> {
+    /// Library aggregates, optionally scoped to one source (`source = None` ⇒ whole library).
+    /// The scoped form powers per-source sidebar counts; a federated source never reaches here —
+    /// the engine proxies its stats to the peer instead.
+    pub fn stats(&self, source: Option<&SourceId>) -> Result<LibraryStats, LibError> {
         let conn = self.conn.lock().unwrap();
+        let sid_blob = source.map(|s| s.as_bytes().to_vec());
+        // One WHERE fragment reused across the asset aggregates; params line up by position.
+        let (asset_where, and_source): (&str, &str) = if sid_blob.is_some() {
+            ("WHERE source_id = ?1", "AND a.source_id = ?1")
+        } else {
+            ("", "")
+        };
+        let p =
+            |sql: &str| -> String { sql.replace("{W}", asset_where).replace("{A}", and_source) };
+        let prms: Vec<&dyn rusqlite::ToSql> = match &sid_blob {
+            Some(b) => vec![b as &dyn rusqlite::ToSql],
+            None => vec![],
+        };
+
         let total: i64 = conn
-            .query_row("SELECT COUNT(*) FROM asset", [], |r| r.get(0))
+            .query_row(&p("SELECT COUNT(*) FROM asset {W}"), &prms[..], |r| {
+                r.get(0)
+            })
             .map_err(internal)?;
         let unanalyzed: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM asset WHERE analysed_at IS NULL",
-                [],
+                &p(if sid_blob.is_some() {
+                    "SELECT COUNT(*) FROM asset WHERE analysed_at IS NULL AND source_id = ?1"
+                } else {
+                    "SELECT COUNT(*) FROM asset WHERE analysed_at IS NULL"
+                }),
+                &prms[..],
                 |r| r.get(0),
             )
             .map_err(internal)?;
-        let sources: i64 = conn
-            .query_row("SELECT COUNT(*) FROM source", [], |r| r.get(0))
-            .map_err(internal)?;
+        let sources: i64 = if sid_blob.is_some() {
+            1
+        } else {
+            conn.query_row("SELECT COUNT(*) FROM source", [], |r| r.get(0))
+                .map_err(internal)?
+        };
 
         let mut by_media = CountMap::new();
         {
             let mut stmt = conn
-                .prepare("SELECT media_type, COUNT(*) FROM asset GROUP BY media_type")
+                .prepare(&p(
+                    "SELECT media_type, COUNT(*) FROM asset {W} GROUP BY media_type",
+                ))
                 .map_err(internal)?;
             let rows = stmt
-                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+                .query_map(&prms[..], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+                })
                 .map_err(internal)?;
             for r in rows {
                 let (k, v) = r.map_err(internal)?;
@@ -369,13 +399,18 @@ impl Store {
         let mut by_source = CountMap::new();
         {
             let mut stmt = conn
-                .prepare(
+                .prepare(&p(if sid_blob.is_some() {
                     "SELECT s.name, COUNT(a.id) FROM source s
-                     LEFT JOIN asset a ON a.source_id = s.id GROUP BY s.id",
-                )
+                     LEFT JOIN asset a ON a.source_id = s.id WHERE s.id = ?1 GROUP BY s.id"
+                } else {
+                    "SELECT s.name, COUNT(a.id) FROM source s
+                     LEFT JOIN asset a ON a.source_id = s.id GROUP BY s.id"
+                }))
                 .map_err(internal)?;
             let rows = stmt
-                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+                .query_map(&prms[..], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+                })
                 .map_err(internal)?;
             for r in rows {
                 let (k, v) = r.map_err(internal)?;
@@ -389,15 +424,16 @@ impl Store {
         let mut tags = CountMap::new();
         {
             let mut stmt = conn
-                .prepare(
-                    "SELECT t.name, COUNT(*) AS n FROM asset_tag at
+                .prepare(&p("SELECT t.name, COUNT(*) AS n FROM asset_tag at
                      JOIN tag t ON t.id = at.tag_id
-                     WHERE at.state = 'confirmed'
-                     GROUP BY at.tag_id ORDER BY n DESC, t.name ASC LIMIT 30",
-                )
+                     JOIN asset a ON a.id = at.asset_id
+                     WHERE at.state = 'confirmed' {A}
+                     GROUP BY at.tag_id ORDER BY n DESC, t.name ASC LIMIT 30"))
                 .map_err(internal)?;
             let rows = stmt
-                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+                .query_map(&prms[..], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+                })
                 .map_err(internal)?;
             for r in rows {
                 let (k, v) = r.map_err(internal)?;
