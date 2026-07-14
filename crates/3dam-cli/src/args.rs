@@ -48,6 +48,13 @@ pub(crate) enum Cmd {
         media: Option<String>,
         #[arg(long)]
         format: Option<String>,
+        /// Limit to one source id.
+        #[arg(long)]
+        source: Option<String>,
+        /// Scope to a folder subtree: a source-relative path prefix (issue #66). Paths are
+        /// source-relative, so this requires `--source`.
+        #[arg(long, requires = "source")]
+        path: Option<String>,
         #[arg(long, default_value_t = 50)]
         limit: u32,
         /// Match strategy (semantic-search M5): `lexical` (FTS + synonyms), `hybrid` (also pulls in
@@ -59,6 +66,13 @@ pub(crate) enum Cmd {
     Sources {
         #[command(subcommand)]
         cmd: SourceCmd,
+    },
+    /// List the immediate subfolders of a source directory, with subtree asset counts (issue #66).
+    Folders {
+        /// Source id (see `sources list`).
+        source: String,
+        /// Source-relative folder to list (default: the source root).
+        prefix: Option<String>,
     },
     /// Manage collections and smart folders.
     Collections {

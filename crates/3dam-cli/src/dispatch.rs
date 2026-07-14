@@ -49,6 +49,8 @@ pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             text,
             media,
             format,
+            source,
+            path,
             limit,
             mode,
         } => {
@@ -65,6 +67,22 @@ pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                     field: FacetField::Format,
                     op: FilterOp::Eq,
                     value: FilterValue::Str(f),
+                });
+            }
+            if let Some(s) = source {
+                // Validate the id up front for a clear error (matches `scan --source`).
+                parse_source_id(&s)?;
+                filters.push(Filter {
+                    field: FacetField::Source,
+                    op: FilterOp::Eq,
+                    value: FilterValue::Str(s),
+                });
+            }
+            if let Some(p) = path {
+                filters.push(Filter {
+                    field: FacetField::Path,
+                    op: FilterOp::Eq,
+                    value: FilterValue::Str(p),
                 });
             }
             let req = QueryRequest {
@@ -137,6 +155,29 @@ pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 println!("removed source {sid}");
             }
         },
+
+        Cmd::Folders { source, prefix } => {
+            let sid = parse_source_id(&source)?;
+            let prefix = prefix.unwrap_or_default();
+            let entries = lib
+                .list_folders(
+                    &ctx,
+                    FolderListing {
+                        source: sid,
+                        prefix: prefix.clone(),
+                    },
+                )
+                .await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&entries)?);
+            } else if entries.is_empty() {
+                println!("no subfolders under '{prefix}'");
+            } else {
+                for e in &entries {
+                    println!("{:>8}  {}", e.asset_count, e.name);
+                }
+            }
+        }
 
         Cmd::Collections { cmd } => match cmd {
             CollectionCmd::List => {

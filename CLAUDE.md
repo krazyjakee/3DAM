@@ -99,7 +99,7 @@ cargo run -p dam -- --connect http://host:7878 --token <t> search "kick"
 cargo run -p dam --                     # GUI role (native egui browse/search/inspect client)
 ```
 
-Key CLI verbs (verb-noun, per tech-spec 13): `scan`, `search`, `get`, `stats`, `sources {list,add,remove}`, `collections {…}`, `convert`, `analyze`, `similar`, `dedup`, `tag`, `export`, `jobs`/`job`, `admin {status,flags,flag,token,audit}`, plus `serve` / `mcp`. Global flags: `--connect`, `--token`, `--data`, `--json`.
+Key CLI verbs (verb-noun, per tech-spec 13): `scan`, `search`, `get`, `stats`, `sources {list,add,remove}`, `folders`, `collections {…}`, `convert`, `analyze`, `similar`, `dedup`, `tag`, `export`, `jobs`/`job`, `admin {status,flags,flag,token,audit}`, plus `serve` / `mcp`. Global flags: `--connect`, `--token`, `--data`, `--json`.
 
 ### Test, lint, format
 
