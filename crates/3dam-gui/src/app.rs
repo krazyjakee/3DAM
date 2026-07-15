@@ -500,7 +500,15 @@ enum Msg {
     CollectionMutated(Result<(), String>),
     /// A backend switch (Connect/Disconnect) finished building the new service (issue #70). On `Ok`
     /// the app rebinds `lib`, resets browse state, and re-subscribes to the event stream.
-    BackendSwitched(Conn, Result<Arc<dyn LibraryService>, String>),
+    BackendSwitched(Conn, Result<Arc<dyn LibraryService>, ConnectError>),
+}
+
+/// Why a backend switch failed. `Unauthorized` is split out (front-door auth, web-parity): a
+/// missing/rejected token reopens the Connect dialog asking for a credential, instead of the
+/// generic "offline" treatment a genuinely unreachable server gets.
+enum ConnectError {
+    Unauthorized,
+    Other(String),
 }
 
 /// A collection CRUD / membership action gathered while rendering, applied after the panels.
@@ -591,6 +599,8 @@ pub struct DamGui {
     connect_open: bool,
     connect_url: String,
     connect_token: String,
+    /// An auth failure to show inside the Connect dialog (token required / rejected).
+    connect_error: Option<String>,
     recent_servers: Vec<String>,
     egui_ctx: egui::Context,
     tx: Sender<Msg>,
@@ -765,6 +775,7 @@ impl DamGui {
             connect_open: false,
             connect_url,
             connect_token,
+            connect_error: None,
             recent_servers,
             egui_ctx: cc.egui_ctx.clone(),
             tx,
@@ -900,8 +911,10 @@ impl DamGui {
     }
 
     /// Begin switching to a different backend (a remote server or back to embedded). The new service
-    /// is built off the UI thread — `open_backend` for a remote endpoint only constructs the HTTP
-    /// client (no handshake), so this never blocks — and posts back a [`Msg::BackendSwitched`].
+    /// is built off the UI thread and posts back a [`Msg::BackendSwitched`]. `open_backend` for a
+    /// remote endpoint only constructs the HTTP client, so the switch is *verified* with one cheap
+    /// stats probe — a token-gated server is caught here (front-door auth, web-parity) instead of
+    /// surfacing as a generic offline error on the first real call.
     fn switch_backend(&mut self, conn: Conn) {
         self.switching = true;
         self.status = if conn.is_remote() {
@@ -914,8 +927,10 @@ impl DamGui {
             self.egui_ctx.clone(),
             self.data_dir.clone(),
         );
+        let auth = self.auth.clone();
         let conn_for_task = conn.clone();
         self.rt.spawn(async move {
+            let remote = conn_for_task.is_remote();
             let backend = match &conn_for_task.endpoint {
                 Some(url) => match Url::parse(url) {
                     Ok(endpoint) => Backend::Connected {
@@ -925,7 +940,7 @@ impl DamGui {
                     Err(e) => {
                         let _ = tx.send(Msg::BackendSwitched(
                             conn_for_task.clone(),
-                            Err(format!("invalid URL: {e}")),
+                            Err(ConnectError::Other(format!("invalid URL: {e}"))),
                         ));
                         egctx.request_repaint();
                         return;
@@ -933,10 +948,24 @@ impl DamGui {
                 },
                 None => Backend::Embedded { data_dir },
             };
-            let res = open_backend(backend)
-                .await
-                .map(Arc::from)
-                .map_err(|e| e.to_string());
+            let res = match open_backend(backend).await {
+                Ok(lib) => {
+                    let lib: Arc<dyn LibraryService> = Arc::from(lib);
+                    // Verify a remote connect: the ctx is transport-side inert (the server resolves
+                    // the bearer token); Unauthorized means "credential required or rejected".
+                    let probe = if remote {
+                        lib.library_stats(&auth, None).await.map(|_| ())
+                    } else {
+                        Ok(())
+                    };
+                    match probe {
+                        Ok(()) => Ok(lib),
+                        Err(dam_api::LibError::Unauthorized) => Err(ConnectError::Unauthorized),
+                        Err(e) => Err(ConnectError::Other(e.to_string())),
+                    }
+                }
+                Err(e) => Err(ConnectError::Other(e.to_string())),
+            };
             let _ = tx.send(Msg::BackendSwitched(conn_for_task, res));
             egctx.request_repaint();
         });
@@ -1064,6 +1093,10 @@ impl DamGui {
                     )
                     .labelled_by(l.id);
                 });
+                if let Some(err) = &self.connect_error {
+                    ui.add_space(2.0);
+                    ui.colored_label(colors(ui.visuals().dark_mode).danger, err.as_str());
+                }
 
                 if !self.recent_servers.is_empty() {
                     ui.add_space(4.0);
@@ -1082,6 +1115,7 @@ impl DamGui {
                         .add_enabled(can_connect, egui::Button::new("Connect"))
                         .clicked()
                     {
+                        self.connect_error = None;
                         let token = self.connect_token.trim();
                         request = Some(Conn {
                             endpoint: Some(self.connect_url.trim().to_string()),
@@ -2431,22 +2465,65 @@ impl DamGui {
         });
     }
 
-    /// Inspect a transport-bearing result to keep the remote reachability chip current (issue #70).
+    /// Inspect a transport-bearing result to keep the remote reachability chip current (issue #70),
+    /// and catch a mid-session credential loss: a remote call failing with exactly "unauthorized"
+    /// (`LibError::Unauthorized`'s Display — `Msg` payloads are strings, so this is a documented
+    /// string-match fallback) means the token was revoked/expired. Reopen the Connect dialog asking
+    /// for a credential (front-door auth, web-parity) instead of calling the server "offline".
     fn note_conn_for(&mut self, msg: &Msg) {
-        match msg {
-            Msg::Assets(r) => self.note_conn(r.is_ok()),
-            Msg::Stats(r) => self.note_conn(r.is_ok()),
-            Msg::Sources(r) => self.note_conn(r.is_ok()),
-            Msg::Detail(r) => self.note_conn(r.is_ok()),
-            _ => {}
+        fn unauthorized<T>(r: &Result<T, String>) -> bool {
+            matches!(r, Err(e) if e == "unauthorized")
+        }
+        let hit = match msg {
+            Msg::Assets(r) => {
+                self.note_conn(r.is_ok());
+                unauthorized(r)
+            }
+            Msg::Stats(r) => {
+                self.note_conn(r.is_ok());
+                unauthorized(r)
+            }
+            Msg::Sources(r) => {
+                self.note_conn(r.is_ok());
+                unauthorized(r)
+            }
+            Msg::Detail(r) => {
+                self.note_conn(r.is_ok());
+                unauthorized(r)
+            }
+            _ => false,
+        };
+        if hit && self.conn.is_remote() && !self.switching && !self.connect_open {
+            self.connect_url = self.conn.endpoint.clone().unwrap_or_default();
+            self.connect_token = self.conn.token.clone().unwrap_or_default();
+            self.connect_error =
+                Some("Your session token is no longer valid — enter a valid token.".to_string());
+            self.connect_open = true;
         }
     }
 
     /// Fold a posted result into view state.
     fn apply(&mut self, msg: Msg) {
         match msg {
-            Msg::BackendSwitched(conn, Ok(lib)) => self.rebind_backend(conn, lib),
-            Msg::BackendSwitched(conn, Err(e)) => {
+            Msg::BackendSwitched(conn, Ok(lib)) => {
+                self.connect_error = None;
+                self.rebind_backend(conn, lib);
+            }
+            // Front-door auth (web-parity): a token problem reopens the Connect dialog — prefilled,
+            // with the reason under the token field — so the user is asked for a credential, not
+            // told the server is down.
+            Msg::BackendSwitched(conn, Err(ConnectError::Unauthorized)) => {
+                self.switching = false;
+                self.status = ConnStatus::Offline;
+                self.connect_url = conn.endpoint.clone().unwrap_or_default();
+                self.connect_token = conn.token.clone().unwrap_or_default();
+                self.connect_error = Some(
+                    "This server requires a token, or the token was rejected — enter a valid token."
+                        .to_string(),
+                );
+                self.connect_open = true;
+            }
+            Msg::BackendSwitched(conn, Err(ConnectError::Other(e))) => {
                 self.switching = false;
                 self.status = if conn.is_remote() {
                     ConnStatus::Offline
