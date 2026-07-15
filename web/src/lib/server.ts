@@ -16,12 +16,18 @@ export interface ServerConfig {
   token: string;
 }
 
+/** One-time migration: the admin surface used to keep its own token under this key. There is one
+ *  credential now (front-door auth) — adopt the legacy value into the server config if it has no
+ *  token of its own, then retire the key. */
+const LEGACY_ADMIN_TOKEN_KEY = "dam_admin_token";
+
 function load(): ServerConfig {
+  let cfg: ServerConfig | null = null;
   try {
     const raw = localStorage.getItem(KEY);
     if (raw) {
       const p = JSON.parse(raw) as Partial<ServerConfig>;
-      return {
+      cfg = {
         base: typeof p.base === "string" ? p.base : "",
         token: typeof p.token === "string" ? p.token : "",
       };
@@ -29,8 +35,23 @@ function load(): ServerConfig {
   } catch {
     /* corrupt entry — fall through to defaults */
   }
-  const envBase = (import.meta.env.VITE_SERVER_BASE as string | undefined) ?? "";
-  return { base: envBase.replace(/\/$/, ""), token: "" };
+  if (!cfg) {
+    const envBase = (import.meta.env.VITE_SERVER_BASE as string | undefined) ?? "";
+    cfg = { base: envBase.replace(/\/$/, ""), token: "" };
+  }
+  try {
+    const legacy = localStorage.getItem(LEGACY_ADMIN_TOKEN_KEY);
+    if (legacy) {
+      if (!cfg.token) {
+        cfg.token = legacy;
+        localStorage.setItem(KEY, JSON.stringify(cfg));
+      }
+      localStorage.removeItem(LEGACY_ADMIN_TOKEN_KEY);
+    }
+  } catch {
+    /* storage unavailable — nothing to migrate */
+  }
+  return cfg;
 }
 
 let config = load();

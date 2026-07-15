@@ -7,8 +7,6 @@ import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 import {
   admin,
-  getAdminToken,
-  setAdminToken,
   type AdminStatus,
   type AuditEntry,
   type CacheTarget,
@@ -16,11 +14,13 @@ import {
   type FlagValue,
   type NewTokenReply,
   type Scope,
+  type SetFlagReply,
   type StorageUsage,
   type TokenInfo,
 } from "@/api/admin";
 import { ApiError } from "@/api/client";
 import { useScan } from "@/api/queries";
+import { getServer, setServer } from "@/lib/server";
 import { errorMessage, toast } from "@/lib/toast";
 import { useDialogs } from "@/lib/dialogs";
 
@@ -33,11 +33,12 @@ export function Settings() {
   const [audit, setAudit] = useState<AuditEntry[]>([]);
   const [usage, setUsage] = useState<StorageUsage | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // The bootstrap owner token, when enabling authentication just minted it (never locked out).
+  const [bootstrap, setBootstrap] = useState<NewTokenReply | null>(null);
   // Which flag write is in flight — disables the flag controls so a slow admin round-trip can't be
   // double-submitted into two conflicting writes (issue #23).
   const [busyFlag, setBusyFlag] = useState<string | null>(null);
   const { confirm } = useDialogs();
-  const promptToken = useAdminTokenPrompt();
 
   /** Refetch the admin surface. Each section renders as its call lands — the storage-usage walk
    *  can take a while on a large cold cache, and it must not hold the flags/tokens/status
@@ -49,6 +50,9 @@ export function Settings() {
         set(await p);
         return null;
       } catch (e) {
+        // 403 = authenticated but not an admin: one clear notice beats five raw errors.
+        if (e instanceof ApiError && e.status === 403)
+          return "Your token lacks the admin scope — ask an admin for one, or sign in with an admin token.";
         return e instanceof Error ? e.message : String(e);
       }
     };
@@ -67,14 +71,24 @@ export function Settings() {
     void refresh();
   }, [refresh]);
 
+  /** Apply a flag-set reply. When enabling authentication minted the bootstrap owner token, adopt
+   *  it as this client's credential in the same motion — the person flipping the switch must never
+   *  be gated by their own action — and surface the secret once. */
+  const applied = useCallback(async (reply: SetFlagReply) => {
+    if (reply.bootstrap_token) {
+      setServer(getServer().base, reply.bootstrap_token.secret);
+      setBootstrap(reply.bootstrap_token);
+    }
+    await refresh({ withUsage: false });
+    toast.success("Setting updated");
+  }, [refresh]);
+
   /** Set a flag, retrying with `confirm` after an explicit warning on an exposure-increasing change. */
   const setFlag = useCallback(
     async (key: string, value: FlagValue, version: number) => {
       setBusyFlag(key);
       try {
-        await admin.setFlag(key, { value, expected_version: version });
-        await refresh({ withUsage: false });
-        toast.success("Setting updated");
+        await applied(await admin.setFlag(key, { value, expected_version: version }));
       } catch (e) {
         if (e instanceof ApiError && e.status === 400 && /exposure/i.test(e.message)) {
           if (
@@ -86,9 +100,9 @@ export function Settings() {
             })
           ) {
             try {
-              await admin.setFlag(key, { value, expected_version: version, confirm: true });
-              await refresh({ withUsage: false });
-              toast.success("Setting updated");
+              await applied(
+                await admin.setFlag(key, { value, expected_version: version, confirm: true }),
+              );
             } catch (e2) {
               toast.error(errorMessage(e2));
             }
@@ -100,7 +114,7 @@ export function Settings() {
         setBusyFlag(null);
       }
     },
-    [refresh, confirm],
+    [applied, confirm],
   );
 
   const flag = (key: string) => flags.find((f) => f.key === key);
@@ -109,26 +123,25 @@ export function Settings() {
     <div className="mx-auto flex min-h-dvh max-w-3xl flex-col gap-6 p-6 text-sm">
       <header className="flex items-center justify-between">
         <h1 className="text-lg font-semibold">Settings &amp; Administration</h1>
-        <div className="flex items-center gap-4">
-          <button
-            type="button"
-            onClick={() => {
-              promptToken();
-              void refresh();
-            }}
-            className="text-fg-muted hover:underline"
-          >
-            Set admin token…
-          </button>
-          <Link to="/" className="text-accent hover:underline">
-            ← Back to library
-          </Link>
-        </div>
+        <Link to="/" className="text-accent hover:underline">
+          ← Back to library
+        </Link>
       </header>
 
       {error && (
         <div className="rounded border border-danger/40 bg-danger/10 px-3 py-2 text-danger">
           {error}
+        </div>
+      )}
+
+      {bootstrap && (
+        <div className="rounded border border-lic-permissive/40 bg-lic-permissive/10 p-3">
+          <p className="text-lic-permissive">
+            Authentication is on and no admin credential existed, so the owner token was created —
+            this browser has adopted it and keeps working. Copy the secret now for other clients; it
+            is shown once:
+          </p>
+          <code className="mt-1 block break-all font-mono text-xs">{bootstrap.secret}</code>
         </div>
       )}
 
@@ -730,20 +743,3 @@ function TokensSection({ tokens, onChange }: { tokens: TokenInfo[]; onChange: ()
   );
 }
 
-/** A small helper for the toolbar link, kept here so the admin-token prompt lives with the surface.
- *  Uses the in-app prompt with a masked input rather than `window.prompt` (issue #29). */
-function useAdminTokenPrompt() {
-  const { prompt } = useDialogs();
-  return async () => {
-    const cur = getAdminToken() ?? "";
-    const next = await prompt({
-      title: "Admin bearer token",
-      message: "Presented on admin API calls. Leave blank to clear.",
-      initial: cur,
-      password: true,
-      allowEmpty: true,
-      confirmLabel: "Save",
-    });
-    if (next !== null) setAdminToken(next.trim() || null);
-  };
-}

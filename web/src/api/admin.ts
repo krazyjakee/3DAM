@@ -1,9 +1,10 @@
 // Typed client over the admin API (`/admin/api/*`, tech-spec 10 §5) — the same routes the CLI
 // drives, so the web Settings surface and headless admin converge on one persisted state (ADR 0004
-// decision 2). The DOM owns networking/auth (tech-spec 09 §B.1); a bearer token, when the operator
-// has one, is read from localStorage and sent on every admin call (Token-mode servers).
+// decision 2). Admin calls ride the same server config as the rest of the client (front-door auth:
+// one credential; when it carries the admin scope this surface opens, otherwise it 403s).
 
 import { ApiError } from "./client";
+import { authHeaders, resolveUrl } from "@/lib/server";
 
 const ADMIN = "/admin/api";
 
@@ -26,6 +27,12 @@ export interface SetFlag {
   value: FlagValue;
   expected_version?: number | null;
   confirm?: boolean;
+}
+
+/** Reply to a flag set: the flag fields (flattened) — plus, exactly when enabling authentication
+ *  minted the first admin credential, the bootstrap owner token (secret shown once). */
+export interface SetFlagReply extends FlagInfo {
+  bootstrap_token?: NewTokenReply | null;
 }
 
 export interface AdminStatus {
@@ -117,22 +124,15 @@ export interface FactoryResetReport {
   tokens_removed: number;
 }
 
-/** The admin bearer token an operator pasted in (Token-mode servers). Persisted locally only. */
-const TOKEN_KEY = "dam_admin_token";
-export function getAdminToken(): string | null {
-  return localStorage.getItem(TOKEN_KEY);
-}
-export function setAdminToken(token: string | null): void {
-  if (token) localStorage.setItem(TOKEN_KEY, token);
-  else localStorage.removeItem(TOKEN_KEY);
+function headers(json: boolean): HeadersInit {
+  const h: Record<string, string> = { accept: "application/json", ...authHeaders() };
+  if (json) h["content-type"] = "application/json";
+  return h;
 }
 
-function headers(json: boolean): HeadersInit {
-  const h: Record<string, string> = { accept: "application/json" };
-  if (json) h["content-type"] = "application/json";
-  const t = getAdminToken();
-  if (t) h["authorization"] = `Bearer ${t}`;
-  return h;
+/** Admin route, resolved against the configured server (not just the SPA origin). */
+function url(path: string): string {
+  return resolveUrl(`${ADMIN}${path}`);
 }
 
 async function decode<T>(res: Response): Promise<T> {
@@ -150,22 +150,22 @@ async function decode<T>(res: Response): Promise<T> {
 
 export const admin = {
   status: async () =>
-    decode<AdminStatus>(await fetch(`${ADMIN}/status`, { headers: headers(false) })),
+    decode<AdminStatus>(await fetch(url("/status"), { headers: headers(false) })),
   flags: async () =>
-    decode<FlagInfo[]>(await fetch(`${ADMIN}/flags`, { headers: headers(false) })),
+    decode<FlagInfo[]>(await fetch(url("/flags"), { headers: headers(false) })),
   setFlag: async (key: string, req: SetFlag) =>
-    decode<FlagInfo>(
-      await fetch(`${ADMIN}/flags/${key}`, {
+    decode<SetFlagReply>(
+      await fetch(url(`/flags/${key}`), {
         method: "PUT",
         headers: headers(true),
         body: JSON.stringify(req),
       }),
     ),
   tokens: async () =>
-    decode<TokenInfo[]>(await fetch(`${ADMIN}/tokens`, { headers: headers(false) })),
+    decode<TokenInfo[]>(await fetch(url("/tokens"), { headers: headers(false) })),
   createToken: async (req: NewToken) =>
     decode<NewTokenReply>(
-      await fetch(`${ADMIN}/tokens`, {
+      await fetch(url("/tokens"), {
         method: "POST",
         headers: headers(true),
         body: JSON.stringify(req),
@@ -173,17 +173,17 @@ export const admin = {
     ),
   revokeToken: async (id: string) =>
     decode<void>(
-      await fetch(`${ADMIN}/tokens/${id}`, { method: "DELETE", headers: headers(false) }),
+      await fetch(url(`/tokens/${id}`), { method: "DELETE", headers: headers(false) }),
     ),
   audit: async (limit = 100) =>
-    decode<AuditEntry[]>(await fetch(`${ADMIN}/audit?limit=${limit}`, { headers: headers(false) })),
+    decode<AuditEntry[]>(await fetch(url(`/audit?limit=${limit}`), { headers: headers(false) })),
 
   // ── storage & maintenance ──────────────────────────────────────────────────
   storageUsage: async () =>
-    decode<StorageUsage>(await fetch(`${ADMIN}/maintenance/usage`, { headers: headers(false) })),
+    decode<StorageUsage>(await fetch(url("/maintenance/usage"), { headers: headers(false) })),
   clearCache: async (target: CacheTarget) =>
     decode<ClearCacheReport>(
-      await fetch(`${ADMIN}/maintenance/clear-cache`, {
+      await fetch(url("/maintenance/clear-cache"), {
         method: "POST",
         headers: headers(true),
         body: JSON.stringify({ target }),
@@ -191,15 +191,15 @@ export const admin = {
     ),
   clearAnalysis: async () =>
     decode<ClearAnalysisReport>(
-      await fetch(`${ADMIN}/maintenance/clear-analysis`, { method: "POST", headers: headers(false) }),
+      await fetch(url("/maintenance/clear-analysis"), { method: "POST", headers: headers(false) }),
     ),
   vacuum: async () =>
     decode<VacuumReport>(
-      await fetch(`${ADMIN}/maintenance/vacuum`, { method: "POST", headers: headers(false) }),
+      await fetch(url("/maintenance/vacuum"), { method: "POST", headers: headers(false) }),
     ),
   wipe: async (confirm: boolean) =>
     decode<WipeReport>(
-      await fetch(`${ADMIN}/maintenance/wipe`, {
+      await fetch(url("/maintenance/wipe"), {
         method: "POST",
         headers: headers(true),
         body: JSON.stringify({ confirm }),
@@ -207,7 +207,7 @@ export const admin = {
     ),
   factoryReset: async (confirm: boolean) =>
     decode<FactoryResetReport>(
-      await fetch(`${ADMIN}/maintenance/factory-reset`, {
+      await fetch(url("/maintenance/factory-reset"), {
         method: "POST",
         headers: headers(true),
         body: JSON.stringify({ confirm }),
