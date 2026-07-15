@@ -20,6 +20,12 @@
       "port": 5273
     },
     {
+      "name": "web-auth-smoke",
+      "runtimeExecutable": "env",
+      "runtimeArgs": ["VITE_API_TARGET=http://127.0.0.1:7444", "pnpm", "--dir", "web", "dev", "--port", "5274", "--strictPort"],
+      "port": 5274
+    },
+    {
       "name": "web-verify",
       "runtimeExecutable": "pnpm",
       "runtimeArgs": ["--dir", "web", "dev"],
