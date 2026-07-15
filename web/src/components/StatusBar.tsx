@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState } from "react";
-import { ChevronUp, Loader2, Server, X } from "lucide-react";
+import { ChevronUp, Loader2, LogIn, Server, X } from "lucide-react";
 import { useCancelJob, useJobs, useStats, useVersion } from "@/api/queries";
 import { useConnection, type ConnState } from "@/api/connection";
 import type { JobStatus, MediaType } from "@/api/types";
-import { isRemote, serverLabel } from "@/lib/server";
+import { getServer, isRemote, serverLabel } from "@/lib/server";
 import { ConnectDialog } from "./ConnectDialog";
+import { TokenLoginForm } from "./AuthGate";
 
 /** Bottom status strip: active scan/analysis jobs with live progress, the live-connection state, and
  *  the server build. A single job shows inline; concurrent jobs condense into one aggregate bar with
@@ -34,9 +35,43 @@ export function StatusBar() {
       )}
       <MediaBreakdown />
       <ConnectionPill state={conn.state} />
+      {version.data?.auth === "anonymous" && <SignedOutChip />}
       <ServerChip />
       <span className="tabular-nums">{version.data?.server ?? ""}</span>
     </footer>
+  );
+}
+
+/** Anonymous-mode posture chip (front-door auth): browsing is public but writes need a credential,
+ *  so a signed-out session shows exactly one affordance — Sign in — instead of failing writes with
+ *  raw errors. Signed in, the chip disappears (the token rides every request; scopes decide). */
+function SignedOutChip() {
+  const [open, setOpen] = useState(false);
+  if (getServer().token) return null;
+  return (
+    <>
+      <button
+        className="flex items-center gap-1 rounded px-1.5 py-0.5 text-warn hover:text-fg"
+        onClick={() => setOpen(true)}
+        title="Browsing read-only — sign in to make changes"
+      >
+        <LogIn size={11} />
+        <span>Signed out · Sign in</span>
+      </button>
+      {open && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+          onClick={() => setOpen(false)}
+        >
+          <div
+            className="w-full max-w-md rounded-lg border border-border bg-surface p-4 shadow-xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <TokenLoginForm reason={null} allowReadOnly={false} onClose={() => setOpen(false)} />
+          </div>
+        </div>
+      )}
+    </>
   );
 }
 

@@ -103,6 +103,9 @@ export interface VersionInfo {
   api: string;
   server: string;
   capabilities: string[];
+  /** The server's auth posture — lets the AuthGate render a login before provoking 401s.
+   *  Absent on older servers (treated as "off"). */
+  auth?: import("./admin").AuthMode;
 }
 
 export const api = {

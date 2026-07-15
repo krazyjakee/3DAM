@@ -4,6 +4,7 @@
 
 import { useStats } from "./queries";
 import { useWsConnected } from "./ws";
+import { isUnauthorized } from "@/lib/auth";
 
 export type ConnState = "online" | "reconnecting" | "offline";
 
@@ -20,7 +21,8 @@ export function useConnection(): Connection {
   // `stats` has no polling of its own, but the WS reconnect invalidates it, so recovery clears the error.
   const stats = useStats();
   const wsConnected = useWsConnected();
-  const backendDown = stats.isError;
+  // A 401 is the AuthGate's business (missing/revoked credential), never "offline".
+  const backendDown = stats.isError && !isUnauthorized(stats.error);
   const state: ConnState = backendDown ? "offline" : wsConnected ? "online" : "reconnecting";
   return { state, backendDown, live: wsConnected && !backendDown };
 }
