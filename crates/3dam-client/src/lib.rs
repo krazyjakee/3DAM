@@ -6,8 +6,8 @@
 use async_trait::async_trait;
 use dam_api::admin::{
     AdminStatus, AuditEntry, CacheTarget, ClearAnalysisReport, ClearCacheReport, ClearCacheRequest,
-    ConfirmRequest, FactoryResetReport, FlagInfo, NewToken, NewTokenReply, SetFlag, StorageUsage,
-    TokenInfo, VacuumReport, WipeReport,
+    ConfirmRequest, FactoryResetReport, FlagInfo, NewToken, NewTokenReply, SetFlag, SetFlagReply,
+    StorageUsage, TokenInfo, VacuumReport, WipeReport,
 };
 use dam_api::dto::*;
 use dam_api::event::EventTopic;
@@ -276,8 +276,9 @@ impl ApiClient {
     pub async fn admin_flags(&self) -> Result<Vec<FlagInfo>, LibError> {
         self.get("/admin/api/flags").await
     }
-    /// `PUT /admin/api/flags/{key}`.
-    pub async fn admin_set_flag(&self, key: &str, req: &SetFlag) -> Result<FlagInfo, LibError> {
+    /// `PUT /admin/api/flags/{key}` — the reply carries the bootstrap owner token when enabling
+    /// auth minted the first admin credential.
+    pub async fn admin_set_flag(&self, key: &str, req: &SetFlag) -> Result<SetFlagReply, LibError> {
         self.put(&format!("/admin/api/flags/{key}"), req).await
     }
     /// `GET /admin/api/tokens`.

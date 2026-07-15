@@ -39,7 +39,7 @@ async fn run_admin_remote(
                         expected_version: None,
                         confirm,
                     };
-                    print_flags(&[client.admin_set_flag(fk.as_str(), &req).await?], json)?;
+                    print_set_flag(&client.admin_set_flag(fk.as_str(), &req).await?, json)?;
                 }
                 None => {
                     let all = client.admin_flags().await?;
@@ -113,7 +113,7 @@ async fn run_admin_embedded(
                         expected_version: None,
                         confirm,
                     };
-                    print_flags(&[store.set_flag(fk, req, "cli")?], json)?;
+                    print_set_flag(&store.set_flag(fk, req, "cli")?, json)?;
                 }
                 None => print_flags(&[store.flag_info(fk)], json)?,
             }
@@ -321,6 +321,19 @@ fn print_tokens(tokens: &[TokenInfo], json: bool) -> anyhow::Result<()> {
     for t in tokens {
         let scopes: Vec<String> = t.scopes.to_vec().iter().map(|s| format!("{s:?}")).collect();
         println!("{}  {:<20} [{}]", t.token_id, t.label, scopes.join(","));
+    }
+    Ok(())
+}
+
+fn print_set_flag(reply: &SetFlagReply, json: bool) -> anyhow::Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(reply)?);
+        return Ok(());
+    }
+    print_flags(std::slice::from_ref(&reply.flag), false)?;
+    if let Some(t) = &reply.bootstrap_token {
+        println!("authentication is on and no admin credential existed — minted the owner token:");
+        print_new_token(t, false)?;
     }
     Ok(())
 }

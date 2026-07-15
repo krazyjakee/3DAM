@@ -71,7 +71,7 @@ async fn set_flag(
     State(st): State<AppState>,
     Path(key): Path<String>,
     Json(req): Json<SetFlag>,
-) -> Result<Json<FlagInfo>, ApiError> {
+) -> Result<Json<SetFlagReply>, ApiError> {
     let key = parse_key(&key)?;
     Ok(Json(st.store.set_flag(key, req, &actor_of(&ctx))?))
 }

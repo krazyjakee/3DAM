@@ -259,8 +259,15 @@ impl ServerStore {
     }
 
     /// Set a flag through the audited path (tech-spec 10 §2.3, §5): optimistic-concurrency check,
-    /// exposure confirmation, store write, in-memory update, audit append. Returns the applied info.
-    pub fn set_flag(&self, key: FlagKey, req: SetFlag, actor: &str) -> Result<FlagInfo, LibError> {
+    /// exposure confirmation, store write, in-memory update, audit append. Returns the applied info
+    /// — plus the bootstrap owner token when this set turned authentication on with zero admin
+    /// credentials in the store (never locked out: the gate always comes with a key).
+    pub fn set_flag(
+        &self,
+        key: FlagKey,
+        req: SetFlag,
+        actor: &str,
+    ) -> Result<SetFlagReply, LibError> {
         if !req.value.matches(key) {
             return Err(LibError::BadRequest(format!(
                 "flag '{key}' value has the wrong type"
@@ -305,7 +312,44 @@ impl ServerStore {
             f.apply(key, req.value);
             f.versions.insert(key, new_version);
         }
-        Ok(self.flag_info(key))
+        // Turning authentication on must hand the operator a key in the same motion: with zero
+        // admin-scoped tokens the instance would be gated with no holder of a credential.
+        let bootstrap_token = match req.value {
+            FlagValue::Auth(mode) if mode != AuthMode::Off => {
+                self.bootstrap_owner_token_if_needed(actor)?
+            }
+            _ => None,
+        };
+        Ok(SetFlagReply {
+            flag: self.flag_info(key),
+            bootstrap_token,
+        })
+    }
+
+    /// Mint the **bootstrap owner token** (label `owner`, full owner scopes, no expiry) iff no
+    /// admin-scoped token exists — the "never locked out" guarantee behind [`Self::set_flag`] and
+    /// serve startup (a config file can seed a credentialed mode on first boot). No-op otherwise, so
+    /// it never re-mints or spams the audit log.
+    pub fn bootstrap_owner_token_if_needed(
+        &self,
+        actor: &str,
+    ) -> Result<Option<NewTokenReply>, LibError> {
+        let has_admin = self
+            .list_tokens()?
+            .iter()
+            .any(|t| t.scopes.has(dam_api::service::Scope::Admin));
+        if has_admin {
+            return Ok(None);
+        }
+        self.create_token(
+            NewToken {
+                label: "owner".into(),
+                scopes: Scopes::owner(),
+                expires: None,
+            },
+            actor,
+        )
+        .map(Some)
     }
 
     // ── tokens (tech-spec 10 §1.4) ───────────────────────────────────────────

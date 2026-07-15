@@ -314,6 +314,18 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
             "  ⚠ exposed beyond localhost with no auth and no TLS — set the authentication flag"
         );
     }
+    // Never locked out: a config file can seed a credentialed mode on first boot (the hardened
+    // template does), which would gate the instance with zero key holders. Mint the bootstrap owner
+    // token and print it once — recoverable from the container/service logs until first use.
+    if !matches!(s.auth, dam_api::admin::AuthMode::Off) {
+        if let Some(t) = store.bootstrap_owner_token_if_needed("startup")? {
+            eprintln!(
+                "  authentication is on and no admin credential existed — minted the owner token\n  \
+                 secret (shown once): {}",
+                t.secret
+            );
+        }
+    }
     ready.store(true, std::sync::atomic::Ordering::Relaxed);
 
     // TLS deployment: serve HTTPS via axum-server (its own graceful-shutdown handle), still flipping

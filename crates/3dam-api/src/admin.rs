@@ -139,6 +139,19 @@ pub struct SetFlag {
     pub confirm: bool,
 }
 
+/// Reply to `PUT /admin/api/flags/{key}`: the updated flag — plus, exactly when enabling
+/// authentication activated a gate with zero admin credentials in the store, the auto-minted
+/// **bootstrap owner token** (never locked out: the gate always comes with a key). The flag fields
+/// are flattened, so readers expecting a bare [`FlagInfo`] keep working.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SetFlagReply {
+    #[serde(flatten)]
+    pub flag: FlagInfo,
+    /// Present only when this set minted the first admin credential; the secret is shown once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap_token: Option<NewTokenReply>,
+}
+
 /// Server posture at a glance (`GET /admin/api/status`, tech-spec 10 §5) — what an operator needs to
 /// answer "am I safe to expose?".
 #[derive(Clone, Debug, Serialize, Deserialize)]

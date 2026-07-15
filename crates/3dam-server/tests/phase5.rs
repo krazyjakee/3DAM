@@ -290,7 +290,7 @@ async fn confirm_gate_and_concurrency_on_store() {
             "t",
         )
         .unwrap();
-    assert_eq!(info.version, 1);
+    assert_eq!(info.flag.version, 1);
 
     // Stale expected_version → Conflict.
     let err = store
@@ -756,4 +756,57 @@ async fn version_reports_auth_mode_publicly() {
     let (st, body) = call(&app, "GET", "/api/version", None, None).await;
     assert_eq!(st, StatusCode::OK, "version stays public in token mode");
     assert_eq!(body["auth"], "token");
+}
+
+#[tokio::test]
+async fn enabling_auth_mints_a_bootstrap_owner_token() {
+    // Turning authentication on with zero admin credentials must hand the operator a key in the
+    // same motion — an instance is never gated with no holder of a credential.
+    let (app, store, _lib) = harness(true).await;
+
+    // The owner (auth off) enables token mode over the admin API with an empty token store.
+    let (st, body) = call(
+        &app,
+        "PUT",
+        "/admin/api/flags/authentication",
+        None,
+        Some(json!({"value": "token", "confirm": true})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        body["value"], "token",
+        "flag fields stay flattened in the reply"
+    );
+    let secret = body["bootstrap_token"]["secret"]
+        .as_str()
+        .expect("enabling auth on an empty token store mints the owner token")
+        .to_string();
+    assert_eq!(body["bootstrap_token"]["label"], "owner");
+
+    // The minted secret is a working admin credential — the flip never locks the operator out.
+    let (st, status) = call(&app, "GET", "/admin/api/status", Some(&secret), None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(status["auth"], "token");
+
+    // Flipping again mints nothing: an admin credential now exists.
+    let (st, body) = call(
+        &app,
+        "PUT",
+        "/admin/api/flags/authentication",
+        Some(&secret),
+        Some(json!({"value": "anonymous", "confirm": true})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        body.get("bootstrap_token").is_none() || body["bootstrap_token"].is_null(),
+        "no re-mint once an admin token exists: {body}"
+    );
+
+    // And the startup path is idempotent too.
+    assert!(store
+        .bootstrap_owner_token_if_needed("startup")
+        .unwrap()
+        .is_none());
 }
