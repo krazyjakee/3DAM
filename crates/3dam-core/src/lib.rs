@@ -416,6 +416,10 @@ pub struct EmbeddedLibrary {
     /// whole-library pass yields when the host runs short on memory or CPU, or its disks are
     /// stalled under bulk I/O.
     governor: Arc<resources::Governor>,
+    /// TTL-cached cache-tier footprints for [`Self::storage_usage`]. The walk stats every file
+    /// under `cache/` — tens of thousands of inodes on a large library, minutes on a cold HDD —
+    /// so the Settings screen must not pay it on every load. Invalidated on [`Self::clear_caches`].
+    usage_cache: Mutex<Option<(std::time::Instant, CacheUsage, CacheUsage)>>,
 }
 
 impl EmbeddedLibrary {
@@ -484,6 +488,7 @@ impl EmbeddedLibrary {
             semantic,
             fed: federation::PeerRegistry::new(),
             governor,
+            usage_cache: Mutex::new(None),
         })
     }
 
@@ -575,9 +580,36 @@ impl EmbeddedLibrary {
     // through the audited admin surface, not the generic frontend trait.
 
     /// Report on-disk usage: `library.db` + `server.db` sizes, both cache tiers, and catalog counts.
-    /// Read-only. File sizing runs off the async runtime.
+    /// Read-only. File sizing runs off the async runtime. The cache-tier walk (a stat per cached
+    /// file — tens of thousands on a big library, and seek-bound on an HDD) is TTL-cached so
+    /// repeated Settings loads don't re-pay it; DB sizes and catalog counts are always live.
     pub async fn storage_usage(&self) -> Result<StorageUsage, LibError> {
+        const CACHE_WALK_TTL: std::time::Duration = std::time::Duration::from_secs(30);
         let stats = self.db(|s| s.stats(None)).await?;
+        let cached = self
+            .usage_cache
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|(at, ..)| at.elapsed() < CACHE_WALK_TTL)
+            .map(|(_, t, p)| (*t, *p));
+        let (thumbnails, previews) = match cached {
+            Some(tiers) => tiers,
+            None => {
+                let cache_dir = self.data_dir.join("cache");
+                let tiers = tokio::task::spawn_blocking(move || {
+                    (
+                        dir_usage(&cache_dir.join("thumbnails")),
+                        dir_usage(&cache_dir.join("previews")),
+                    )
+                })
+                .await
+                .map_err(|e| LibError::Internal(e.to_string()))?;
+                *self.usage_cache.lock().unwrap() =
+                    Some((std::time::Instant::now(), tiers.0, tiers.1));
+                tiers
+            }
+        };
         let data_dir = self.data_dir.clone();
         tokio::task::spawn_blocking(move || {
             let file_len = |p: PathBuf| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
@@ -585,8 +617,8 @@ impl EmbeddedLibrary {
                 data_dir: data_dir.display().to_string(),
                 library_db_bytes: file_len(data_dir.join("library.db")),
                 server_db_bytes: file_len(data_dir.join("server.db")),
-                thumbnails: dir_usage(&data_dir.join("cache").join("thumbnails")),
-                previews: dir_usage(&data_dir.join("cache").join("previews")),
+                thumbnails,
+                previews,
                 asset_count: stats.total,
                 source_count: stats.sources,
             })
@@ -600,7 +632,7 @@ impl EmbeddedLibrary {
     /// emits no event.
     pub async fn clear_caches(&self, target: CacheTarget) -> Result<ClearCacheReport, LibError> {
         let data_dir = self.data_dir.clone();
-        tokio::task::spawn_blocking(move || {
+        let report = tokio::task::spawn_blocking(move || {
             let cache = data_dir.join("cache");
             let mut freed = CacheUsage { bytes: 0, files: 0 };
             if matches!(target, CacheTarget::Thumbnails | CacheTarget::All) {
@@ -613,13 +645,17 @@ impl EmbeddedLibrary {
                 freed.bytes += u.bytes;
                 freed.files += u.files;
             }
-            Ok(ClearCacheReport {
+            ClearCacheReport {
                 bytes_freed: freed.bytes,
                 files_deleted: freed.files,
-            })
+            }
         })
         .await
-        .map_err(|e| LibError::Internal(e.to_string()))?
+        .map_err(|e| LibError::Internal(e.to_string()))?;
+        // The tier footprints just changed — drop the TTL cache so the next `storage_usage`
+        // re-walks (the cleared dirs are empty, so that walk is cheap).
+        *self.usage_cache.lock().unwrap() = None;
+        Ok(report)
     }
 
     /// Drop the analysis layer (suggestions + embeddings + derived attrs) and mark every asset due

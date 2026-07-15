@@ -39,24 +39,28 @@ export function Settings() {
   const { confirm } = useDialogs();
   const promptToken = useAdminTokenPrompt();
 
-  const refresh = useCallback(async () => {
-    try {
-      const [s, f, t, a, u] = await Promise.all([
-        admin.status(),
-        admin.flags(),
-        admin.tokens(),
-        admin.audit(25),
-        admin.storageUsage(),
-      ]);
-      setStatus(s);
-      setFlags(f);
-      setTokens(t);
-      setAudit(a);
-      setUsage(u);
-      setError(null);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    }
+  /** Refetch the admin surface. Each section renders as its call lands — the storage-usage walk
+   *  can take a while on a large cold cache, and it must not hold the flags/tokens/status
+   *  sections (or the whole screen) hostage. `withUsage: false` skips it for refreshes that
+   *  can't change storage (flag/token writes). */
+  const refresh = useCallback(async (opts?: { withUsage?: boolean }) => {
+    const settle = async <T,>(p: Promise<T>, set: (v: T) => void): Promise<string | null> => {
+      try {
+        set(await p);
+        return null;
+      } catch (e) {
+        return e instanceof Error ? e.message : String(e);
+      }
+    };
+    const calls = [
+      settle(admin.status(), setStatus),
+      settle(admin.flags(), setFlags),
+      settle(admin.tokens(), setTokens),
+      settle(admin.audit(25), setAudit),
+    ];
+    if (opts?.withUsage !== false) calls.push(settle(admin.storageUsage(), setUsage));
+    const failures = (await Promise.all(calls)).filter((m): m is string => m !== null);
+    setError(failures[0] ?? null);
   }, []);
 
   useEffect(() => {
@@ -69,7 +73,7 @@ export function Settings() {
       setBusyFlag(key);
       try {
         await admin.setFlag(key, { value, expected_version: version });
-        await refresh();
+        await refresh({ withUsage: false });
         toast.success("Setting updated");
       } catch (e) {
         if (e instanceof ApiError && e.status === 400 && /exposure/i.test(e.message)) {
@@ -83,7 +87,7 @@ export function Settings() {
           ) {
             try {
               await admin.setFlag(key, { value, expected_version: version, confirm: true });
-              await refresh();
+              await refresh({ withUsage: false });
               toast.success("Setting updated");
             } catch (e2) {
               toast.error(errorMessage(e2));
@@ -234,7 +238,7 @@ export function Settings() {
 
       <StorageSection usage={usage} onChange={refresh} />
 
-      <TokensSection tokens={tokens} onChange={refresh} />
+      <TokensSection tokens={tokens} onChange={() => void refresh({ withUsage: false })} />
 
       <section className="flex flex-col gap-2">
         <h2 className="font-medium text-fg-muted">Audit log</h2>
