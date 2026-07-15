@@ -497,10 +497,13 @@ fn serve_embedded(path: &str) -> Option<Response> {
     )
 }
 
-async fn version() -> Json<serde_json::Value> {
+async fn version(State(st): State<AppState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "api": "v1",
         "server": concat!("3dam ", env!("CARGO_PKG_VERSION")),
+        // The auth posture, on the one public route: lets a client render its login gate up front
+        // instead of provoking 401s (the same fact a 401 would reveal anyway).
+        "auth": st.store.auth_mode(),
         "capabilities": ["query", "sources", "scan", "stats", "ws", "web", "thumbnail", "convert",
                          "analyze", "similar", "duplicates", "suggestions", "collections", "export",
                          "auth", "flags", "mcp"],

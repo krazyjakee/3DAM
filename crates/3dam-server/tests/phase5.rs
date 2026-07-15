@@ -543,3 +543,217 @@ async fn mcp_adapter_stdio_is_locally_trusted() {
             >= 3
     );
 }
+
+// ── front-door auth: the network ceiling caps implicit trust, not identities ─
+
+/// Mint a token with the given scopes while the store is still in Off mode.
+fn mint(store: &ServerStore, label: &str, scopes: dam_api::service::Scopes) -> String {
+    store
+        .create_token(
+            dam_api::admin::NewToken {
+                label: label.into(),
+                scopes,
+                expires: None,
+            },
+            "test",
+        )
+        .unwrap()
+        .secret
+}
+
+fn set_auth(store: &ServerStore, mode: dam_api::admin::AuthMode) {
+    store
+        .set_flag(
+            dam_api::admin::FlagKey::Authentication,
+            dam_api::admin::SetFlag {
+                value: dam_api::admin::FlagValue::Auth(mode),
+                expected_version: None,
+                confirm: false,
+            },
+            "test",
+        )
+        .unwrap();
+}
+
+#[tokio::test]
+async fn verified_write_token_bypasses_network_ceiling() {
+    // Bound beyond localhost, network_writes off: a *verified* write-scoped token still writes —
+    // past the front door, the credential's scopes alone decide (tech-spec 10 §4.2).
+    let (app, store, _lib) = harness(false).await;
+    use dam_api::service::Scope;
+    let secret = mint(
+        &store,
+        "writer",
+        dam_api::service::Scopes::none()
+            .with(Scope::Read)
+            .with(Scope::Write),
+    );
+    set_auth(&store, dam_api::admin::AuthMode::Token);
+
+    let (st, body) = call(
+        &app,
+        "POST",
+        "/api/v1/collections",
+        Some(&secret),
+        Some(json!({"name": "from-the-network"})),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "verified write token must not be capped by network_writes: {body}"
+    );
+}
+
+#[tokio::test]
+async fn implicit_trust_still_capped_by_network_ceiling() {
+    // Auth off + non-loopback bind: the owner-posture caller has Write scope but no verified
+    // identity, so the network ceiling still applies until the flag opens it.
+    let (app, store, _lib) = harness(false).await;
+
+    let (st, body) = call(
+        &app,
+        "POST",
+        "/api/v1/collections",
+        None,
+        Some(json!({"name": "blocked"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    assert_eq!(
+        body["code"], "disabled",
+        "implicit trust is read-only to the network"
+    );
+
+    store
+        .set_flag(
+            dam_api::admin::FlagKey::NetworkWrites,
+            dam_api::admin::SetFlag {
+                value: dam_api::admin::FlagValue::Bool(true),
+                expected_version: None,
+                confirm: true,
+            },
+            "test",
+        )
+        .unwrap();
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/api/v1/collections",
+        None,
+        Some(json!({"name": "now-allowed"})),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "network_writes opens implicit-trust writes"
+    );
+}
+
+#[tokio::test]
+async fn read_token_never_gains_write_from_ceiling_bypass() {
+    // The bypass is about the ceiling, not the scopes: a verified read-only token still lacks Write.
+    let (app, store, _lib) = harness(false).await;
+    let secret = mint(
+        &store,
+        "reader",
+        dam_api::service::Scopes::none().with(dam_api::service::Scope::Read),
+    );
+    set_auth(&store, dam_api::admin::AuthMode::Token);
+
+    let (st, body) = call(
+        &app,
+        "POST",
+        "/api/v1/jobs/scan",
+        Some(&secret),
+        Some(json!({"sources": [], "mode": "full"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    assert_eq!(
+        body["code"], "forbidden",
+        "scope miss, not the ceiling: {body}"
+    );
+}
+
+#[tokio::test]
+async fn mcp_write_tools_follow_token_scope_not_ceiling() {
+    let (app, store, _lib) = harness(false).await;
+    use dam_api::admin::{FlagKey, FlagValue, McpMode, SetFlag};
+    use dam_api::service::Scope;
+
+    store
+        .set_flag(
+            FlagKey::McpServer,
+            SetFlag {
+                value: FlagValue::Mcp(McpMode::ReadWrite),
+                expected_version: None,
+                confirm: true,
+            },
+            "test",
+        )
+        .unwrap();
+
+    let write_tools = |body: &Value| -> bool {
+        body["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["name"] == "convert")
+    };
+
+    // Implicit trust (auth off, non-loopback, network_writes off): write tools hidden.
+    let (_, body) = rpc(&app, None, "tools/list", json!({})).await;
+    assert!(
+        !write_tools(&body),
+        "implicit trust beyond localhost sees read tools only"
+    );
+
+    // A verified write token sees the write tools — ceiling does not apply to identities.
+    let secret = mint(
+        &store,
+        "agent",
+        dam_api::service::Scopes::none()
+            .with(Scope::Read)
+            .with(Scope::Write)
+            .with(Scope::McpUse),
+    );
+    set_auth(&store, dam_api::admin::AuthMode::Token);
+    let (_, body) = rpc(&app, Some(&secret), "tools/list", json!({})).await;
+    assert!(write_tools(&body), "verified write token sees write tools");
+
+    // ReadOnly stays a surface gate: it hides write tools from everyone, tokens included.
+    store
+        .set_flag(
+            FlagKey::McpServer,
+            SetFlag {
+                value: FlagValue::Mcp(McpMode::ReadOnly),
+                expected_version: None,
+                confirm: false,
+            },
+            "test",
+        )
+        .unwrap();
+    let (_, body) = rpc(&app, Some(&secret), "tools/list", json!({})).await;
+    assert!(
+        !write_tools(&body),
+        "ReadOnly hides write tools even from write tokens"
+    );
+}
+
+#[tokio::test]
+async fn version_reports_auth_mode_publicly() {
+    // The one public route carries the auth posture so a client can render its login gate without
+    // provoking 401s.
+    let (app, store, _lib) = harness(true).await;
+
+    let (st, body) = call(&app, "GET", "/api/version", None, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(body["auth"], "off");
+
+    set_auth(&store, dam_api::admin::AuthMode::Token);
+    let (st, body) = call(&app, "GET", "/api/version", None, None).await;
+    assert_eq!(st, StatusCode::OK, "version stays public in token mode");
+    assert_eq!(body["auth"], "token");
+}

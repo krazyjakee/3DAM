@@ -67,7 +67,7 @@ watch      = true
 [flags]
 auth              = "off"        # off | anonymous | token | oidc   (one gate: web/API/MCP/federation)
 remote_access     = false        # exposing beyond localhost gates on this + an auth mode
-network_writes    = false        # read-only to the network by default
+network_writes    = false        # implicit-trust callers are read-only to the network; verified write tokens are not capped
 mcp               = "off"        # off | read-only | writes   (mounts/unmounts POST /mcp — file 11)
 inbound_federation= false        # answer federated queries from peers?
 remote_connect    = false        # accept GUI/CLI --connect sessions as a backend?

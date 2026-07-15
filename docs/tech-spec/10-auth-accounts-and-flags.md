@@ -231,7 +231,7 @@ Off by default (`UserAccounts = Off` ⇒ single-tenant, whatever the auth mode g
 Three fixed roles for v1 (custom roles are an Open question, per PRODUCT_SPEC §10):
 
 - **admin** — manage feature flags, sources, tokens, and other accounts (the admin API, §5), plus everything editor can do.
-- **editor** — everything viewer can do **plus writes** (tag / set_license / convert / scan / export), *subject to* the `NetworkWrites` flag — the flag is the network-level ceiling, the role is the identity-level grant; a write requires both.
+- **editor** — everything viewer can do **plus writes** (tag / set_license / convert / scan / export). The `NetworkWrites` flag is the ceiling on **implicit trust only** (the auth-off owner posture, anonymous callers): a *verified* credential's scopes alone decide — front-door auth, one gate at the connection, permissions after it.
 - **viewer** — read-only browse, search, similarity, preview.
 
 ### 4.2 Role → scope mapping
@@ -256,7 +256,7 @@ fn anon_scopes() -> ScopeSet { Read | McpUse }        // what Anonymous mode gra
 
 Effective granted scopes = `scopes_for(role)` intersected with any narrowing on the credential (a token issued below its account's ceiling) and gated by the relevant flag at the point of use:
 
-- `Scope::Write` present **and** `NetworkWrites = true` ⇒ a write handler proceeds; either missing ⇒ `403`.
+- `Scope::Write` present ⇒ a write handler proceeds for a **verified credential** (identity resolved from a token); an **implicit-trust** caller (auth off / anonymous, no credential) additionally needs `NetworkWrites = true` on a non-loopback bind. Missing scope ⇒ `403`; implicit trust without the flag ⇒ `403 disabled`.
 - `Scope::McpUse` is necessary but not sufficient for MCP — the `McpServer` flag must be on (else the route is absent), and its ReadOnly/ReadWrite setting further gates MCP write tools ([11](11-mcp-server.md)).
 - `Scope::Admin` gates the entire admin API (§5); once auth is on, the admin surface is **never** reachable anonymously (ADR 0004 negative note).
 

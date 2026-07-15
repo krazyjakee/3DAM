@@ -94,16 +94,20 @@ impl FromRequestParts<AppState> for Reader {
     }
 }
 
-/// A context authorised to **write**: it holds `Write` *and* writes are permitted on this bind — the
-/// network-level ceiling (tech-spec 10 §4.2). Writes default off beyond localhost; the
-/// `NetworkWrites` flag opens them. Localhost is always allowed to write (the owner's own machine).
+/// A context authorised to **write**: it holds `Write` and, when the caller has **no verified
+/// credential**, writes are permitted on this bind — the network ceiling (tech-spec 10 §4.2) caps
+/// *implicit trust* (the auth-off owner posture, anonymous callers), not authenticated identities.
+/// A verified token's scopes alone decide (front-door auth: one gate, then permissions). Implicit
+/// writes default off beyond localhost; the `NetworkWrites` flag opens them; localhost is always
+/// allowed (the owner's own machine).
 pub struct Writer(pub AuthContext);
 impl FromRequestParts<AppState> for Writer {
     type Rejection = ApiError;
     async fn from_request_parts(parts: &mut Parts, st: &AppState) -> Result<Self, ApiError> {
         let ctx = resolve(&st.store, bearer(parts))?;
         ctx.require(Scope::Write)?;
-        if !st.localhost_only && !st.store.network_writes() {
+        // identity is Some(label) exactly for store-verified tokens (see `resolve`).
+        if ctx.identity.is_none() && !st.localhost_only && !st.store.network_writes() {
             return Err(ApiError(LibError::Disabled(
                 "network writes are disabled (enable the network_writes flag)".into(),
             )));

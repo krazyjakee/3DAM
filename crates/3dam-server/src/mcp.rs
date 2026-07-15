@@ -25,28 +25,46 @@ use std::sync::Arc;
 /// The MCP protocol revision we speak.
 pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 
-/// Decides whether a write tool may run (tech-spec 11 §6). Combines *where the server is bound*, the
-/// `McpServer` flag, and (per call) the caller's `Write` scope. stdio is locally trusted.
+/// Decides whether a write tool may run (tech-spec 11 §6). Combines the `McpServer` flag (the
+/// surface gate: `ReadOnly` hides write tools from everyone), the caller's `Write` scope, and — for
+/// callers with no verified credential — *where the server is bound*. A verified token's scopes
+/// alone decide (front-door auth): the network ceiling caps implicit trust, not identities.
 #[derive(Clone, Copy)]
 pub struct WriteGate {
-    allow: bool,
+    /// Surface gate: are write tools exposed at all? stdio: always; HTTP: `McpServer = ReadWrite`.
+    write_tools: bool,
+    /// May an implicit-trust caller (no verified identity) write on this bind? Localhost, or the
+    /// `NetworkWrites` flag. Verified tokens are not subject to this ceiling.
+    implicit_write_ok: bool,
 }
 
 impl WriteGate {
     /// stdio runs against an embedded engine the user already controls → writes allowed (still
     /// non-destructive; the gate governs authorisation, not destructiveness — tech-spec 11 §6).
     pub fn local_stdio() -> Self {
-        WriteGate { allow: true }
+        WriteGate {
+            write_tools: true,
+            implicit_write_ok: true,
+        }
     }
-    /// The served endpoint: writes need `McpServer = ReadWrite` *and* an allowed bind (localhost, or
-    /// the `NetworkWrites` flag when bound beyond localhost).
+    /// The served endpoint: writes need `McpServer = ReadWrite`, plus an allowed bind (localhost, or
+    /// the `NetworkWrites` flag) when the caller carries no verified credential.
     pub fn from_flags(mcp: McpMode, localhost_only: bool, network_writes: bool) -> Self {
-        let allow = matches!(mcp, McpMode::ReadWrite) && (localhost_only || network_writes);
-        WriteGate { allow }
+        WriteGate {
+            write_tools: matches!(mcp, McpMode::ReadWrite),
+            implicit_write_ok: localhost_only || network_writes,
+        }
     }
-    /// A write is permitted iff the transport/flag posture allows it and the caller holds `Write`.
+    /// A write is permitted iff write tools are exposed, the caller holds `Write`, and — unless the
+    /// caller is a verified identity — the bind posture allows implicit-trust writes.
     fn permits(&self, ctx: &AuthContext) -> bool {
-        self.allow && (ctx.embedded || ctx.scopes.has(Scope::Write))
+        if !self.write_tools {
+            return false;
+        }
+        if ctx.embedded {
+            return true;
+        }
+        ctx.scopes.has(Scope::Write) && (ctx.identity.is_some() || self.implicit_write_ok)
     }
 }
 
