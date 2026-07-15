@@ -10,8 +10,8 @@
     {
       "name": "3dam-serve",
       "runtimeExecutable": "target/release/3dam",
-      "runtimeArgs": ["serve"],
-      "port": 7878
+      "runtimeArgs": ["serve", "--addr", "127.0.0.1:7333"],
+      "port": 7333
     },
     {
       "name": "web",
