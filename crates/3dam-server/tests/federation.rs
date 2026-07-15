@@ -45,7 +45,11 @@ async fn library_with(dir: &Path, files: &[(&str, &[u8])]) -> Arc<EmbeddedLibrar
     for (name, bytes) in files {
         std::fs::write(src.join(name), bytes).unwrap();
     }
-    let lib = Arc::new(EmbeddedLibrary::open(&dir.join("data")).await.unwrap());
+    let lib = Arc::new(
+        EmbeddedLibrary::open_with(&dir.join("data"), dam_core::ResourceOptions::ungoverned())
+            .await
+            .unwrap(),
+    );
     let ctx = AuthContext::embedded();
     let sid = lib
         .add_source(

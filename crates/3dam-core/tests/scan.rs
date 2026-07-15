@@ -32,7 +32,10 @@ async fn scan_indexes_files_and_emits_events() {
     std::fs::write(assets.join("sub/c.gltf"), b"{\"asset\":{}}").unwrap();
     std::fs::write(assets.join("note.txt"), b"not an asset").unwrap(); // must be skipped
 
-    let lib = EmbeddedLibrary::open(&tmp.join("data")).await.unwrap();
+    let lib =
+        EmbeddedLibrary::open_with(&tmp.join("data"), dam_core::ResourceOptions::ungoverned())
+            .await
+            .unwrap();
     let ctx = AuthContext::embedded();
 
     // Subscribe before scanning so no events are missed.
@@ -138,7 +141,10 @@ async fn remove_and_block_survives_rescan() {
     std::fs::write(assets.join("keep.png"), b"\x89PNG\r\nKEEP").unwrap();
     std::fs::write(assets.join("drop.png"), b"\x89PNG\r\nDROP").unwrap();
 
-    let lib = EmbeddedLibrary::open(&tmp.join("data")).await.unwrap();
+    let lib =
+        EmbeddedLibrary::open_with(&tmp.join("data"), dam_core::ResourceOptions::ungoverned())
+            .await
+            .unwrap();
     let ctx = AuthContext::embedded();
 
     let sid = lib
@@ -243,7 +249,10 @@ async fn remove_and_block_purges_all_identical_copies() {
     std::fs::write(assets.join("c.png"), dup).unwrap();
     std::fs::write(assets.join("other.png"), b"\x89PNG\r\nOTHER").unwrap();
 
-    let lib = EmbeddedLibrary::open(&tmp.join("data")).await.unwrap();
+    let lib =
+        EmbeddedLibrary::open_with(&tmp.join("data"), dam_core::ResourceOptions::ungoverned())
+            .await
+            .unwrap();
     let ctx = AuthContext::embedded();
     let sid = lib
         .add_source(

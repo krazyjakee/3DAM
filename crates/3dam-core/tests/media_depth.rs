@@ -71,7 +71,10 @@ async fn metadata_thumbnail_and_convert() {
     )
     .unwrap();
 
-    let lib = EmbeddedLibrary::open(&tmp.join("data")).await.unwrap();
+    let lib =
+        EmbeddedLibrary::open_with(&tmp.join("data"), dam_core::ResourceOptions::ungoverned())
+            .await
+            .unwrap();
     let ctx = AuthContext::embedded();
     let sid = lib
         .add_source(

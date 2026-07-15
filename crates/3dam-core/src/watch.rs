@@ -46,6 +46,9 @@ pub(crate) struct WatchManager {
     rt: tokio::runtime::Handle,
     live: Arc<Mutex<HashMap<SourceId, WatchEntry>>>,
     in_flight: Arc<Mutex<HashSet<SourceId>>>,
+    /// Host-pressure governor the triggered delta scans pace against (tech-spec 14 §3.4) — a
+    /// watch-driven re-scan is the same bulk reader as a submitted one.
+    governor: Arc<crate::resources::Governor>,
 }
 
 impl WatchManager {
@@ -53,6 +56,7 @@ impl WatchManager {
         store: Arc<Store>,
         events: broadcast::Sender<LibraryEvent>,
         rt: tokio::runtime::Handle,
+        governor: Arc<crate::resources::Governor>,
     ) -> WatchManager {
         WatchManager {
             store,
@@ -60,6 +64,7 @@ impl WatchManager {
             rt,
             live: Arc::new(Mutex::new(HashMap::new())),
             in_flight: Arc::new(Mutex::new(HashSet::new())),
+            governor,
         }
     }
 
@@ -112,6 +117,7 @@ impl WatchManager {
         let in_flight = self.in_flight.clone();
         let live = self.live.clone();
         let rt = self.rt.clone();
+        let governor = self.governor.clone();
         self.rt.spawn_blocking(move || {
             let (tx, mut rx) = mpsc::unbounded_channel::<()>();
             let mut watcher =
@@ -148,7 +154,7 @@ impl WatchManager {
                             more = rx.recv() => if more.is_none() { return },
                         }
                     }
-                    trigger_delta(&store, &events, &in_flight, id);
+                    trigger_delta(&store, &events, &in_flight, &governor, id);
                 }
             });
             // Publish the live watcher, replacing the `Pending` reservation.
@@ -160,10 +166,11 @@ impl WatchManager {
         let store = self.store.clone();
         let events = self.events.clone();
         let in_flight = self.in_flight.clone();
+        let governor = self.governor.clone();
         self.rt.spawn(async move {
             loop {
                 tokio::time::sleep(POLL_INTERVAL).await;
-                trigger_delta(&store, &events, &in_flight, id);
+                trigger_delta(&store, &events, &in_flight, &governor, id);
             }
         });
     }
@@ -193,6 +200,7 @@ fn trigger_delta(
     store: &Arc<Store>,
     events: &broadcast::Sender<LibraryEvent>,
     in_flight: &Arc<Mutex<HashSet<SourceId>>>,
+    governor: &Arc<crate::resources::Governor>,
     id: SourceId,
 ) {
     {
@@ -222,9 +230,18 @@ fn trigger_delta(
     let store = store.clone();
     let events = events.clone();
     let in_flight = in_flight.clone();
+    let governor = governor.clone();
     tokio::task::spawn_blocking(move || {
         let cancel = Arc::new(AtomicBool::new(false));
-        scan::run_scan(store, events, job, vec![info], ScanMode::Delta, cancel);
+        scan::run_scan(
+            store,
+            events,
+            job,
+            vec![info],
+            ScanMode::Delta,
+            cancel,
+            &governor,
+        );
         in_flight.lock().unwrap().remove(&id);
     });
 }

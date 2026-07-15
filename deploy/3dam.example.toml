@@ -45,12 +45,17 @@ auto_analyze   = true
 federation = false
 
 [resources]
-# Good-neighbour limits (tech-spec 14 §5) for the background grind (thumbnail pre-render + the
-# analysis pass). 3DAM already self-governs with no config: the background pool is sized from the
-# *effective* CPU budget (container cgroup quota respected), hard-capped at 4 threads, reniced to
-# yield to anything else on the box, and it PAUSES automatically whenever host available memory
-# drops below a floor (default 10% of RAM, clamped 256 MiB – 2 GiB) or the 1-min load runs beyond
-# the CPU budget. These knobs tune that governor; the same pair is honoured as environment
-# variables (3DAM_BG_THREADS / 3DAM_MIN_FREE_MEMORY_MB) for container/systemd deployments.
+# Good-neighbour limits (tech-spec 14 §5) for the bulk work (scan hashing, thumbnail pre-render,
+# the analysis pass). 3DAM already self-governs with no config: the background pool is sized from
+# the *effective* CPU budget (container cgroup quota respected), hard-capped at 4 threads, reniced
+# to yield to anything else on the box, and bulk work PAUSES automatically whenever host available
+# memory drops below a floor (default 10% of RAM, clamped 256 MiB – 2 GiB), the 1-min load runs
+# beyond the CPU budget, or the disk is stalled under bulk I/O (PSI full-stall avg10 above a
+# ceiling, default 25% — the signal that catches slow/bulk HDD reads blockading the whole box,
+# which loadavg and memory cannot see; requires PSI, kernel ≥ 4.20). These knobs tune that
+# governor; the same set is honoured as environment variables (3DAM_BG_THREADS /
+# 3DAM_MIN_FREE_MEMORY_MB / 3DAM_MAX_IO_STALL_PCT) for container/systemd deployments.
+# Setting max_io_stall_pct to 100 disables the I/O gate.
 #background_threads = 2
 #min_free_memory_mb = 2048
+#max_io_stall_pct = 25

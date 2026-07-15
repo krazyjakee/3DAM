@@ -83,7 +83,11 @@ async fn scan_alone_populates_analysis_and_thumbnails() {
     .unwrap();
 
     let data_dir = tmp.join("data");
-    let lib = Arc::new(EmbeddedLibrary::open(&data_dir).await.unwrap());
+    let lib = Arc::new(
+        EmbeddedLibrary::open_with(&data_dir, dam_core::ResourceOptions::ungoverned())
+            .await
+            .unwrap(),
+    );
     let ctx = AuthContext::embedded();
     let sid = lib
         .add_source(

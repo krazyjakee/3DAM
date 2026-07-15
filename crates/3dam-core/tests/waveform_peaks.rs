@@ -56,7 +56,10 @@ async fn analysis_computes_waveform_peaks_on_the_dto() {
     std::fs::create_dir_all(&src).unwrap();
     write_tone_wav(&src.join("tone.wav"));
 
-    let lib = EmbeddedLibrary::open(&tmp.join("data")).await.unwrap();
+    let lib =
+        EmbeddedLibrary::open_with(&tmp.join("data"), dam_core::ResourceOptions::ungoverned())
+            .await
+            .unwrap();
     let ctx = AuthContext::embedded();
     let sid = lib
         .add_source(

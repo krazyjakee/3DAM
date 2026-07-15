@@ -413,7 +413,8 @@ pub struct EmbeddedLibrary {
     /// rebuilt from the source table and invalidated on source add/remove.
     fed: federation::PeerRegistry,
     /// Host-pressure governor (tech-spec 14 §3.4): background loops pace themselves against it so a
-    /// whole-library pass yields when the host runs short on memory or CPU.
+    /// whole-library pass yields when the host runs short on memory or CPU, or its disks are
+    /// stalled under bulk I/O.
     governor: Arc<resources::Governor>,
 }
 
@@ -425,8 +426,8 @@ impl EmbeddedLibrary {
     }
 
     /// Open with explicit resource knobs (the server passes its `[resources]` config through
-    /// here). Unset knobs fall back to the `3DAM_BG_THREADS` / `3DAM_MIN_FREE_MEMORY_MB`
-    /// environment variables, then to host-derived defaults.
+    /// here). Unset knobs fall back to the `3DAM_BG_THREADS` / `3DAM_MIN_FREE_MEMORY_MB` /
+    /// `3DAM_MAX_IO_STALL_PCT` environment variables, then to host-derived defaults.
     pub async fn open_with(
         data_dir: &Path,
         resources: ResourceOptions,
@@ -438,10 +439,17 @@ impl EmbeddedLibrary {
             .map_err(|e| LibError::Internal(e.to_string()))??;
         let store = Arc::new(store);
         let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        // Built before the watch manager: watch-triggered delta scans are bulk readers too and
+        // pace against the same governor as everything else (tech-spec 14 §3.4).
+        let governor = Arc::new(resources::Governor::new(
+            resources.min_free_memory_mb,
+            resources.max_io_stall_pct,
+        ));
         let watchers = watch::WatchManager::new(
             store.clone(),
             events.clone(),
             tokio::runtime::Handle::current(),
+            governor.clone(),
         );
         // NB: watchers are *not* started here. Auto-rescan only makes sense for long-running roles
         // (serve/mcp), which call `start_watchers()` explicitly. A run-and-exit CLI command must not
@@ -475,7 +483,7 @@ impl EmbeddedLibrary {
             bg_pool: Arc::new(bg_pool),
             semantic,
             fed: federation::PeerRegistry::new(),
-            governor: Arc::new(resources::Governor::new(resources.min_free_memory_mb)),
+            governor,
         })
     }
 
@@ -1190,8 +1198,9 @@ impl LibraryService for EmbeddedLibrary {
 
         let store = self.store.clone();
         let events = self.events.clone();
+        let governor = self.governor.clone();
         tokio::task::spawn_blocking(move || {
-            scan::run_scan(store, events, job, sources, mode, cancel);
+            scan::run_scan(store, events, job, sources, mode, cancel, &governor);
         });
 
         Ok(job)

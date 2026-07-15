@@ -88,7 +88,10 @@ async fn model_thumbnail_renders_caches_and_fails_soft() {
     )
     .unwrap();
 
-    let lib = EmbeddedLibrary::open(&tmp.join("data")).await.unwrap();
+    let lib =
+        EmbeddedLibrary::open_with(&tmp.join("data"), dam_core::ResourceOptions::ungoverned())
+            .await
+            .unwrap();
     let ctx = AuthContext::embedded();
     let sid = lib
         .add_source(
@@ -163,7 +166,10 @@ async fn model_preview_serves_dmsh_blob_and_caches() {
     )
     .unwrap();
 
-    let lib = EmbeddedLibrary::open(&tmp.join("data")).await.unwrap();
+    let lib =
+        EmbeddedLibrary::open_with(&tmp.join("data"), dam_core::ResourceOptions::ungoverned())
+            .await
+            .unwrap();
     let ctx = AuthContext::embedded();
     let sid = lib
         .add_source(

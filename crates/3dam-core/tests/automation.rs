@@ -105,7 +105,10 @@ async fn analyze_similar_dedup_and_review() {
     d.save(src.join("d.png")).unwrap();
     std::fs::copy(src.join("d.png"), src.join("d_copy.png")).unwrap();
 
-    let lib = EmbeddedLibrary::open(&tmp.join("data")).await.unwrap();
+    let lib =
+        EmbeddedLibrary::open_with(&tmp.join("data"), dam_core::ResourceOptions::ungoverned())
+            .await
+            .unwrap();
     let ctx = AuthContext::embedded();
     let sid = lib
         .add_source(
@@ -324,7 +327,10 @@ async fn similar_on_unembedded_is_empty() {
     // A structurally-broken "png" — decode fails, so no embedding is produced (fail-soft).
     std::fs::write(src.join("broken.png"), b"\x89PNG\r\n\x1a\nnot-a-real-png").unwrap();
 
-    let lib = EmbeddedLibrary::open(&tmp.join("data")).await.unwrap();
+    let lib =
+        EmbeddedLibrary::open_with(&tmp.join("data"), dam_core::ResourceOptions::ungoverned())
+            .await
+            .unwrap();
     let ctx = AuthContext::embedded();
     let sid = lib
         .add_source(
@@ -380,7 +386,10 @@ async fn maintenance_clear_analysis_and_wipe() {
     b.put_pixel(0, 0, image::Rgba([200, 10, 10, 255]));
     b.save(src.join("b.png")).unwrap();
 
-    let lib = EmbeddedLibrary::open(&tmp.join("data")).await.unwrap();
+    let lib =
+        EmbeddedLibrary::open_with(&tmp.join("data"), dam_core::ResourceOptions::ungoverned())
+            .await
+            .unwrap();
     let ctx = AuthContext::embedded();
     let sid = lib
         .add_source(

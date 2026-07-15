@@ -82,7 +82,10 @@ async fn open_with_source(
 ) -> (EmbeddedLibrary, AuthContext, PathBuf) {
     let src = tmp.join("src");
     std::fs::create_dir_all(&src).unwrap();
-    let lib = EmbeddedLibrary::open(&tmp.join("data")).await.unwrap();
+    let lib =
+        EmbeddedLibrary::open_with(&tmp.join("data"), dam_core::ResourceOptions::ungoverned())
+            .await
+            .unwrap();
     let ctx = AuthContext::embedded();
     lib.add_source(
         &ctx,

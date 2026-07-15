@@ -29,6 +29,7 @@ pub(crate) fn run_scan(
     sources: Vec<SourceInfo>,
     mode: ScanMode,
     cancel: Arc<AtomicBool>,
+    governor: &crate::resources::Governor,
 ) {
     // Establish the progress denominator up front so the job shows a real percentage + ETA rather
     // than an indeterminate bar. A **full** scan re-reads every file (and new files matter), so we
@@ -112,6 +113,14 @@ pub(crate) fn run_scan(
                     if mode == ScanMode::Delta && unchanged(&index, &fe) {
                         skipped += 1;
                         return true;
+                    }
+                    // Good-neighbour pacing (tech-spec 14 §3.4), placed exactly where the bulk
+                    // I/O starts: everything above is directory metadata, everything below opens
+                    // and hashes file bytes — the reads that can blockade a slow HDD. Pausing
+                    // here lets the walk finish cheap entries while the disk recovers.
+                    governor.pace(&cancel);
+                    if cancel.load(Ordering::Relaxed) {
+                        return false;
                     }
                     // Materialise bytes locally (in place for local, downloaded for remote).
                     let fetched = match fs.fetch(&fe.rel_path) {

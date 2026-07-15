@@ -41,7 +41,9 @@ async fn prefetch_warms_the_thumbnail_cache() {
     .unwrap();
 
     let data_dir = tmp.join("data");
-    let lib = EmbeddedLibrary::open(&data_dir).await.unwrap();
+    let lib = EmbeddedLibrary::open_with(&data_dir, dam_core::ResourceOptions::ungoverned())
+        .await
+        .unwrap();
     let ctx = AuthContext::embedded();
     let sid = lib
         .add_source(

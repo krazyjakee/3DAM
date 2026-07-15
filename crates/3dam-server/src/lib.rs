@@ -257,6 +257,7 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
     let resources = dam_core::ResourceOptions {
         background_threads: file.resources.background_threads,
         min_free_memory_mb: file.resources.min_free_memory_mb,
+        max_io_stall_pct: file.resources.max_io_stall_pct,
     };
     let lib = Arc::new(EmbeddedLibrary::open_with(&cfg.data_dir, resources).await?);
     lib.start_watchers(); // long-running role: resume auto-rescan for watch-enabled sources.

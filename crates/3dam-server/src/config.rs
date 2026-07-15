@@ -23,9 +23,10 @@ pub struct ServeFile {
 }
 
 /// `[resources]` — the good-neighbour knobs (tech-spec 14 §5). Unset values fall back to the
-/// `3DAM_BG_THREADS` / `3DAM_MIN_FREE_MEMORY_MB` environment variables, then host-derived defaults
-/// (cgroup-aware CPU budget, 10% memory floor). Plain config, not runtime flags: resource limits
-/// are an operator/deployment property, not a live exposure toggle.
+/// `3DAM_BG_THREADS` / `3DAM_MIN_FREE_MEMORY_MB` / `3DAM_MAX_IO_STALL_PCT` environment variables,
+/// then host-derived defaults (cgroup-aware CPU budget, 10% memory floor, 25% I/O-stall ceiling).
+/// Plain config, not runtime flags: resource limits are an operator/deployment property, not a
+/// live exposure toggle.
 #[derive(Debug, Default, serde::Deserialize)]
 pub struct ResourcesBlock {
     /// Background pool size (thumbnail/analysis grind). Default: effective CPUs − 2, capped at 4.
@@ -33,6 +34,9 @@ pub struct ResourcesBlock {
     /// Pause background work while host available memory is below this floor (MiB).
     /// Default: 10% of the memory ceiling, clamped to [256 MiB, 2 GiB].
     pub min_free_memory_mb: Option<u64>,
+    /// Pause bulk reads (scan hashing) and grind while the disk's PSI full-stall `avg10` exceeds
+    /// this percentage. Default 25; ≥ 100 disables the I/O gate.
+    pub max_io_stall_pct: Option<f64>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]

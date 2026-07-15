@@ -23,7 +23,11 @@ fn unique_tmp() -> std::path::PathBuf {
 }
 
 async fn harness(localhost_only: bool) -> (axum::Router, Arc<ServerStore>, Arc<EmbeddedLibrary>) {
-    let lib = Arc::new(EmbeddedLibrary::open(&unique_tmp()).await.unwrap());
+    let lib = Arc::new(
+        EmbeddedLibrary::open_with(&unique_tmp(), dam_core::ResourceOptions::ungoverned())
+            .await
+            .unwrap(),
+    );
     let store = Arc::new(ServerStore::open_in_memory().unwrap());
     let app = router(lib.clone(), store.clone(), "127.0.0.1:7878", localhost_only);
     (app, store, lib)
@@ -477,7 +481,11 @@ async fn mcp_off_is_404_then_mounts_and_gates_writes() {
 
 #[tokio::test]
 async fn mcp_adapter_stdio_is_locally_trusted() {
-    let lib = Arc::new(EmbeddedLibrary::open(&unique_tmp()).await.unwrap());
+    let lib = Arc::new(
+        EmbeddedLibrary::open_with(&unique_tmp(), dam_core::ResourceOptions::ungoverned())
+            .await
+            .unwrap(),
+    );
     let library: Arc<dyn dam_api::service::LibraryService> = lib;
     let adapter = dam_server::McpAdapter::new(library, WriteGate::local_stdio());
     let ctx = dam_api::service::AuthContext::embedded();

@@ -12,10 +12,16 @@
 //!    tenants. Workers are also reniced (+10, idle I/O class) on Linux so anything else on the
 //!    box preempts them.
 //! 2. **Pacing** ([`Governor`]): between work items, background loops consult a cheap cached
-//!    sample of host memory + load. Under pressure (available memory below the floor, or load
-//!    beyond the CPU budget) the loop *pauses* — work resumes when the host recovers. Fail-soft:
-//!    on platforms without `/proc` / cgroups every probe returns `None` and the governor never
-//!    pauses (the pre-existing behaviour).
+//!    sample of host memory + load + disk stall. Under pressure (available memory below the
+//!    floor, load beyond the CPU budget, or I/O stall beyond the ceiling) the loop *pauses* —
+//!    work resumes when the host recovers. Fail-soft: on platforms without `/proc` / cgroups
+//!    every probe returns `None` and the governor never pauses (the pre-existing behaviour).
+//!
+//! The I/O signal exists because the other two can't see a disk blockade: bulk reads (scan
+//! hashing, decode for analysis/thumbnails) on a slow HDD queue behind each other until *every*
+//! task touching that disk — SQLite, health probes, co-tenants — blocks in `D` state, yet a
+//! handful of stalled workers never push loadavg past `1.5 × cpus` and memory stays healthy.
+//! PSI (`/proc/pressure/io`, kernel ≥ 4.20) measures the stall directly.
 //!
 //! All probes are best-effort text reads of `/proc` and `/sys/fs/cgroup`; a missing or malformed
 //! file simply yields `None`.
@@ -35,6 +41,11 @@ const SAMPLE_EVERY: Duration = Duration::from_secs(2);
 
 /// How long a paused loop sleeps between pressure re-checks.
 const PAUSE_TICK: Duration = Duration::from_millis(500);
+
+/// Default I/O full-stall ceiling (%). At 25% the `avg10` decay makes a saturated HDD duty-cycle
+/// the grind to roughly a few seconds of reads per ~15 s pause — the disk keeps breathing for
+/// everyone else. The `avg10` window itself is the hysteresis: no flapping, no log spam.
+pub const DEFAULT_MAX_IO_STALL_PCT: f64 = 25.0;
 
 // ── probes ───────────────────────────────────────────────────────────────────
 
@@ -138,6 +149,38 @@ pub fn loadavg_1() -> Option<f64> {
         .ok()
 }
 
+/// Parse the `full` line of a PSI file into its `avg10` percentage.
+///
+/// `full avg10=…` is the share of the last 10 s in which **every** non-idle task was stalled on
+/// I/O at once — the direct signature of a saturated disk blockading the box, and deliberately
+/// not `some` (one stalled task is normal life on any busy disk).
+fn parse_psi_full_avg10(text: &str) -> Option<f64> {
+    text.lines()
+        .find(|l| l.starts_with("full"))?
+        .split_whitespace()
+        .find_map(|tok| tok.strip_prefix("avg10="))
+        .and_then(|v| v.parse().ok())
+}
+
+/// Current I/O stall (%), the worse of two views: the host's (`/proc/pressure/io` — the whole box
+/// is I/O-blocked, the incident mode) and our cgroup's (`io.pressure` — *our* bulk reads have a
+/// slow disk saturated, even if the rest of the host still runs). `None` where PSI is absent
+/// (non-Linux, kernel < 4.20, or booted `psi=0`) — fail-soft, like every other probe here.
+pub fn io_stall_pct() -> Option<f64> {
+    let host = std::fs::read_to_string("/proc/pressure/io")
+        .ok()
+        .as_deref()
+        .and_then(parse_psi_full_avg10);
+    let cg = std::fs::read_to_string("/sys/fs/cgroup/io.pressure")
+        .ok()
+        .as_deref()
+        .and_then(parse_psi_full_avg10);
+    match (host, cg) {
+        (Some(h), Some(c)) => Some(h.max(c)),
+        (h, c) => h.or(c),
+    }
+}
+
 /// Size the bounded background pool: `effective_cpus − 2` (the inspector-priority headroom,
 /// tech-spec 14), hard-capped at [`DEFAULT_BG_THREAD_CAP`] unless the operator overrides — and an
 /// override is still clamped to the effective CPU budget, never past it.
@@ -158,6 +201,8 @@ pub struct Governor {
     min_free_bytes: u64,
     /// Pause while the 1-min loadavg exceeds this multiple of the effective CPU budget.
     max_load_per_cpu: f64,
+    /// Pause while the I/O full-stall share ([`io_stall_pct`]) exceeds this percentage.
+    max_io_stall_pct: f64,
     state: Mutex<GovState>,
 }
 
@@ -171,7 +216,8 @@ struct GovState {
 impl Governor {
     /// `min_free_memory_mb = None` picks the default floor: 10% of the memory ceiling, clamped to
     /// [256 MiB, 2 GiB]. On a host where no ceiling is readable the floor is 512 MiB.
-    pub fn new(min_free_memory_mb: Option<u64>) -> Governor {
+    /// `max_io_stall_pct = None` picks [`DEFAULT_MAX_IO_STALL_PCT`]; ≥ 100 disables the I/O gate.
+    pub fn new(min_free_memory_mb: Option<u64>, max_io_stall_pct: Option<f64>) -> Governor {
         let min_free_bytes = match min_free_memory_mb {
             Some(mb) => mb * 1024 * 1024,
             None => match memory_limit() {
@@ -182,6 +228,7 @@ impl Governor {
         Governor {
             min_free_bytes,
             max_load_per_cpu: 1.5,
+            max_io_stall_pct: max_io_stall_pct.unwrap_or(DEFAULT_MAX_IO_STALL_PCT),
             state: Mutex::new(GovState {
                 sampled_at: None,
                 pressured: false,
@@ -191,10 +238,17 @@ impl Governor {
     }
 
     /// The raw decision, injectable for tests.
-    fn decide(&self, available: Option<u64>, load1: Option<f64>, cpus: usize) -> bool {
+    fn decide(
+        &self,
+        available: Option<u64>,
+        load1: Option<f64>,
+        io_stall: Option<f64>,
+        cpus: usize,
+    ) -> bool {
         let mem_pressure = available.is_some_and(|a| a < self.min_free_bytes);
         let load_pressure = load1.is_some_and(|l| l > self.max_load_per_cpu * cpus as f64);
-        mem_pressure || load_pressure
+        let io_pressure = io_stall.is_some_and(|s| s > self.max_io_stall_pct);
+        mem_pressure || load_pressure || io_pressure
     }
 
     /// Is the host under pressure right now? Samples at most every [`SAMPLE_EVERY`]; logs each
@@ -206,8 +260,9 @@ impl Governor {
         }
         let available = available_memory();
         let load = loadavg_1();
+        let io_stall = io_stall_pct();
         let cpus = effective_cpus();
-        st.pressured = self.decide(available, load, cpus);
+        st.pressured = self.decide(available, load, io_stall, cpus);
         st.sampled_at = Some(Instant::now());
         if st.pressured != st.was_pressured {
             st.was_pressured = st.pressured;
@@ -215,6 +270,7 @@ impl Governor {
                 tracing::info!(
                     available_mb = available.map(|a| a / (1024 * 1024)),
                     load1 = load,
+                    io_stall_pct = io_stall,
                     cpus,
                     "host under pressure — background work paused"
                 );
@@ -249,14 +305,17 @@ pub fn deprioritize_current_thread() {
 }
 
 /// Engine construction options (resource knobs). Server reads `[resources]` from the serve
-/// config; embedded roles fall back to env (`3DAM_BG_THREADS`, `3DAM_MIN_FREE_MEMORY_MB`) then
-/// defaults, so a container or systemd unit can tune without a config file.
+/// config; embedded roles fall back to env (`3DAM_BG_THREADS`, `3DAM_MIN_FREE_MEMORY_MB`,
+/// `3DAM_MAX_IO_STALL_PCT`) then defaults, so a container or systemd unit can tune without a
+/// config file.
 #[derive(Default, Clone)]
 pub struct ResourceOptions {
     /// Background pool size override (clamped to the effective CPU budget).
     pub background_threads: Option<usize>,
     /// Pause background work when host available memory dips below this (MiB).
     pub min_free_memory_mb: Option<u64>,
+    /// Pause bulk reads/grind when I/O full-stall (PSI `avg10`) exceeds this (%). ≥ 100 disables.
+    pub max_io_stall_pct: Option<f64>,
 }
 
 impl ResourceOptions {
@@ -267,6 +326,19 @@ impl ResourceOptions {
         ResourceOptions {
             background_threads: parse("3DAM_BG_THREADS"),
             min_free_memory_mb: parse("3DAM_MIN_FREE_MEMORY_MB"),
+            max_io_stall_pct: parse("3DAM_MAX_IO_STALL_PCT"),
+        }
+    }
+
+    /// Options that render the pressure governor inert: no memory floor, no I/O-stall gate.
+    /// For hermetic tests (and one-shot tooling) on busy dev/CI boxes — there, a scan parking
+    /// because the *build itself* is hammering the disk is flake, not good-neighbourliness.
+    /// Every knob is `Some`, so `or_env()` leaves these as-is.
+    pub fn ungoverned() -> ResourceOptions {
+        ResourceOptions {
+            background_threads: None,
+            min_free_memory_mb: Some(0),
+            max_io_stall_pct: Some(f64::INFINITY),
         }
     }
 
@@ -276,6 +348,7 @@ impl ResourceOptions {
         ResourceOptions {
             background_threads: self.background_threads.or(env.background_threads),
             min_free_memory_mb: self.min_free_memory_mb.or(env.min_free_memory_mb),
+            max_io_stall_pct: self.max_io_stall_pct.or(env.max_io_stall_pct),
         }
     }
 }
@@ -309,17 +382,40 @@ mod tests {
     }
 
     #[test]
-    fn governor_decides_on_memory_and_load() {
-        let g = Governor::new(Some(1024)); // 1 GiB floor
+    fn psi_full_avg10_parses() {
+        let text = "some avg10=12.34 avg60=5.00 avg300=1.00 total=123456\n\
+                    full avg10=8.15 avg60=3.00 avg300=0.50 total=65432\n";
+        assert_eq!(parse_psi_full_avg10(text), Some(8.15));
+        // `some` alone (old kernels expose only it for some resources) is deliberately ignored.
+        assert_eq!(
+            parse_psi_full_avg10("some avg10=99.0 avg60=0.0 avg300=0.0 total=1\n"),
+            None
+        );
+        assert_eq!(parse_psi_full_avg10(""), None);
+        assert_eq!(parse_psi_full_avg10("full garbage\n"), None);
+    }
+
+    #[test]
+    fn governor_decides_on_memory_load_and_io() {
+        let g = Governor::new(Some(1024), None); // 1 GiB floor, default 25% I/O ceiling
         let gib = 1024 * 1024 * 1024;
-        // Healthy: plenty free, load under budget.
-        assert!(!g.decide(Some(4 * gib), Some(2.0), 4));
+        // Healthy: plenty free, load under budget, disk quiet.
+        assert!(!g.decide(Some(4 * gib), Some(2.0), Some(0.5), 4));
         // Memory floor breached.
-        assert!(g.decide(Some(gib / 2), Some(0.5), 4));
+        assert!(g.decide(Some(gib / 2), Some(0.5), Some(0.0), 4));
         // Load runaway (>1.5×cpus).
-        assert!(g.decide(Some(4 * gib), Some(7.0), 4));
-        // No probes (non-Linux): never pauses.
-        assert!(!g.decide(None, None, 4));
+        assert!(g.decide(Some(4 * gib), Some(7.0), Some(0.0), 4));
+        // Disk blockade: everything else healthy, but the box is I/O-stalled. This is exactly
+        // the incident load/memory could not see — bulk HDD reads queueing every task in D state.
+        assert!(g.decide(Some(4 * gib), Some(1.0), Some(60.0), 4));
+        assert!(!g.decide(Some(4 * gib), Some(1.0), Some(24.9), 4));
+        // No probes (non-Linux, or psi=0): never pauses.
+        assert!(!g.decide(None, None, None, 4));
+        // Operator override: a 90% ceiling tolerates the 60% stall; ≥100 disables the gate.
+        let lax = Governor::new(Some(1024), Some(90.0));
+        assert!(!lax.decide(Some(4 * gib), Some(1.0), Some(60.0), 4));
+        let off = Governor::new(Some(1024), Some(100.0));
+        assert!(!off.decide(Some(4 * gib), Some(1.0), Some(100.0), 4));
     }
 
     #[test]
@@ -335,7 +431,7 @@ mod tests {
 
     #[test]
     fn pace_returns_immediately_when_cancelled() {
-        let g = Governor::new(Some(u64::MAX / (1024 * 1024))); // impossible floor → always pressured
+        let g = Governor::new(Some(u64::MAX / (1024 * 1024)), None); // impossible floor → always pressured
         let cancel = AtomicBool::new(true);
         let start = Instant::now();
         g.pace(&cancel); // must not sleep
@@ -351,7 +447,7 @@ mod live_probe {
         if available_memory().is_none() {
             return; // non-Linux: governor is inert by design
         }
-        let g = Governor::new(Some(9_999_999)); // ~9.5 TiB floor
+        let g = Governor::new(Some(9_999_999), None); // ~9.5 TiB floor
         assert!(
             g.pressured(),
             "available={:?} load={:?} cpus={}",
