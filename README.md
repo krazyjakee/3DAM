@@ -28,7 +28,7 @@ The `3dam` binary dispatches on its first argument — no separate installs, no 
 
 | Invocation        | Role                                                              |
 | ----------------- | ---------------------------------------------------------------- |
-| `3dam` (no arg)   | **GUI** — native desktop shell (egui) *(stub today — see Status)* |
+| `3dam` (no arg)   | **GUI** — native desktop shell (Tauri webview over the web client)   |
 | `3dam serve`      | **HTTP/WS server** + embedded web client + MCP endpoint          |
 | `3dam mcp`        | **MCP server** over stdio                                        |
 | anything else     | **CLI** — run-and-exit (`scan`, `search`, `convert`, …)          |
@@ -40,8 +40,8 @@ no code change.
 
 ## Status
 
-The engine, CLI, and web client are working; the native GUI and headless renderer are
-stubs. Shipped so far (capability phases 1–5 of the [product spec](docs/PRODUCT_SPEC.md)
+The engine, CLI, web client, native desktop shell, and headless renderer are all
+working. Shipped so far (capability phases 1–5 of the [product spec](docs/PRODUCT_SPEC.md)
 §9):
 
 - **Catalog** — SQLite catalog with forward-only migrations, sources, jobs, collections, tags.
@@ -50,11 +50,13 @@ stubs. Shipped so far (capability phases 1–5 of the [product spec](docs/PRODUC
 - **Reach** — SFTP and SMB file sources behind a `FileSource` seam, delta scan + watch/auto-rescan, smart-folder saved queries, export manifests.
 - **Server & web** — axum REST + WebSocket API, embedded React web client, runtime feature flags, token auth + scopes, MCP.
 
-Not yet real: the **native egui GUI** (`crates/3dam-gui` is a ~14-line stub — the web
-client is the only live UI today, by design) and the **headless wgpu renderer**
-(`crates/3dam-render`). Embeddings are **model-free v1** vectors behind the
-`EmbeddingSpace` seam; SigLIP/CLAP model-backed extractors are a later feature-gated bump.
-See [`docs/ROADMAP.md`](docs/ROADMAP.md) for status against the spec.
+The **desktop app** (`crates/3dam-desktop`) is a Tauri webview shell over the same
+embedded web client the server ships ([ADR 0013](docs/adr/0013-desktop-shell-tauri.md)) —
+one UI codebase, so web ↔ native parity is structural. The **headless wgpu renderer**
+(`crates/3dam-render`) produces textured-PBR turntable thumbnails for 3D assets.
+Embeddings are **model-free v1** vectors behind the `EmbeddingSpace` seam; SigLIP/CLAP
+model-backed extractors are a later feature-gated bump. See
+[`docs/ROADMAP.md`](docs/ROADMAP.md) for status against the spec.
 
 ## Install
 
@@ -192,10 +194,9 @@ The crate layout, seams, and data model are documented in
 
 Issues and PRs welcome. Good first targets:
 
-- flesh out the native egui GUI (`crates/3dam-gui`) toward web-client parity
+- native desktop affordances in the Tauri shell (`crates/3dam-desktop`): folder pickers, tray, OS integration
 - new `FileSource` backends (S3, peers) behind the existing `open_source()` seam
 - additional media handlers or convert targets in `dam-media`
-- the headless wgpu renderer (`crates/3dam-render`)
 
 The spec is the single source of truth: [`docs/PRODUCT_SPEC.md`](docs/PRODUCT_SPEC.md) §9
 is the authoritative roadmap, and [`docs/ROADMAP.md`](docs/ROADMAP.md) tracks status

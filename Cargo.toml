@@ -11,7 +11,7 @@ members = [
     "crates/3dam-client",
     "crates/3dam-server",
     "crates/3dam-frontend",
-    "crates/3dam-gui",
+    "crates/3dam-desktop",
     "crates/3dam-cli",
     "crates/3dam",
     "xtask",
@@ -46,7 +46,7 @@ dam-core = { path = "crates/3dam-core" }
 dam-client = { path = "crates/3dam-client" }
 dam-server = { path = "crates/3dam-server" }
 dam-frontend = { path = "crates/3dam-frontend" }
-dam-gui = { path = "crates/3dam-gui" }
+dam-desktop = { path = "crates/3dam-desktop" }
 dam-cli = { path = "crates/3dam-cli" }
 
 # async / runtime

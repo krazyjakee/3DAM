@@ -1,8 +1,9 @@
 //! `dam-render` — the wgpu renderer (tech-spec 06, [ADR 0002](../../docs/adr/0002-3d-render-crate-boundary.md)).
 //!
 //! Owns GPU work (headless render-to-PNG thumbnails and, later, the multi-view render feeding shape
-//! embeddings and the surface shared with the GUI viewer) but **never** windowing — that stays in
-//! `3dam-gui`. Renders headless with no surface and falls back to a software rasteriser
+//! embeddings) but **never** windowing — the desktop shell is a webview (`3dam-desktop`, ADR 0013)
+//! whose 3D viewer is the `dam-viewer` WASM island. Renders headless with no surface and falls back
+//! to a software rasteriser
 //! (Mesa lavapipe/llvmpipe) on GPU-less hosts, as validated by `spikes/headless-render/` (ADR 0001).
 //!
 //! Models are imported via **Assimp** (`russimp-ng`, statically linked — [ADR 0011](../../docs/adr/0011-assimp-import-backend.md))

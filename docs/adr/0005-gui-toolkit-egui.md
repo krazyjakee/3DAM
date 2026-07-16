@@ -1,6 +1,8 @@
 # ADR 0005 — GUI toolkit: egui / eframe
 
-Status: **Accepted (draft)** · Date: 2026-07-06 · Deciders: 3DAM core
+Status: **Superseded by [0013 — Desktop shell: Tauri webview](0013-desktop-shell-tauri.md)** (2026-07-16;
+the egui client was built to substantive parity, then replaced by a Tauri shell over the embedded
+web client — one UI codebase, parity by construction) · Date: 2026-07-06 · Deciders: 3DAM core
 Supersedes: — · Related: [0001 — 3D render backend](0001-3d-render-backend.md),
 [0002 — 3D render crate boundary](0002-3d-render-crate-boundary.md),
 [PRODUCT_SPEC.md](../PRODUCT_SPEC.md) §7, §10, [tech-spec 12](../tech-spec/12-desktop-gui.md)

@@ -20,10 +20,10 @@
 //!
 //! **Relationship to `dam-render` (ADR 0002).** The GPU internals here (PBR-lite shader, one draw
 //! loop, versioned bounds auto-fit framing) are the *browser embodiment* of the [tech-spec 06]
-//! renderer. `dam-render` is not yet built; when it lands, the shared pieces (camera framing math,
-//! the `pbr.wgsl` set) reconcile with it so the web viewer and the headless thumbnailer frame and
-//! shade "the same way by construction". Kept self-contained for now so the islands can proceed while
-//! `dam-render`/`dam-gui` are still stubs.
+//! renderer. The shared pieces (camera framing math, the `pbr.wgsl` set) reconcile with it so the
+//! web viewer and the headless thumbnailer frame and shade "the same way by construction". Kept
+//! self-contained (separate wgpu instances, wasm vs native). Since ADR 0013 these islands are also
+//! the desktop app's viewers — the Tauri shell renders the same web client.
 //!
 //! [tech-spec 09]: ../../../docs/tech-spec/09-server-and-web-client.md
 //! [tech-spec 06]: ../../../docs/tech-spec/06-3d-render.md

@@ -77,8 +77,9 @@ fallback, each frontend owns its presentation, native desktop GUI — no webview
   full-page canvas. *(Serves phase 2.)*
 - **Responsive + touch pass** — the web client degrades gracefully to tablet/phone widths (see
   *Mobile & tablet posture*) before it is considered done.
-- **Desktop GUI (egui)** — the native app, reusing the settled interaction patterns and the same
-  engine/API. *(Phase 5 / spec §9 GUI parity.)*
+- **Desktop GUI** — the native app. Built first as an egui client to substantive parity, then
+  replaced by a Tauri webview shell over the embedded web client (ADR 0013) — one UI codebase,
+  parity by construction. *(Phase 5 / spec §9 GUI parity.)*
 
 ### Progress
 
@@ -199,9 +200,8 @@ and read/write/admin scopes gate handlers (writes further gated by the network c
 flags|flag|token|status|audit|maintenance</code>, embedded or <code>--connect</code>) and the web <strong>Settings / Administration</strong>
 surface (grouped flag cards, warn-and-confirm, token management, audit trail, and a <strong>Storage &amp; maintenance</strong>
 section — usage overview, clear thumbnail/3D-preview caches, clear analysis, VACUUM, reset-catalog, and factory-reset,
-all audited and non-destructive to source files). <em>(These maintenance controls are web + CLI today; the native egui
-Settings surface inherits them when the desktop GUI is built — it is still a stub, so the whole Settings area is
-web-only for now.)</em> The <strong>MCP server</strong> (ADR 0003,
+all audited and non-destructive to source files). <em>(The desktop shell renders the same web client
+(ADR 0013), so the Settings surface is native too.)</em> The <strong>MCP server</strong> (ADR 0003,
 hand-rolled JSON-RPC over <code>dyn LibraryService</code> — no subprocess) serves tools/resources/prompts over both
 <code>3dam mcp</code> stdio (locally trusted) and <code>POST /mcp</code> on the shared port; the <code>mcp_server</code>
 flag mounts/unmounts it (<code>Off ⇒ 404</code>) and a <code>WriteGate</code> (bind + flag + caller scope) filters the write
@@ -249,7 +249,7 @@ Most were resolved on 2026-07-06 in [ADR 0008](adr/0008-web-client-stack.md) (we
 - ~~Code signing &amp; notarization.~~ **Unsigned for v1;** revisit post-v1.
 - ~~Distribution channels.~~ **GitHub Releases only for v1** ([ADR 0009 §10](adr/0009-v1-scope-decisions.md)).
 - ~~View-logic sharing web ↔ desktop.~~ **Each frontend owns its presentation over the shared API in v1;** no shared view crate ([ADR 0009 §9](adr/0009-v1-scope-decisions.md)).
-- ~~Desktop GUI embeds a webview.~~ **No** — fully native egui in v1 ([ADR 0009 §9](adr/0009-v1-scope-decisions.md)).
+- ~~Desktop GUI embeds a webview.~~ Originally **no** (fully native egui, [ADR 0009 §9](adr/0009-v1-scope-decisions.md)); **reversed 2026-07-16** — the desktop app is now a Tauri webview over the embedded web client ([ADR 0013](adr/0013-desktop-shell-tauri.md)).
 
 ---
 

@@ -1,5 +1,13 @@
 # 01 — Architecture & crates
 
+> **Amendment ([ADR 0013](../adr/0013-desktop-shell-tauri.md), 2026-07-16):** wherever this spec
+> says `3dam-gui` (the egui desktop client), the shipped crate is now **`3dam-desktop`** — a Tauri
+> webview shell that boots `dam-server` in-process (loopback, ephemeral port) and renders the
+> embedded web client, or navigates to a remote `3dam serve` in `--connect` mode. The desktop shell
+> therefore sits on `3dam-server` rather than holding a `LibraryService` directly; the role dispatch
+> (§5) and every other crate boundary are unchanged. The egui client's design record is
+> [12-desktop-gui.md](12-desktop-gui.md) (superseded).
+
 Status: **Draft v0.1** · Scope: the Cargo workspace — the authoritative crate list and each crate's job, the dependency-direction rules and their CI enforcement, the embedded-vs-connected `LibraryService` wiring, the single-binary role dispatch, and compile-time feature gating.
 
 This file is the low-level companion to [PRODUCT_SPEC.md](../PRODUCT_SPEC.md) §4 (system architecture) and §7 (candidate stack), and to [DESIGN_GUIDELINES.md](../DESIGN_GUIDELINES.md) §2 (architecture guidelines). The product spec establishes *one binary, three roles over a shared `3dam-core` engine*, clients depending on a `LibraryService` seam rather than the engine directly, and a safe-by-default server. This file turns that shape into a concrete crate layout, names the dependency edges that are allowed to exist (and how CI forbids the rest), and gives Rust-ish pseudocode for the two mechanisms that make the shape work: **role dispatch** (how one binary becomes GUI/CLI/server/MCP) and **`LibraryService` selection** (how a front-end picks the in-process engine vs a remote API client). It does not re-decide the render crate boundary — that is [ADR 0002](../adr/0002-3d-render-crate-boundary.md) — nor does it own the `LibraryService` trait's methods and DTOs, which belong to [03-library-service-and-api.md](03-library-service-and-api.md). It fixes the crate *names* the rest of the spec references.

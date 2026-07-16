@@ -7,7 +7,7 @@ Guidance for AI agents (and humans) working in this repository. Read this before
 3DAM is a cross-platform, Rust-first **game-asset manager** for **audio, image, and 3D** assets. It unifies them into one local SQLite catalog and layers **content-based automation** on top: metadata extraction, thumbnails, embeddings, similarity search, auto-tagging, and deduplication. It is local-first, non-destructive, and federation-ready.
 
 **One binary, four roles.** The `3dam` binary dispatches on `argv[1]`:
-- (no arg) → **GUI** (native desktop, egui/eframe; a comprehensive client now — see *Reality check*)
+- (no arg) → **GUI** (native desktop: a Tauri webview shell over the embedded web client, [ADR 0013](docs/adr/0013-desktop-shell-tauri.md))
 - `serve` → **HTTP/WS server** + embedded web client + MCP endpoint
 - `mcp` → **MCP server** over stdio
 - anything else → **CLI** (run-and-exit; `scan`, `search`, `convert`, …)
@@ -18,11 +18,7 @@ Every role talks to the same engine through one trait, `LibraryService`, so the 
 
 ## Golden rules
 
-1. **UI parity — web *and* native GUI.** 3DAM ships two user-facing clients and they must stay in sync:
-   - **Web UI** — `web/` (React 19 + TypeScript + Tailwind v4), served by `3dam serve`.
-   - **Native GUI** — `crates/3dam-gui` (`dam-gui`, egui/eframe per [ADR 0005](docs/adr/0005-gui-toolkit-egui.md)).
-
-   Any user-facing feature, layout, or interaction change must be implemented in **both** clients, with consistent behaviour, naming, and workflow. Do not consider a UI task done until both are covered. **Reality check:** the web client still leads (web-first phasing), but the native egui GUI (issue #34) has caught up to **substantive parity** — browse (grid + sortable table), full search + Advanced Search, the complete inspector (metadata, feature bars, tags, textured 3D viewer, audio waveform), collections CRUD, per-asset + batch actions, duplicate/blocklist views, live updates, and a web-matched theme. The tracked gap list is **[docs/GUI_PARITY.md](docs/GUI_PARITY.md)** (only server-admin / mobile-responsive rows remain, marked ▫ n/a for the embedded desktop app) — when you add or change a user-facing web feature, implement the egui equivalent in the same breath or update its row there with a note. Never let a user-facing capability exist in one client with no plan for the other.
+1. **One UI codebase — the web client is the UI.** 3DAM has one user-facing UI, `web/` (React 19 + TypeScript + Tailwind v4), delivered through two shells: the browser (`3dam serve` embeds the built client) and the **native desktop app** (`crates/3dam-desktop`, a Tauri webview over an in-process server — [ADR 0013](docs/adr/0013-desktop-shell-tauri.md), superseding the egui client of ADR 0005). Web ↔ native parity is therefore **structural**: build a user-facing feature once in `web/` and it ships everywhere. What still needs deliberate care: both form factors (the desktop viewport *and* the responsive/touch collapse) must keep working, and desktop-only affordances (native dialogs, tray, OS integration) are additive Tauri work in `crates/3dam-desktop`, never a parallel UI. History: [docs/GUI_PARITY.md](docs/GUI_PARITY.md).
 
 2. **The spec is the single source of truth.** `docs/PRODUCT_SPEC.md` **§9** is the authoritative capability roadmap. `docs/ROADMAP.md` only tracks *status* against it — it is not a separate plan. When scope is ambiguous, defer to §9.
 
@@ -63,14 +59,14 @@ Packages are named `dam-*` (Cargo forbids leading digits); directories are brand
 | `3dam-server` | `dam-server` | axum server: `/api/v1` REST + WS, embedded web client (`rust-embed`), auth/admin, MCP mount; owns `server.db` (tokens, flags, audit) | Wraps an `EmbeddedLibrary`. |
 | `3dam-frontend` | `dam-frontend` | `Backend`/`open_backend` + `Role`/`classify` dispatch glue | Tiny; shared by CLI + GUI. |
 | `3dam-cli` | `dam-cli` | clap command tree; also exports `serve()` and `mcp()` entry points | Human output by default, `--json`/`--csv` opt-in. |
-| `3dam-gui` | `dam-gui` | Native desktop client (egui/eframe) | A comprehensive client at substantive parity with web (see `docs/GUI_PARITY.md`); an interactive wgpu 3D viewer + audio playback. |
+| `3dam-desktop` | `dam-desktop` | Native desktop shell (Tauri 2 webview) | Boots `dam_server::serve_desktop` in-process (loopback, ephemeral port) and opens the embedded web client in a native window; `--connect` navigates to a remote server instead ([ADR 0013](docs/adr/0013-desktop-shell-tauri.md)). Replaced the egui client (`3dam-gui`, in git history). |
 | `3dam` | `dam` | Binary entrypoint: `classify(argv)` → dispatch | GUI is sync; CLI/serve/mcp run on tokio. |
 | `3dam-render` | `dam-render` | Headless wgpu render-to-PNG (textured-PBR turntable thumbnails) + the self-contained `DMSH` preview blob | Real; all formats via Assimp/russimp-ng, behind dam-core's `render` feature ([ADR 0011](docs/adr/0011-assimp-import-backend.md)). |
 | `3dam-viewer` | `dam-viewer` | Browser WASM/wgpu viewer islands (3D model + audio waveform) | `cdylib`+`rlib`; GPU deps only under `cfg(target_arch = "wasm32")`, so native `cargo build` skips them. |
 
 ### Dependency flow
 
-`dam-api` is the root (serde-only). `dam-media`/`dam-sources` are leaf handlers → `dam-store` → `dam-core` (engine). `dam-client` implements the same trait over HTTP. `dam-server` wraps `dam-core`. `dam-frontend` glues embedded+connected; `dam-cli` sits on `dam-frontend`+`dam-server`; `dam` dispatches into cli/gui. `dam-render`/`dam-viewer` are independent GPU crates.
+`dam-api` is the root (serde-only). `dam-media`/`dam-sources` are leaf handlers → `dam-store` → `dam-core` (engine). `dam-client` implements the same trait over HTTP. `dam-server` wraps `dam-core`. `dam-frontend` glues embedded+connected; `dam-cli` sits on `dam-frontend`+`dam-server`; `dam-desktop` sits on `dam-server` (in-process serve) + Tauri; `dam` dispatches into cli/desktop. `dam-render`/`dam-viewer` are independent GPU crates.
 
 ### Data & storage
 
@@ -96,7 +92,7 @@ cargo run -p dam -- serve               # HTTP/WS server + web client (binds 127
 cargo run -p dam -- scan <dir> --wait   # CLI: scan a folder and wait for the job
 cargo run -p dam -- search "brick" --media image --json
 cargo run -p dam -- --connect http://host:7878 --token <t> search "kick"
-cargo run -p dam --                     # GUI role (native egui browse/search/inspect client)
+cargo run -p dam --                     # GUI role (Tauri desktop shell over the embedded web client)
 ```
 
 Key CLI verbs (verb-noun, per tech-spec 13): `scan`, `search`, `get`, `stats`, `sources {list,add,remove}`, `folders`, `collections {…}`, `convert`, `analyze`, `similar`, `dedup`, `tag`, `export`, `jobs`/`job`, `admin {status,flags,flag,token,audit}`, plus `serve` / `mcp`. Global flags: `--connect`, `--token`, `--data`, `--json`.
@@ -136,11 +132,11 @@ pnpm wasm         # cargo xtask wasm
 
 ### Prerequisites for the full build
 
-`wasm-pack` (WASM viewer) and `pnpm` (web) are optional for a native-only Rust build — xtask skips them gracefully — but required for a complete `serve` with a real web client. Linux GUI/audio builds need the usual system libs (GTK, xkbcommon, wayland, xcb, ALSA, ssl/pkg-config; see `.github/workflows/release.yml`).
+`wasm-pack` (WASM viewer) and `pnpm` (web) are optional for a native-only Rust build — xtask skips them gracefully — but required for a complete `serve` (and desktop shell) with a real web client. Linux builds need the usual system libs (GTK3 + **webkit2gtk-4.1** for the Tauri shell, ssl/pkg-config; see `.github/workflows/release.yml`).
 
 ---
 
-## Web UI shape (for parity work)
+## Web UI shape (this is the whole UI — browser and desktop shell)
 
 - **Three-region workspace** (`web/src/components/Workspace.tsx`): **Navigation** (left, filters + sources), **Browser** (center, virtualised grid/table via `@tanstack/react-virtual`, 100k+ rows), **Inspector** (right, detail + preview), plus a bottom **StatusBar** (live jobs + stats).
 - **State:** server state via **TanStack Query** (`web/src/api/queries.ts`); UI/view state (search, filters, selection, view mode) lives in **URL params** (`web/src/lib/view-state.ts`) for deep-linking; live updates via **WebSocket** (`web/src/api/ws.ts`) invalidating query keys.
@@ -164,7 +160,8 @@ pnpm wasm         # cargo xtask wasm
 ## Gotchas
 
 - **Dev-proxy port mismatch.** `3dam serve` binds **`127.0.0.1:7878`** by default, but `web/vite.config.ts` proxies `/api` to **`127.0.0.1:7333`**. For local web dev, either run `3dam serve --addr 127.0.0.1:7333` or set `VITE_API_TARGET=http://127.0.0.1:7878` before `pnpm dev`. (This inconsistency is real in the tree — don't "fix" one side without checking the other.)
-- **The native GUI and native renderer are real (no longer stubs).** `dam-gui` is a comprehensive egui client (see `docs/GUI_PARITY.md`) and `dam-render` produces textured-PBR turntable thumbnails + the `DMSH` preview blob. Parity work there means *editing* existing code — read it first. `dam-gui` uses eframe's **wgpu** backend (its own wgpu-24 instance, distinct from dam-render/dam-viewer's wgpu-30); the interactive 3D viewer (`viewer3d.rs`) renders the `DMSH` blob against that device.
+- **The desktop app is a webview, not a native toolkit.** `dam-desktop` (Tauri) renders the embedded web client — "native GUI work" is almost always `web/` work. The webview loads an `http://127.0.0.1` origin, so Tauri IPC is deliberately unavailable in page JS; native affordances need explicit capability plumbing (ADR 0013). The egui client (`3dam-gui`) was removed at ADR 0013 — it lives in git history, don't resurrect pieces of it casually.
+- **The native renderer is real (no longer a stub).** `dam-render` produces textured-PBR turntable thumbnails + the `DMSH` preview blob (consumed by the web/WASM viewer), behind dam-core's `render` feature.
 - **Embeddings are model-free in v1.** Similarity/dedup work off a v1 vector behind the EmbeddingSpace seam. SigLIP (image/3D, candle) and CLAP (audio, ort/ONNX) are a later feature-gated bump — see `spikes/embedding-models/` and [ADR 0006](docs/adr/0006-inference-candle.md).
 - **Newer-schema DBs are rejected.** If you bump the schema and then run an older binary against that DB, it refuses to open by design.
 - **Release CI is a scaffold.** `.github/workflows/release.yml` is `workflow_dispatch`-only until the app is production-ready; it is not wired to tag pushes yet.
@@ -178,5 +175,5 @@ pnpm wasm         # cargo xtask wasm
 - `docs/ROADMAP.md` — status against §9 (phases 1–5 shipped; 6 federation/auth & 7 polish/scale later; 8 beyond v1).
 - `docs/DESIGN_GUIDELINES.md` — dark-first, information-dense UI rules (governs both clients).
 - `docs/tech-spec/00`–`15` — numbered deep specs. Crate descriptions cite them (e.g. 01 architecture, 03 LibraryService/API, 05 analysis, 09 server/web, 12 GUI, 13 CLI, 14 concurrency).
-- `docs/adr/0001`–`0010` — decisions (render backend, crate split, MCP, feature flags, egui, candle, tokio+rayon, React stack, v1 scope, package naming).
+- `docs/adr/0001`–`0013` — decisions (render backend, crate split, MCP, feature flags, egui [superseded], candle, tokio+rayon, React stack, v1 scope, package naming, Assimp, prefetch, Tauri desktop shell).
 - `spikes/` — validation experiments that gate/inform ADRs (vector-index, headless-render, embedding-models, cross-peer-similarity).

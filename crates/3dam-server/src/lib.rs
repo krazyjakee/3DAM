@@ -500,6 +500,104 @@ async fn wait_for_signal() {
     }
 }
 
+/// What [`serve_desktop`] reports back to the desktop shell (ADR 0013): where the in-process server
+/// listens and the credential the webview should present.
+pub struct DesktopServer {
+    /// `http://127.0.0.1:<port>` — loopback only, ephemeral port.
+    pub url: String,
+    /// A fresh owner-scoped shell token when the `Authentication` flag is on; `None` when it is Off
+    /// (an Off-mode server already resolves the unauthenticated local caller to owner trust).
+    pub token: Option<String>,
+}
+
+/// Run the server for the native desktop shell (ADR 0013): the same engine + store + router as
+/// [`serve`], but bound to `127.0.0.1:0` (loopback, ephemeral port), defaults-only config (no config
+/// file, no TLS), and no signal handling — the shell owns the process lifetime and this future is
+/// simply dropped (or the process exits) when the window closes. The bound URL (and shell credential)
+/// is sent through `ready` once the listener is accepting.
+pub async fn serve_desktop(
+    data_dir: PathBuf,
+    ready: tokio::sync::oneshot::Sender<anyhow::Result<DesktopServer>>,
+) {
+    let (app, listener, info) = match desktop_setup(&data_dir).await {
+        Ok(parts) => parts,
+        Err(e) => {
+            let _ = ready.send(Err(e));
+            return;
+        }
+    };
+    let _ = ready.send(Ok(info));
+    if let Err(e) = axum::serve(listener, app).await {
+        tracing::error!(error = %e, "desktop server exited with an error");
+    }
+}
+
+/// Wire the desktop server: open the stores, start watchers + the background pipeline, mint the
+/// shell credential, and bind. Split from [`serve_desktop`] so setup failures funnel to one `?` path.
+async fn desktop_setup(
+    data_dir: &std::path::Path,
+) -> anyhow::Result<(Router, tokio::net::TcpListener, DesktopServer)> {
+    let lib = Arc::new(EmbeddedLibrary::open(data_dir).await?);
+    lib.start_watchers();
+    let store = Arc::new(ServerStore::open(&data_dir.join("server.db"))?);
+    lib.start_background_pipeline(Arc::new(ServerPipelinePolicy {
+        store: store.clone(),
+    }));
+    let token = desktop_shell_token(&store)?;
+
+    // No graceful drain for the desktop role — leak the sender (as the test seam does) so the WS
+    // loops never observe a spurious shutdown flip from a dropped channel.
+    let (tx, shutdown) = watch::channel(false);
+    Box::leak(Box::new(tx));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let actual = listener.local_addr()?;
+    let state = AppState {
+        lib,
+        store,
+        bind: actual.to_string(),
+        localhost_only: true,
+        tls: false,
+        shutdown,
+        ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+    };
+    tracing::info!(%actual, "3dam desktop server listening");
+    Ok((
+        build_router(state),
+        listener,
+        DesktopServer {
+            url: format!("http://{actual}"),
+            token,
+        },
+    ))
+}
+
+/// The desktop shell's credential when the `Authentication` flag is on: a fresh owner-scoped token
+/// per launch, with the previous launch's revoked by label so they don't accumulate in `server.db`.
+/// (Two concurrent shells on one data dir will fight over this label — the second launch signs the
+/// first out; an accepted edge, same as today's concurrent-session behaviour.)
+fn desktop_shell_token(store: &ServerStore) -> Result<Option<String>, LibError> {
+    use dam_api::admin::{AuthMode, NewToken};
+    if matches!(store.auth_mode(), AuthMode::Off) {
+        return Ok(None);
+    }
+    const LABEL: &str = "desktop shell";
+    for t in store.list_tokens()? {
+        if t.label == LABEL {
+            store.revoke_token(&t.token_id, "desktop")?;
+        }
+    }
+    let minted = store.create_token(
+        NewToken {
+            label: LABEL.into(),
+            scopes: dam_api::service::Scopes::owner(),
+            expires: None,
+        },
+        "desktop",
+    )?;
+    Ok(Some(minted.secret))
+}
+
 /// The MCP stdio transport (`3dam mcp`, tech-spec 11 §2.2). Opens an embedded engine — no network,
 /// no running server, no auth surface — and serves the identical adapter over stdio. Locally trusted:
 /// writes are allowed (still non-destructive). Unaffected by the served `McpServer` flag (§7).

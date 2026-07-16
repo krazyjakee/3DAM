@@ -1,0 +1,28 @@
+[package]
+name = "dam-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native desktop shell (Tauri webview, ADR 0013): the embedded web client served by an in-process dam-server."
+
+[dependencies]
+# The shell boots the same axum server `3dam serve` runs — loopback, ephemeral port, embedded React
+# client — and points the webview at it. One UI codebase for web and desktop (ADR 0013).
+dam-server = { workspace = true }
+# `default_data_dir` only (re-exported so front-ends need not link 3dam-core for the path helper).
+dam-frontend = { workspace = true }
+# The in-process server runs on its own runtime on a background thread; the main thread belongs to
+# the webview event loop (golden rule 5 still holds — the engine's tokio/rayon split is unchanged).
+tokio = { workspace = true }
+# Validate the `--connect` endpoint into the URL the webview navigates to (hosted mode, issue #70).
+url = { workspace = true }
+# JSON-encode the shell token into the localStorage init script without hand-escaping.
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+
+# The webview shell (ADR 0013). Declared here rather than in the workspace table since this crate is
+# its only consumer (the eframe precedent).
+tauri = { version = "2", features = [] }
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
