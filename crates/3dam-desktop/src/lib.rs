@@ -62,6 +62,11 @@ pub fn run(args: Vec<OsString>) -> u8 {
     });
 
     let outcome = tauri::Builder::default()
+        // Native dialogs (the Add-Source folder picker). The webview loads a remote
+        // `http://127.0.0.1:<port>` URL, so IPC is off by default; the capability in
+        // `capabilities/loopback-dialog.json` grants exactly `dialog:allow-open` to the loopback
+        // origin — a `--connect` remote server's page never gets IPC.
+        .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
             let mut win = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url))
                 .title("3DAM")

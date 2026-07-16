@@ -23,6 +23,9 @@ anyhow = { workspace = true }
 # The webview shell (ADR 0013). Declared here rather than in the workspace table since this crate is
 # its only consumer (the eframe precedent).
 tauri = { version = "2", features = [] }
+# Native file dialogs (the Add-Source folder picker). Exposed to the web client through the
+# loopback-scoped capability in `capabilities/` — see that file for the security posture.
+tauri-plugin-dialog = "2"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

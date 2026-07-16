@@ -4,6 +4,7 @@
   "identifier": "io.github.krazyjakee.threedam",
   "app": {
     "windows": [],
+    "withGlobalTauri": true,
     "security": {
       "csp": null
     }
