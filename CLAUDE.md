@@ -113,6 +113,9 @@ Server tests exercise the axum router in-process via `ServiceExt::oneshot` (no s
 cargo xtask ci          # fmt --check + clippy -D warnings + tests + web build (the canonical pre-push gate)
 cargo xtask web         # build the React client → web/dist/ (builds wasm first; skips gracefully if pnpm missing)
 cargo xtask wasm        # wasm-pack build dam-viewer → web/src/wasm/ (skips gracefully if wasm-pack missing)
+cargo xtask bundle      # package the desktop app (deb/AppImage): web → release 3dam → `cargo tauri bundle`
+                        # (skips gracefully if tauri-cli missing; the bundler wraps the pre-built
+                        #  target/release/3dam via mainBinaryName — dam-desktop itself stays a lib)
 cargo xtask check-deps  # dependency-direction guard (placeholder, not yet enforced)
 ```
 

@@ -72,8 +72,19 @@ cargo build -p dam --release
 
 The binary lands at `target/release/3dam`. A native-only build skips the wasm-only viewer
 deps; `wasm-pack` (WASM viewer) and `pnpm` (web client) are optional and only needed for a
-complete `serve` with the live web UI. Linux GUI/audio builds need the usual system libs
-(GTK, xkbcommon, wayland, xcb, ALSA, ssl/pkg-config).
+complete `serve` (and desktop shell) with the live web UI. Linux builds need the usual system
+libs (GTK3 + webkit2gtk-4.1 for the Tauri desktop shell, ssl/pkg-config).
+
+### Package the desktop app (deb / AppImage)
+
+```sh
+cargo install tauri-cli --version '^2'   # one-time; xtask skips gracefully without it
+cargo xtask bundle
+```
+
+This builds the web client, then the release `3dam` binary, then runs the Tauri bundler
+against it (config in `crates/3dam-desktop/tauri.conf.json`). Bundles land under
+`target/release/bundle/`. The AppImage target additionally needs `librsvg2-dev` installed.
 
 ## Quick start
 
@@ -184,6 +195,7 @@ cargo clippy --all-targets -- -D warnings     # lint
 cargo xtask ci                                # the canonical pre-push gate (fmt + clippy + tests + web build)
 cargo xtask web                               # build the React client → web/dist/
 cargo xtask wasm                              # wasm-pack build the dam-viewer islands
+cargo xtask bundle                            # package the desktop app (deb/AppImage via tauri-cli)
 ```
 
 The crate layout, seams, and data model are documented in
