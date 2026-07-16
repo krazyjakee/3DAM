@@ -71,12 +71,15 @@ impl Scopes {
     }
     /// The scopes an unauthenticated request gets when `Authentication = Off` — full local trust
     /// (owner posture), so an operator can never lock themselves out of their own localhost server.
+    /// Includes `Federate`: the owner is the machine's full authority and must not silently lack a
+    /// capability the embedded engine holds (kept in step with [`Scopes::all`]).
     pub fn owner() -> Self {
         Scopes::none()
             .with(Scope::Read)
             .with(Scope::Write)
             .with(Scope::Admin)
             .with(Scope::McpUse)
+            .with(Scope::Federate)
     }
     pub fn with(self, s: Scope) -> Self {
         Scopes(self.0 | s.bit())
@@ -109,6 +112,18 @@ impl<'de> serde::Deserialize<'de> for Scopes {
         let v = Vec::<Scope>::deserialize(de)?;
         Ok(Scopes::collect(v))
     }
+}
+
+/// The caller's own resolved identity + effective scopes — the answer to `whoami` (tech-spec 10
+/// §1.2). Lets a front-end shape its UI to what this credential may actually do (disable a write
+/// button rather than let the request 403), so permissions are visible *before* an action, not
+/// discovered by its failure. `anonymous` is the honest "no verified credential" signal: true under
+/// `Off`/`Anonymous` with no token, false for a store-verified token or the local embedded owner.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct WhoAmI {
+    pub identity: Option<String>,
+    pub scopes: Scopes,
+    pub anonymous: bool,
 }
 
 /// Carries identity, granted scopes, and (later) a visibility ceiling. Resolved once per request by
@@ -148,10 +163,33 @@ impl AuthContext {
             Err(LibError::Forbidden(format!("missing scope: {scope:?}")))
         }
     }
+    /// This context described back to the caller (the `whoami` answer). The embedded engine always
+    /// carries the full scope set, so it reports itself as a non-anonymous owner.
+    ///
+    /// `anonymous` marks a genuinely unauthenticated, non-owner caller — the `Anonymous`-mode
+    /// fallback. The two credential-less contexts are the auth-off local *owner* (full trust, holds
+    /// `Admin`) and the anonymous caller (read-only, no `Admin`); the `Admin` scope is what tells them
+    /// apart, so the owner is not reported as anonymous even though it presented no token.
+    pub fn whoami(&self) -> WhoAmI {
+        WhoAmI {
+            identity: self.identity.clone(),
+            scopes: self.scopes,
+            anonymous: !self.embedded && self.identity.is_none() && !self.scopes.has(Scope::Admin),
+        }
+    }
 }
 
 #[async_trait]
 pub trait LibraryService: Send + Sync {
+    // ── identity ─────────────────────────────────────────────────────────────
+    /// Who this credential is and what it may do — the front-door model's "permissions decide after
+    /// the gate" made legible to a client, which shapes its UI to the granted scopes instead of
+    /// discovering them through 403s. The embedded engine answers from its own full-trust context;
+    /// the connected client asks the server, whose answer reflects the presented token.
+    async fn whoami(&self, ctx: &AuthContext) -> Result<WhoAmI, LibError> {
+        Ok(ctx.whoami())
+    }
+
     // ── browse / search ────────────────────────────────────────────────────
     async fn query(
         &self,

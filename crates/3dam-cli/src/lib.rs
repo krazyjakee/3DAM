@@ -12,6 +12,7 @@ use dam_api::dto::*;
 use dam_api::id::{AssetId, CollectionId, JobId, SourceId};
 use dam_api::page::PageParams;
 use dam_api::service::{AuthContext, LibraryService, Scope, Scopes};
+use dam_api::LibError;
 use dam_frontend::{default_data_dir, open_backend, Backend};
 use dam_server::ServeConfig;
 use std::ffi::OsString;
@@ -48,6 +49,14 @@ pub async fn run(args: Vec<OsString>) -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e}");
+            // A bare "unauthorized" from a `--connect`ed server tells the user nothing actionable.
+            // Point them at the fix: the server is in token mode and wants a credential.
+            if matches!(e.downcast_ref::<LibError>(), Some(LibError::Unauthorized)) {
+                eprintln!(
+                    "hint: this server requires a token — pass --token <secret> \
+                     (an operator mints one with `3dam admin token add`)."
+                );
+            }
             ExitCode::FAILURE
         }
     }

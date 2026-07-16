@@ -20,7 +20,7 @@ use crate::theme::colors;
 use crate::ui::{self, icon};
 use dam_frontend::{open_backend, Backend};
 
-use dam_api::service::{AuthContext, LibraryService};
+use dam_api::service::{AuthContext, LibraryService, Scope, Scopes, WhoAmI};
 use dam_api::{
     AddSource, AnalyzeRequest, Asset, AssetId, AssetSummary, BlockEntry, Collection, CollectionId,
     CollectionKind, CollectionMembers, CollisionRule, ContentHash, ConvertReport, ConvertRequest,
@@ -501,6 +501,10 @@ enum Msg {
     /// A backend switch (Connect/Disconnect) finished building the new service (issue #70). On `Ok`
     /// the app rebinds `lib`, resets browse state, and re-subscribes to the event stream.
     BackendSwitched(Conn, Result<Arc<dyn LibraryService>, ConnectError>),
+    /// The resolved identity + effective scopes of the current connection (front-door auth,
+    /// web-parity). Answers `whoami`, letting the UI disable write actions the credential can't
+    /// perform *before* they 403 rather than after. Posted on connect + at launch.
+    Whoami(Result<WhoAmI, String>),
 }
 
 /// Why a backend switch failed. `Unauthorized` is split out (front-door auth, web-parity): a
@@ -509,6 +513,42 @@ enum Msg {
 enum ConnectError {
     Unauthorized,
     Other(String),
+}
+
+/// Classify a posted message's transport outcome for the reachability chip + auth-failure catch.
+/// Returns `Some(Ok)` / `Some(Err(code))` for every message that carries a `Result<_, String>` from
+/// a service call (read *or* write), and `None` for messages with no network round-trip to judge
+/// (a decoded thumbnail, a live event, the already-classified backend switch). Centralising this so
+/// `note_conn_for` treats reads and mutations uniformly — a 401/403 on any of them is caught, not
+/// just on the handful of read variants that used to be hard-coded (front-door auth, web-parity).
+fn msg_outcome(msg: &Msg) -> Option<Result<(), &str>> {
+    fn o<T>(r: &Result<T, String>) -> Option<Result<(), &str>> {
+        Some(r.as_ref().map(|_| ()).map_err(|e| e.as_str()))
+    }
+    match msg {
+        Msg::Assets(r) => o(r),
+        Msg::Detail(r) => o(r),
+        Msg::Sources(r) => o(r),
+        Msg::Stats(r) => o(r),
+        Msg::Folders(_, r) => o(r),
+        Msg::SourceAdded(r) => o(r),
+        Msg::Similar(_, r) => o(r),
+        Msg::Collections(r) => o(r),
+        Msg::Export(r) => o(r),
+        Msg::Duplicates(r) => o(r),
+        Msg::DupView(r) => o(r),
+        Msg::AssetRemoved(r) => o(r),
+        Msg::Blocklist(r) => o(r),
+        Msg::Unblocked(r) => o(r),
+        Msg::Convert(r) => o(r),
+        Msg::AudioBytes(_, r) => o(r),
+        Msg::Waveform(_, r) => o(r),
+        Msg::ModelMesh(_, r) => o(r),
+        Msg::CollectionMutated(r) => o(r),
+        Msg::Whoami(r) => o(r),
+        // No network outcome to judge (or already classified elsewhere).
+        Msg::Thumb(..) | Msg::Event(_) | Msg::BackendSwitched(..) => None,
+    }
 }
 
 /// A collection CRUD / membership action gathered while rendering, applied after the panels.
@@ -566,6 +606,54 @@ enum ConnStatus {
     Online,
     /// Remote backend unreachable (transient) — auto-recovers on the next successful call.
     Offline,
+    /// Remote backend reachable but rejecting the presented credential (front-door auth,
+    /// web-parity). Distinct from `Offline` so the chip reads "Sign-in needed" — the fix is a
+    /// token, not waiting for the server to come back.
+    NeedsAuth,
+}
+
+/// What the current connection may actually do — the `whoami` answer, cached so the UI can disable
+/// write controls the credential lacks (front-door auth, web-parity) instead of letting them 403.
+/// The embedded engine is full-trust; a connected caller reflects the presented token.
+#[derive(Clone)]
+struct Caps {
+    scopes: Scopes,
+    anonymous: bool,
+    identity: Option<String>,
+}
+
+impl Caps {
+    /// The in-process embedded engine — full local trust (all scopes, non-anonymous).
+    fn embedded() -> Self {
+        Self {
+            scopes: Scopes::all(),
+            anonymous: false,
+            identity: None,
+        }
+    }
+    /// A connection whose scopes aren't known yet (probe in flight) — assume no write so we don't
+    /// briefly offer actions that will 403; the real answer arrives via `Msg::Whoami`.
+    fn unknown() -> Self {
+        Self {
+            scopes: Scopes::none(),
+            anonymous: true,
+            identity: None,
+        }
+    }
+    fn from_whoami(w: WhoAmI) -> Self {
+        Self {
+            scopes: w.scopes,
+            anonymous: w.anonymous,
+            identity: w.identity,
+        }
+    }
+    fn can_write(&self) -> bool {
+        self.scopes.has(Scope::Write)
+    }
+    #[allow(dead_code)] // reserved for the connected-mode admin panel (out of scope here — see TODO)
+    fn can_admin(&self) -> bool {
+        self.scopes.has(Scope::Admin)
+    }
 }
 
 /// A compact `host[:port]` label for the connection chip (falls back to the raw string).
@@ -590,6 +678,9 @@ pub struct DamGui {
     conn: Conn,
     data_dir: PathBuf,
     status: ConnStatus,
+    /// What the current connection may do (front-door auth, web-parity) — drives scope-aware button
+    /// disabling and the read-only signal. Embedded = full trust; a remote answers via `whoami`.
+    caps: Caps,
     /// A backend switch (Connect/Disconnect) is building the new service off-thread.
     switching: bool,
     /// The live-event pump task; aborted when the backend switches so the old client's reconnect
@@ -760,6 +851,13 @@ impl DamGui {
         } else {
             ConnStatus::Local
         };
+        // Embedded is full-trust; a remote's scopes are unknown until the launch probe answers
+        // (assume no-write meanwhile so we never briefly offer actions the token can't perform).
+        let caps = if conn.is_remote() {
+            Caps::unknown()
+        } else {
+            Caps::embedded()
+        };
         let recent_servers = conn.endpoint.iter().cloned().collect();
         let connect_url = conn.endpoint.clone().unwrap_or_default();
         let connect_token = conn.token.clone().unwrap_or_default();
@@ -770,6 +868,7 @@ impl DamGui {
             conn,
             data_dir,
             status,
+            caps,
             switching: false,
             event_task: None,
             connect_open: false,
@@ -867,13 +966,22 @@ impl DamGui {
         };
         // Kick the initial loads against the freshly opened library.
         let egctx = cc.egui_ctx.clone();
-        app.load_assets(&egctx);
-        app.load_sources(&egctx);
-        app.load_stats(&egctx);
-        app.load_collections(&egctx);
-        app.load_duplicates(&egctx);
-        app.load_blocklist(&egctx);
-        app.event_task = Some(app.spawn_events());
+        if app.conn.is_remote() {
+            // A `--connect` launch verifies the connection/token first (fix #4): a stale token was
+            // previously indistinguishable from an unreachable server. The probe posts a
+            // `BackendSwitched`, whose Ok path rebinds + reloads + fetches scopes, and whose
+            // Unauthorized path opens the re-auth dialog with the right message.
+            app.verify_launch(&egctx);
+        } else {
+            app.load_assets(&egctx);
+            app.load_sources(&egctx);
+            app.load_stats(&egctx);
+            app.load_collections(&egctx);
+            app.load_duplicates(&egctx);
+            app.load_blocklist(&egctx);
+            app.load_whoami(&egctx);
+            app.event_task = Some(app.spawn_events());
+        }
         app
     }
 
@@ -983,6 +1091,13 @@ impl DamGui {
         } else {
             ConnStatus::Local
         };
+        // Embedded is full-trust; a remote's scopes are re-resolved by the `whoami` load below (keep
+        // no-write until it answers so we don't flash write actions the new token may lack).
+        self.caps = if conn.is_remote() {
+            Caps::unknown()
+        } else {
+            Caps::embedded()
+        };
         // Remember the endpoint for quick reconnection (most-recent first, de-duplicated).
         if let Some(ep) = &conn.endpoint {
             self.recent_servers.retain(|s| s != ep);
@@ -1021,6 +1136,7 @@ impl DamGui {
         self.load_collections(&egctx);
         self.load_duplicates(&egctx);
         self.load_blocklist(&egctx);
+        self.load_whoami(&egctx);
         self.event_task = Some(self.spawn_events());
     }
 
@@ -1038,6 +1154,19 @@ impl DamGui {
         };
     }
 
+    /// Whether the current connection may mutate the library (front-door auth, web-parity). Gates the
+    /// enabled state of every write control so a lacking scope disables the button (with a hover
+    /// explanation) rather than letting the action 403. Embedded is always true.
+    fn can_write(&self) -> bool {
+        self.caps.can_write()
+    }
+
+    /// Whether the current connection is a remote one that can't write — the trigger for the
+    /// "Read-only" chrome (a signed-out/anonymous or read-scoped token). Embedded never is.
+    fn read_only_remote(&self) -> bool {
+        self.conn.is_remote() && !self.can_write()
+    }
+
     /// Colour + short label for the toolbar connection chip. Colours come from the active theme's
     /// tokens (web `ServerChip`/`ConnectionPill` semantics: local → dim, remote/online → accent,
     /// trouble → warn/danger) so the chip follows dark/light like everything else.
@@ -1046,10 +1175,19 @@ impl DamGui {
         match self.status {
             ConnStatus::Local => (c.fg_dim, "Local".to_string()),
             ConnStatus::Connecting => (c.warn, "Connecting…".to_string()),
-            ConnStatus::Online => (
-                c.accent,
-                short_host(self.conn.endpoint.as_deref().unwrap_or("server")),
-            ),
+            ConnStatus::Online => {
+                let host = short_host(self.conn.endpoint.as_deref().unwrap_or("server"));
+                // Read-only signal (front-door auth, web-parity): a remote whose token can't write
+                // is flagged in-line so the user knows before clicking, mirroring the web
+                // "sign in to make changes" intent.
+                if self.read_only_remote() {
+                    (c.warn, format!("{host} · Read-only"))
+                } else {
+                    (c.accent, host)
+                }
+            }
+            // A rejected credential is not "offline" — the fix is a token, not a wait.
+            ConnStatus::NeedsAuth => (c.danger, "Sign-in needed".to_string()),
             ConnStatus::Offline => (c.danger, "Offline".to_string()),
         }
     }
@@ -2301,6 +2439,48 @@ impl DamGui {
         });
     }
 
+    /// Ask the current backend who this credential is and what it may do (front-door auth,
+    /// web-parity). The answer drives scope-aware button disabling + the read-only signal. Embedded
+    /// answers from full-trust local context; a remote reflects the presented token. A mid-session
+    /// `Unauthorized` here also reopens the re-auth flow (handled where `Msg::Whoami` is folded in).
+    fn load_whoami(&self, egctx: &egui::Context) {
+        let (lib, auth, tx, egctx) = (
+            self.lib.clone(),
+            self.auth.clone(),
+            self.tx.clone(),
+            egctx.clone(),
+        );
+        self.rt.spawn(async move {
+            let r = lib.whoami(&auth).await.map_err(|e| e.to_string());
+            let _ = tx.send(Msg::Whoami(r));
+            egctx.request_repaint();
+        });
+    }
+
+    /// Verify a `--connect` launch the same way the in-app Connect dialog does (fix: a launch used to
+    /// skip the probe, so a stale `--token` looked like "server down" rather than "sign-in needed").
+    /// Reuses the already-open `lib`: a cheap stats probe classifies the connection, and on success
+    /// `whoami` fills in the scopes. Posts a `Msg::BackendSwitched` so the existing Ok/Unauthorized/
+    /// Other handling (dialog reopen, NeedsAuth chip) applies uniformly.
+    fn verify_launch(&self, egctx: &egui::Context) {
+        let (lib, auth, tx, egctx, conn) = (
+            self.lib.clone(),
+            self.auth.clone(),
+            self.tx.clone(),
+            egctx.clone(),
+            self.conn.clone(),
+        );
+        self.rt.spawn(async move {
+            let res = match lib.library_stats(&auth, None).await {
+                Ok(_) => Ok(lib),
+                Err(dam_api::LibError::Unauthorized) => Err(ConnectError::Unauthorized),
+                Err(e) => Err(ConnectError::Other(e.to_string())),
+            };
+            let _ = tx.send(Msg::BackendSwitched(conn, res));
+            egctx.request_repaint();
+        });
+    }
+
     /// Add a local-filesystem source, then kick a full scan so it ingests. Source/asset events from
     /// the scan refresh the rail + grid live. The add outcome is posted back so a rejected path
     /// surfaces in the rail rather than vanishing.
@@ -2465,40 +2645,58 @@ impl DamGui {
         });
     }
 
-    /// Inspect a transport-bearing result to keep the remote reachability chip current (issue #70),
-    /// and catch a mid-session credential loss: a remote call failing with exactly "unauthorized"
-    /// (`LibError::Unauthorized`'s Display — `Msg` payloads are strings, so this is a documented
-    /// string-match fallback) means the token was revoked/expired. Reopen the Connect dialog asking
-    /// for a credential (front-door auth, web-parity) instead of calling the server "offline".
+    /// Inspect a transport-bearing result to keep the remote reachability chip current (issue #70)
+    /// and catch auth failures on *any* message — read or write (front-door auth, web-parity). Every
+    /// `Result<_, String>` payload is classified uniformly via [`msg_outcome`] rather than a
+    /// hand-picked few, so a mid-session `unauthorized` arriving on a mutation (AssetRemoved,
+    /// CollectionMutated, Unblocked, …) reopens the re-auth flow instead of dead-ending as a raw
+    /// toast, and a `forbidden` (missing scope) is reframed into a clear "token can't do that"
+    /// message instead of a raw `forbidden: …` banner. (`LibError`'s Display gives the code prefix;
+    /// `Msg` payloads are strings, so this is the documented string-match seam.)
     fn note_conn_for(&mut self, msg: &Msg) {
-        fn unauthorized<T>(r: &Result<T, String>) -> bool {
-            matches!(r, Err(e) if e == "unauthorized")
-        }
-        let hit = match msg {
-            Msg::Assets(r) => {
-                self.note_conn(r.is_ok());
-                unauthorized(r)
-            }
-            Msg::Stats(r) => {
-                self.note_conn(r.is_ok());
-                unauthorized(r)
-            }
-            Msg::Sources(r) => {
-                self.note_conn(r.is_ok());
-                unauthorized(r)
-            }
-            Msg::Detail(r) => {
-                self.note_conn(r.is_ok());
-                unauthorized(r)
-            }
-            _ => false,
+        let Some(outcome) = msg_outcome(msg) else {
+            return; // non-network message (thumb decode, live event, backend switch)
         };
-        if hit && self.conn.is_remote() && !self.switching && !self.connect_open {
-            self.connect_url = self.conn.endpoint.clone().unwrap_or_default();
-            self.connect_token = self.conn.token.clone().unwrap_or_default();
-            self.connect_error =
-                Some("Your session token is no longer valid — enter a valid token.".to_string());
-            self.connect_open = true;
+        self.note_conn(outcome.is_ok());
+        if !self.conn.is_remote() || self.switching {
+            return;
+        }
+        match outcome {
+            // A revoked/expired/absent credential — reopen the Connect dialog asking for a token.
+            Err("unauthorized") => {
+                self.status = ConnStatus::NeedsAuth;
+                if !self.connect_open {
+                    self.connect_url = self.conn.endpoint.clone().unwrap_or_default();
+                    self.connect_token = self.conn.token.clone().unwrap_or_default();
+                    self.connect_error = Some(
+                        "Your session token is no longer valid — enter a valid token.".to_string(),
+                    );
+                    self.connect_open = true;
+                }
+            }
+            // A scope-denied write (the token is valid but lacks `Write`): reframe the raw
+            // `forbidden: missing scope: Write` into plain language, and mark the connection
+            // read-only so the offending controls disable going forward.
+            Err(e) if e.starts_with("forbidden") => {
+                // Drop `Write` from the cached scopes so the disable-on-lack rules kick in (our
+                // whoami read may have been optimistic, or this action needed a scope we lack).
+                let remaining = Scopes::collect(
+                    self.caps
+                        .scopes
+                        .to_vec()
+                        .into_iter()
+                        .filter(|s| *s != Scope::Write),
+                );
+                self.caps = Caps {
+                    scopes: remaining,
+                    anonymous: self.caps.anonymous,
+                    identity: self.caps.identity.clone(),
+                };
+                self.error = Some(
+                    "This server's token doesn't allow that (write access required).".to_string(),
+                );
+            }
+            _ => {}
         }
     }
 
@@ -2514,7 +2712,7 @@ impl DamGui {
             // told the server is down.
             Msg::BackendSwitched(conn, Err(ConnectError::Unauthorized)) => {
                 self.switching = false;
-                self.status = ConnStatus::Offline;
+                self.status = ConnStatus::NeedsAuth;
                 self.connect_url = conn.endpoint.clone().unwrap_or_default();
                 self.connect_token = conn.token.clone().unwrap_or_default();
                 self.connect_error = Some(
@@ -2534,6 +2732,18 @@ impl DamGui {
                     "Couldn't connect to {}: {e}",
                     conn.endpoint.as_deref().unwrap_or("embedded")
                 ));
+            }
+            // The resolved scopes for the current connection (front-door auth, web-parity). An error
+            // reaching `whoami` is handled by `note_conn_for` (it reopens re-auth on Unauthorized);
+            // here we just fold a successful answer into the caps that gate write controls.
+            Msg::Whoami(Ok(w)) => {
+                self.caps = Caps::from_whoami(w);
+            }
+            Msg::Whoami(Err(_)) => {
+                // Couldn't resolve — stay conservative (no write) for a remote; embedded never fails.
+                if self.conn.is_remote() {
+                    self.caps = Caps::unknown();
+                }
             }
             Msg::Assets(Ok(page)) => {
                 self.total = page.total;
@@ -2889,6 +3099,13 @@ impl eframe::App for DamGui {
             self.audio_for = None;
         }
 
+        // Whether this connection may mutate the library — snapshotted once for the frame so every
+        // write control disables consistently (front-door auth, web-parity). Embedded = always true.
+        let can_write = self.can_write();
+        // Hover text on a disabled write control, explaining *why* it's off (mirrors the web
+        // "sign in to make changes" tooltips) rather than leaving it inexplicably greyed.
+        const NO_WRITE_HINT: &str = "Requires write access on this server";
+
         // Actions gathered while rendering (immutable borrows of self), applied after the panels.
         let mut do_query = false;
         let mut grid_click: Option<(AssetId, ClickMods)> = None;
@@ -3042,8 +3259,15 @@ impl eframe::App for DamGui {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // Export the current view (collection or faceted query) as a manifest.
                     if ui
-                        .button(format!("{}  Export", icon::EXPORT))
-                        .on_hover_text("Export this view as a manifest")
+                        .add_enabled(
+                            can_write,
+                            egui::Button::new(format!("{}  Export", icon::EXPORT)),
+                        )
+                        .on_hover_text(if can_write {
+                            "Export this view as a manifest"
+                        } else {
+                            NO_WRITE_HINT
+                        })
                         .clicked()
                     {
                         self.export_assets.clear(); // export the view, not a stale selection
@@ -3095,12 +3319,23 @@ impl eframe::App for DamGui {
                             .strong(),
                     );
                     ui.separator();
-                    if ui.button(format!("{}  Analyze", icon::SPARKLE)).clicked() {
-                        batch_analyze = true;
-                    }
-                    if ui.button(format!("{}  Export", icon::EXPORT)).clicked() {
-                        batch_export = true;
-                    }
+                    // Batch Analyze/Export both mutate (jobs + a manifest write) — gate on write.
+                    ui.add_enabled_ui(can_write, |ui| {
+                        if ui
+                            .button(format!("{}  Analyze", icon::SPARKLE))
+                            .on_hover_text(if can_write { "" } else { NO_WRITE_HINT })
+                            .clicked()
+                        {
+                            batch_analyze = true;
+                        }
+                        if ui
+                            .button(format!("{}  Export", icon::EXPORT))
+                            .on_hover_text(if can_write { "" } else { NO_WRITE_HINT })
+                            .clicked()
+                        {
+                            batch_export = true;
+                        }
+                    });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button(format!("{}  Clear", icon::X)).clicked() {
                             batch_clear = true;
@@ -3244,9 +3479,18 @@ impl eframe::App for DamGui {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
+                                    // Adding a source ingests + scans — a write. Disable when the
+                                    // token can't (front-door auth, web-parity).
                                     if ui
-                                        .button(egui::RichText::new(icon::PLUS))
-                                        .on_hover_text("Add a source")
+                                        .add_enabled(
+                                            can_write,
+                                            egui::Button::new(egui::RichText::new(icon::PLUS)),
+                                        )
+                                        .on_hover_text(if can_write {
+                                            "Add a source"
+                                        } else {
+                                            NO_WRITE_HINT
+                                        })
                                         .clicked()
                                     {
                                         nav.toggle_add = true;
@@ -3392,10 +3636,18 @@ impl eframe::App for DamGui {
                                         nav.set_confirm = Some(None);
                                     }
                                 } else {
+                                    // Rescan + remove both mutate the catalog — gate on write.
                                     if !federated {
                                         let rescan = ui
-                                            .small_button(icon::ARROWS_CLOCKWISE)
-                                            .on_hover_text("Rescan source");
+                                            .add_enabled(
+                                                can_write,
+                                                egui::Button::new(icon::ARROWS_CLOCKWISE).small(),
+                                            )
+                                            .on_hover_text(if can_write {
+                                                "Rescan source"
+                                            } else {
+                                                NO_WRITE_HINT
+                                            });
                                         ui::access_label(
                                             &rescan,
                                             &format!("Rescan source {}", s.name),
@@ -3404,8 +3656,16 @@ impl eframe::App for DamGui {
                                             nav.source = Some(SourceAction::Rescan(sid));
                                         }
                                     }
-                                    let remove =
-                                        ui.small_button(icon::TRASH).on_hover_text("Remove source");
+                                    let remove = ui
+                                        .add_enabled(
+                                            can_write,
+                                            egui::Button::new(icon::TRASH).small(),
+                                        )
+                                        .on_hover_text(if can_write {
+                                            "Remove source"
+                                        } else {
+                                            NO_WRITE_HINT
+                                        });
                                     ui::access_label(&remove, &format!("Remove source {}", s.name));
                                     if remove.clicked() {
                                         nav.set_confirm = Some(Some(sid));
@@ -3430,8 +3690,15 @@ impl eframe::App for DamGui {
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     if ui
-                                        .button(egui::RichText::new(icon::PLUS))
-                                        .on_hover_text("Create a collection")
+                                        .add_enabled(
+                                            can_write,
+                                            egui::Button::new(egui::RichText::new(icon::PLUS)),
+                                        )
+                                        .on_hover_text(if can_write {
+                                            "Create a collection"
+                                        } else {
+                                            NO_WRITE_HINT
+                                        })
                                         .clicked()
                                     {
                                         self.collection_new_name.clear();
@@ -3474,14 +3741,29 @@ impl eframe::App for DamGui {
                                 pick_collection = Some(if on { None } else { Some(col_item.id) });
                             }
                             resp.context_menu(|ui| {
+                                // Rename + delete edit the catalog — gate on write.
                                 if ui
-                                    .button(format!("{}  Rename…", icon::PENCIL_SIMPLE))
+                                    .add_enabled(
+                                        can_write,
+                                        egui::Button::new(format!(
+                                            "{}  Rename…",
+                                            icon::PENCIL_SIMPLE
+                                        )),
+                                    )
+                                    .on_hover_text(if can_write { "" } else { NO_WRITE_HINT })
                                     .clicked()
                                 {
                                     open_rename = Some((col_item.id, col_item.name.clone()));
                                     ui.close_menu();
                                 }
-                                if ui.button(format!("{}  Delete", icon::TRASH)).clicked() {
+                                if ui
+                                    .add_enabled(
+                                        can_write,
+                                        egui::Button::new(format!("{}  Delete", icon::TRASH)),
+                                    )
+                                    .on_hover_text(if can_write { "" } else { NO_WRITE_HINT })
+                                    .clicked()
+                                {
                                     collection_action = Some(CollectionAction::Delete(col_item.id));
                                     ui.close_menu();
                                 }
@@ -3628,9 +3910,23 @@ impl eframe::App for DamGui {
                                         .small()
                                         .weak(),
                                 );
-                                inspector(ui, asset, None, &mut tag_review, &mut asset_action);
+                                inspector(
+                                    ui,
+                                    asset,
+                                    None,
+                                    &mut tag_review,
+                                    &mut asset_action,
+                                    can_write,
+                                );
                             } else {
-                                inspector(ui, asset, thumb, &mut tag_review, &mut asset_action);
+                                inspector(
+                                    ui,
+                                    asset,
+                                    thumb,
+                                    &mut tag_review,
+                                    &mut asset_action,
+                                    can_write,
+                                );
                             }
 
                             // Audio preview: waveform + play/stop for the selected audio asset.
@@ -3673,50 +3969,58 @@ impl eframe::App for DamGui {
                                 let aid = asset.summary.id;
                                 ui.separator();
                                 ui::section_label(ui, "Collections");
-                                ui.horizontal_wrapped(|ui| {
-                                    for cid in &asset.collections {
-                                        let name = self
+                                // Membership edits (add/remove) are writes — disable the whole
+                                // control group when the token can't write (front-door auth parity).
+                                ui.add_enabled_ui(can_write, |ui| {
+                                    ui.horizontal_wrapped(|ui| {
+                                        for cid in &asset.collections {
+                                            let name = self
+                                                .collections
+                                                .iter()
+                                                .find(|c| c.id == *cid)
+                                                .map(|c| c.name.as_str())
+                                                .unwrap_or("(collection)");
+                                            if ui
+                                                .small_button(format!("{name} ×"))
+                                                .on_hover_text(if can_write {
+                                                    "Remove from collection"
+                                                } else {
+                                                    NO_WRITE_HINT
+                                                })
+                                                .clicked()
+                                            {
+                                                collection_action =
+                                                    Some(CollectionAction::RemoveMember {
+                                                        id: *cid,
+                                                        asset: aid,
+                                                    });
+                                            }
+                                        }
+                                        // Manual collections this asset isn't a member of yet.
+                                        let addable: Vec<(CollectionId, String)> = self
                                             .collections
                                             .iter()
-                                            .find(|c| c.id == *cid)
-                                            .map(|c| c.name.as_str())
-                                            .unwrap_or("(collection)");
-                                        if ui
-                                            .small_button(format!("{name} ×"))
-                                            .on_hover_text("Remove from collection")
-                                            .clicked()
-                                        {
-                                            collection_action =
-                                                Some(CollectionAction::RemoveMember {
-                                                    id: *cid,
-                                                    asset: aid,
-                                                });
-                                        }
-                                    }
-                                    // Manual collections this asset isn't a member of yet.
-                                    let addable: Vec<(CollectionId, String)> = self
-                                        .collections
-                                        .iter()
-                                        .filter(|c| {
-                                            matches!(c.kind, CollectionKind::Manual)
-                                                && !asset.collections.contains(&c.id)
-                                        })
-                                        .map(|c| (c.id, c.name.clone()))
-                                        .collect();
-                                    if !addable.is_empty() {
-                                        ui.menu_button("Add to…", |ui| {
-                                            for (cid, name) in addable {
-                                                if ui.button(name).clicked() {
-                                                    collection_action =
-                                                        Some(CollectionAction::AddMember {
-                                                            id: cid,
-                                                            asset: aid,
-                                                        });
-                                                    ui.close_menu();
+                                            .filter(|c| {
+                                                matches!(c.kind, CollectionKind::Manual)
+                                                    && !asset.collections.contains(&c.id)
+                                            })
+                                            .map(|c| (c.id, c.name.clone()))
+                                            .collect();
+                                        if !addable.is_empty() {
+                                            ui.menu_button("Add to…", |ui| {
+                                                for (cid, name) in addable {
+                                                    if ui.button(name).clicked() {
+                                                        collection_action =
+                                                            Some(CollectionAction::AddMember {
+                                                                id: cid,
+                                                                asset: aid,
+                                                            });
+                                                        ui.close_menu();
+                                                    }
                                                 }
-                                            }
-                                        });
-                                    }
+                                            });
+                                        }
+                                    });
                                 });
                             }
 
@@ -3967,7 +4271,7 @@ impl eframe::App for DamGui {
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     if self.blocklist_view {
-                        self.blocklist_review(ui, &mut unblock_hash);
+                        self.blocklist_review(ui, &mut unblock_hash, can_write);
                     } else if self.dup_view {
                         self.dup_review(
                             ui,
@@ -3975,6 +4279,7 @@ impl eframe::App for DamGui {
                             &mut asset_action,
                             &mut pick_dup_kind,
                             &mut pick_dup_media,
+                            can_write,
                         );
                     } else if self.assets.is_empty() && !self.loading {
                         ui.add_space(12.0);
@@ -3986,6 +4291,7 @@ impl eframe::App for DamGui {
                             &mut grid_activate,
                             &mut to_load,
                             &mut asset_action,
+                            can_write,
                         );
                     } else {
                         self.list(
@@ -3994,6 +4300,7 @@ impl eframe::App for DamGui {
                             &mut grid_activate,
                             &mut asset_action,
                             &mut sort_click,
+                            can_write,
                         );
                     }
                 });
@@ -4036,7 +4343,11 @@ impl eframe::App for DamGui {
                     );
                     ui.separator();
                     ui.horizontal(|ui| {
-                        if ui.button("Export").clicked() {
+                        if ui
+                            .add_enabled(can_write, egui::Button::new("Export"))
+                            .on_hover_text(if can_write { "" } else { NO_WRITE_HINT })
+                            .clicked()
+                        {
                             do_export = true;
                         }
                         if ui.button("Close").clicked() {
@@ -4115,7 +4426,11 @@ impl eframe::App for DamGui {
                         });
                         ui.separator();
                         ui.horizontal(|ui| {
-                            if ui.button("Convert").clicked() {
+                            if ui
+                                .add_enabled(can_write, egui::Button::new("Convert"))
+                                .on_hover_text(if can_write { "" } else { NO_WRITE_HINT })
+                                .clicked()
+                            {
                                 do_convert = true;
                             }
                             if ui.button("Close").clicked() {
@@ -4487,6 +4802,7 @@ impl DamGui {
         activate: &mut Option<(AssetId, MediaType)>,
         menu: &mut Option<AssetAction>,
         sort_click: &mut Option<usize>,
+        can_write: bool,
     ) {
         const FORMAT_W: f32 = 56.0;
         const LICENSE_W: f32 = 96.0;
@@ -4691,7 +5007,7 @@ impl DamGui {
             if resp.double_clicked() {
                 *activate = Some((a.id, a.media));
             }
-            resp.context_menu(|ui| asset_context_menu(ui, a, menu));
+            resp.context_menu(|ui| asset_context_menu(ui, a, menu, can_write));
             if !ui.is_rect_visible(rect) {
                 continue;
             }
@@ -4730,7 +5046,12 @@ impl DamGui {
     /// The blocklist management surface (issue #21): the removed-and-blocked content hashes, each
     /// with an Unblock button that lets a future scan re-import the content. Mirrors the web
     /// blocklist page.
-    fn blocklist_review(&self, ui: &mut egui::Ui, unblock: &mut Option<ContentHash>) {
+    fn blocklist_review(
+        &self,
+        ui: &mut egui::Ui,
+        unblock: &mut Option<ContentHash>,
+        can_write: bool,
+    ) {
         ui.add_space(4.0);
         ui.heading(format!("{}  Blocklist", icon::PROHIBIT));
         ui.label(
@@ -4772,7 +5093,16 @@ impl DamGui {
                     let hex = e.hash.to_string();
                     let short = hex.get(..16).unwrap_or(&hex);
                     ui.label(egui::RichText::new(short).small().monospace().weak());
-                    if ui.small_button("Unblock").clicked() {
+                    // Unblocking lets a future scan re-import — a write.
+                    if ui
+                        .add_enabled(can_write, egui::Button::new("Unblock").small())
+                        .on_hover_text(if can_write {
+                            ""
+                        } else {
+                            "Requires write access on this server"
+                        })
+                        .clicked()
+                    {
                         *unblock = Some(e.hash);
                     }
                     ui.end_row();
@@ -4791,6 +5121,7 @@ impl DamGui {
         menu: &mut Option<AssetAction>,
         pick_kind: &mut Option<DupKind>,
         pick_media: &mut Option<Option<MediaType>>,
+        can_write: bool,
     ) {
         ui.add_space(4.0);
         ui.heading(format!("{}  Duplicate review", icon::COPY));
@@ -4888,7 +5219,7 @@ impl DamGui {
                         if resp.clicked() {
                             *member_click = Some(m.id);
                         }
-                        resp.context_menu(|ui| asset_context_menu(ui, m, menu));
+                        resp.context_menu(|ui| asset_context_menu(ui, m, menu, can_write));
                     }
                 });
             });
@@ -4907,6 +5238,7 @@ impl DamGui {
         activate: &mut Option<(AssetId, MediaType)>,
         to_load: &mut Vec<AssetId>,
         menu: &mut Option<AssetAction>,
+        can_write: bool,
     ) {
         const CARD_W: f32 = 150.0;
         const FOOTER_H: f32 = 40.0;
@@ -4937,7 +5269,7 @@ impl DamGui {
                 if resp.double_clicked() {
                     *activate = Some((a.id, a.media));
                 }
-                resp.context_menu(|ui| asset_context_menu(ui, a, menu));
+                resp.context_menu(|ui| asset_context_menu(ui, a, menu, can_write));
                 if !ui.is_rect_visible(rect) {
                     continue;
                 }
@@ -5048,6 +5380,7 @@ fn inspector(
     thumb: Option<&egui::TextureHandle>,
     tag_review: &mut Option<(AssetId, String, ReviewAction)>,
     action: &mut Option<AssetAction>,
+    can_write: bool,
 ) {
     let s = &asset.summary;
     let c = colors(ui.visuals().dark_mode);
@@ -5119,43 +5452,54 @@ fn inspector(
     ui::license_badge(ui, license_label(s.license.status));
     ui.add_space(6.0);
 
-    // Per-asset maintenance actions (mirrors the web context menu / inspector actions).
-    ui.horizontal_wrapped(|ui| {
-        let analyzed = asset.timestamps.analyzed.is_some();
-        if ui
-            .button(format!(
-                "{}  {}",
-                icon::SPARKLE,
-                if analyzed { "Reanalyze" } else { "Analyze" }
-            ))
-            .clicked()
-        {
-            *action = Some(AssetAction::Reanalyze(s.id));
-        }
-        // Only media with a server thumbnail can be regenerated.
-        if matches!(s.media, MediaType::Image | MediaType::Model)
-            && ui
-                .button(format!("{}  Thumbnail", icon::IMAGE))
-                .on_hover_text("Regenerate thumbnail")
+    // Per-asset maintenance actions (mirrors the web context menu / inspector actions). All of these
+    // mutate (jobs, transcode, catalog removal) — disable the group when the token can't write, with
+    // a one-line reason instead of inexplicably greyed buttons (front-door auth, web-parity).
+    if !can_write {
+        ui.label(
+            egui::RichText::new("Read-only — sign in with a write token to make changes")
+                .small()
+                .weak(),
+        );
+    }
+    ui.add_enabled_ui(can_write, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            let analyzed = asset.timestamps.analyzed.is_some();
+            if ui
+                .button(format!(
+                    "{}  {}",
+                    icon::SPARKLE,
+                    if analyzed { "Reanalyze" } else { "Analyze" }
+                ))
                 .clicked()
-        {
-            *action = Some(AssetAction::RegenThumb(s.id));
-        }
-        // Convert (transcode) — image/audio only; 3D can't transcode in v1.
-        if matches!(s.media, MediaType::Image | MediaType::Audio)
-            && ui.button(format!("{}  Convert", icon::SWAP)).clicked()
-        {
-            *action = Some(AssetAction::Convert(s.id, s.media));
-        }
-        // Remove from the catalog (non-destructive to the file; confirms first). Block is offered in
-        // the right-click menu.
-        if ui
-            .button(format!("{}  Remove", icon::TRASH))
-            .on_hover_text("Remove from the catalog (the file is untouched)")
-            .clicked()
-        {
-            *action = Some(AssetAction::Remove(s.id, s.name.clone(), false));
-        }
+            {
+                *action = Some(AssetAction::Reanalyze(s.id));
+            }
+            // Only media with a server thumbnail can be regenerated.
+            if matches!(s.media, MediaType::Image | MediaType::Model)
+                && ui
+                    .button(format!("{}  Thumbnail", icon::IMAGE))
+                    .on_hover_text("Regenerate thumbnail")
+                    .clicked()
+            {
+                *action = Some(AssetAction::RegenThumb(s.id));
+            }
+            // Convert (transcode) — image/audio only; 3D can't transcode in v1.
+            if matches!(s.media, MediaType::Image | MediaType::Audio)
+                && ui.button(format!("{}  Convert", icon::SWAP)).clicked()
+            {
+                *action = Some(AssetAction::Convert(s.id, s.media));
+            }
+            // Remove from the catalog (non-destructive to the file; confirms first). Block is offered in
+            // the right-click menu.
+            if ui
+                .button(format!("{}  Remove", icon::TRASH))
+                .on_hover_text("Remove from the catalog (the file is untouched)")
+                .clicked()
+            {
+                *action = Some(AssetAction::Remove(s.id, s.name.clone(), false));
+            }
+        });
     });
 
     // ── DETAILS ──
@@ -5220,17 +5564,32 @@ fn inspector(
                     (c.fg, c.surface2)
                 };
                 ui::pill(ui, &t.name, fg, bg);
+                // Tag accept/reject go through the write-gated review endpoint — disable when the
+                // token can't write (front-door auth, web-parity).
                 if auto {
                     if rejected {
                         let restore = ui
-                            .small_button(icon::ARROW_COUNTER_CLOCKWISE)
-                            .on_hover_text("Restore tag");
+                            .add_enabled(
+                                can_write,
+                                egui::Button::new(icon::ARROW_COUNTER_CLOCKWISE).small(),
+                            )
+                            .on_hover_text(if can_write {
+                                "Restore tag"
+                            } else {
+                                "Requires write access on this server"
+                            });
                         ui::access_label(&restore, &format!("Restore tag {}", t.name));
                         if restore.clicked() {
                             *tag_review = Some((s.id, t.name.clone(), ReviewAction::Accept));
                         }
                     } else {
-                        let reject = ui.small_button(icon::X).on_hover_text("Reject tag");
+                        let reject = ui
+                            .add_enabled(can_write, egui::Button::new(icon::X).small())
+                            .on_hover_text(if can_write {
+                                "Reject tag"
+                            } else {
+                                "Requires write access on this server"
+                            });
                         ui::access_label(&reject, &format!("Reject tag {}", t.name));
                         if reject.clicked() {
                             *tag_review = Some((s.id, t.name.clone(), ReviewAction::Reject));
@@ -5493,37 +5852,55 @@ fn media_tag(m: MediaType) -> &'static str {
 }
 
 /// The right-click context menu for a grid card / list row — the per-asset actions, mirroring the
-/// web context menu. Writes the chosen action into `menu` (applied after the panels).
-fn asset_context_menu(ui: &mut egui::Ui, a: &AssetSummary, menu: &mut Option<AssetAction>) {
-    if ui.button("Analyze").clicked() {
-        *menu = Some(AssetAction::Reanalyze(a.id));
-        ui.close_menu();
+/// web context menu. Writes the chosen action into `menu` (applied after the panels). Every entry
+/// mutates, so the whole menu disables when the connection lacks write (front-door auth, web-parity)
+/// with a single explanatory line instead of a wall of silently-greyed items.
+fn asset_context_menu(
+    ui: &mut egui::Ui,
+    a: &AssetSummary,
+    menu: &mut Option<AssetAction>,
+    can_write: bool,
+) {
+    if !can_write {
+        ui.label(
+            egui::RichText::new("Requires write access on this server")
+                .small()
+                .weak(),
+        );
+        ui.separator();
     }
-    if matches!(a.media, MediaType::Image | MediaType::Model)
-        && ui.button("Regenerate thumbnail").clicked()
-    {
-        *menu = Some(AssetAction::RegenThumb(a.id));
-        ui.close_menu();
-    }
-    if matches!(a.media, MediaType::Image | MediaType::Audio) && ui.button("Convert…").clicked() {
-        *menu = Some(AssetAction::Convert(a.id, a.media));
-        ui.close_menu();
-    }
-    if ui.button("Export…").clicked() {
-        *menu = Some(AssetAction::Export(a.id));
-        ui.close_menu();
-    }
-    ui.separator();
-    // Remove from the catalog (the file is never touched). "+ block" also blocklists its hash so a
-    // rescan can't re-import it. Both confirm first (issue #21).
-    if ui.button("Remove…").clicked() {
-        *menu = Some(AssetAction::Remove(a.id, a.name.clone(), false));
-        ui.close_menu();
-    }
-    if ui.button("Remove + block…").clicked() {
-        *menu = Some(AssetAction::Remove(a.id, a.name.clone(), true));
-        ui.close_menu();
-    }
+    ui.add_enabled_ui(can_write, |ui| {
+        if ui.button("Analyze").clicked() {
+            *menu = Some(AssetAction::Reanalyze(a.id));
+            ui.close_menu();
+        }
+        if matches!(a.media, MediaType::Image | MediaType::Model)
+            && ui.button("Regenerate thumbnail").clicked()
+        {
+            *menu = Some(AssetAction::RegenThumb(a.id));
+            ui.close_menu();
+        }
+        if matches!(a.media, MediaType::Image | MediaType::Audio) && ui.button("Convert…").clicked()
+        {
+            *menu = Some(AssetAction::Convert(a.id, a.media));
+            ui.close_menu();
+        }
+        if ui.button("Export…").clicked() {
+            *menu = Some(AssetAction::Export(a.id));
+            ui.close_menu();
+        }
+        ui.separator();
+        // Remove from the catalog (the file is never touched). "+ block" also blocklists its hash
+        // so a rescan can't re-import it. Both confirm first (issue #21).
+        if ui.button("Remove…").clicked() {
+            *menu = Some(AssetAction::Remove(a.id, a.name.clone(), false));
+            ui.close_menu();
+        }
+        if ui.button("Remove + block…").clicked() {
+            *menu = Some(AssetAction::Remove(a.id, a.name.clone(), true));
+            ui.close_menu();
+        }
+    });
 }
 
 /// Read the ctrl/cmd + shift modifiers at click time (for multi-select).

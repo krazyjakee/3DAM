@@ -10,8 +10,9 @@ import { useQuery } from "@tanstack/react-query";
 import { api } from "@/api/client";
 import { useVersion } from "@/api/queries";
 import { getServer, resolveUrl, serverLabel, setServer } from "@/lib/server";
-import { isUnauthorized, useAuthExpired } from "@/lib/auth";
+import { AUTH_COPY, isUnauthorized, useAuthExpired } from "@/lib/auth";
 import { bootDecision } from "@/lib/auth-policy";
+import { useFocusTrap } from "@/lib/use-focus-trap";
 import { ConnectDialog } from "./ConnectDialog";
 
 export function AuthGate({ children }: { children: ReactNode }) {
@@ -40,10 +41,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
 
   if (expired)
     return (
-      <LoginScreen
-        reason="Your session token is no longer valid."
-        allowReadOnly={auth === "anonymous"}
-      />
+      <LoginScreen reason={AUTH_COPY.sessionExpired} allowReadOnly={auth === "anonymous"} />
     );
   if (auth !== "token" && auth !== "anonymous") return <>{children}</>;
 
@@ -51,10 +49,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
     if (probe.isPending) return <BootSplash />;
     if (probe.isError && isUnauthorized(probe.error))
       return (
-        <LoginScreen
-          reason="The saved token was rejected by this server."
-          allowReadOnly={auth === "anonymous"}
-        />
+        <LoginScreen reason={AUTH_COPY.tokenRejected} allowReadOnly={auth === "anonymous"} />
       );
     return <>{children}</>; // token valid (any other error is the offline UX's business)
   }
@@ -70,11 +65,19 @@ function BootSplash() {
   );
 }
 
-/** The full-screen login gate: the token form over a bare background — no interface, no assets. */
+/** The full-screen login gate: the token form over a bare background — no interface, no assets. It's
+ *  the app's only surface here, so there's nothing to Escape to — just a focus-trapped dialog. */
 function LoginScreen({ reason, allowReadOnly }: { reason: string | null; allowReadOnly: boolean }) {
+  const ref = useFocusTrap<HTMLDivElement>(true);
   return (
     <div className="fixed inset-0 flex items-center justify-center bg-bg p-4">
-      <div className="w-full max-w-md rounded-lg border border-border bg-surface p-4 shadow-xl">
+      <div
+        ref={ref}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="login-title"
+        className="w-full max-w-md rounded-lg border border-border bg-surface p-4 shadow-xl"
+      >
         <TokenLoginForm reason={reason} allowReadOnly={allowReadOnly} />
       </div>
     </div>
@@ -111,11 +114,11 @@ export function TokenLoginForm({
         headers: { accept: "application/json", authorization: `Bearer ${t}` },
       });
       if (res.status === 401) {
-        setError("Token rejected — check it and try again.");
+        setError(AUTH_COPY.tokenRejected);
         return;
       }
       if (res.status === 403) {
-        setError("Token accepted but lacks the read scope needed to browse.");
+        setError(AUTH_COPY.lacksRead);
         return;
       }
       // Valid (or the server is mid-hiccup — the app's offline UX owns that): persist and restart
@@ -123,7 +126,7 @@ export function TokenLoginForm({
       setServer(getServer().base, t);
       location.reload();
     } catch {
-      setError("Could not reach the server.");
+      setError(AUTH_COPY.unreachable);
     } finally {
       setBusy(false);
     }
@@ -136,13 +139,19 @@ export function TokenLoginForm({
 
   return (
     <>
-      <h2 className="mb-1 font-medium">Sign in to {serverLabel()}</h2>
+      <h2 id="login-title" className="mb-1 font-medium">
+        Sign in to {serverLabel()}
+      </h2>
       <p className="mb-3 text-[12px] text-fg-dim">
         This server requires a token. Paste one issued by its operator (
         <code className="font-mono">3dam admin token add</code>).
       </p>
 
-      {error && <p className="mb-2 text-[12px] text-danger">{error}</p>}
+      {error && (
+        <p role="alert" aria-live="polite" className="mb-2 text-[12px] text-danger">
+          {error}
+        </p>
+      )}
 
       <form
         onSubmit={(e) => {

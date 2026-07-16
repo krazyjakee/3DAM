@@ -12,10 +12,16 @@ use dam_api::admin::*;
 use dam_api::service::AuthContext;
 use dam_api::LibError;
 
-/// The audit actor string for a request (tech-spec 10 §4.5): the token label, or `owner` for the
-/// unauthenticated localhost owner under `Authentication = Off`.
+/// The audit actor string for a request (tech-spec 10 §4.5). A store-verified token records as
+/// `token:<label>`; an unauthenticated localhost owner (under `Authentication = Off`) records as
+/// `local-owner`. The two were both bare `owner` before — indistinguishable in the trail, since the
+/// bootstrap token is *labelled* "owner" — so the prefix makes attribution unambiguous: was this the
+/// no-credential local owner, or the holder of a token named "owner"?
 fn actor_of(ctx: &AuthContext) -> String {
-    ctx.identity.clone().unwrap_or_else(|| "owner".to_string())
+    match &ctx.identity {
+        Some(label) => format!("token:{label}"),
+        None => "local-owner".to_string(),
+    }
 }
 
 pub fn routes() -> Router<AppState> {

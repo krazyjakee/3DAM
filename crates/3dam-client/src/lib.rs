@@ -14,7 +14,7 @@ use dam_api::event::EventTopic;
 use dam_api::event::{LibraryEvent, SubscribeRequest};
 use dam_api::id::{AssetId, CollectionId, ContentHash, JobId, SourceId};
 use dam_api::page::{Page, PageParams};
-use dam_api::service::{AuthContext, EventStream, LibraryService};
+use dam_api::service::{AuthContext, EventStream, LibraryService, WhoAmI};
 use dam_api::{ErrorBody, LibError, PeerAdvertise};
 use futures::StreamExt;
 use serde::de::DeserializeOwned;
@@ -456,6 +456,12 @@ impl LibraryService for ApiClient {
             format: "dmsh".to_string(),
             media: MediaType::Model,
         })
+    }
+
+    async fn whoami(&self, _ctx: &AuthContext) -> Result<WhoAmI, LibError> {
+        // The server resolves the presented token; the local advisory ctx is ignored (as with every
+        // connected call — the boundary, not the client, decides scopes).
+        self.get("/api/v1/whoami").await
     }
 
     async fn library_stats(

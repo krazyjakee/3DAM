@@ -108,8 +108,22 @@ export interface VersionInfo {
   auth?: import("./admin").AuthMode;
 }
 
+/** Who the current bearer token resolves to, and what it can do (front-door auth). Drives the
+ *  scope-aware UI: write controls disable without `write`, the Settings link hides without `admin`.
+ *  In token mode a missing/invalid token 401s (the AuthGate owns that); anonymous mode reports the
+ *  anonymous caller's scopes. */
+export interface WhoAmI {
+  identity: string | null;
+  scopes: import("./admin").Scope[];
+  anonymous: boolean;
+}
+
 export const api = {
   version: () => get<VersionInfo>("/api/version"),
+
+  /** The current token's identity + scopes (front-door auth). Under token mode a missing/invalid
+   *  token 401s here (the AuthGate handles it); anonymous mode returns the anonymous scopes. */
+  whoami: () => get<WhoAmI>(`${API}/whoami`),
 
   // browse / search
   query: (req: QueryRequest) => send<Page<AssetSummary>>("POST", `${API}/query`, req),

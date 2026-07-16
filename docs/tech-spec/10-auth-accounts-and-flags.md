@@ -76,6 +76,10 @@ Resolution order in the middleware:
 
 The context is computed once per request; scope checks downstream are pure set-membership tests against `ScopeSet`, never a re-derivation. A handler that needs a capability calls a small guard (`ctx.require(Scope::Write)?` → `403` on miss).
 
+**`GET /api/v1/whoami`** reflects the resolved context back to the caller — `{ identity, scopes, anonymous }` — so a front-end can shape its UI to the granted scopes (disable a write control rather than let the action 403). It requires no scope of its own: it reports whatever the presented credential resolves to, and under `Token` mode with no credential it still `401`s (the client's cue to render a login gate). This is the "one gate, then permissions decide" model made legible to the client instead of discovered through failures. `anonymous` distinguishes the two credential-less contexts by the `Admin` scope: the auth-off local **owner** (full trust) is *not* anonymous, the `Anonymous`-mode fallback caller *is*.
+
+**401 responses** carry `WWW-Authenticate: Bearer` (RFC 7235 §3.1); all responses carry `Referrer-Policy: no-referrer`, so a token that rides a read GET's `?token=` query param (the browser `<img>`/`<audio>`/WS path, §1.1) is not leaked onward via the `Referer` header. `CorsLayer::permissive()` is intentional and load-bearing: hosted-mode (issue #74) has the web client on a *different origin* from the server it drives, so the API must accept cross-origin requests. Bearer tokens are not ambient credentials, so permissive CORS does not expose them to a drive-by page.
+
 ### 1.3 Credential storage — client vs server
 
 Two stores, never mixed, per DESIGN_GUIDELINES §2 ("credentials live in the OS secret store, never in the library file") and PRODUCT_SPEC §5:

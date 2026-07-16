@@ -11,6 +11,7 @@ import {
   type AuditEntry,
   type CacheTarget,
   type FlagInfo,
+  type FlagKey,
   type FlagValue,
   type NewTokenReply,
   type Scope,
@@ -19,10 +20,12 @@ import {
   type TokenInfo,
 } from "@/api/admin";
 import { ApiError } from "@/api/client";
-import { useScan } from "@/api/queries";
+import { useScan, useWhoami } from "@/api/queries";
 import { getServer, setServer } from "@/lib/server";
 import { errorMessage, toast } from "@/lib/toast";
 import { useDialogs } from "@/lib/dialogs";
+import { useEscape, useFocusTrap } from "@/lib/use-focus-trap";
+import { TokenLoginForm } from "./AuthGate";
 
 const ALL_SCOPES: Scope[] = ["read", "write", "admin", "mcp_use", "federate"];
 
@@ -38,6 +41,11 @@ export function Settings() {
   // Which flag write is in flight — disables the flag controls so a slow admin round-trip can't be
   // double-submitted into two conflicting writes (issue #23).
   const [busyFlag, setBusyFlag] = useState<string | null>(null);
+  // A 403/401 landing here (non-admin or anonymous) shouldn't dead-end — offer an in-page sign-in.
+  const [signIn, setSignIn] = useState(false);
+  // The current credential's identity — used to flag "this is the token you're signed in with" on
+  // the revoke row, so an admin doesn't accidentally lock themselves out.
+  const whoami = useWhoami();
   const { confirm } = useDialogs();
 
   /** Refetch the admin surface. Each section renders as its call lands — the storage-usage walk
@@ -117,7 +125,7 @@ export function Settings() {
     [applied, confirm],
   );
 
-  const flag = (key: string) => flags.find((f) => f.key === key);
+  const flag = (key: FlagKey) => flags.find((f) => f.key === key);
 
   return (
     <div className="mx-auto flex min-h-dvh max-w-3xl flex-col gap-6 p-6 text-sm">
@@ -129,10 +137,18 @@ export function Settings() {
       </header>
 
       {error && (
-        <div className="rounded border border-danger/40 bg-danger/10 px-3 py-2 text-danger">
-          {error}
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded border border-danger/40 bg-danger/10 px-3 py-2 text-danger">
+          <span>{error}</span>
+          <button
+            type="button"
+            className="btn shrink-0"
+            onClick={() => setSignIn(true)}
+          >
+            Sign in with an admin token
+          </button>
         </div>
       )}
+      {signIn && <SettingsSignIn onClose={() => setSignIn(false)} />}
 
       {bootstrap && (
         <div className="rounded border border-lic-permissive/40 bg-lic-permissive/10 p-3">
@@ -251,7 +267,11 @@ export function Settings() {
 
       <StorageSection usage={usage} onChange={refresh} />
 
-      <TokensSection tokens={tokens} onChange={() => void refresh({ withUsage: false })} />
+      <TokensSection
+        tokens={tokens}
+        currentIdentity={whoami.data?.identity ?? null}
+        onChange={() => void refresh({ withUsage: false })}
+      />
 
       <section className="flex flex-col gap-2">
         <h2 className="font-medium text-fg-muted">Audit log</h2>
@@ -269,6 +289,31 @@ export function Settings() {
           ))}
         </div>
       </section>
+    </div>
+  );
+}
+
+/** In-page sign-in for the Settings surface (issue: don't dead-end a non-admin at a 403). Wraps the
+ *  shared TokenLoginForm in a focus-trapped, Escape-dismissable modal; a successful sign-in reloads,
+ *  re-fetching the admin surface with the new (hopefully admin-scoped) credential. */
+function SettingsSignIn({ onClose }: { onClose: () => void }) {
+  const ref = useFocusTrap<HTMLDivElement>(true);
+  useEscape(onClose);
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+      onClick={onClose}
+    >
+      <div
+        ref={ref}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="login-title"
+        className="w-full max-w-md rounded-lg border border-border bg-surface p-4 shadow-xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <TokenLoginForm reason={null} allowReadOnly={false} onClose={onClose} />
+      </div>
     </div>
   );
 }
@@ -315,23 +360,29 @@ function FlagCard({
 }: {
   title: string;
   hint: string;
+  /** The reported flag, or undefined when this server doesn't expose it (leaner/older build). */
   flag?: FlagInfo;
   children: ReactNode;
 }) {
+  // Absent from the /flags response: this build doesn't support the flag, so a toggle here would be
+  // a silent no-op. Say so and drop the control (issue: never a control that does nothing).
+  const unsupported = !flag;
   return (
     <div className="flex items-center justify-between gap-4 rounded border border-border p-3">
       <div className="min-w-0">
         <div className="flex items-center gap-2">
           <span className="font-medium">{title}</span>
-          {flag && (
+          {flag ? (
             <span className="text-xs text-fg-dim">
               {flag.live ? "live" : "restart"} · v{flag.version}
             </span>
+          ) : (
+            <span className="text-xs text-fg-dim italic">unsupported on this server</span>
           )}
         </div>
         <p className="text-xs text-fg-dim">{hint}</p>
       </div>
-      <div className="shrink-0">{children}</div>
+      <div className="shrink-0">{unsupported ? null : children}</div>
     </div>
   );
 }
@@ -628,23 +679,39 @@ function StorageSection({
   );
 }
 
-function TokensSection({ tokens, onChange }: { tokens: TokenInfo[]; onChange: () => void }) {
+function TokensSection({
+  tokens,
+  currentIdentity,
+  onChange,
+}: {
+  tokens: TokenInfo[];
+  /** The label of the token this browser is signed in with (from /whoami), so its row can be
+   *  flagged and its revoke warned about — never lock yourself out by accident. */
+  currentIdentity: string | null;
+  onChange: () => void;
+}) {
   const [label, setLabel] = useState("");
   const [scopes, setScopes] = useState<Scope[]>(["read", "mcp_use"]);
+  // Optional expiry (the API's NewToken.expires) — a local `datetime-local` value, "" for no expiry.
+  const [expiry, setExpiry] = useState("");
   const [created, setCreated] = useState<NewTokenReply | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   // Which token is being revoked — keeps its row's button disabled during the round-trip so a
   // second click can't fire a duplicate revoke (issue #23).
   const [revoking, setRevoking] = useState<string | null>(null);
+  const { confirm } = useDialogs();
 
   const create = async () => {
     setErr(null);
     setCreating(true);
     try {
-      const reply = await admin.createToken({ label, scopes });
+      // datetime-local is local wall-clock with no zone; parse to epoch ms for the API. No expiry → null.
+      const expires = expiry ? new Date(expiry).getTime() : null;
+      const reply = await admin.createToken({ label, scopes, expires });
       setCreated(reply);
       setLabel("");
+      setExpiry("");
       onChange();
       toast.success(`Token “${reply.label}” issued`);
     } catch (e) {
@@ -655,10 +722,22 @@ function TokensSection({ tokens, onChange }: { tokens: TokenInfo[]; onChange: ()
     }
   };
 
-  const revoke = async (id: string) => {
-    setRevoking(id);
+  const revoke = async (t: TokenInfo) => {
+    // Confirm every revoke; call out extra-loudly when it looks like the caller's own session token,
+    // since revoking it signs this browser out (and, if it's the last admin, may lock everyone out).
+    const isSelf = currentIdentity != null && t.label === currentIdentity;
+    const ok = await confirm({
+      title: `Revoke token “${t.label}”?`,
+      message: isSelf
+        ? "This looks like the token you're signed in with — revoking it will sign this browser out immediately, and if it's the only admin token you could lock yourself out. This cannot be undone."
+        : "Any client using this token loses access immediately. This cannot be undone.",
+      danger: true,
+      confirmLabel: "Revoke token",
+    });
+    if (!ok) return;
+    setRevoking(t.token_id);
     try {
-      await admin.revokeToken(id);
+      await admin.revokeToken(t.token_id);
       onChange();
       toast.success("Token revoked");
     } catch (e) {
@@ -680,6 +759,17 @@ function TokensSection({ tokens, onChange }: { tokens: TokenInfo[]; onChange: ()
             value={label}
             onChange={(e) => setLabel(e.target.value)}
           />
+          <label className="flex items-center gap-1 text-xs text-fg-dim">
+            <span>Expires</span>
+            <input
+              type="datetime-local"
+              className="field w-auto"
+              aria-label="Token expiry (optional)"
+              title="Optional — leave blank for a token that never expires"
+              value={expiry}
+              onChange={(e) => setExpiry(e.target.value)}
+            />
+          </label>
           <button
             type="button"
             disabled={!label.trim() || creating}
@@ -718,26 +808,42 @@ function TokensSection({ tokens, onChange }: { tokens: TokenInfo[]; onChange: ()
 
       <div className="rounded border border-border">
         {tokens.length === 0 && <div className="px-3 py-2 text-fg-dim">(no tokens)</div>}
-        {tokens.map((t) => (
-          <div
-            key={t.token_id}
-            className="flex items-center gap-3 border-b border-border px-3 py-1.5 last:border-0"
-          >
-            <span className="w-40 truncate font-medium">{t.label}</span>
-            <span className="flex-1 truncate text-xs text-fg-dim">{t.scopes.join(", ")}</span>
-            <span className="text-xs text-fg-dim">
-              {t.last_used ? `used ${new Date(t.last_used).toLocaleDateString()}` : "unused"}
-            </span>
-            <button
-              type="button"
-              disabled={revoking === t.token_id}
-              onClick={() => void revoke(t.token_id)}
-              className="text-danger hover:underline disabled:opacity-40"
+        {tokens.map((t) => {
+          const isSelf = currentIdentity != null && t.label === currentIdentity;
+          return (
+            <div
+              key={t.token_id}
+              className="flex items-center gap-3 border-b border-border px-3 py-1.5 last:border-0"
             >
-              {revoking === t.token_id ? "revoking…" : "revoke"}
-            </button>
-          </div>
-        ))}
+              <span className="flex w-40 min-w-0 items-center gap-1.5 truncate font-medium">
+                <span className="truncate">{t.label}</span>
+                {isSelf && (
+                  <span
+                    className="shrink-0 rounded bg-accent-muted px-1 text-[10px] tracking-wide text-accent uppercase"
+                    title="The token this browser is signed in with"
+                  >
+                    this session
+                  </span>
+                )}
+              </span>
+              <span className="flex-1 truncate text-xs text-fg-dim">{t.scopes.join(", ")}</span>
+              <span className="text-xs text-fg-dim">
+                {t.expires ? `expires ${new Date(t.expires).toLocaleDateString()}` : "no expiry"}
+              </span>
+              <span className="text-xs text-fg-dim">
+                {t.last_used ? `used ${new Date(t.last_used).toLocaleDateString()}` : "unused"}
+              </span>
+              <button
+                type="button"
+                disabled={revoking === t.token_id}
+                onClick={() => void revoke(t)}
+                className="text-danger hover:underline disabled:opacity-40"
+              >
+                {revoking === t.token_id ? "revoking…" : "revoke"}
+              </button>
+            </div>
+          );
+        })}
       </div>
     </section>
   );

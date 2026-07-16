@@ -36,6 +36,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 use tower_http::cors::CorsLayer;
+use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 
 use auth::{Reader, Writer};
@@ -117,13 +118,45 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status =
             StatusCode::from_u16(self.0.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        (status, Json(self.0.to_body())).into_response()
+        let mut resp = (status, Json(self.0.to_body())).into_response();
+        // A 401 SHOULD advertise the scheme it wants (RFC 7235 §3.1). We use bearer tokens, so say
+        // so — tools and generic HTTP clients key off this header, and it costs nothing.
+        if status == StatusCode::UNAUTHORIZED {
+            resp.headers_mut().insert(
+                header::WWW_AUTHENTICATE,
+                header::HeaderValue::from_static("Bearer"),
+            );
+        }
+        resp
     }
 }
 
 fn parse_id<T: std::str::FromStr>(s: &str, what: &str) -> Result<T, ApiError> {
     s.parse::<T>()
         .map_err(|_| ApiError(LibError::BadRequest(format!("invalid {what} id"))))
+}
+
+/// Write a secret (the bootstrap owner token) to a file readable only by the owner. On Unix the file
+/// is created with `0600` before any bytes are written, so the secret is never briefly world-readable;
+/// elsewhere it falls back to a plain write (best effort). Kept out of the logs on purpose.
+fn write_secret_file(path: &std::path::Path, secret: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        writeln!(f, "{secret}")
+    }
+    #[cfg(not(unix))]
+    {
+        let mut f = std::fs::File::create(path)?;
+        writeln!(f, "{secret}")
+    }
 }
 
 /// Assemble the router over a fully-built [`AppState`].
@@ -134,6 +167,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
         // balancer / systemd watchdog can poll them without a token: liveness vs readiness.
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
+        .route("/api/v1/whoami", get(whoami))
         .route("/api/v1/query", post(query))
         .route("/api/v1/assets/{id}", get(get_asset).delete(remove_asset))
         .route("/api/v1/assets/{id}/content", get(asset_content))
@@ -191,6 +225,13 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .fallback(static_handler)
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
+        // Reads carry the bearer as a `?token=` query param on `<img>`/`<audio>`/WS loads (browsers
+        // can't header-auth those). `no-referrer` stops that token leaking onward via the `Referer`
+        // header when a preview or the page links out. Applied to every response, cheaply.
+        .layer(SetResponseHeaderLayer::overriding(
+            header::REFERRER_POLICY,
+            header::HeaderValue::from_static("no-referrer"),
+        ))
         .with_state(state)
 }
 
@@ -316,13 +357,21 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
     }
     // Never locked out: a config file can seed a credentialed mode on first boot (the hardened
     // template does), which would gate the instance with zero key holders. Mint the bootstrap owner
-    // token and print it once — recoverable from the container/service logs until first use.
+    // token — but the secret must NOT land in stderr/journald/docker logs, which persist and are
+    // widely readable. Write it to a 0600 file the operator collects once and then deletes; log only
+    // the path.
     if !matches!(s.auth, dam_api::admin::AuthMode::Off) {
         if let Some(t) = store.bootstrap_owner_token_if_needed("startup")? {
+            let path = cfg.data_dir.join("bootstrap-owner-token.txt");
+            write_secret_file(&path, &t.secret)?;
             eprintln!(
                 "  authentication is on and no admin credential existed — minted the owner token\n  \
-                 secret (shown once): {}",
-                t.secret
+                 secret written to {} (owner-only; save it, then delete the file)",
+                path.display()
+            );
+            tracing::warn!(
+                path = %path.display(),
+                "minted bootstrap owner token; secret is in the file, kept out of the logs"
             );
         }
     }
@@ -520,6 +569,18 @@ async fn version(State(st): State<AppState>) -> Json<serde_json::Value> {
                          "analyze", "similar", "duplicates", "suggestions", "collections", "export",
                          "auth", "flags", "mcp"],
     }))
+}
+
+/// `GET /api/v1/whoami` — the caller's resolved identity + effective scopes (tech-spec 10 §1.2).
+/// Deliberately requires no scope of its own: it reports whatever the presented credential resolves
+/// to, so a client can shape its UI to the granted scopes. Under `Token` mode with no credential it
+/// still `401`s (via `resolve`), which is the signal to show a login gate.
+async fn whoami(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<dam_api::WhoAmI>, ApiError> {
+    let ctx = auth::resolve(&st.store, auth::bearer_header(&headers))?;
+    Ok(Json(ctx.whoami()))
 }
 
 /// Liveness probe (issue #75): the process is up and the axum stack is answering. Always `200 ok`

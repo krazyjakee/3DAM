@@ -15,8 +15,20 @@ export type Scope = "read" | "write" | "admin" | "mcp_use" | "federate";
 /** A flag's value is untagged JSON: an auth mode, an MCP mode, or a bool (tech-spec 10 §2.2). */
 export type FlagValue = AuthMode | McpMode | boolean;
 
+/** Every runtime feature-flag key the Settings surface can render (tech-spec 10 §2, ADR 0004). The
+ *  server only *reports* the flags it supports — an older/leaner build may omit some — so Settings
+ *  keys its cards off this union but renders an "unsupported on this server" note for any it asks
+ *  for that the `/flags` response doesn't include, rather than a toggle that silently no-ops. */
+export type FlagKey =
+  | "authentication"
+  | "mcp_server"
+  | "network_writes"
+  | "federation"
+  | "auto_thumbnail"
+  | "auto_analyze";
+
 export interface FlagInfo {
-  key: "authentication" | "mcp_server" | "network_writes";
+  key: FlagKey;
   value: FlagValue;
   version: number;
   live: boolean;

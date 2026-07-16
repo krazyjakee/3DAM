@@ -14,6 +14,7 @@ import {
 import {
   useAnalyze,
   useAsset,
+  useCan,
   useCollectionMembers,
   useCollections,
   useDuplicates,
@@ -24,6 +25,7 @@ import {
   useSources,
 } from "@/api/queries";
 import { api, ApiError } from "@/api/client";
+import { AUTH_COPY } from "@/lib/auth";
 import type {
   Asset,
   AssetId,
@@ -351,16 +353,18 @@ function Body({ asset }: { asset: Asset }) {
  *  facet: starring here makes the asset appear under that filter. */
 function FavoriteButton({ asset }: { asset: Asset }) {
   const setFavorite = useSetFavorite();
+  const canWrite = useCan("write");
   const on = asset.summary.favorite;
+  const label = on ? "Remove from favourites" : "Add to favourites";
   return (
     <button
       type="button"
-      className="flex shrink-0 items-center justify-center transition-colors disabled:opacity-40 coarse:min-h-11 coarse:min-w-11"
+      className="flex shrink-0 items-center justify-center transition-colors disabled:cursor-not-allowed disabled:opacity-40 coarse:min-h-11 coarse:min-w-11"
       style={{ color: on ? "var(--color-accent)" : "var(--color-fg-dim)" }}
-      title={on ? "Remove from favourites" : "Add to favourites"}
-      aria-label={on ? "Remove from favourites" : "Add to favourites"}
+      title={!canWrite ? AUTH_COPY.needsWrite : label}
+      aria-label={label}
       aria-pressed={on}
-      disabled={setFavorite.isPending}
+      disabled={setFavorite.isPending || !canWrite}
       onClick={() => setFavorite.mutate({ asset: asset.summary.id, favorite: !on })}
     >
       <Star size={16} className={on ? "fill-current" : ""} />
@@ -375,6 +379,7 @@ function FavoriteButton({ asset }: { asset: Asset }) {
 function Actions({ asset }: { asset: Asset }) {
   const analyze = useAnalyze();
   const regenerateThumbnail = useRegenerateThumbnail();
+  const canWrite = useCan("write");
   const { summary } = asset;
   const analyzed = asset.timestamps.analyzed != null;
   const thumbable = summary.media === "image" || summary.media === "model";
@@ -383,10 +388,14 @@ function Actions({ asset }: { asset: Asset }) {
     <div className="mt-3 flex flex-wrap gap-2">
       <button
         type="button"
-        className="btn"
-        disabled={analyze.isPending}
+        className="btn disabled:cursor-not-allowed disabled:opacity-40"
+        disabled={analyze.isPending || !canWrite}
         onClick={() => analyze.mutate({ assets: [summary.id], force: true })}
-        title="Re-run analysis (embeddings, tileability, auto-tags) for this asset"
+        title={
+          !canWrite
+            ? AUTH_COPY.needsWrite
+            : "Re-run analysis (embeddings, tileability, auto-tags) for this asset"
+        }
       >
         <Sparkles size={13} />
         {analyzed ? "Reanalyze" : "Analyze"}
@@ -394,10 +403,14 @@ function Actions({ asset }: { asset: Asset }) {
       {thumbable && (
         <button
           type="button"
-          className="btn"
-          disabled={regenerateThumbnail.isPending}
+          className="btn disabled:cursor-not-allowed disabled:opacity-40"
+          disabled={regenerateThumbnail.isPending || !canWrite}
           onClick={() => regenerateThumbnail.mutate([summary.id])}
-          title="Rebuild the preview thumbnail from the current source file"
+          title={
+            !canWrite
+              ? AUTH_COPY.needsWrite
+              : "Rebuild the preview thumbnail from the current source file"
+          }
         >
           <RefreshCw size={13} />
           Regenerate thumbnail
@@ -414,6 +427,7 @@ function Actions({ asset }: { asset: Asset }) {
 function CollectionsGroup({ asset }: { asset: Asset }) {
   const collections = useCollections();
   const members = useCollectionMembers();
+  const canWrite = useCan("write");
   const all = collections.data ?? [];
   const inIds = new Set(asset.collections);
   const inCollections = all.filter((c) => inIds.has(c.id));
@@ -437,10 +451,10 @@ function CollectionsGroup({ asset }: { asset: Asset }) {
               {c.name}
               {c.kind === "manual" && (
                 <button
-                  className="flex items-center justify-center hover:text-danger disabled:opacity-40 coarse:min-h-11 coarse:min-w-11"
-                  title={`Remove from ${c.name}`}
+                  className="flex items-center justify-center hover:text-danger disabled:cursor-not-allowed disabled:opacity-40 coarse:min-h-11 coarse:min-w-11"
+                  title={!canWrite ? AUTH_COPY.needsWrite : `Remove from ${c.name}`}
                   aria-label={`Remove from ${c.name}`}
-                  disabled={members.isPending}
+                  disabled={members.isPending || !canWrite}
                   onClick={() => edit(c.id, "remove")}
                 >
                   <X size={11} />
@@ -452,10 +466,11 @@ function CollectionsGroup({ asset }: { asset: Asset }) {
       )}
       {addable.length > 0 && (
         <select
-          className="field mt-2"
+          className="field mt-2 disabled:cursor-not-allowed disabled:opacity-40"
           aria-label="Add to collection"
+          title={!canWrite ? AUTH_COPY.needsWrite : undefined}
           value=""
-          disabled={members.isPending}
+          disabled={members.isPending || !canWrite}
           onChange={(e) => {
             if (e.target.value) edit(e.target.value, "add");
           }}
@@ -667,6 +682,7 @@ function TagChip({
   onReview: (action: ReviewAction) => void;
 }) {
   const auto = tag.source === "auto";
+  const canWrite = useCan("write");
   const confidence =
     tag.confidence != null ? ` · ${Math.round(tag.confidence * 100)}%` : "";
 
@@ -698,20 +714,20 @@ function TagChip({
       <span className={rejected ? "line-through" : ""}>{tag.name}</span>
       {rejected ? (
         <button
-          className="flex items-center justify-center hover:text-accent disabled:opacity-40 coarse:min-h-11 coarse:min-w-11"
-          title="Restore tag — include it in search again"
+          className="flex items-center justify-center hover:text-accent disabled:cursor-not-allowed disabled:opacity-40 coarse:min-h-11 coarse:min-w-11"
+          title={!canWrite ? AUTH_COPY.needsWrite : "Restore tag — include it in search again"}
           aria-label={`Restore tag ${tag.name}`}
-          disabled={busy}
+          disabled={busy || !canWrite}
           onClick={() => onReview("accept")}
         >
           <RotateCcw size={12} />
         </button>
       ) : (
         <button
-          className="flex items-center justify-center hover:text-danger disabled:opacity-40 coarse:min-h-11 coarse:min-w-11"
-          title="Reject tag — hide it from search"
+          className="flex items-center justify-center hover:text-danger disabled:cursor-not-allowed disabled:opacity-40 coarse:min-h-11 coarse:min-w-11"
+          title={!canWrite ? AUTH_COPY.needsWrite : "Reject tag — hide it from search"}
           aria-label={`Reject tag ${tag.name}`}
-          disabled={busy}
+          disabled={busy || !canWrite}
           onClick={() => onReview("reject")}
         >
           <X size={12} />

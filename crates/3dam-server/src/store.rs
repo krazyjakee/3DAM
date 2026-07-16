@@ -359,6 +359,15 @@ impl ServerStore {
         if req.label.trim().is_empty() {
             return Err(LibError::BadRequest("token label is required".into()));
         }
+        // A scope-less token authenticates yet can do nothing — under `Token` mode it 403s every
+        // route, which reads as a broken credential. Reject it at mint time rather than hand back a
+        // confusing dud.
+        if req.scopes.to_vec().is_empty() {
+            return Err(LibError::BadRequest(
+                "a token needs at least one scope (read, write, admin, mcp_use, or federate)"
+                    .into(),
+            ));
+        }
         // High-entropy secret: two time-ordered v7 UUIDs (each carries OS-random bits) → 128 hex
         // chars behind a `dam_` prefix. Stored only as its blake3 hash.
         let secret = format!(
@@ -550,7 +559,12 @@ impl ServerStore {
 
     pub fn status(&self, bind: &str, localhost_only: bool, tls: bool) -> AdminStatus {
         let f = self.flags.read().unwrap();
-        let exposed_without_auth = !localhost_only && matches!(f.auth, AuthMode::Off) && !tls;
+        // "Exposed" = reachable off-box, no transport encryption, and no credential demanded of an
+        // unauthenticated caller. Both `Off` (everyone is owner) and `Anonymous` (everyone gets read
+        // unauthenticated) qualify — `Anonymous` on `0.0.0.0` is still a world-readable catalog, so
+        // it must trip the same warning rather than reporting itself safe.
+        let unauthenticated_reachable = matches!(f.auth, AuthMode::Off | AuthMode::Anonymous);
+        let exposed_without_auth = !localhost_only && unauthenticated_reachable && !tls;
         AdminStatus {
             bind: bind.to_string(),
             localhost_only,

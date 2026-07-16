@@ -5,6 +5,23 @@
 import { useSyncExternalStore } from "react";
 import { ApiError } from "@/api/client";
 
+// One consistent set of auth-copy strings, so the boot-probe rejection, the in-form rejection, and
+// an expired session don't each phrase "bad token" differently (issue: consistent copy).
+export const AUTH_COPY = {
+  /** A stored/typed token the server rejected (401). */
+  tokenRejected: "That token was rejected — check it and try again.",
+  /** A previously-valid session token that is no longer accepted (revoked/expired). */
+  sessionExpired: "Your session token is no longer valid — sign in again.",
+  /** A token accepted but without the read scope needed to browse. */
+  lacksRead: "That token is missing the read access needed to browse.",
+  /** Could not reach the server at all. */
+  unreachable: "Couldn't reach that server — check the address and that it's running.",
+  /** The standard write-gate tooltip for a caller lacking the write scope. */
+  needsWrite: "Requires write access — sign in with a token that has it.",
+  /** A scope-denied write (403) reframed for a signed-in but under-scoped token. */
+  writeDenied: "That action needs write access your token doesn't have.",
+} as const;
+
 let expired = false;
 const listeners = new Set<() => void>();
 

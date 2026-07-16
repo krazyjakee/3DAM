@@ -32,4 +32,4 @@ pub use federation::{
 };
 pub use id::{AssetId, CollectionId, ContentHash, JobId, SourceId, TagId};
 pub use page::{Cursor, ItemWarning, Page, PageParams, PartialStatus};
-pub use service::{AuthContext, EventStream, LibraryService, Scope, Scopes};
+pub use service::{AuthContext, EventStream, LibraryService, Scope, Scopes, WhoAmI};

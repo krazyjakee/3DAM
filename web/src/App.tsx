@@ -10,7 +10,7 @@ import { ApiError, type VersionInfo } from "./api/client";
 import { qk } from "./api/queries";
 import { DialogProvider } from "./lib/dialogs";
 import { ThemeProvider } from "./lib/theme";
-import { isUnauthorized, notifyUnauthorized } from "./lib/auth";
+import { AUTH_COPY, isUnauthorized, notifyUnauthorized } from "./lib/auth";
 import { getServer } from "./lib/server";
 import { errorMessage, toast } from "./lib/toast";
 
@@ -20,6 +20,13 @@ function isSignedOutWrite(error: unknown): boolean {
   if (!(error instanceof ApiError) || error.status !== 403 || getServer().token) return false;
   const version = queryClient.getQueryData<VersionInfo>(qk.version);
   return version?.auth === "anonymous";
+}
+
+// A scope-denied write with a token present (a signed-in read-only token, or any under-scoped
+// credential) is a permissions posture, not a crash — reframe the raw "forbidden: …" into one
+// clear line rather than leaking the server's error string.
+function isScopeDeniedWrite(error: unknown): boolean {
+  return error instanceof ApiError && error.status === 403 && !!getServer().token;
 }
 
 // Every mutation reports through one place (issue #23): a failure always raises an error toast, so
@@ -41,6 +48,10 @@ const queryClient: QueryClient = new QueryClient({
       }
       if (isSignedOutWrite(error)) {
         toast.info("Read-only — sign in to make changes");
+        return;
+      }
+      if (isScopeDeniedWrite(error)) {
+        toast.info(AUTH_COPY.writeDenied);
         return;
       }
       const prefix = mutation.meta?.errorPrefix as string | undefined;

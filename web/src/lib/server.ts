@@ -86,6 +86,14 @@ export function clearServer(): void {
   localStorage.removeItem(KEY);
 }
 
+/** Drop the bearer token but stay pointed at the same server (sign out). Distinct from
+ *  `clearServer`, which also resets the base URL back to same-origin. On a token-gated server this
+ *  returns to the login gate; on an anonymous server it drops to read-only browsing. */
+export function clearToken(): void {
+  config = { ...config, token: "" };
+  localStorage.setItem(KEY, JSON.stringify(config));
+}
+
 /** Resolve an API path against the configured base (relative/same-origin when unset). */
 export function resolveUrl(path: string): string {
   return config.base ? `${config.base}${path}` : path;

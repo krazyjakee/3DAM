@@ -35,7 +35,9 @@ import {
   useSources,
   useStats,
 } from "@/api/queries";
+import { useCan } from "@/api/queries";
 import { useConnection } from "@/api/connection";
+import { useWriteGate, type WriteGate } from "@/lib/write-gate";
 import type {
   Collection,
   FacetField,
@@ -190,6 +192,8 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
   const removeSource = useRemoveSource();
   const conn = useConnection();
   const { confirm } = useDialogs();
+  const { gate } = useWriteGate();
+  const canAdmin = useCan("admin");
   const [showAdd, setShowAdd] = useState(false);
 
   const total = stats.data?.total ?? 0;
@@ -210,20 +214,24 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
           </div>
         </div>
         <button
-          className="btn ml-auto px-1.5 py-1 coarse:min-h-11 coarse:min-w-11 coarse:justify-center"
-          title="Analyze library (embeddings, similarity, auto-tags)"
+          className="btn ml-auto px-1.5 py-1 disabled:opacity-40 coarse:min-h-11 coarse:min-w-11 coarse:justify-center"
           aria-label="Analyze library"
           onClick={() => analyze.mutate({})}
-          disabled={analyze.isPending}
+          {...gate({
+            disabled: analyze.isPending,
+            title: "Analyze library (embeddings, similarity, auto-tags)",
+          })}
         >
           <Sparkles size={13} className={analyze.isPending ? "animate-pulse" : ""} />
         </button>
         <button
-          className="btn px-1.5 py-1 coarse:min-h-11 coarse:min-w-11 coarse:justify-center"
-          title="Quick rescan — changed files only (all sources)"
+          className="btn px-1.5 py-1 disabled:opacity-40 coarse:min-h-11 coarse:min-w-11 coarse:justify-center"
           aria-label="Quick rescan all sources (changed files only)"
           onClick={() => scan.mutate({ mode: "delta" })}
-          disabled={scan.isPending}
+          {...gate({
+            disabled: scan.isPending,
+            title: "Quick rescan — changed files only (all sources)",
+          })}
         >
           <RefreshCw size={13} className={scan.isPending ? "animate-spin" : ""} />
         </button>
@@ -315,9 +323,10 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
           Sources
         </span>
         <button
-          className="flex items-center justify-center text-fg-dim hover:text-accent coarse:min-h-11 coarse:min-w-11"
-          title="Add source"
+          className="flex items-center justify-center text-fg-dim hover:text-accent disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:text-fg-dim coarse:min-h-11 coarse:min-w-11"
+          aria-label="Add source"
           onClick={() => setShowAdd(true)}
+          {...gate({ title: "Add source" })}
         >
           <FolderPlus size={14} />
         </button>
@@ -336,6 +345,7 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
         <SourceRow
           key={s.id}
           source={s}
+          gate={gate}
           active={state.source === s.id && !state.path && !state.collection}
           removing={removeSource.isPending && removeSource.variables === s.id}
           onNavigate={onNavigate}
@@ -368,6 +378,7 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
 
       {/* collections & smart folders (phase 4) */}
       <Collections
+        gate={gate}
         activeId={state.collection}
         onSelect={(id) =>
           go({
@@ -402,14 +413,26 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
       >
         <Ban size={14} /> Rescan blocklist
       </Link>
-      {/* Admin / Settings surface (tech-spec 09 §B.4). */}
-      <Link
-        to="/settings"
-        onClick={onNavigate}
-        className="flex items-center gap-2 border-t border-border px-3 py-2 text-xs text-fg-dim hover:text-accent coarse:min-h-11"
-      >
-        <SettingsIcon size={14} /> Settings &amp; Administration
-      </Link>
+      {/* Admin / Settings surface (tech-spec 09 §B.4). Gated on the admin scope: a non-admin has
+          nothing to do there (every action 403s), so show it disabled-with-reason rather than a
+          dead-end link. */}
+      {canAdmin ? (
+        <Link
+          to="/settings"
+          onClick={onNavigate}
+          className="flex items-center gap-2 border-t border-border px-3 py-2 text-xs text-fg-dim hover:text-accent coarse:min-h-11"
+        >
+          <SettingsIcon size={14} /> Settings &amp; Administration
+        </Link>
+      ) : (
+        <span
+          className="flex cursor-not-allowed items-center gap-2 border-t border-border px-3 py-2 text-xs text-fg-dim opacity-40 coarse:min-h-11"
+          title="Requires an admin token"
+          aria-disabled="true"
+        >
+          <SettingsIcon size={14} /> Settings &amp; Administration
+        </span>
+      )}
       {showAdd && <AddSourceDialog onClose={() => setShowAdd(false)} />}
     </nav>
   );
@@ -454,9 +477,11 @@ function Count({ n, loading = false }: { n: number; loading?: boolean }) {
  *  saved query (set via the CLI in v1) and is shown read-only with a Sparkles marker. Adding assets
  *  to a manual collection happens per-asset in the Inspector (batch add lands with multi-select). */
 function Collections({
+  gate,
   activeId,
   onSelect,
 }: {
+  gate: WriteGate["gate"];
   activeId: string | null;
   onSelect: (id: string | null) => void;
 }) {
@@ -479,11 +504,10 @@ function Collections({
           Collections
         </span>
         <button
-          className="flex items-center justify-center text-fg-dim hover:text-accent coarse:min-h-11 coarse:min-w-11"
-          title="New collection"
+          className="flex items-center justify-center text-fg-dim hover:text-accent disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:text-fg-dim coarse:min-h-11 coarse:min-w-11"
           aria-label="New collection"
           onClick={onCreate}
-          disabled={create.isPending}
+          {...gate({ disabled: create.isPending, title: "New collection" })}
         >
           <FolderPlus size={14} />
         </button>
@@ -500,6 +524,7 @@ function Collections({
         <CollectionRow
           key={c.id}
           collection={c}
+          gate={gate}
           active={activeId === c.id}
           onSelect={() => onSelect(activeId === c.id ? null : c.id)}
           onRename={async () => {
@@ -529,12 +554,14 @@ function Collections({
 
 function CollectionRow({
   collection,
+  gate,
   active,
   onSelect,
   onRename,
   onDelete,
 }: {
   collection: Collection;
+  gate: WriteGate["gate"];
   active: boolean;
   onSelect: () => void;
   onRename: () => void;
@@ -570,18 +597,18 @@ function CollectionRow({
       <div className="hidden items-center gap-1 group-hover:flex coarse:flex">
         {/* Renaming a smart folder is fine; its query is edited via the CLI in v1. */}
         <button
-          className="flex items-center justify-center text-fg-dim hover:text-accent coarse:min-h-11 coarse:min-w-11"
-          title="Rename"
+          className="flex items-center justify-center text-fg-dim hover:text-accent disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:text-fg-dim coarse:min-h-11 coarse:min-w-11"
           aria-label={`Rename collection ${collection.name}`}
           onClick={onRename}
+          {...gate({ title: "Rename" })}
         >
           <Pencil size={12} />
         </button>
         <button
-          className="flex items-center justify-center text-fg-dim hover:text-danger coarse:min-h-11 coarse:min-w-11"
-          title="Delete"
+          className="flex items-center justify-center text-fg-dim hover:text-danger disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:text-fg-dim coarse:min-h-11 coarse:min-w-11"
           aria-label={`Delete collection ${collection.name}`}
           onClick={onDelete}
+          {...gate({ title: "Delete" })}
         >
           <Trash2 size={12} />
         </button>
@@ -592,6 +619,7 @@ function CollectionRow({
 
 function SourceRow({
   source,
+  gate,
   active,
   removing,
   onSelect,
@@ -600,6 +628,7 @@ function SourceRow({
   onNavigate,
 }: {
   source: SourceInfo;
+  gate: WriteGate["gate"];
   active: boolean;
   removing: boolean;
   onSelect: () => void;
@@ -684,19 +713,19 @@ function SourceRow({
       <div className="hidden items-center gap-1 group-hover:flex coarse:flex">
         {!peer && (
           <button
-            className="flex items-center justify-center text-fg-dim hover:text-accent coarse:min-h-11 coarse:min-w-11"
-            title="Quick rescan — changed files only (full re-scan lives in Settings)"
+            className="flex items-center justify-center text-fg-dim hover:text-accent disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:text-fg-dim coarse:min-h-11 coarse:min-w-11"
             aria-label="Quick rescan this source (changed files only)"
             onClick={onRescan}
+            {...gate({ title: "Quick rescan — changed files only (full re-scan lives in Settings)" })}
           >
             <RefreshCw size={12} className={scanning ? "animate-spin" : ""} />
           </button>
         )}
         <button
-          className="flex items-center justify-center text-fg-dim hover:text-danger disabled:opacity-40 coarse:min-h-11 coarse:min-w-11"
-          title="Remove"
+          className="flex items-center justify-center text-fg-dim hover:text-danger disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:text-fg-dim coarse:min-h-11 coarse:min-w-11"
+          aria-label="Remove source"
           onClick={onRemove}
-          disabled={removing}
+          {...gate({ disabled: removing, title: "Remove" })}
         >
           <Trash2 size={12} className={removing ? "animate-pulse" : ""} />
         </button>

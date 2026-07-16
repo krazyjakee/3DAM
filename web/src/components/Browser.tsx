@@ -19,6 +19,7 @@ import {
 import {
   useAnalyze,
   useAssets,
+  useCan,
   useCollectionMembers,
   useCollections,
   useDuplicates,
@@ -27,6 +28,8 @@ import {
 } from "@/api/queries";
 import { api } from "@/api/client";
 import type { AssetSummary, DupGroup, SearchMode, SortField } from "@/api/types";
+import { AUTH_COPY } from "@/lib/auth";
+import { useWriteGate } from "@/lib/write-gate";
 import { useViewState } from "@/lib/view-state";
 import { useDebounced } from "@/lib/use-debounced";
 import { bytes } from "@/lib/format";
@@ -364,6 +367,7 @@ function SelectionBar({
   const analyze = useAnalyze();
   const collections = useCollections();
   const members = useCollectionMembers();
+  const { canWrite, gate } = useWriteGate();
   const manual = (collections.data ?? []).filter((c) => c.kind === "manual");
   const [showExport, setShowExport] = useState(false);
   const [showConvert, setShowConvert] = useState(false);
@@ -373,16 +377,24 @@ function SelectionBar({
     <div className="flex items-center gap-2 border-b border-border bg-surface px-3 py-1.5 text-xs">
       <span className="font-medium text-fg tabular-nums">{assets.length} selected</span>
       <button
-        className="btn"
+        className="btn disabled:cursor-not-allowed disabled:opacity-40"
         onClick={() => analyze.mutate({ assets: ids })}
-        disabled={analyze.isPending}
+        {...gate({ disabled: analyze.isPending })}
       >
         <Sparkles size={12} /> Analyze
       </button>
-      <button className="btn" onClick={() => setShowConvert(true)}>
+      <button
+        className="btn disabled:cursor-not-allowed disabled:opacity-40"
+        onClick={() => setShowConvert(true)}
+        {...gate()}
+      >
         <FileCog size={12} /> Convert
       </button>
-      <button className="btn" onClick={() => setShowExport(true)}>
+      <button
+        className="btn disabled:cursor-not-allowed disabled:opacity-40"
+        onClick={() => setShowExport(true)}
+        {...gate()}
+      >
         <FileDown size={12} /> Export
       </button>
       {showConvert && (
@@ -392,15 +404,21 @@ function SelectionBar({
         <ExportDialog scope={{ assets: ids }} onClose={() => setShowExport(false)} />
       )}
       <select
-        className="field w-auto"
+        className="field w-auto disabled:cursor-not-allowed disabled:opacity-40"
         aria-label="Add selection to collection"
         value=""
-        disabled={manual.length === 0 || members.isPending}
+        disabled={manual.length === 0 || members.isPending || !canWrite}
         onChange={(e) => {
           if (e.target.value) members.mutate({ id: e.target.value, members: { add: ids } });
           e.currentTarget.value = "";
         }}
-        title={manual.length === 0 ? "No manual collections yet" : "Add selection to a collection"}
+        title={
+          !canWrite
+            ? AUTH_COPY.needsWrite
+            : manual.length === 0
+              ? "No manual collections yet"
+              : "Add selection to a collection"
+        }
       >
         <option value="" disabled>
           Add to collection…
@@ -436,6 +454,7 @@ function Toolbar({
   searching?: boolean;
 }) {
   const { state, patch, request } = useViewState();
+  const { gate } = useWriteGate();
   const [showExport, setShowExport] = useState(false);
   return (
     <div className="flex items-center gap-2 border-b border-border px-3 py-2">
@@ -530,10 +549,10 @@ function Toolbar({
 
       {/* Export the current view — a collection when one is active, else the faceted query. */}
       <button
-        className="btn shrink-0 px-1.5 py-1 coarse:min-h-11 coarse:min-w-11 coarse:justify-center"
-        title="Export manifest for the current view"
+        className="btn shrink-0 px-1.5 py-1 disabled:cursor-not-allowed disabled:opacity-40 coarse:min-h-11 coarse:min-w-11 coarse:justify-center"
         aria-label="Export manifest"
         onClick={() => setShowExport(true)}
+        {...gate({ title: "Export manifest for the current view" })}
       >
         <FileDown size={14} />
       </button>
@@ -1091,7 +1110,23 @@ function TableRow({
  *  until hover/focus (always shown once starred, or on touch) so the dense grid stays low-chrome. */
 function FavoriteStar({ asset }: { asset: AssetSummary }) {
   const setFavorite = useSetFavorite();
+  const canWrite = useCan("write");
   const on = asset.favorite;
+  // Read-only: a starred asset still shows its (non-clickable) marker so the state is visible, but
+  // there's no toggle affordance — an unstarred tile shows nothing to click.
+  if (!canWrite) {
+    if (!on) return null;
+    return (
+      <span
+        aria-hidden="true"
+        title="Favourite (read-only — needs write access to change)"
+        className="flex shrink-0 items-center justify-center rounded coarse:min-h-11 coarse:min-w-11"
+        style={{ color: "var(--color-accent)" }}
+      >
+        <Star size={12} className="fill-current" />
+      </span>
+    );
+  }
   return (
     <span
       aria-hidden="true"

@@ -73,7 +73,7 @@ axum-server = { version = "0.7", features = ["tls-rustls"] }
 # Direct handle on rustls only to install the ring crypto provider for axum-server's TLS (issue #75).
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "set-header"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 url = "2"
 # web-client embedding (tech-spec 09 §A.4): bake web/dist into the binary, MIME by extension.
