@@ -5,6 +5,14 @@ edition.workspace = true
 license.workspace = true
 description = "Native desktop shell (Tauri webview, ADR 0013): the embedded web client served by an in-process dam-server."
 
+# Packaging (tech-spec 15 §15.5): this crate is a *lib* — the product binary is the `3dam` bin of
+# the `dam` package (crates/3dam). tauri.conf.json therefore sets `mainBinaryName: "3dam"` and we
+# bundle with `cargo tauri bundle` (never `cargo tauri build`), which packages the already-built
+# target/release/3dam. Run it via `cargo xtask bundle`, which sequences web → binary → bundle.
+# Icons in icons/ (32/128/256 PNGs, icon.ico, icon.icns) are generated from icons/icon.png
+# (512×512) with Pillow; regenerate all sizes from that source if the logo changes. The .icns is
+# Pillow-written (PNG-typed entries, valid on macOS ≥ 10.7) — sizes above 512 are upscaled.
+
 [dependencies]
 # The shell boots the same axum server `3dam serve` runs — loopback, ephemeral port, embedded React
 # client — and points the webview at it. One UI codebase for web and desktop (ADR 0013).

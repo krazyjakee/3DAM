@@ -21,9 +21,11 @@ fn main() -> ExitCode {
         "web" => build_web(),
         // Build just the WASM viewer islands (tech-spec 09 §B.3) into web/src/wasm/.
         "wasm" => build_wasm(),
+        // Package the desktop app (deb/AppImage on Linux) via the Tauri bundler.
+        "bundle" => bundle(),
         "check-deps" => check_deps(),
         other => {
-            eprintln!("unknown xtask '{other}'. try: ci | web | wasm | check-deps");
+            eprintln!("unknown xtask '{other}'. try: ci | web | wasm | bundle | check-deps");
             false
         }
     };
@@ -32,6 +34,31 @@ fn main() -> ExitCode {
     } else {
         ExitCode::FAILURE
     }
+}
+
+/// Package the desktop app into OS bundles (tech-spec 15 §15.5). The layout is unusual and the
+/// order matters: `crates/3dam-desktop` holds `tauri.conf.json` but is a *lib* crate — the product
+/// binary is the `3dam` bin of the `dam` package (`crates/3dam`, ADR 0010). So we build the web
+/// client (embedded via `rust-embed`), then the real `3dam` release binary, then run `cargo tauri
+/// bundle`, which packages the *already-built* `target/release/3dam` — `mainBinaryName: "3dam"` in
+/// `tauri.conf.json` points the bundler at it, and no second (Tauri-driven) cargo build happens.
+/// Skips gracefully with a hint if `tauri-cli` is absent, mirroring the `pnpm`/`wasm-pack` handling.
+fn bundle() -> bool {
+    // Check the bundler first — without it the web/binary builds below would be minutes of work
+    // just to announce a skip.
+    if which_cargo_subcommand("tauri").is_none() {
+        eprintln!(
+            "xtask bundle: `tauri-cli` not found — skipping desktop packaging (install with \
+             `cargo install tauri-cli --version '^2'` to bundle the desktop app)."
+        );
+        return true;
+    }
+    if !build_web() {
+        return false;
+    }
+    let desktop = Path::new(env!("CARGO_MANIFEST_DIR")).join("../crates/3dam-desktop");
+    run("cargo", &["build", "-p", "dam", "--release"])
+        && run_in(&desktop, "cargo", &["tauri", "bundle"])
 }
 
 /// Placeholder for the dependency-direction guard (tech-spec 01 §2): assert the allowed-edge
@@ -101,6 +128,19 @@ fn build_wasm() -> bool {
             "--release",
         ],
     )
+}
+
+/// Like [`which`], but for cargo subcommands (`cargo-tauri` etc.), which only answer `--version`
+/// when dispatched through `cargo`.
+fn which_cargo_subcommand(sub: &str) -> Option<()> {
+    Command::new("cargo")
+        .args([sub, "--version"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .ok()
+        .filter(|s| s.success())
+        .map(|_| ())
 }
 
 fn which(bin: &str) -> Option<()> {
