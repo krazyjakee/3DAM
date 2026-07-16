@@ -14,9 +14,18 @@
 
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use dam_frontend::default_data_dir;
-use tauri::{WebviewUrl, WebviewWindowBuilder};
+use tauri::menu::{AboutMetadata, Menu, MenuBuilder, MenuItemBuilder, SubmenuBuilder};
+use tauri::{AppHandle, Manager, Runtime, WebviewUrl, WebviewWindowBuilder};
+use tauri_plugin_window_state::StateFlags;
+
+/// Webview zoom bounds and step for the View menu — browser conventions (25%–300%, 10% steps).
+/// The factor is shell-side state: `set_zoom` is write-only, so the menu handler tracks it.
+const ZOOM_MIN: f64 = 0.25;
+const ZOOM_MAX: f64 = 3.0;
+const ZOOM_STEP: f64 = 0.1;
 
 /// Entry point for the GUI role. Bare `3dam` serves the platform-default embedded library to the
 /// webview; `--connect <url> [--token <t>]` opens straight against a remote `3dam serve`, and
@@ -61,7 +70,22 @@ pub fn run(args: Vec<OsString>) -> u8 {
         )
     });
 
+    // The webview zoom factor lives in the menu-event closure: `set_zoom` is write-only, so the
+    // shell is the source of truth for Zoom In/Out stepping.
+    let zoom = Mutex::new(1.0_f64);
+
     let outcome = tauri::Builder::default()
+        // Persist exactly what the window-geometry contract promises — size, position, maximized —
+        // and nothing surprising (no VISIBLE, so a crash while hidden can't persist a ghost window;
+        // no FULLSCREEN, so F11 is per-session). Restore is automatic: the plugin's
+        // `on_window_ready` hook fires for the `.setup()`-built window as well.
+        .plugin(
+            tauri_plugin_window_state::Builder::default()
+                .with_state_flags(StateFlags::SIZE | StateFlags::POSITION | StateFlags::MAXIMIZED)
+                .build(),
+        )
+        .menu(app_menu)
+        .on_menu_event(move |app, event| handle_menu_event(app, event.id().as_ref(), &zoom))
         .setup(move |app| {
             let mut win = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url))
                 .title("3DAM")
@@ -80,6 +104,115 @@ pub fn run(args: Vec<OsString>) -> u8 {
             eprintln!("3dam desktop: {e}");
             1
         }
+    }
+}
+
+/// The native app menu — small and honest: only entries the shell can actually service. Quit and
+/// the View items are custom ids handled in [`handle_menu_event`]; About is the predefined item
+/// (native About dialog on every platform, no dialog plugin needed). The layout is the
+/// Windows/Linux convention; a macOS app-menu arrangement can come with the bundle work.
+fn app_menu<R: Runtime>(handle: &AppHandle<R>) -> tauri::Result<Menu<R>> {
+    let file = SubmenuBuilder::new(handle, "File")
+        .item(
+            &MenuItemBuilder::with_id("quit", "Quit")
+                .accelerator("CmdOrCtrl+Q")
+                .build(handle)?,
+        )
+        .build()?;
+    let view = SubmenuBuilder::new(handle, "View")
+        .item(
+            &MenuItemBuilder::with_id("reload", "Reload")
+                .accelerator("CmdOrCtrl+R")
+                .build(handle)?,
+        )
+        .separator()
+        .item(
+            &MenuItemBuilder::with_id("zoom-reset", "Actual Size")
+                .accelerator("CmdOrCtrl+0")
+                .build(handle)?,
+        )
+        .item(
+            // "=" is the unshifted key under "+" — the accelerator browsers actually bind.
+            &MenuItemBuilder::with_id("zoom-in", "Zoom In")
+                .accelerator("CmdOrCtrl+=")
+                .build(handle)?,
+        )
+        .item(
+            &MenuItemBuilder::with_id("zoom-out", "Zoom Out")
+                .accelerator("CmdOrCtrl+-")
+                .build(handle)?,
+        )
+        .separator()
+        .item(
+            // Custom rather than `PredefinedMenuItem::fullscreen` (that one is macOS-only).
+            &MenuItemBuilder::with_id("fullscreen", "Toggle Fullscreen")
+                .accelerator("F11")
+                .build(handle)?,
+        );
+    // The Web Inspector only exists in debug builds (`open_devtools` is compiled out of release
+    // unless the `devtools` feature is enabled), so the menu item follows it.
+    #[cfg(debug_assertions)]
+    let view = view.separator().item(
+        &MenuItemBuilder::with_id("devtools", "Toggle DevTools")
+            .accelerator("CmdOrCtrl+Shift+I")
+            .build(handle)?,
+    );
+    let view = view.build()?;
+    let help = SubmenuBuilder::new(handle, "Help")
+        .about_with_text(
+            "About 3DAM",
+            Some(AboutMetadata {
+                name: Some("3DAM".into()),
+                version: Some(env!("CARGO_PKG_VERSION").into()),
+                ..Default::default()
+            }),
+        )
+        .build()?;
+    MenuBuilder::new(handle)
+        .items(&[&file, &view, &help])
+        .build()
+}
+
+/// Service a menu click. Fail-soft throughout (golden rule 6): a webview call that errors — or a
+/// window that has already gone away — drops the click rather than crashing the shell.
+fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, id: &str, zoom: &Mutex<f64>) {
+    if id == "quit" {
+        app.exit(0);
+        return;
+    }
+    let Some(win) = app.get_webview_window("main") else {
+        return;
+    };
+    match id {
+        "reload" => {
+            let _ = win.reload();
+        }
+        "zoom-reset" | "zoom-in" | "zoom-out" => {
+            let Ok(mut factor) = zoom.lock() else {
+                return;
+            };
+            let next = match id {
+                "zoom-in" => (*factor + ZOOM_STEP).min(ZOOM_MAX),
+                "zoom-out" => (*factor - ZOOM_STEP).max(ZOOM_MIN),
+                _ => 1.0,
+            };
+            if win.set_zoom(next).is_ok() {
+                *factor = next;
+            }
+        }
+        "fullscreen" => {
+            let now = win.is_fullscreen().unwrap_or(false);
+            let _ = win.set_fullscreen(!now);
+        }
+        #[cfg(debug_assertions)]
+        "devtools" => {
+            if win.is_devtools_open() {
+                win.close_devtools();
+            } else {
+                win.open_devtools();
+            }
+        }
+        _ => {}
     }
 }
 

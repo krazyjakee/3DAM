@@ -23,6 +23,10 @@ anyhow = { workspace = true }
 # The webview shell (ADR 0013). Declared here rather than in the workspace table since this crate is
 # its only consumer (the eframe precedent).
 tauri = { version = "2", features = [] }
+# Window geometry persistence (size/position/maximized across launches). Its `on_window_ready` hook
+# restores runtime-created windows too, so the window built in `.setup()` is covered without an
+# explicit `restore_state` call.
+tauri-plugin-window-state = "2"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
