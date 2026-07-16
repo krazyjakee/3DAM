@@ -26,6 +26,10 @@ tauri = { version = "2", features = [] }
 # Native file dialogs (the Add-Source folder picker). Exposed to the web client through the
 # loopback-scoped capability in `capabilities/` — see that file for the security posture.
 tauri-plugin-dialog = "2"
+# Window geometry persistence (size/position/maximized across launches). Its `on_window_ready` hook
+# restores runtime-created windows too, so the window built in `.setup()` is covered without an
+# explicit `restore_state` call.
+tauri-plugin-window-state = "2"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
