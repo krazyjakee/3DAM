@@ -1,12 +1,13 @@
 import { useEffect, useRef, useState } from "react";
-import { ChevronUp, Loader2, LogIn, LogOut, Server, ShieldCheck, X } from "lucide-react";
+import { ChevronUp, EyeOff, Loader2, LogIn, LogOut, Server, ShieldCheck, X } from "lucide-react";
 import { useCancelJob, useJobs, useScopes, useStats, useVersion, useWhoami } from "@/api/queries";
+import { authApi } from "@/api/auth";
 import { useConnection, type ConnState } from "@/api/connection";
 import type { JobStatus, MediaType } from "@/api/types";
 import { clearToken, getServer, isRemote, serverLabel } from "@/lib/server";
 import { useEscape, useFocusTrap } from "@/lib/use-focus-trap";
 import { ConnectDialog } from "./ConnectDialog";
-import { TokenLoginForm } from "./AuthGate";
+import { AccountLoginForm, TokenLoginForm } from "./AuthGate";
 
 /** Bottom status strip: active scan/analysis jobs with live progress, the live-connection state, and
  *  the server build. A single job shows inline; concurrent jobs condense into one aggregate bar with
@@ -36,7 +37,7 @@ export function StatusBar() {
       )}
       <MediaBreakdown />
       <ConnectionPill state={conn.state} />
-      <IdentityChip auth={version.data?.auth} />
+      <IdentityChip auth={version.data?.auth} accounts={version.data?.accounts === true} />
       <ServerChip />
       <span className="tabular-nums">{version.data?.server ?? ""}</span>
     </footer>
@@ -44,19 +45,23 @@ export function StatusBar() {
 }
 
 /** Sign-in / identity / sign-out chip (front-door auth). On a gated server (token or anonymous):
- *  - signed out → "Sign in" opens the token form (anonymous browses read-only meanwhile);
+ *  - signed out → "Sign in" opens the sign-in form (anonymous browses read-only meanwhile);
  *  - signed in → the identity + scope hint, with a Sign out that drops the credential.
- *  Nothing shows when auth is off (there's no credential to manage). */
-function IdentityChip({ auth }: { auth?: string }) {
+ *  With user accounts (issue #42) the credential may be a session cookie: the chip shows the
+ *  account's username, Sign out also ends the server-side session, and a sharing-restricted view is
+ *  flagged. Nothing shows when auth is off (there's no credential to manage). */
+function IdentityChip({ auth, accounts }: { auth?: string; accounts: boolean }) {
   const [open, setOpen] = useState(false);
   const whoami = useWhoami();
   const scopes = useScopes();
   // Only manage a credential where the server actually has one (token/anonymous postures).
   if (auth !== "token" && auth !== "anonymous") return null;
 
-  const signedIn = !!getServer().token;
+  const account = whoami.data?.account ?? null;
+  const restricted = whoami.data?.restricted === true;
+  const signedIn = !!getServer().token || !!account;
   const canWrite = scopes.includes("write");
-  const identity = whoami.data?.identity ?? null;
+  const identity = account?.username ?? whoami.data?.identity ?? null;
 
   if (!signedIn) {
     return (
@@ -69,10 +74,25 @@ function IdentityChip({ auth }: { auth?: string }) {
           <LogIn size={11} />
           <span>Signed out · Sign in</span>
         </button>
-        {open && <SignInModal onClose={() => setOpen(false)} />}
+        {open && <SignInModal accounts={accounts} onClose={() => setOpen(false)} />}
       </>
     );
   }
+
+  const signOut = async () => {
+    // End the server-side session when signed in via account (CSRF-stamped); best-effort — a dead
+    // server shouldn't trap the user signed in. Then drop any stored token and reload so every
+    // transport restarts unauthenticated and lands on the gate / read-only browsing.
+    if (account) {
+      try {
+        await authApi.logout();
+      } catch {
+        /* best-effort — the reload lands on the gate either way */
+      }
+    }
+    clearToken();
+    location.reload();
+  };
 
   return (
     <span className="flex items-center gap-1">
@@ -81,22 +101,30 @@ function IdentityChip({ auth }: { auth?: string }) {
         title={
           canWrite
             ? "Signed in with write access"
-            : "Signed in read-only — writes need a token with write access"
+            : "Signed in read-only — writes need a credential with write access"
         }
       >
         <ShieldCheck size={11} className={canWrite ? "text-accent" : "text-warn"} />
         <span className="max-w-[140px] truncate">{identity ?? "Signed in"}</span>
         {!canWrite && <span className="text-warn">· read-only</span>}
       </span>
+      {restricted && (
+        <span
+          className="flex items-center text-fg-dim"
+          title="Some content may be hidden by sharing rules"
+          aria-label="Some content may be hidden by sharing rules"
+        >
+          <EyeOff size={11} />
+        </span>
+      )}
       <button
         className="flex items-center gap-1 rounded px-1.5 py-0.5 hover:text-fg"
-        onClick={() => {
-          // Drop the token but keep the server; a full reload restarts every transport unauthenticated
-          // (queries, WS, media `?token=` URLs) and lands on the gate / read-only browsing.
-          clearToken();
-          location.reload();
-        }}
-        title="Sign out — drop the token (stays connected to this server)"
+        onClick={() => void signOut()}
+        title={
+          account
+            ? "Sign out — end this session (stays connected to this server)"
+            : "Sign out — drop the token (stays connected to this server)"
+        }
       >
         <LogOut size={11} />
         <span>Sign out</span>
@@ -105,9 +133,10 @@ function IdentityChip({ auth }: { auth?: string }) {
   );
 }
 
-/** The dismissable sign-in dialog (front-door auth) — the token form in a focus-trapped modal with
- *  Escape/backdrop to close. Shared shape with the boot gate; here it's optional and closable. */
-function SignInModal({ onClose }: { onClose: () => void }) {
+/** The dismissable sign-in dialog (front-door auth) — the sign-in form in a focus-trapped modal
+ *  with Escape/backdrop to close. Shared shape with the boot gate; here it's optional and closable.
+ *  Accounts-on servers get the username/password form (token reachable via its toggle). */
+function SignInModal({ accounts, onClose }: { accounts: boolean; onClose: () => void }) {
   const ref = useFocusTrap<HTMLDivElement>(true);
   useEscape(onClose);
   return (
@@ -123,7 +152,11 @@ function SignInModal({ onClose }: { onClose: () => void }) {
         className="w-full max-w-md rounded-lg border border-border bg-surface p-4 shadow-xl"
         onClick={(e) => e.stopPropagation()}
       >
-        <TokenLoginForm reason={null} allowReadOnly={false} onClose={onClose} />
+        {accounts ? (
+          <AccountLoginForm reason={null} allowReadOnly={false} onClose={onClose} />
+        ) : (
+          <TokenLoginForm reason={null} allowReadOnly={false} onClose={onClose} />
+        )}
       </div>
     </div>
   );

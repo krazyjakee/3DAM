@@ -11,6 +11,7 @@
 
 mod admin;
 mod auth;
+mod authn;
 mod config;
 mod mcp;
 mod store;
@@ -219,6 +220,8 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/api/v1/ws", get(ws_handler))
         // The MCP endpoint (tech-spec 11): present, but the handler 404s when the flag is Off.
         .route("/mcp", post(mcp_http))
+        // User accounts: claim/login/sessions (phase 6, issue #42) — 404 while the flag is off.
+        .merge(authn::routes())
         // The admin API (tech-spec 10 §5), guarded by the AdminAuth extractor.
         .merge(admin::routes())
         // SPA fallback: any non-API GET serves the embedded web client (tech-spec 09 §A.4).
@@ -306,6 +309,13 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
     for (key, value) in file.flag_seeds() {
         store.seed_flag(key, value)?;
     }
+    // Config-plane recovery hatch (ADR 0009 §3, issue #42): `[accounts] reopen_claim = true`
+    // re-opens the first-run claim window for this boot, so a lost sole admin can be recovered
+    // from the machine that owns the config file. Audited, and loud below via the unclaimed beat.
+    if file.accounts.reopen_claim == Some(true) {
+        store.reopen_claim("config-file")?;
+        eprintln!("  ⚠ [accounts] reopen_claim: the claim window is OPEN — the next localhost signup becomes admin");
+    }
 
     // Hosted-mode background pipeline (issue #71): proactively drain thumbnails + analysis on ingest
     // so a freshly-connected client hits ready data instead of paying first-look render latency.
@@ -377,6 +387,25 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
     }
     ready.store(true, std::sync::atomic::Ordering::Relaxed);
 
+    // Unclaimed state is loud (issue #42 §2): while accounts are on with no admin claimed, warn on
+    // a beat so an exposed unclaimed instance is never silent. The task ends itself once claimed.
+    {
+        let store = store.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                tick.tick().await;
+                if !store.unclaimed() {
+                    break;
+                }
+                tracing::warn!(
+                    "user accounts are on but UNCLAIMED — the first signup from localhost \
+                     becomes admin; claim it now (web UI) or via POST /api/v1/auth/claim"
+                );
+            }
+        });
+    }
+
     // TLS deployment: serve HTTPS via axum-server (its own graceful-shutdown handle), still flipping
     // the WS watch so idle sockets close. Plaintext keeps the axum::serve path below.
     if let Some((cert, key)) = tls_paths {
@@ -391,7 +420,13 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
     //   3. axum stops accepting and drains in-flight requests. A grace timer is the backstop so a
     //      wedged connection can't hang the process — past the window we stop waiting and exit.
     let shutdown_rx_backstop = shutdown_tx.subscribe();
-    let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
+    // ConnectInfo gives handlers the peer address — the first-run claim gate binds acceptance to a
+    // loopback peer (issue #42 §2), which needs more than the bind posture when listening wide.
+    let serve = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
         wait_for_signal().await;
         tracing::info!("shutdown signal received; draining connections");
         eprintln!(
@@ -454,7 +489,7 @@ async fn serve_tls(
 
     axum_server::from_tcp_rustls(std_listener, config)
         .handle(handle)
-        .serve(app.into_make_service())
+        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
         .await?;
     tracing::info!(%actual, "TLS shutdown complete; all connections drained");
     Ok(())
@@ -578,7 +613,9 @@ async fn desktop_setup(
 /// first out; an accepted edge, same as today's concurrent-session behaviour.)
 fn desktop_shell_token(store: &ServerStore) -> Result<Option<String>, LibError> {
     use dam_api::admin::{AuthMode, NewToken};
-    if matches!(store.auth_mode(), AuthMode::Off) {
+    // The *effective* mode: `UserAccounts` on gates the surface even with the auth flag Off, and
+    // the shell webview still needs a credential to reach its own in-process server (ADR 0013).
+    if matches!(store.effective_auth_mode(), AuthMode::Off) {
         return Ok(None);
     }
     const LABEL: &str = "desktop shell";
@@ -661,11 +698,16 @@ async fn version(State(st): State<AppState>) -> Json<serde_json::Value> {
         "api": "v1",
         "server": concat!("3dam ", env!("CARGO_PKG_VERSION")),
         // The auth posture, on the one public route: lets a client render its login gate up front
-        // instead of provoking 401s (the same fact a 401 would reveal anyway).
-        "auth": st.store.auth_mode(),
+        // instead of provoking 401s (the same fact a 401 would reveal anyway). The *effective*
+        // mode — `UserAccounts` on raises `Off` to `Token` (issue #42).
+        "auth": st.store.effective_auth_mode(),
+        // Accounts posture (issue #42): lets the client offer username/password login (and the
+        // first-run claim screen while unclaimed) instead of the bare token prompt.
+        "accounts": st.store.user_accounts(),
+        "unclaimed": st.store.unclaimed(),
         "capabilities": ["query", "sources", "scan", "stats", "ws", "web", "thumbnail", "convert",
                          "analyze", "similar", "duplicates", "suggestions", "collections", "export",
-                         "auth", "flags", "mcp"],
+                         "auth", "flags", "mcp", "accounts"],
     }))
 }
 
@@ -677,8 +719,12 @@ async fn whoami(
     State(st): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<dam_api::WhoAmI>, ApiError> {
-    let ctx = auth::resolve(&st.store, auth::bearer_header(&headers))?;
-    Ok(Json(ctx.whoami()))
+    let resolved = auth::resolve(
+        &st.store,
+        auth::bearer_header(&headers),
+        auth::cookie_value(&headers, auth::SESSION_COOKIE),
+    )?;
+    Ok(Json(resolved.ctx.whoami()))
 }
 
 /// Liveness probe (issue #75): the process is up and the axum stack is answering. Always `200 ok`
@@ -945,6 +991,13 @@ async fn remove_source(
 ) -> Result<StatusCode, ApiError> {
     let id: SourceId = parse_id(&id, "source")?;
     st.lib.remove_source(&ctx, &id, req).await?;
+    // Orphan-GC the cross-database soft references (issue #42): shares of a deleted source are
+    // dead grants. Ids are uuids (never recycled), so a failure here is clutter, not exposure.
+    let _ = st.store.remove_shares_for_resource(
+        dam_api::accounts::ShareResource::Source,
+        &id.to_string(),
+        "system",
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1020,6 +1073,12 @@ async fn delete_collection(
 ) -> Result<StatusCode, ApiError> {
     let id: CollectionId = parse_id(&id, "collection")?;
     st.lib.delete_collection(&ctx, &id).await?;
+    // Orphan-GC shares pointing at the deleted collection (issue #42; see remove_source).
+    let _ = st.store.remove_shares_for_resource(
+        dam_api::accounts::ShareResource::Collection,
+        &id.to_string(),
+        "system",
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1102,14 +1161,28 @@ async fn ws_handler(
     headers: HeaderMap,
     State(st): State<AppState>,
 ) -> Response {
-    if let Err(e) = auth::resolve_ws(&st.store, &headers, q.token) {
-        return ApiError(e).into_response();
-    }
-    ws.on_upgrade(move |socket| ws_loop(socket, st))
+    let resolved = match auth::resolve_ws(&st.store, &headers, q.token.clone()) {
+        Ok(r) => r,
+        Err(e) => return ApiError(e).into_response(),
+    };
+    // Keep the raw credentials so the long-lived loop can *re-resolve* when shares/groups change
+    // (issue #42): a revoked share must not keep feeding a stale ceiling to an open socket.
+    let token = auth::bearer_header(&headers).or(q.token);
+    let cookie = auth::cookie_value(&headers, auth::SESSION_COOKIE);
+    ws.on_upgrade(move |socket| ws_loop(socket, st, resolved.ctx, token, cookie))
 }
 
-async fn ws_loop(mut socket: WebSocket, st: AppState) {
-    let mut stream = match st.lib.subscribe(&ectx(), SubscribeRequest::default()).await {
+async fn ws_loop(
+    mut socket: WebSocket,
+    st: AppState,
+    ctx: dam_api::service::AuthContext,
+    token: Option<String>,
+    cookie: Option<String>,
+) {
+    // Subscribe under the *caller's* context, not the embedded owner — the engine filters the
+    // stream to the ceiling (restricted subscribers get no job/asset payloads; issue #42).
+    let mut vis_gen = st.store.visibility_generation();
+    let mut stream = match st.lib.subscribe(&ctx, SubscribeRequest::default()).await {
         Ok(s) => s,
         Err(_) => return,
     };
@@ -1123,6 +1196,25 @@ async fn ws_loop(mut socket: WebSocket, st: AppState) {
             }
             ev = stream.next() => {
                 let Some(ev) = ev else { break }; // event bus closed (engine shutting down)
+                // A share/group/account mutation since we subscribed: re-resolve the credential
+                // and re-subscribe under the fresh ceiling; a now-invalid credential closes.
+                let gen_now = st.store.visibility_generation();
+                if gen_now != vis_gen {
+                    vis_gen = gen_now;
+                    match auth::resolve(&st.store, token.clone(), cookie.clone()) {
+                        Ok(r) if r.ctx.scopes.has(dam_api::service::Scope::Read) => {
+                            match st.lib.subscribe(&r.ctx, SubscribeRequest::default()).await {
+                                Ok(s) => stream = s,
+                                Err(_) => break,
+                            }
+                        }
+                        _ => {
+                            let _ = socket.send(Message::Close(None)).await;
+                            break;
+                        }
+                    }
+                    continue; // the in-flight event predates the fresh ceiling — drop it
+                }
                 match serde_json::to_string(&ev) {
                     Ok(txt) => {
                         if socket.send(Message::Text(txt.into())).await.is_err() {
@@ -1139,16 +1231,35 @@ async fn ws_loop(mut socket: WebSocket, st: AppState) {
 /// `POST /mcp` — the Streamable-HTTP MCP transport (tech-spec 11 §2.1). The `McpServer` flag is read
 /// live: `Off` ⇒ `404` (route absent, checked *before* auth so a disabled endpoint cannot even be
 /// probed). Otherwise auth is resolved on the shared surface and one JSON-RPC message is dispatched.
+///
+/// A cookie-authenticated call passes the same CSRF gate as any other write: this is a POST that can
+/// reach write tools, and while `SameSite=Strict` already stops a cross-site cookie from riding
+/// along, the double-submit token is the second fence (ADR 0009 §4). Bearer-credentialled agents —
+/// the normal MCP client — are unaffected.
 async fn mcp_http(State(st): State<AppState>, headers: HeaderMap, body: Body) -> Response {
     use dam_api::admin::McpMode;
     let mcp = st.store.mcp_mode();
     if matches!(mcp, McpMode::Off) {
         return ApiError(LibError::NotFound("mcp is disabled".into())).into_response();
     }
-    let ctx = match auth::resolve(&st.store, auth::bearer_header(&headers)) {
-        Ok(c) => c,
+    let resolved = match auth::resolve(
+        &st.store,
+        auth::bearer_header(&headers),
+        auth::cookie_value(&headers, auth::SESSION_COOKIE),
+    ) {
+        Ok(r) => r,
         Err(e) => return ApiError(e).into_response(),
     };
+    if let Some(sess) = &resolved.session {
+        let presented = headers.get(auth::CSRF_HEADER).and_then(|v| v.to_str().ok());
+        if presented != Some(sess.csrf.as_str()) {
+            return ApiError(LibError::Forbidden(
+                "missing or invalid CSRF token (send the login csrf in x-dam-csrf)".into(),
+            ))
+            .into_response();
+        }
+    }
+    let ctx = resolved.ctx;
     let bytes = match axum::body::to_bytes(body, 4 * 1024 * 1024).await {
         Ok(b) => b,
         Err(_) => return ApiError(LibError::BadRequest("body too large".into())).into_response(),

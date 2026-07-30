@@ -11,6 +11,7 @@
 
 use dam_api::dto::*;
 use dam_api::id::AssetId;
+use dam_api::service::Visibility;
 use dam_api::LibError;
 use dam_store::Store;
 use serde::Serialize;
@@ -51,8 +52,12 @@ struct CreditRow {
     url: Option<String>,
 }
 
-pub(crate) fn run_export(store: &Store, req: ExportRequest) -> Result<ExportReport, LibError> {
-    let ids = resolve_ids(store, &req)?;
+pub(crate) fn run_export(
+    store: &Store,
+    req: ExportRequest,
+    vis: &Visibility,
+) -> Result<ExportReport, LibError> {
+    let ids = resolve_ids(store, &req, vis)?;
 
     // Gather full records (license/attribution/tags need the inspector record, not the grid row).
     let mut assets = Vec::with_capacity(ids.len());
@@ -92,19 +97,44 @@ pub(crate) fn run_export(store: &Store, req: ExportRequest) -> Result<ExportRepo
     })
 }
 
-/// Resolve the selector to an ordered id set (ids → collection → query → whole library).
-fn resolve_ids(store: &Store, req: &ExportRequest) -> Result<Vec<AssetId>, LibError> {
+/// Resolve the selector to an ordered id set (ids → collection → query → whole library), under
+/// the caller's visibility ceiling — bulk egress gets the same predicate as browse (issue #42
+/// leak audit): explicit ids are filtered, an unreachable collection is `NotFound`, and the
+/// query/whole-library forms compose the ceiling in SQL.
+fn resolve_ids(
+    store: &Store,
+    req: &ExportRequest,
+    vis: &Visibility,
+) -> Result<Vec<AssetId>, LibError> {
     if !req.assets.is_empty() {
-        return Ok(req.assets.clone());
+        let mut out = Vec::with_capacity(req.assets.len());
+        for id in &req.assets {
+            if store.asset_visible(id, vis)? {
+                out.push(*id);
+            }
+        }
+        return Ok(out);
     }
     if let Some(cid) = req.collection {
+        if !store.collection_visible(&cid, vis)? {
+            return Err(LibError::NotFound(format!("collection {cid}")));
+        }
         let coll = store.get_collection(&cid)?;
         return match coll.kind {
-            CollectionKind::Manual => store.collection_member_ids(&cid),
-            CollectionKind::Smart => store.query_asset_ids(&coll.query.unwrap_or_default()),
+            CollectionKind::Manual => {
+                let members = store.collection_member_ids(&cid)?;
+                let mut out = Vec::with_capacity(members.len());
+                for id in members {
+                    if store.asset_visible(&id, vis)? {
+                        out.push(id);
+                    }
+                }
+                Ok(out)
+            }
+            CollectionKind::Smart => store.query_asset_ids(&coll.query.unwrap_or_default(), vis),
         };
     }
-    store.query_asset_ids(&req.query.clone().unwrap_or_default())
+    store.query_asset_ids(&req.query.clone().unwrap_or_default(), vis)
 }
 
 fn needs_attribution(a: &Asset) -> bool {

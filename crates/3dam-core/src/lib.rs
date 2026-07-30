@@ -26,7 +26,7 @@ use dam_api::dto::*;
 use dam_api::event::{ChangeKind, LibraryEvent, SubscribeRequest};
 use dam_api::id::{AssetId, CollectionId, ContentHash, JobId, SourceId};
 use dam_api::page::{Page, PageParams};
-use dam_api::service::{AuthContext, EventStream, LibraryService};
+use dam_api::service::{AuthContext, EventStream, LibraryService, Visibility};
 use dam_api::LibError;
 use dam_store::Store;
 use futures::StreamExt;
@@ -517,11 +517,106 @@ impl EmbeddedLibrary {
             .map_err(|e| LibError::Internal(e.to_string()))?
     }
 
+    // ── visibility enforcement (tech-spec 10 §4.3, issue #42) ────────────────
+    //
+    // The ceiling is resolved once at auth time (server) and enforced here, in the engine, as a
+    // query predicate — so search, similarity, dedup, stats, folders, collections, previews, and
+    // export all filter through the same few store choke points and no transport handler can
+    // forget. An unreachable resource answers `NotFound`/absent, never `Forbidden` — existence is
+    // part of what the ceiling hides.
+
+    /// Restricted contexts may not run library-wide operations (source management, scans,
+    /// analysis, blocklist edits, conversion): the reachable set is per-resource, but these
+    /// operations span the whole catalog.
+    fn require_full_visibility(ctx: &AuthContext, what: &str) -> Result<(), LibError> {
+        if ctx.visibility.is_full() {
+            Ok(())
+        } else {
+            Err(LibError::Forbidden(format!(
+                "{what} requires unrestricted visibility"
+            )))
+        }
+    }
+
+    /// Guard a single-asset read: an asset outside the ceiling answers `NotFound`,
+    /// indistinguishable from a nonexistent id.
+    async fn require_asset_visible(&self, ctx: &AuthContext, id: &AssetId) -> Result<(), LibError> {
+        if ctx.visibility.is_full() {
+            return Ok(());
+        }
+        let vis = ctx.visibility.clone();
+        let id = *id;
+        let ok = self.db(move |s| s.asset_visible(&id, &vis)).await?;
+        if ok {
+            Ok(())
+        } else {
+            Err(LibError::NotFound(format!("asset {id}")))
+        }
+    }
+
+    /// Guard a single-asset write: the asset must be *write*-reachable (a `write` share on its
+    /// source or a containing shared collection). Unreachable-for-read stays `NotFound`; readable
+    /// but not writable is `Forbidden` — the share level, not existence, is what's denied here.
+    async fn require_asset_writable(
+        &self,
+        ctx: &AuthContext,
+        id: &AssetId,
+    ) -> Result<(), LibError> {
+        if ctx.visibility.is_full() {
+            return Ok(());
+        }
+        self.require_asset_visible(ctx, id).await?;
+        let wv = ctx.visibility.write_view();
+        let id = *id;
+        let ok = self.db(move |s| s.asset_visible(&id, &wv)).await?;
+        if ok {
+            Ok(())
+        } else {
+            Err(LibError::Forbidden(
+                "no write access to this asset (a write share is required)".into(),
+            ))
+        }
+    }
+
+    /// Guard a collection write: `NotFound` when unreachable, `Forbidden` without a write share.
+    async fn require_collection_writable(
+        &self,
+        ctx: &AuthContext,
+        id: &CollectionId,
+    ) -> Result<(), LibError> {
+        if ctx.visibility.is_full() {
+            return Ok(());
+        }
+        let vis = ctx.visibility.clone();
+        let cid = *id;
+        let visible = self.db(move |s| s.collection_visible(&cid, &vis)).await?;
+        if !visible {
+            return Err(LibError::NotFound(format!("collection {id}")));
+        }
+        if ctx.visibility.allows_collection_write(id) {
+            Ok(())
+        } else {
+            Err(LibError::Forbidden(
+                "no write access to this collection (a write share is required)".into(),
+            ))
+        }
+    }
+
     /// The local-index query path — the pre-federation body of [`LibraryService::query`], shared
     /// by the plain path and the fan-out engine (which merges this page with the peers').
     pub(crate) async fn local_query(
         &self,
         req: QueryRequest,
+    ) -> Result<Page<AssetSummary>, LibError> {
+        self.local_query_vis(req, Visibility::Full).await
+    }
+
+    /// [`Self::local_query`] under a visibility ceiling (issue #42) — the ceiling composes into the
+    /// store's WHERE clause, so lexical, hybrid, and semantic paths all filter identically.
+    pub(crate) async fn local_query_vis(
+        &self,
+        req: QueryRequest,
+        vis: Visibility,
     ) -> Result<Page<AssetSummary>, LibError> {
         let model = self.semantic.clone();
         self.db(move |s| {
@@ -535,7 +630,7 @@ impl EmbeddedLibrary {
                     .map(|v| (m.space_id(MediaType::Image), v)),
                 _ => None,
             };
-            s.query_assets_semantic(&req, text_vec)
+            s.query_assets_semantic(&req, text_vec, &vis)
         })
         .await
     }
@@ -585,7 +680,7 @@ impl EmbeddedLibrary {
     /// repeated Settings loads don't re-pay it; DB sizes and catalog counts are always live.
     pub async fn storage_usage(&self) -> Result<StorageUsage, LibError> {
         const CACHE_WALK_TTL: std::time::Duration = std::time::Duration::from_secs(30);
-        let stats = self.db(|s| s.stats(None)).await?;
+        let stats = self.db(|s| s.stats(None, &Visibility::Full)).await?;
         let cached = self
             .usage_cache
             .lock()
@@ -751,35 +846,42 @@ fn purge_asset_cache(data_dir: &Path, key: &str) -> u64 {
 impl LibraryService for EmbeddedLibrary {
     async fn query(
         &self,
-        _ctx: &AuthContext,
+        ctx: &AuthContext,
         req: QueryRequest,
     ) -> Result<Page<AssetSummary>, LibError> {
         // Federated fan-out (phase 6, issue #39): merge local + peer pages when federated sources
         // are registered. `local_only` marks a peer-bound call — one hop, never transitive.
-        if !req.local_only {
+        // Restricted contexts never fan out (a peer's catalog is outside their reachable set);
+        // their query runs locally under the ceiling predicate.
+        if !req.local_only && ctx.visibility.is_full() {
             if let Some(page) = federation::federated_query(self, &req).await? {
                 return Ok(page);
             }
         }
-        self.local_query(req).await
+        self.local_query_vis(req, ctx.visibility.clone()).await
     }
 
-    async fn get_asset(&self, _ctx: &AuthContext, id: &AssetId) -> Result<Asset, LibError> {
+    async fn get_asset(&self, ctx: &AuthContext, id: &AssetId) -> Result<Asset, LibError> {
+        self.require_asset_visible(ctx, id).await?;
         let id = *id;
         match self.db(move |s| s.get_asset(&id)).await {
             // A merged result can name a peer-owned asset: proxy the detail read (phase 6).
-            Err(LibError::NotFound(_)) => federation::proxy_get_asset(self, &id)
-                .await
-                .ok_or_else(|| LibError::NotFound(format!("asset {id}"))),
+            // Never for a restricted context — the ceiling can't vouch for peer-owned ids.
+            Err(LibError::NotFound(_)) if ctx.visibility.is_full() => {
+                federation::proxy_get_asset(self, &id)
+                    .await
+                    .ok_or_else(|| LibError::NotFound(format!("asset {id}")))
+            }
             r => r,
         }
     }
 
     async fn read_content(
         &self,
-        _ctx: &AuthContext,
+        ctx: &AuthContext,
         id: &AssetId,
     ) -> Result<AssetContent, LibError> {
+        self.require_asset_visible(ctx, id).await?;
         let id = *id;
         let local = self
             .db(move |s| {
@@ -788,19 +890,22 @@ impl LibraryService for EmbeddedLibrary {
             })
             .await;
         match local {
-            Err(LibError::NotFound(_)) => federation::proxy_read_content(self, &id)
-                .await
-                .ok_or_else(|| LibError::NotFound(format!("asset {id}"))),
+            Err(LibError::NotFound(_)) if ctx.visibility.is_full() => {
+                federation::proxy_read_content(self, &id)
+                    .await
+                    .ok_or_else(|| LibError::NotFound(format!("asset {id}")))
+            }
             r => r,
         }
     }
 
     async fn read_related_content(
         &self,
-        _ctx: &AuthContext,
+        ctx: &AuthContext,
         id: &AssetId,
         rel: &str,
     ) -> Result<AssetContent, LibError> {
+        self.require_asset_visible(ctx, id).await?;
         let id = *id;
         let rel = rel.to_string();
         let rel2 = rel.clone();
@@ -811,19 +916,22 @@ impl LibraryService for EmbeddedLibrary {
             })
             .await;
         match local {
-            Err(LibError::NotFound(_)) => federation::proxy_read_related(self, &id, &rel)
-                .await
-                .ok_or_else(|| LibError::NotFound(format!("asset {id}"))),
+            Err(LibError::NotFound(_)) if ctx.visibility.is_full() => {
+                federation::proxy_read_related(self, &id, &rel)
+                    .await
+                    .ok_or_else(|| LibError::NotFound(format!("asset {id}")))
+            }
             r => r,
         }
     }
 
     async fn read_thumbnail(
         &self,
-        _ctx: &AuthContext,
+        ctx: &AuthContext,
         id: &AssetId,
         max_edge: u32,
     ) -> Result<AssetContent, LibError> {
+        self.require_asset_visible(ctx, id).await?;
         let id = *id;
         let edge = max_edge.clamp(THUMB_MIN_EDGE, THUMB_MAX_EDGE);
         let data_dir = self.data_dir.clone();
@@ -840,8 +948,8 @@ impl LibraryService for EmbeddedLibrary {
             Ok(Some(hit)) => return Ok(hit),
             Ok(None) => {}
             // Peer-owned asset: fetch its remote-owned preview — the one sanctioned federated byte
-            // transfer (tech-spec 07 §4) — through the 7-day local peer cache.
-            Err(LibError::NotFound(_)) => {
+            // transfer (tech-spec 07 §4) — through the 7-day local peer cache. Full-visibility only.
+            Err(LibError::NotFound(_)) if ctx.visibility.is_full() => {
                 return federation::proxy_thumbnail(self, &id, edge)
                     .await
                     .ok_or_else(|| LibError::NotFound(format!("asset {id}")))
@@ -859,9 +967,10 @@ impl LibraryService for EmbeddedLibrary {
 
     async fn read_model_preview(
         &self,
-        _ctx: &AuthContext,
+        ctx: &AuthContext,
         id: &AssetId,
     ) -> Result<AssetContent, LibError> {
+        self.require_asset_visible(ctx, id).await?;
         let id = *id;
         let data_dir = self.data_dir.clone();
         let local = self
@@ -871,15 +980,19 @@ impl LibraryService for EmbeddedLibrary {
             })
             .await;
         match local {
-            Err(LibError::NotFound(_)) => federation::proxy_model_preview(self, &id)
-                .await
-                .ok_or_else(|| LibError::NotFound(format!("asset {id}"))),
+            Err(LibError::NotFound(_)) if ctx.visibility.is_full() => {
+                federation::proxy_model_preview(self, &id)
+                    .await
+                    .ok_or_else(|| LibError::NotFound(format!("asset {id}")))
+            }
             r => r,
         }
     }
 
-    async fn prefetch(&self, _ctx: &AuthContext, req: PrefetchRequest) -> Result<(), LibError> {
-        if req.assets.is_empty() {
+    async fn prefetch(&self, ctx: &AuthContext, req: PrefetchRequest) -> Result<(), LibError> {
+        // A pure optimisation: for a restricted context it's a safe no-op (the on-demand reads
+        // still generate + guard), which keeps hidden ids from steering the warm path.
+        if req.assets.is_empty() || !ctx.visibility.is_full() {
             return Ok(());
         }
         // Warm the exact thumbnail edge the client will request (the grid uses a variable edge the
@@ -921,12 +1034,17 @@ impl LibraryService for EmbeddedLibrary {
 
     async fn library_stats(
         &self,
-        _ctx: &AuthContext,
+        ctx: &AuthContext,
         source: Option<SourceId>,
     ) -> Result<LibraryStats, LibError> {
+        let vis = ctx.visibility.clone();
         let Some(sid) = source else {
-            return self.db(|s| s.stats(None)).await;
+            return self.db(move |s| s.stats(None, &vis)).await;
         };
+        // A source-scoped read of an unreachable source is absent, not an aggregate oracle.
+        if !ctx.visibility.allows_source(&sid) {
+            return Err(LibError::NotFound(format!("source {sid}")));
+        }
         // A federated source's counts live on the peer — proxy the read so the sidebar shows the
         // peer's own numbers, as fresh as the call (phase 6). Local kinds scope the local catalog.
         if let Some(peer) = self
@@ -943,22 +1061,37 @@ impl LibraryService for EmbeddedLibrary {
             .await
             .map_err(|_| LibError::SourceUnavailable(format!("peer '{}' timed out", peer.name)))?;
         }
-        self.db(move |s| s.stats(Some(&sid))).await
+        self.db(move |s| s.stats(Some(&sid), &vis)).await
     }
 
     async fn convert(
         &self,
-        _ctx: &AuthContext,
+        ctx: &AuthContext,
         req: ConvertRequest,
     ) -> Result<ConvertReport, LibError> {
+        // Restricted contexts may convert only assets they can reach (the outputs land in a
+        // server-side dir either way, which non-destructive §5.1 already confines).
+        if !ctx.visibility.is_full() {
+            for id in &req.inputs {
+                self.require_asset_visible(ctx, id).await?;
+            }
+        }
         self.db(move |s| convert::run_convert(s, req)).await
     }
 
-    async fn list_sources(&self, _ctx: &AuthContext) -> Result<Vec<SourceInfo>, LibError> {
-        self.db(|s| s.list_sources()).await
+    async fn list_sources(&self, ctx: &AuthContext) -> Result<Vec<SourceInfo>, LibError> {
+        let all = self.db(|s| s.list_sources()).await?;
+        // An unshared source is absent from the listing (issue #42): filter, don't 403.
+        Ok(all
+            .into_iter()
+            .filter(|s| ctx.visibility.allows_source(&s.id))
+            .collect())
     }
 
-    async fn get_source(&self, _ctx: &AuthContext, id: &SourceId) -> Result<SourceInfo, LibError> {
+    async fn get_source(&self, ctx: &AuthContext, id: &SourceId) -> Result<SourceInfo, LibError> {
+        if !ctx.visibility.allows_source(id) {
+            return Err(LibError::NotFound(format!("source {id}")));
+        }
         let id = *id;
         self.db(move |s| {
             s.get_source(&id)?
@@ -969,9 +1102,14 @@ impl LibraryService for EmbeddedLibrary {
 
     async fn list_folders(
         &self,
-        _ctx: &AuthContext,
+        ctx: &AuthContext,
         req: FolderListing,
     ) -> Result<Vec<FolderEntry>, LibError> {
+        // Folder trees enumerate paths without touching assets (issue #42 leak audit): an
+        // unreachable source has no tree. A collection-only grant reaches assets, not the tree.
+        if !ctx.visibility.allows_source(&req.source) {
+            return Err(LibError::NotFound(format!("source {}", req.source)));
+        }
         // Normalise the prefix so the derived-tree SQL is well-defined: empty (root) or ending in `/`.
         let prefix = if req.prefix.is_empty() || req.prefix.ends_with('/') {
             req.prefix
@@ -982,7 +1120,8 @@ impl LibraryService for EmbeddedLibrary {
         self.db(move |s| s.list_folders(&source, &prefix)).await
     }
 
-    async fn add_source(&self, _ctx: &AuthContext, req: AddSource) -> Result<SourceId, LibError> {
+    async fn add_source(&self, ctx: &AuthContext, req: AddSource) -> Result<SourceId, LibError> {
+        Self::require_full_visibility(ctx, "adding a source")?;
         let opts = dam_sources::ConnOptions {
             username: req.options.username.clone(),
             password: req.options.password.clone(),
@@ -1063,10 +1202,11 @@ impl LibraryService for EmbeddedLibrary {
 
     async fn remove_source(
         &self,
-        _ctx: &AuthContext,
+        ctx: &AuthContext,
         id: &SourceId,
         req: RemoveSource,
     ) -> Result<(), LibError> {
+        Self::require_full_visibility(ctx, "removing a source")?;
         let id = *id;
         self.db(move |s| s.remove_source(&id, req.keep_metadata))
             .await?;
@@ -1077,10 +1217,16 @@ impl LibraryService for EmbeddedLibrary {
     // ── remove / blocklist (issue #21) ───────────────────────────────────────
     async fn remove_asset(
         &self,
-        _ctx: &AuthContext,
+        ctx: &AuthContext,
         id: &AssetId,
         req: RemoveAsset,
     ) -> Result<(), LibError> {
+        self.require_asset_writable(ctx, id).await?;
+        // Blocklisting is a library-wide policy (it affects every future scan), not a per-asset
+        // edit — reserved for unrestricted identities.
+        if req.block {
+            Self::require_full_visibility(ctx, "blocklisting content")?;
+        }
         let id = *id;
         self.db(move |s| s.remove_asset(&id, req.block)).await?;
         // Live update: drop the row from every open grid/inspector (mirrors AssetAdded on scan).
@@ -1088,31 +1234,43 @@ impl LibraryService for EmbeddedLibrary {
         Ok(())
     }
 
-    async fn list_blocklist(&self, _ctx: &AuthContext) -> Result<Vec<BlockEntry>, LibError> {
+    async fn list_blocklist(&self, ctx: &AuthContext) -> Result<Vec<BlockEntry>, LibError> {
+        // Blocked hashes describe library-wide content a restricted caller may not reach — the
+        // list is simply empty for them (absent, not forbidden).
+        if !ctx.visibility.is_full() {
+            return Ok(Vec::new());
+        }
         self.db(|s| s.list_blocklist()).await
     }
 
-    async fn unblock(&self, _ctx: &AuthContext, hash: &ContentHash) -> Result<(), LibError> {
+    async fn unblock(&self, ctx: &AuthContext, hash: &ContentHash) -> Result<(), LibError> {
+        Self::require_full_visibility(ctx, "editing the blocklist")?;
         let hash = *hash;
         self.db(move |s| s.unblock(&hash)).await
     }
 
     // ── collections / smart folders ──────────────────────────────────────────
-    async fn list_collections(&self, _ctx: &AuthContext) -> Result<Vec<Collection>, LibError> {
-        self.db(|s| s.list_collections()).await
+    async fn list_collections(&self, ctx: &AuthContext) -> Result<Vec<Collection>, LibError> {
+        let vis = ctx.visibility.clone();
+        self.db(move |s| s.list_collections_vis(&vis)).await
     }
 
     async fn get_collection(
         &self,
-        _ctx: &AuthContext,
+        ctx: &AuthContext,
         id: &CollectionId,
     ) -> Result<Collection, LibError> {
         let id = *id;
+        let vis = ctx.visibility.clone();
         self.db(move |s| {
+            if !s.collection_visible(&id, &vis)? {
+                return Err(LibError::NotFound(format!("collection {id}")));
+            }
             let mut c = s.get_collection(&id)?;
-            // A smart folder's count is the live match count — compute it on the single-item read.
+            // A smart folder's count is the live match count — compute it on the single-item read,
+            // under the caller's ceiling so the count is never an oracle for hidden matches.
             if c.kind == CollectionKind::Smart {
-                let ids = s.query_asset_ids(&c.query.clone().unwrap_or_default())?;
+                let ids = s.query_asset_ids(&c.query.clone().unwrap_or_default(), &vis)?;
                 c.count = Some(ids.len() as u64);
             }
             Ok(c)
@@ -1122,9 +1280,12 @@ impl LibraryService for EmbeddedLibrary {
 
     async fn create_collection(
         &self,
-        _ctx: &AuthContext,
+        ctx: &AuthContext,
         req: NewCollection,
     ) -> Result<CollectionId, LibError> {
+        // v1: collections are library-level objects with no owner concept — a restricted identity
+        // cannot create one (post-v1 ownership may relax this; ADR 0009 freeze).
+        Self::require_full_visibility(ctx, "creating a collection")?;
         if req.kind == CollectionKind::Smart && req.query.is_none() {
             return Err(LibError::BadRequest(
                 "a smart folder requires a query".into(),
@@ -1139,10 +1300,13 @@ impl LibraryService for EmbeddedLibrary {
 
     async fn update_collection(
         &self,
-        _ctx: &AuthContext,
+        ctx: &AuthContext,
         id: &CollectionId,
         req: UpdateCollection,
     ) -> Result<(), LibError> {
+        self.require_collection_writable(ctx, id).await?;
+        // Replacing a smart folder's saved query changes what it *matches*, not what the caller
+        // can reach — results stay ceiling-filtered — so a write share safely covers it.
         let id = *id;
         let query_json = serialize_opt_query(&req.query)?;
         let name = req.name.clone();
@@ -1152,19 +1316,28 @@ impl LibraryService for EmbeddedLibrary {
 
     async fn delete_collection(
         &self,
-        _ctx: &AuthContext,
+        ctx: &AuthContext,
         id: &CollectionId,
     ) -> Result<(), LibError> {
+        self.require_collection_writable(ctx, id).await?;
         let id = *id;
         self.db(move |s| s.delete_collection(&id)).await
     }
 
     async fn modify_collection_members(
         &self,
-        _ctx: &AuthContext,
+        ctx: &AuthContext,
         id: &CollectionId,
         req: CollectionMembers,
     ) -> Result<(), LibError> {
+        self.require_collection_writable(ctx, id).await?;
+        // Every asset being *added* must itself be reachable — otherwise membership in a shared
+        // collection would grant visibility of a hidden asset (issue #42 rule 5, inverted).
+        if !ctx.visibility.is_full() {
+            for a in &req.add {
+                self.require_asset_visible(ctx, a).await?;
+            }
+        }
         let id = *id;
         let add = req.add.clone();
         let remove = req.remove.clone();
@@ -1174,23 +1347,28 @@ impl LibraryService for EmbeddedLibrary {
 
     async fn collection_assets(
         &self,
-        _ctx: &AuthContext,
+        ctx: &AuthContext,
         id: &CollectionId,
         page: PageParams,
     ) -> Result<Page<AssetSummary>, LibError> {
         let id = *id;
+        let vis = ctx.visibility.clone();
         self.db(move |s| {
+            if !s.collection_visible(&id, &vis)? {
+                return Err(LibError::NotFound(format!("collection {id}")));
+            }
             let coll = s.get_collection(&id)?;
             match coll.kind {
                 CollectionKind::Manual => {
-                    let items = s.collection_summaries(&id, page.clamped(500))?;
+                    let items = s.collection_summaries(&id, page.clamped(500), &vis)?;
                     Ok(Page::new(items, None))
                 }
                 CollectionKind::Smart => {
-                    // Live resolution: run the saved query with the caller's page window.
+                    // Live resolution: run the saved query with the caller's page window, under
+                    // the caller's ceiling (a shared smart folder never widens the reachable set).
                     let mut q = coll.query.unwrap_or_default();
                     q.page = page;
-                    s.query_assets(&q)
+                    s.query_assets_semantic(&q, None, &vis)
                 }
             }
         })
@@ -1199,13 +1377,15 @@ impl LibraryService for EmbeddedLibrary {
 
     async fn export(
         &self,
-        _ctx: &AuthContext,
+        ctx: &AuthContext,
         req: ExportRequest,
     ) -> Result<ExportReport, LibError> {
-        self.db(move |s| export::run_export(s, req)).await
+        let vis = ctx.visibility.clone();
+        self.db(move |s| export::run_export(s, req, &vis)).await
     }
 
-    async fn submit_scan(&self, _ctx: &AuthContext, req: ScanRequest) -> Result<JobId, LibError> {
+    async fn submit_scan(&self, ctx: &AuthContext, req: ScanRequest) -> Result<JobId, LibError> {
+        Self::require_full_visibility(ctx, "scanning")?;
         // Resolve target sources (all file sources when none specified; federated peers excluded).
         let all = self.db(|s| s.list_sources()).await?;
         let sources: Vec<SourceInfo> = if req.sources.is_empty() {
@@ -1244,9 +1424,10 @@ impl LibraryService for EmbeddedLibrary {
 
     async fn submit_analyze(
         &self,
-        _ctx: &AuthContext,
+        ctx: &AuthContext,
         req: AnalyzeRequest,
     ) -> Result<JobId, LibError> {
+        Self::require_full_visibility(ctx, "analysis")?;
         // Plan: resolve the due (or requested) targets up front so the job total is known (§1.2).
         let assets = req.assets.clone();
         let force = req.force;
@@ -1281,9 +1462,14 @@ impl LibraryService for EmbeddedLibrary {
 
     async fn regenerate_thumbnails(
         &self,
-        _ctx: &AuthContext,
+        ctx: &AuthContext,
         req: ThumbnailRegenRequest,
     ) -> Result<ThumbnailRegenReport, LibError> {
+        if !ctx.visibility.is_full() {
+            for id in &req.assets {
+                self.require_asset_writable(ctx, id).await?;
+            }
+        }
         let data_dir = self.data_dir.clone();
         // Resolve each asset's content key inside the store lock, then purge its cache slice; the
         // next thumbnail read re-renders from source. A missing asset fails the whole request (the
@@ -1309,10 +1495,14 @@ impl LibraryService for EmbeddedLibrary {
         ctx: &AuthContext,
         req: SimilarRequest,
     ) -> Result<Page<SimilarHit>, LibError> {
+        // The seed asset itself must be reachable (a hidden id must not seed a ranking), and the
+        // neighbour candidates are ceiling-filtered inside the store's summary fetch.
+        self.require_asset_visible(ctx, &req.asset).await?;
         let (asset, k) = (req.asset, req.k);
         let filters = req.filters.clone();
+        let vis = ctx.visibility.clone();
         let hits = self
-            .db(move |s| s.similar(&asset, k, &filters))
+            .db(move |s| s.similar(&asset, k, &filters, &vis))
             .await?
             .into_iter()
             // Tag each hit with the media space it was ranked in (the explanation, §3.2).
@@ -1322,7 +1512,8 @@ impl LibraryService for EmbeddedLibrary {
                 score,
             })
             .collect::<Vec<_>>();
-        if req.local_only {
+        if req.local_only || !ctx.visibility.is_full() {
+            // Restricted contexts never fan out — peer catalogs sit outside their reachable set.
             return Ok(Page::new(hits, None));
         }
         // Cross-peer similarity (phase 6, issue #40): ship the query asset's own vector to every
@@ -1371,9 +1562,10 @@ impl LibraryService for EmbeddedLibrary {
 
     async fn find_similar_by_vector(
         &self,
-        _ctx: &AuthContext,
+        ctx: &AuthContext,
         req: dam_api::VectorSimilarRequest,
     ) -> Result<Page<SimilarHit>, LibError> {
+        let vis = ctx.visibility.clone();
         // The serving side of cross-peer similarity (issue #40): rank the shipped vector against
         // this catalog's own index. Strictly local by construction — never re-fans-out.
         let dam_api::VectorSimilarRequest {
@@ -1385,7 +1577,7 @@ impl LibraryService for EmbeddedLibrary {
         } = req;
         let space_for_hits = space.clone();
         let hits = self
-            .db(move |s| s.similar_by_vector(&space, &vector, k, &filters))
+            .db(move |s| s.similar_by_vector(&space, &vector, k, &filters, &vis))
             .await?
             .into_iter()
             .map(|(asset, score)| SimilarHit {
@@ -1399,17 +1591,19 @@ impl LibraryService for EmbeddedLibrary {
 
     async fn list_duplicates(
         &self,
-        _ctx: &AuthContext,
+        ctx: &AuthContext,
         req: DupRequest,
     ) -> Result<Vec<DupGroup>, LibError> {
-        self.db(move |s| s.duplicates(&req)).await
+        let vis = ctx.visibility.clone();
+        self.db(move |s| s.duplicates(&req, &vis)).await
     }
 
     async fn review_suggestion(
         &self,
-        _ctx: &AuthContext,
+        ctx: &AuthContext,
         req: SuggestionReview,
     ) -> Result<(), LibError> {
+        self.require_asset_writable(ctx, &req.asset).await?;
         let state = match req.action {
             ReviewAction::Accept => "confirmed",
             ReviewAction::Reject => "rejected",
@@ -1424,7 +1618,8 @@ impl LibraryService for EmbeddedLibrary {
         Ok(())
     }
 
-    async fn set_favorite(&self, _ctx: &AuthContext, req: FavoriteRequest) -> Result<(), LibError> {
+    async fn set_favorite(&self, ctx: &AuthContext, req: FavoriteRequest) -> Result<(), LibError> {
+        self.require_asset_writable(ctx, &req.asset).await?;
         let id = req.asset;
         let on = req.favorite;
         self.db(move |s| s.set_favorite(&id, on)).await?;
@@ -1435,20 +1630,31 @@ impl LibraryService for EmbeddedLibrary {
         Ok(())
     }
 
-    async fn get_job(&self, _ctx: &AuthContext, id: &JobId) -> Result<JobStatus, LibError> {
+    async fn get_job(&self, ctx: &AuthContext, id: &JobId) -> Result<JobStatus, LibError> {
+        // Jobs are library-wide operations (scans/analysis name paths in their progress): absent
+        // for restricted contexts, who also cannot submit them.
+        if !ctx.visibility.is_full() {
+            return Err(LibError::NotFound(format!("job {id}")));
+        }
         let id = *id;
         self.db(move |s| s.get_job(&id)).await
     }
 
     async fn list_jobs(
         &self,
-        _ctx: &AuthContext,
+        ctx: &AuthContext,
         req: JobListRequest,
     ) -> Result<Page<JobStatus>, LibError> {
+        if !ctx.visibility.is_full() {
+            return Ok(Page::new(Vec::new(), None));
+        }
         self.db(move |s| s.list_jobs(&req)).await
     }
 
-    async fn cancel_job(&self, _ctx: &AuthContext, id: &JobId) -> Result<(), LibError> {
+    async fn cancel_job(&self, ctx: &AuthContext, id: &JobId) -> Result<(), LibError> {
+        if !ctx.visibility.is_full() {
+            return Err(LibError::NotFound(format!("job {id}")));
+        }
         if let Some(flag) = self.cancels.lock().unwrap().get(id) {
             flag.store(true, Ordering::Relaxed);
         }
@@ -1466,13 +1672,31 @@ impl LibraryService for EmbeddedLibrary {
 
     async fn subscribe(
         &self,
-        _ctx: &AuthContext,
+        ctx: &AuthContext,
         _req: SubscribeRequest,
     ) -> Result<EventStream<LibraryEvent>, LibError> {
         let rx = self.events.subscribe();
+        let vis = ctx.visibility.clone();
         // Drop lag errors (a slow subscriber missed events) rather than failing the stream.
-        let stream =
-            tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(|r| async move { r.ok() });
+        // Restricted subscribers get a conservatively-filtered stream (issue #42 leak audit):
+        // job progress names paths, and per-asset events can't be cheaply vouched for, so only
+        // reachable-source state changes and catalog resets pass. Their UIs refetch on demand.
+        let stream = tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(move |r| {
+            let keep = match (&vis, r.as_ref()) {
+                (_, Err(_)) => false,
+                (Visibility::Full, Ok(_)) => true,
+                (v, Ok(LibraryEvent::SourceState { id, .. })) => v.allows_source(id),
+                (_, Ok(LibraryEvent::CatalogReset)) => true,
+                (Visibility::Restricted(_), Ok(_)) => false,
+            };
+            async move {
+                if keep {
+                    r.ok()
+                } else {
+                    None
+                }
+            }
+        });
         Ok(Box::pin(stream))
     }
 }

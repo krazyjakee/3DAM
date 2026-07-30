@@ -4,7 +4,8 @@
 // one credential; when it carries the admin scope this surface opens, otherwise it 403s).
 
 import { ApiError } from "./client";
-import { authHeaders, resolveUrl } from "@/lib/server";
+import type { AccountRole } from "./types";
+import { authHeaders, csrfHeaders, resolveUrl } from "@/lib/server";
 
 const ADMIN = "/admin/api";
 
@@ -24,6 +25,7 @@ export type FlagKey =
   | "mcp_server"
   | "network_writes"
   | "federation"
+  | "user_accounts"
   | "auto_thumbnail"
   | "auto_analyze";
 
@@ -56,6 +58,10 @@ export interface AdminStatus {
   network_writes: boolean;
   exposed_without_auth: boolean;
   token_count: number;
+  // ── user accounts (issue #42; absent on older servers) ──
+  accounts_enabled?: boolean;
+  unclaimed?: boolean;
+  account_count?: number;
 }
 
 export interface TokenInfo {
@@ -86,6 +92,64 @@ export interface AuditEntry {
   action: string;
   target?: string | null;
   detail?: unknown;
+}
+
+// ── user accounts / groups / shares (issue #42; 404 while the flag is off) ───
+
+export interface AccountInfo {
+  account_id: string;
+  username: string;
+  display_name: string | null;
+  role: AccountRole;
+  disabled: boolean;
+  created: number;
+  last_login: number | null;
+}
+
+export interface NewAccount {
+  username: string;
+  password: string;
+  display_name?: string | null;
+  role: AccountRole;
+}
+
+/** Patch an account: absent fields are unchanged. `password` resets the credential. */
+export interface UpdateAccount {
+  display_name?: string | null;
+  role?: AccountRole;
+  disabled?: boolean;
+  password?: string;
+}
+
+export interface GroupInfo {
+  group_id: string;
+  name: string;
+  created: number;
+  /** Member account ids. */
+  members: string[];
+}
+
+export type ShareResource = "source" | "collection";
+export type ShareAccess = "read" | "write";
+
+/** Grant one account *or* one group access to a source/collection (exactly one target set). */
+export interface NewShare {
+  resource: ShareResource;
+  resource_id: string;
+  account_id?: string | null;
+  group_id?: string | null;
+  access: ShareAccess;
+}
+
+export interface ShareInfo {
+  share_id: string;
+  resource: ShareResource;
+  resource_id: string;
+  account_id?: string | null;
+  group_id?: string | null;
+  access: ShareAccess;
+  granted_by: string;
+  created: number;
 }
 
 // ── storage & maintenance (Settings §Storage) ────────────────────────────────
@@ -137,7 +201,12 @@ export interface FactoryResetReport {
 }
 
 function headers(json: boolean): HeadersInit {
-  const h: Record<string, string> = { accept: "application/json", ...authHeaders() };
+  // The CSRF stamp rides every admin call (cookie-session mutations need it; harmless elsewhere).
+  const h: Record<string, string> = {
+    accept: "application/json",
+    ...authHeaders(),
+    ...csrfHeaders(),
+  };
   if (json) h["content-type"] = "application/json";
   return h;
 }
@@ -189,6 +258,74 @@ export const admin = {
     ),
   audit: async (limit = 100) =>
     decode<AuditEntry[]>(await fetch(url(`/audit?limit=${limit}`), { headers: headers(false) })),
+
+  // ── user accounts / groups / shares (issue #42) ────────────────────────────
+  accounts: async () =>
+    decode<AccountInfo[]>(await fetch(url("/accounts"), { headers: headers(false) })),
+  createAccount: async (req: NewAccount) =>
+    decode<AccountInfo>(
+      await fetch(url("/accounts"), {
+        method: "POST",
+        headers: headers(true),
+        body: JSON.stringify(req),
+      }),
+    ),
+  updateAccount: async (id: string, req: UpdateAccount) =>
+    decode<AccountInfo>(
+      await fetch(url(`/accounts/${id}`), {
+        method: "PUT",
+        headers: headers(true),
+        body: JSON.stringify(req),
+      }),
+    ),
+  deleteAccount: async (id: string) =>
+    decode<void>(
+      await fetch(url(`/accounts/${id}`), { method: "DELETE", headers: headers(false) }),
+    ),
+  /** Revoke every live session of one account ("sign out everywhere"). */
+  revokeAccountSessions: async (id: string) =>
+    decode<{ revoked: number }>(
+      await fetch(url(`/accounts/${id}/sessions`), { method: "DELETE", headers: headers(false) }),
+    ),
+
+  groups: async () =>
+    decode<GroupInfo[]>(await fetch(url("/groups"), { headers: headers(false) })),
+  createGroup: async (name: string) =>
+    decode<GroupInfo>(
+      await fetch(url("/groups"), {
+        method: "POST",
+        headers: headers(true),
+        body: JSON.stringify({ name }),
+      }),
+    ),
+  deleteGroup: async (id: string) =>
+    decode<void>(
+      await fetch(url(`/groups/${id}`), { method: "DELETE", headers: headers(false) }),
+    ),
+  /** Replace a group's member set (the full list, not a delta). */
+  setGroupMembers: async (id: string, accountIds: string[]) =>
+    decode<GroupInfo>(
+      await fetch(url(`/groups/${id}/members`), {
+        method: "PUT",
+        headers: headers(true),
+        body: JSON.stringify({ account_ids: accountIds }),
+      }),
+    ),
+
+  shares: async () =>
+    decode<ShareInfo[]>(await fetch(url("/shares"), { headers: headers(false) })),
+  createShare: async (req: NewShare) =>
+    decode<ShareInfo>(
+      await fetch(url("/shares"), {
+        method: "POST",
+        headers: headers(true),
+        body: JSON.stringify(req),
+      }),
+    ),
+  deleteShare: async (id: string) =>
+    decode<void>(
+      await fetch(url(`/shares/${id}`), { method: "DELETE", headers: headers(false) }),
+    ),
 
   // ── storage & maintenance ──────────────────────────────────────────────────
   storageUsage: async () =>

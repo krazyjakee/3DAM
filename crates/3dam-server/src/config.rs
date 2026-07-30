@@ -20,6 +20,8 @@ pub struct ServeFile {
     pub flags: FlagsBlock,
     #[serde(default)]
     pub resources: ResourcesBlock,
+    #[serde(default)]
+    pub accounts: AccountsBlock,
 }
 
 /// `[resources]` — the good-neighbour knobs (tech-spec 14 §5). Unset values fall back to the
@@ -62,6 +64,18 @@ pub struct FlagsBlock {
     /// Serve as a federation peer (phase 6, issue #39): mounts `GET /api/v1/advertise` so other
     /// 3DAM instances can register this one as a federated source. Off by default.
     pub federation: Option<bool>,
+    /// Full user accounts (phase 6, issue #42): login/session auth, groups, sharing. Off by
+    /// default; on raises the effective auth gate to at least `token`.
+    pub user_accounts: Option<bool>,
+}
+
+/// `[accounts]` — the config-plane recovery hatch (ADR 0009 §3, issue #42). Not a flag: it acts
+/// once per boot, not as live-toggleable state.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct AccountsBlock {
+    /// Re-open the first-run claim window this boot, so a lost sole admin can be recovered: the
+    /// next claim from localhost becomes a (new) admin account. Remove it again after recovery.
+    pub reopen_claim: Option<bool>,
 }
 
 impl ServeFile {
@@ -101,6 +115,9 @@ impl ServeFile {
         }
         if let Some(f) = self.flags.federation {
             out.push((FlagKey::Federation, FlagValue::Bool(f)));
+        }
+        if let Some(u) = self.flags.user_accounts {
+            out.push((FlagKey::UserAccounts, FlagValue::Bool(u)));
         }
         out
     }

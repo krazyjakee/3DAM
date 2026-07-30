@@ -5,6 +5,7 @@
 //! HTTP, so it costs nothing to link everywhere and imposes no transitive weight. Everyone
 //! depends on it; it depends on no other workspace crate.
 
+pub mod accounts;
 pub mod admin;
 pub mod dto;
 pub mod error;
@@ -24,6 +25,11 @@ pub fn now_ms() -> i64 {
 }
 
 // Flat re-exports so consumers write `dam_api::AssetId`, `dam_api::LibError`, etc.
+pub use accounts::{
+    AccountIdentity, AccountInfo, AccountsStatus, ClaimRequest, GroupInfo, GroupMembers,
+    LoginReply, LoginRequest, NewAccount, NewGroup, NewShare, Role, SessionInfo, ShareAccess,
+    ShareInfo, ShareResource, UpdateAccount,
+};
 pub use dto::*;
 pub use error::{internal, ErrorBody, LibError};
 pub use event::{ChangeKind, EventTopic, JobEvent, LibraryEvent, SubscribeRequest};
@@ -32,4 +38,6 @@ pub use federation::{
 };
 pub use id::{AssetId, CollectionId, ContentHash, JobId, SourceId, TagId};
 pub use page::{Cursor, ItemWarning, Page, PageParams, PartialStatus};
-pub use service::{AuthContext, EventStream, LibraryService, Scope, Scopes, WhoAmI};
+pub use service::{
+    AuthContext, EventStream, LibraryService, Scope, Scopes, Visibility, VisibilityScope, WhoAmI,
+};

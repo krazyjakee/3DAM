@@ -1636,6 +1636,7 @@ name = "dam-server"
 version = "0.1.1"
 dependencies = [
  "anyhow",
+ "argon2",
  "axum",
  "axum-server",
  "blake3",

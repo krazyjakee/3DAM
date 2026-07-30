@@ -24,18 +24,100 @@ impl Store {
     }
 
     pub fn list_collections(&self) -> Result<Vec<Collection>, LibError> {
+        self.list_collections_vis(&Visibility::Full)
+    }
+
+    /// Collections reachable under a visibility ceiling (issue #42 rule 5): a collection is present
+    /// iff it was shared directly, **or** it is a *view over* assets the caller can already reach
+    /// (≥1 member in a readable source). A shared collection's member count is its real count; for
+    /// a source-derived view the count still reflects all members — the assets themselves stay
+    /// filtered by the query path, so no hidden asset is enumerable through it.
+    pub fn list_collections_vis(&self, vis: &Visibility) -> Result<Vec<Collection>, LibError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, name, kind, query, created_at, updated_at,
-                        (SELECT COUNT(*) FROM collection_member m WHERE m.collection_id = collection.id)
-                 FROM collection ORDER BY name COLLATE NOCASE",
-            )
-            .map_err(internal)?;
+        let mut where_sql = String::new();
+        let mut binds: Vec<Value> = Vec::new();
+        if let Some(scope) = vis.restricted() {
+            let mut arms: Vec<String> = vec!["0=1".into()];
+            if !scope.collections.is_empty() {
+                let ph = scope
+                    .collections
+                    .iter()
+                    .map(|_| "?")
+                    .collect::<Vec<_>>()
+                    .join(",");
+                arms.push(format!("collection.id IN ({ph})"));
+                for c in &scope.collections {
+                    binds.push(Value::Blob(c.as_bytes().to_vec()));
+                }
+            }
+            if !scope.sources.is_empty() {
+                let ph = scope
+                    .sources
+                    .iter()
+                    .map(|_| "?")
+                    .collect::<Vec<_>>()
+                    .join(",");
+                arms.push(format!(
+                    "EXISTS (SELECT 1 FROM collection_member m JOIN asset a ON a.id = m.asset_id
+                             WHERE m.collection_id = collection.id AND a.source_id IN ({ph}))"
+                ));
+                for s in &scope.sources {
+                    binds.push(Value::Blob(s.as_bytes().to_vec()));
+                }
+            }
+            where_sql = format!(" WHERE ({})", arms.join(" OR "));
+        }
+        let sql = format!(
+            "SELECT id, name, kind, query, created_at, updated_at,
+                    (SELECT COUNT(*) FROM collection_member m WHERE m.collection_id = collection.id)
+             FROM collection{where_sql} ORDER BY name COLLATE NOCASE"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(internal)?;
         let rows = stmt
-            .query_map([], |r| Self::row_to_collection(r, true))
+            .query_map(rusqlite::params_from_iter(binds.iter()), |r| {
+                Self::row_to_collection(r, true)
+            })
             .map_err(internal)?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(internal)
+    }
+
+    /// Whether one collection is reachable under a ceiling — the single-resource form of
+    /// [`Self::list_collections_vis`], used by the engine's `get_collection`/`collection_assets`
+    /// guards so an unreachable collection is a plain `NotFound` (absent, not forbidden).
+    pub fn collection_visible(
+        &self,
+        id: &CollectionId,
+        vis: &Visibility,
+    ) -> Result<bool, LibError> {
+        let Some(scope) = vis.restricted() else {
+            return Ok(true);
+        };
+        if scope.collections.contains(id) {
+            return Ok(true);
+        }
+        if scope.sources.is_empty() {
+            return Ok(false);
+        }
+        let conn = self.conn.lock().unwrap();
+        let ph = scope
+            .sources
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut binds: Vec<Value> = vec![Value::Blob(id.as_bytes().to_vec())];
+        for s in &scope.sources {
+            binds.push(Value::Blob(s.as_bytes().to_vec()));
+        }
+        let sql = format!(
+            "SELECT 1 FROM collection_member m JOIN asset a ON a.id = m.asset_id
+             WHERE m.collection_id = ?1 AND a.source_id IN ({ph}) LIMIT 1"
+        );
+        let hit: Option<i64> = conn
+            .query_row(&sql, rusqlite::params_from_iter(binds.iter()), |r| r.get(0))
+            .optional()
+            .map_err(internal)?;
+        Ok(hit.is_some())
     }
 
     pub fn get_collection(&self, id: &CollectionId) -> Result<Collection, LibError> {
@@ -170,24 +252,51 @@ impl Store {
     }
 
     /// Members of a manual collection as grid summaries, newest-added first (bounded by `limit`).
+    /// The visibility ceiling filters members: a shared collection's own members all pass (the
+    /// collection id is in the ceiling), while a source-derived collection view shows only the
+    /// members from readable sources.
     pub fn collection_summaries(
         &self,
         id: &CollectionId,
         limit: u32,
+        vis: &Visibility,
     ) -> Result<Vec<AssetSummary>, LibError> {
         let conn = self.conn.lock().unwrap();
+        let mut vis_sql = String::new();
+        let mut vis_binds: Vec<Value> = Vec::new();
+        push_visibility(vis, "asset", &mut vis_sql, &mut vis_binds);
         let sql = format!(
             "{GRID_SELECT} FROM collection_member cm JOIN asset ON asset.id = cm.asset_id {ATTR_JOINS} \
-             WHERE cm.collection_id = ?1 ORDER BY cm.added_at DESC, asset.id ASC LIMIT ?2"
+             WHERE cm.collection_id = ?{vis_sql} ORDER BY cm.added_at DESC, asset.id ASC LIMIT ?"
         );
+        let mut binds: Vec<Value> = vec![Value::Blob(id.as_bytes().to_vec())];
+        binds.extend(vis_binds);
+        binds.push(Value::Integer(limit.min(QUERY_MAX_LIMIT) as i64));
         let mut stmt = conn.prepare(&sql).map_err(internal)?;
         let rows = stmt
-            .query_map(
-                params![id.as_bytes().to_vec(), limit.min(QUERY_MAX_LIMIT) as i64],
-                row_to_summary,
-            )
+            .query_map(rusqlite::params_from_iter(binds.iter()), row_to_summary)
             .map_err(internal)?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(internal)
+    }
+
+    /// Whether one asset is reachable under a ceiling: readable source, or membership in a readable
+    /// collection. The single-asset guard behind `get_asset`/`read_content`/thumbnail/preview —
+    /// an unreachable asset answers `NotFound`, indistinguishable from a nonexistent one.
+    pub fn asset_visible(&self, id: &AssetId, vis: &Visibility) -> Result<bool, LibError> {
+        if vis.restricted().is_none() {
+            return Ok(true);
+        }
+        let conn = self.conn.lock().unwrap();
+        let mut where_sql = String::from("SELECT 1 FROM asset WHERE asset.id = ?");
+        let mut binds: Vec<Value> = vec![Value::Blob(id.as_bytes().to_vec())];
+        push_visibility(vis, "asset", &mut where_sql, &mut binds);
+        let hit: Option<i64> = conn
+            .query_row(&where_sql, rusqlite::params_from_iter(binds.iter()), |r| {
+                r.get(0)
+            })
+            .optional()
+            .map_err(internal)?;
+        Ok(hit.is_some())
     }
 
     /// Collections that contain an asset (manual membership) — surfaced on the inspector record.

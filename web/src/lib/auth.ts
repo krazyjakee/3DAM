@@ -16,6 +16,10 @@ export const AUTH_COPY = {
   lacksRead: "That token is missing the read access needed to browse.",
   /** Could not reach the server at all. */
   unreachable: "Couldn't reach that server — check the address and that it's running.",
+  /** A username/password pair the server rejected (401, user accounts). */
+  wrongCredentials: "Wrong username or password.",
+  /** Too many failed sign-ins — the server locked the account out for a while (429). */
+  lockedOut: "Too many attempts — try again in a few minutes.",
   /** The standard write-gate tooltip for a caller lacking the write scope. */
   needsWrite: "Requires write access — sign in with a token that has it.",
   /** A scope-denied write (403) reframed for a signed-in but under-scoped token. */

@@ -104,6 +104,16 @@ export function authHeaders(): Record<string, string> {
   return config.token ? { authorization: `Bearer ${config.token}` } : {};
 }
 
+/** The `x-dam-csrf` header for cookie-session-authenticated requests (user accounts, issue #42).
+ *  The server mirrors the CSRF value in the readable `dam_csrf` cookie exactly so a reloaded page
+ *  can recover it here; every non-GET request authenticated by the session cookie must carry it.
+ *  Attached unconditionally by the shared fetch helpers — it's harmless alongside a bearer token or
+ *  on an auth-off server (empty when the cookie is absent). */
+export function csrfHeaders(): Record<string, string> {
+  const m = document.cookie.match(/(?:^|;\s*)dam_csrf=([^;]+)/);
+  return m ? { "x-dam-csrf": decodeURIComponent(m[1]) } : {};
+}
+
 /** A media URL (`<img>`/`<audio>`/mesh `src`): base-resolved, with the token as a `?token=` query
  *  param since element loads can't set an `Authorization` header. */
 export function mediaUrl(path: string): string {

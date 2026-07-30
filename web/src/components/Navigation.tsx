@@ -18,6 +18,7 @@ import {
   Pencil,
   RefreshCw,
   Settings as SettingsIcon,
+  Share2,
   Sparkles,
   Star,
   Sun,
@@ -34,8 +35,10 @@ import {
   useScan,
   useSources,
   useStats,
+  useVersion,
 } from "@/api/queries";
 import { useCan } from "@/api/queries";
+import type { ShareResource } from "@/api/admin";
 import { useConnection } from "@/api/connection";
 import { useWriteGate, type WriteGate } from "@/lib/write-gate";
 import type {
@@ -52,6 +55,7 @@ import { useDialogs } from "@/lib/dialogs";
 import { useTheme, type ThemePref } from "@/lib/theme";
 import { AddSourceDialog } from "./AddSourceDialog";
 import { FolderTree } from "./FolderTree";
+import { ShareDialog } from "./ShareDialog";
 
 const MEDIA: { key: MediaType; label: string; Icon: typeof AudioLines }[] = [
   { key: "audio", label: "Audio", Icon: AudioLines },
@@ -195,6 +199,15 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
   const { gate } = useWriteGate();
   const canAdmin = useCan("admin");
   const [showAdd, setShowAdd] = useState(false);
+  // Sharing (user accounts, issue #42): the Share… affordance is admin-only and needs the
+  // `user_accounts` flag on — /api/version already reports it, so no extra query.
+  const accountsOn = useVersion().data?.accounts === true;
+  const canShare = canAdmin && accountsOn;
+  const [share, setShare] = useState<{
+    resource: ShareResource;
+    id: string;
+    name: string;
+  } | null>(null);
 
   const total = stats.data?.total ?? 0;
   const byMedia = stats.data?.by_media ?? {};
@@ -353,6 +366,11 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
             // Selecting the source row means the whole source — drop any folder scope (issue #66).
             go({ source: state.source === s.id ? null : s.id, path: null, collection: null })
           }
+          onShare={
+            canShare
+              ? () => setShare({ resource: "source", id: s.id, name: s.name })
+              : undefined
+          }
           onRescan={() => scan.mutate({ sources: [s.id], mode: "delta" })}
           onRemove={async () => {
             const n = s.stats.asset_count;
@@ -379,6 +397,11 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
       {/* collections & smart folders (phase 4) */}
       <Collections
         gate={gate}
+        onShare={
+          canShare
+            ? (c) => setShare({ resource: "collection", id: c.id, name: c.name })
+            : undefined
+        }
         activeId={state.collection}
         onSelect={(id) =>
           go({
@@ -434,6 +457,14 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
         </span>
       )}
       {showAdd && <AddSourceDialog onClose={() => setShowAdd(false)} />}
+      {share && (
+        <ShareDialog
+          resource={share.resource}
+          resourceId={share.id}
+          resourceName={share.name}
+          onClose={() => setShare(null)}
+        />
+      )}
     </nav>
   );
 }
@@ -480,10 +511,13 @@ function Collections({
   gate,
   activeId,
   onSelect,
+  onShare,
 }: {
   gate: WriteGate["gate"];
   activeId: string | null;
   onSelect: (id: string | null) => void;
+  /** Open the sharing dialog for a collection (admin + accounts flag on); undefined hides it. */
+  onShare?: (c: Collection) => void;
 }) {
   const collections = useCollections();
   const create = useCreateCollection();
@@ -526,6 +560,7 @@ function Collections({
           collection={c}
           gate={gate}
           active={activeId === c.id}
+          onShare={onShare && (() => onShare(c))}
           onSelect={() => onSelect(activeId === c.id ? null : c.id)}
           onRename={async () => {
             const name = (
@@ -559,6 +594,7 @@ function CollectionRow({
   onSelect,
   onRename,
   onDelete,
+  onShare,
 }: {
   collection: Collection;
   gate: WriteGate["gate"];
@@ -566,6 +602,8 @@ function CollectionRow({
   onSelect: () => void;
   onRename: () => void;
   onDelete: () => void;
+  /** Sharing (issue #42) — present only for admins with the accounts flag on. */
+  onShare?: () => void;
 }) {
   const smart = collection.kind === "smart";
   return (
@@ -595,6 +633,17 @@ function CollectionRow({
         )}
       </button>
       <div className="hidden items-center gap-1 group-hover:flex coarse:flex">
+        {/* Sharing (issue #42): admin-only, so it bypasses the write gate — an admin always may. */}
+        {onShare && (
+          <button
+            className="flex items-center justify-center text-fg-dim hover:text-accent coarse:min-h-11 coarse:min-w-11"
+            aria-label={`Share collection ${collection.name}`}
+            title="Share…"
+            onClick={onShare}
+          >
+            <Share2 size={12} />
+          </button>
+        )}
         {/* Renaming a smart folder is fine; its query is edited via the CLI in v1. */}
         <button
           className="flex items-center justify-center text-fg-dim hover:text-accent disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:text-fg-dim coarse:min-h-11 coarse:min-w-11"
@@ -625,6 +674,7 @@ function SourceRow({
   onSelect,
   onRescan,
   onRemove,
+  onShare,
   onNavigate,
 }: {
   source: SourceInfo;
@@ -634,6 +684,8 @@ function SourceRow({
   onSelect: () => void;
   onRescan: () => void;
   onRemove: () => void;
+  /** Sharing (issue #42) — present only for admins with the accounts flag on. */
+  onShare?: () => void;
   onNavigate?: () => void;
 }) {
   const scanning = source.state === "scanning";
@@ -711,6 +763,17 @@ function SourceRow({
       </button>
       {/* Hover-reveal under a mouse; always visible on touch, where there is no hover. */}
       <div className="hidden items-center gap-1 group-hover:flex coarse:flex">
+        {/* Sharing (issue #42): admin-only, so it bypasses the write gate — an admin always may. */}
+        {onShare && (
+          <button
+            className="flex items-center justify-center text-fg-dim hover:text-accent coarse:min-h-11 coarse:min-w-11"
+            aria-label={`Share source ${source.name}`}
+            title="Share…"
+            onClick={onShare}
+          >
+            <Share2 size={12} />
+          </button>
+        )}
         {!peer && (
           <button
             className="flex items-center justify-center text-fg-dim hover:text-accent disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:text-fg-dim coarse:min-h-11 coarse:min-w-11"

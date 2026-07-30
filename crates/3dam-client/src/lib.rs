@@ -4,6 +4,9 @@
 //! of the seam. Phase 1 covers the REST slice; the WS live-update transport lands with the server WS.
 
 use async_trait::async_trait;
+use dam_api::accounts::{
+    AccountInfo, GroupInfo, GroupMembers, NewAccount, NewGroup, NewShare, ShareInfo, UpdateAccount,
+};
 use dam_api::admin::{
     AdminStatus, AuditEntry, CacheTarget, ClearAnalysisReport, ClearCacheReport, ClearCacheRequest,
     ConfirmRequest, FactoryResetReport, FlagInfo, NewToken, NewTokenReply, SetFlag, SetFlagReply,
@@ -257,6 +260,17 @@ impl ApiClient {
         Self::decode(resp).await
     }
 
+    /// DELETE with no reply body (the common case; a DELETE that answers JSON decodes inline).
+    async fn delete(&self, path: &str) -> Result<(), LibError> {
+        let resp = self
+            .http
+            .delete(self.url(path)?)
+            .send()
+            .await
+            .map_err(|e| LibError::SourceUnavailable(e.to_string()))?;
+        Self::expect_no_content(resp).await
+    }
+
     // ── federation (phase 6, issue #39) — this client is also the peer transport ──
 
     /// `GET /api/v1/advertise` — the peer's self-description (protocol version, catalog weight,
@@ -291,13 +305,7 @@ impl ApiClient {
     }
     /// `DELETE /admin/api/tokens/{id}`.
     pub async fn admin_revoke_token(&self, id: &str) -> Result<(), LibError> {
-        let resp = self
-            .http
-            .delete(self.url(&format!("/admin/api/tokens/{id}"))?)
-            .send()
-            .await
-            .map_err(|e| LibError::SourceUnavailable(e.to_string()))?;
-        Self::expect_no_content(resp).await
+        self.delete(&format!("/admin/api/tokens/{id}")).await
     }
     /// `GET /admin/api/audit?limit=N`.
     pub async fn admin_audit(&self, limit: u32) -> Result<Vec<AuditEntry>, LibError> {
@@ -342,6 +350,75 @@ impl ApiClient {
             &ConfirmRequest { confirm },
         )
         .await
+    }
+
+    // ── accounts / groups / shares (phase 6, issue #42) ──────────────────────
+    // The whole surface 404s while the server's `user_accounts` flag is off (ADR 0004).
+
+    /// `GET /admin/api/accounts`.
+    pub async fn admin_accounts(&self) -> Result<Vec<AccountInfo>, LibError> {
+        self.get("/admin/api/accounts").await
+    }
+    /// `POST /admin/api/accounts`.
+    pub async fn admin_create_account(&self, req: &NewAccount) -> Result<AccountInfo, LibError> {
+        self.post("/admin/api/accounts", req).await
+    }
+    /// `PUT /admin/api/accounts/{id}` — partial update; absent fields are left unchanged.
+    pub async fn admin_update_account(
+        &self,
+        id: &str,
+        req: &UpdateAccount,
+    ) -> Result<AccountInfo, LibError> {
+        self.put(&format!("/admin/api/accounts/{id}"), req).await
+    }
+    /// `DELETE /admin/api/accounts/{id}`.
+    pub async fn admin_delete_account(&self, id: &str) -> Result<(), LibError> {
+        self.delete(&format!("/admin/api/accounts/{id}")).await
+    }
+    /// `DELETE /admin/api/accounts/{id}/sessions` — sign the account out everywhere; returns how
+    /// many sessions were revoked.
+    pub async fn admin_revoke_account_sessions(&self, id: &str) -> Result<u64, LibError> {
+        let resp = self
+            .http
+            .delete(self.url(&format!("/admin/api/accounts/{id}/sessions"))?)
+            .send()
+            .await
+            .map_err(|e| LibError::SourceUnavailable(e.to_string()))?;
+        let reply: serde_json::Value = Self::decode(resp).await?;
+        Ok(reply.get("revoked").and_then(|v| v.as_u64()).unwrap_or(0))
+    }
+    /// `GET /admin/api/groups`.
+    pub async fn admin_groups(&self) -> Result<Vec<GroupInfo>, LibError> {
+        self.get("/admin/api/groups").await
+    }
+    /// `POST /admin/api/groups`.
+    pub async fn admin_create_group(&self, req: &NewGroup) -> Result<GroupInfo, LibError> {
+        self.post("/admin/api/groups", req).await
+    }
+    /// `DELETE /admin/api/groups/{id}` — its shares and memberships cascade away.
+    pub async fn admin_delete_group(&self, id: &str) -> Result<(), LibError> {
+        self.delete(&format!("/admin/api/groups/{id}")).await
+    }
+    /// `PUT /admin/api/groups/{id}/members` — replaces the full membership set.
+    pub async fn admin_set_group_members(
+        &self,
+        id: &str,
+        req: &GroupMembers,
+    ) -> Result<GroupInfo, LibError> {
+        self.put(&format!("/admin/api/groups/{id}/members"), req)
+            .await
+    }
+    /// `GET /admin/api/shares`.
+    pub async fn admin_shares(&self) -> Result<Vec<ShareInfo>, LibError> {
+        self.get("/admin/api/shares").await
+    }
+    /// `POST /admin/api/shares`.
+    pub async fn admin_create_share(&self, req: &NewShare) -> Result<ShareInfo, LibError> {
+        self.post("/admin/api/shares", req).await
+    }
+    /// `DELETE /admin/api/shares/{id}`.
+    pub async fn admin_delete_share(&self, id: &str) -> Result<(), LibError> {
+        self.delete(&format!("/admin/api/shares/{id}")).await
     }
 }
 

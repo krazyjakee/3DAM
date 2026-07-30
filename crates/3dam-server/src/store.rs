@@ -32,6 +32,10 @@ pub struct FlagState {
     /// peer then performs ride the ordinary `/api/v1` surface under the ordinary auth gate, so this
     /// flag adds discovery, not exposure.
     pub federation: bool,
+    /// Full user accounts (phase 6, issue #42): login/session auth, groups, sharing. Off ⇒ the
+    /// whole `/api/v1/auth` + accounts admin surface 404s; on ⇒ the effective auth gate is raised
+    /// to at least `Token` (see [`ServerStore::effective_auth_mode`]).
+    pub user_accounts: bool,
     versions: HashMap<FlagKey, u64>,
 }
 
@@ -47,6 +51,7 @@ impl FlagState {
             auto_thumbnail: true,
             auto_analyze: true,
             federation: false,
+            user_accounts: false,
             versions: HashMap::new(),
         }
     }
@@ -58,6 +63,7 @@ impl FlagState {
             FlagKey::AutoThumbnail => FlagValue::Bool(self.auto_thumbnail),
             FlagKey::AutoAnalyze => FlagValue::Bool(self.auto_analyze),
             FlagKey::Federation => FlagValue::Bool(self.federation),
+            FlagKey::UserAccounts => FlagValue::Bool(self.user_accounts),
         }
     }
     /// Apply a typed value under its key. The key disambiguates the three `bool` flags, which the
@@ -70,6 +76,7 @@ impl FlagState {
             (FlagKey::AutoThumbnail, FlagValue::Bool(b)) => self.auto_thumbnail = b,
             (FlagKey::AutoAnalyze, FlagValue::Bool(b)) => self.auto_analyze = b,
             (FlagKey::Federation, FlagValue::Bool(b)) => self.federation = b,
+            (FlagKey::UserAccounts, FlagValue::Bool(b)) => self.user_accounts = b,
             // Type-mismatched pairs are rejected before this point (`FlagValue::matches`).
             _ => {}
         }
@@ -108,6 +115,13 @@ fn flag_can_increase_exposure(key: FlagKey) -> bool {
 pub struct ServerStore {
     conn: Mutex<Connection>,
     flags: RwLock<FlagState>,
+    /// The claim window re-opened by the config-file escape hatch (ADR 0009 §3, issue #42):
+    /// per-boot, in-memory only — the next successful claim closes it. With zero accounts the
+    /// instance is unclaimed regardless of this bit.
+    claim_reopened: std::sync::atomic::AtomicBool,
+    /// Bumped on every account/group/share mutation, so a long-lived subscriber (the WS loop) can
+    /// notice its resolved visibility ceiling is stale and re-resolve (issue #42).
+    visibility_gen: std::sync::atomic::AtomicU64,
 }
 
 impl ServerStore {
@@ -117,22 +131,26 @@ impl ServerStore {
             let _ = std::fs::create_dir_all(parent);
         }
         let conn = Connection::open(path).map_err(internal)?;
-        conn.execute_batch(SCHEMA).map_err(internal)?;
-        let store = ServerStore {
-            conn: Mutex::new(conn),
-            flags: RwLock::new(FlagState::defaults()),
-        };
-        store.load_flags()?;
-        Ok(store)
+        Self::from_conn(conn)
     }
 
     /// Open an in-memory store (tests, and the CLI's embedded no-serve-store path).
     pub fn open_in_memory() -> Result<ServerStore, LibError> {
         let conn = Connection::open_in_memory().map_err(internal)?;
+        Self::from_conn(conn)
+    }
+
+    fn from_conn(conn: Connection) -> Result<ServerStore, LibError> {
+        // The accounts tables lean on cascading deletes (sessions/memberships/shares follow their
+        // account or group); rusqlite leaves foreign keys off per SQLite default, so opt in.
+        conn.pragma_update(None, "foreign_keys", "ON")
+            .map_err(internal)?;
         conn.execute_batch(SCHEMA).map_err(internal)?;
         let store = ServerStore {
             conn: Mutex::new(conn),
             flags: RwLock::new(FlagState::defaults()),
+            claim_reopened: std::sync::atomic::AtomicBool::new(false),
+            visibility_gen: std::sync::atomic::AtomicU64::new(0),
         };
         store.load_flags()?;
         Ok(store)
@@ -191,6 +209,22 @@ impl ServerStore {
     /// Federation peer mode (phase 6, issue #39): serve `GET /api/v1/advertise`.
     pub fn federation(&self) -> bool {
         self.flags.read().unwrap().federation
+    }
+    /// Full user accounts (phase 6, issue #42): the `/api/v1/auth` + accounts admin surface.
+    pub fn user_accounts(&self) -> bool {
+        self.flags.read().unwrap().user_accounts
+    }
+
+    /// The auth mode requests are actually resolved under: accounts-on raises `Off` to `Token`
+    /// (real identities imply a gate — issue #42), otherwise the configured mode stands.
+    /// `Anonymous` is left alone: public-read + login-to-elevate is a coherent posture.
+    pub fn effective_auth_mode(&self) -> AuthMode {
+        let f = self.flags.read().unwrap();
+        if f.user_accounts && f.auth == AuthMode::Off {
+            AuthMode::Token
+        } else {
+            f.auth
+        }
     }
 
     pub fn flag_info(&self, key: FlagKey) -> FlagInfo {
@@ -313,9 +347,14 @@ impl ServerStore {
             f.versions.insert(key, new_version);
         }
         // Turning authentication on must hand the operator a key in the same motion: with zero
-        // admin-scoped tokens the instance would be gated with no holder of a credential.
-        let bootstrap_token = match req.value {
-            FlagValue::Auth(mode) if mode != AuthMode::Off => {
+        // admin-scoped tokens the instance would be gated with no holder of a credential. The
+        // `UserAccounts` flag raises the *effective* gate the same way (accounts imply ≥ Token),
+        // so it gets the same guarantee — the claim flow then supersedes the token.
+        let bootstrap_token = match (key, req.value) {
+            (FlagKey::Authentication, FlagValue::Auth(mode)) if mode != AuthMode::Off => {
+                self.bootstrap_owner_token_if_needed(actor)?
+            }
+            (FlagKey::UserAccounts, FlagValue::Bool(true)) => {
                 self.bootstrap_owner_token_if_needed(actor)?
             }
             _ => None,
@@ -494,6 +533,13 @@ impl ServerStore {
                 .map_err(internal)?;
             conn.execute("DELETE FROM audit_log", [])
                 .map_err(internal)?;
+            // The accounts plane resets too (sessions/memberships/shares cascade; failures also
+            // cleared) — a factory reset returns the instance to the unclaimed first-run state.
+            conn.execute("DELETE FROM share", []).map_err(internal)?;
+            conn.execute("DELETE FROM group_", []).map_err(internal)?;
+            conn.execute("DELETE FROM account", []).map_err(internal)?;
+            conn.execute("DELETE FROM login_failure", [])
+                .map_err(internal)?;
             removed as u64
         };
         *self.flags.write().unwrap() = FlagState::defaults();
@@ -558,22 +604,30 @@ impl ServerStore {
     // ── status (tech-spec 10 §5) ─────────────────────────────────────────────
 
     pub fn status(&self, bind: &str, localhost_only: bool, tls: bool) -> AdminStatus {
-        let f = self.flags.read().unwrap();
+        let (auth, mcp, network_writes, accounts_enabled) = {
+            let f = self.flags.read().unwrap();
+            (f.auth, f.mcp, f.network_writes, f.user_accounts)
+        };
         // "Exposed" = reachable off-box, no transport encryption, and no credential demanded of an
         // unauthenticated caller. Both `Off` (everyone is owner) and `Anonymous` (everyone gets read
         // unauthenticated) qualify — `Anonymous` on `0.0.0.0` is still a world-readable catalog, so
-        // it must trip the same warning rather than reporting itself safe.
-        let unauthenticated_reachable = matches!(f.auth, AuthMode::Off | AuthMode::Anonymous);
+        // it must trip the same warning rather than reporting itself safe. Accounts-on raises the
+        // effective gate, so it is judged on the effective mode, not the raw flag.
+        let effective = self.effective_auth_mode();
+        let unauthenticated_reachable = matches!(effective, AuthMode::Off | AuthMode::Anonymous);
         let exposed_without_auth = !localhost_only && unauthenticated_reachable && !tls;
         AdminStatus {
             bind: bind.to_string(),
             localhost_only,
             tls,
-            auth: f.auth,
-            mcp: f.mcp,
-            network_writes: f.network_writes,
+            auth,
+            mcp,
+            network_writes,
             exposed_without_auth,
             token_count: self.list_tokens().map(|t| t.len()).unwrap_or(0),
+            accounts_enabled,
+            unclaimed: self.unclaimed(),
+            account_count: self.count_accounts().unwrap_or(0),
         }
     }
 }
@@ -611,4 +665,61 @@ CREATE TABLE IF NOT EXISTS audit_log (
   target TEXT,
   detail TEXT
 );
+
+-- ── user accounts / sessions / groups / shares (phase 6, issue #42; tech-spec 10 §4) ──
+-- Identity lives here, beside the flags and tokens, so a library file can move between hosts
+-- without carrying accounts. `share.resource_id` is a soft reference into library.db (a uuid,
+-- never recycled); orphans are GC'd when the resource is deleted, not FK-enforced.
+CREATE TABLE IF NOT EXISTS account (
+  account_id    TEXT PRIMARY KEY,
+  username      TEXT NOT NULL UNIQUE COLLATE NOCASE,
+  display_name  TEXT,
+  password_hash TEXT,               -- argon2id PHC string; NULL for an OIDC-only account (#41)
+  role          TEXT NOT NULL,      -- 'admin' | 'editor' | 'viewer'
+  disabled      INTEGER NOT NULL DEFAULT 0,
+  created       INTEGER NOT NULL,
+  last_login    INTEGER
+);
+CREATE TABLE IF NOT EXISTS session (
+  session_id    TEXT PRIMARY KEY,
+  account_id    TEXT NOT NULL REFERENCES account(account_id) ON DELETE CASCADE,
+  secret_hash   TEXT NOT NULL,      -- blake3 of the cookie's random secret half
+  csrf          TEXT NOT NULL,      -- double-submit token, echoed in x-dam-csrf on writes
+  created       INTEGER NOT NULL,
+  last_seen     INTEGER NOT NULL,   -- drives the 14-day inactivity expiry
+  absolute_exp  INTEGER NOT NULL,   -- 90-day hard ceiling
+  user_agent    TEXT
+);
+CREATE INDEX IF NOT EXISTS session_account ON session(account_id);
+CREATE TABLE IF NOT EXISTS login_failure (
+  username TEXT NOT NULL COLLATE NOCASE,
+  at       INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS login_failure_user ON login_failure(username, at);
+CREATE TABLE IF NOT EXISTS group_ (
+  group_id TEXT PRIMARY KEY,
+  name     TEXT NOT NULL UNIQUE COLLATE NOCASE,
+  created  INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS group_member (
+  group_id   TEXT NOT NULL REFERENCES group_(group_id)    ON DELETE CASCADE,
+  account_id TEXT NOT NULL REFERENCES account(account_id) ON DELETE CASCADE,
+  PRIMARY KEY (group_id, account_id)
+);
+CREATE TABLE IF NOT EXISTS share (
+  share_id    TEXT PRIMARY KEY,
+  resource    TEXT NOT NULL,        -- 'source' | 'collection'
+  resource_id TEXT NOT NULL,
+  account_id  TEXT REFERENCES account(account_id) ON DELETE CASCADE,
+  group_id    TEXT REFERENCES group_(group_id)    ON DELETE CASCADE,
+  access      TEXT NOT NULL,        -- 'read' | 'write'
+  granted_by  TEXT NOT NULL,
+  created     INTEGER NOT NULL,
+  CHECK ((account_id IS NULL) != (group_id IS NULL))
+);
+CREATE INDEX IF NOT EXISTS share_resource ON share(resource, resource_id);
 ";
+
+// The accounts/sessions/groups/shares surface (issue #42) — a child module so it can reach the
+// private `conn`/`flags` fields while keeping this file to flags/tokens/audit.
+pub(crate) mod accounts;

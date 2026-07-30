@@ -230,6 +230,21 @@ pub(crate) enum AdminCmd {
         #[command(subcommand)]
         cmd: TokenCmd,
     },
+    /// Manage user accounts (requires the `user_accounts` flag; issue #42).
+    Accounts {
+        #[command(subcommand)]
+        cmd: AccountCmd,
+    },
+    /// Manage groups — flat share targets ("Audio Team"), never permission levels.
+    Groups {
+        #[command(subcommand)]
+        cmd: GroupCmd,
+    },
+    /// Manage shares: grant an account or group access to a source or collection.
+    Share {
+        #[command(subcommand)]
+        cmd: ShareCmd,
+    },
     /// Show the audit log (most recent first).
     Audit {
         #[arg(long, default_value_t = 50)]
@@ -286,6 +301,105 @@ pub(crate) enum TokenCmd {
     List,
     /// Revoke a token by id.
     Revoke { id: String },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum AccountCmd {
+    /// List accounts (username, role, state — never credentials).
+    List,
+    /// Create an account.
+    Add {
+        /// Login username (1–64 chars: letters, digits, '-', '_', '.', '@').
+        username: String,
+        /// Initial password (min 8 chars).
+        #[arg(long)]
+        password: String,
+        /// Permission level: admin | editor | viewer.
+        #[arg(long, default_value = "viewer")]
+        role: String,
+        /// Display name shown in listings.
+        #[arg(long = "name")]
+        display_name: Option<String>,
+    },
+    /// Update an account — only the fields you pass change.
+    Update {
+        /// Account id.
+        id: String,
+        /// New role: admin | editor | viewer.
+        #[arg(long)]
+        role: Option<String>,
+        /// New display name.
+        #[arg(long)]
+        name: Option<String>,
+        /// Disable (true) or re-enable (false) the account. Disabling signs it out everywhere.
+        #[arg(long)]
+        disabled: Option<bool>,
+        /// New password — replaces the credential and revokes the account's other sessions.
+        #[arg(long)]
+        password: Option<String>,
+    },
+    /// Delete an account (its sessions, memberships, and direct shares cascade away).
+    Remove {
+        /// Account id.
+        id: String,
+    },
+    /// Sign an account out everywhere by revoking all of its sessions.
+    RevokeSessions {
+        /// Account id.
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum GroupCmd {
+    /// List groups with their member counts.
+    List,
+    /// Create a group.
+    Add {
+        /// Group name (1–64 chars).
+        name: String,
+    },
+    /// Delete a group (its shares and memberships cascade away).
+    Remove {
+        /// Group id.
+        id: String,
+    },
+    /// Replace a group's membership with the given account ids (whole-set semantics).
+    Members {
+        /// Group id.
+        id: String,
+        /// The full new member set (account ids); pass none to empty the group.
+        account_ids: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum ShareCmd {
+    /// List shares.
+    List,
+    /// Grant one account or group access to one source or collection.
+    Add {
+        /// Share a source by id (exactly one of --source / --collection).
+        #[arg(long)]
+        source: Option<String>,
+        /// Share a collection by id.
+        #[arg(long)]
+        collection: Option<String>,
+        /// Grant to an account by id (exactly one of --account / --group).
+        #[arg(long)]
+        account: Option<String>,
+        /// Grant to a group by id.
+        #[arg(long)]
+        group: Option<String>,
+        /// Grant write access (default: read). Writing also needs Write scope on the identity.
+        #[arg(long)]
+        write: bool,
+    },
+    /// Revoke a share by id.
+    Remove {
+        /// Share id.
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]

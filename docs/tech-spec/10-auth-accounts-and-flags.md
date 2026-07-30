@@ -1,6 +1,12 @@
 # 10 — Auth, accounts & feature flags
 
-Status: **Draft v0.1** · Scope: the server-side auth layer (off / anonymous / token / OIDC-OAuth2) that turns a request into an **auth context**, credential storage (client keychain vs server secret store), the runtime **feature-flag** store and its config-file ↔ admin-UI reconciliation and live-vs-restart lifecycle, opt-in **user accounts** (roles → scopes, visibility scope, bootstrap, audit), and the **admin API** that the web UI and CLI both drive.
+Status: **Draft v0.2** · Scope: the server-side auth layer (off / anonymous / token / OIDC-OAuth2) that turns a request into an **auth context**, credential storage (client keychain vs server secret store), the runtime **feature-flag** store and its config-file ↔ admin-UI reconciliation and live-vs-restart lifecycle, opt-in **user accounts** (roles → scopes, visibility scope, groups & sharing, first-run claim, audit), and the **admin API** that the web UI and CLI both drive.
+
+> **Amended 2026-07-30 (issue #42, phase 6).** Two deliberate changes from v0.1, marked inline:
+> §4.4's single-use bootstrap token is **replaced by the first-run claim** (localhost-gated open
+> signup; the token flow survives as the off-box redemption path), and §4.3 gains **groups and
+> shares** — positive per-resource grants that compose with the per-identity visibility ceiling.
+> Groups are share *targets*, not roles; the ADR 0009 custom-roles freeze is not affected.
 
 This file is the low-level design for the security and administration layer that wraps every `serve`-mode surface. It sits in the **`3dam-server`** crate ([01](01-architecture-and-crates.md) §1, key deps `rustls`/`oauth2`/`argon2`/`keyring`) and implements the mechanics decided in [ADR 0004](../adr/0004-feature-flags-admin.md) and specified at the product level in [PRODUCT_SPEC.md](../PRODUCT_SPEC.md) §6.7 (federation & authentication), §6.11 (server administration), and §5 (the server-side settings/flags/accounts records that live *outside* the library file). It does not restate that rationale or re-decide the ADR — it fills in the types, schemas, and routes.
 
@@ -264,24 +270,76 @@ Effective granted scopes = `scopes_for(role)` intersected with any narrowing on 
 - `Scope::McpUse` is necessary but not sufficient for MCP — the `McpServer` flag must be on (else the route is absent), and its ReadOnly/ReadWrite setting further gates MCP write tools ([11](11-mcp-server.md)).
 - `Scope::Admin` gates the entire admin API (§5); once auth is on, the admin surface is **never** reachable anonymously (ADR 0004 negative note).
 
-### 4.3 Visibility scope
+### 4.3 Visibility scope, groups & sharing *(amended 2026-07-30, issue #42)*
 
-An optional per-account (and per-token) **visibility scope** caps which sources and collections the identity can see — in *every* client, because all clients sit on the one auth surface. It is the **ceiling** on what that identity reaches anywhere; it intersects with, and can only narrow, what a query would otherwise return.
+Two mechanisms compose into what an identity can reach, and the composition rule is the crux:
+
+- the **visibility ceiling** — a per-identity narrowing filter (this section's original concept):
+  it can only *shrink* the reachable set, never widen it;
+- **shares** — positive grants hanging off a *resource* (a source or a collection), targeted at an
+  individual **account** or at a named **group**.
 
 ```rust
-pub enum VisibilityScope {
-    All,                                   // no restriction (default)
-    Restricted { sources: Vec<SourceId>, collections: Vec<CollectionId> },
+pub enum Visibility {
+    Full,                                   // no restriction (admins, tokens, the local owner)
+    Restricted(VisibilityScope),
+}
+pub struct VisibilityScope {                // the reachable set of a restricted identity
+    sources: BTreeSet<SourceId>,            // read-reachable
+    collections: BTreeSet<CollectionId>,
+    write_sources: BTreeSet<SourceId>,      // additionally write-granted
+    write_collections: BTreeSet<CollectionId>,
 }
 ```
 
-For v1 scoping **bottoms out at source and collection level** (not per-asset — an Open question, PRODUCT_SPEC §10). The library service ([03](03-library-service-and-api.md)) receives the `AuthContext` and applies the visibility filter as a query predicate; federated fan-out ([07](07-sources-and-federation.md)) restricts which peers/sources are consulted accordingly. Enforcement is in the engine's query path, not bolted onto each handler, so it cannot be forgotten per endpoint.
+**Groups** are flat (no nesting — resolution stays a set union, not graph traversal) and
+**orthogonal to role**: an account has exactly one role (what it may *do*) and any number of group
+memberships (what it may *reach*). Groups are not custom roles; the ADR 0009 custom-roles freeze
+does not apply to them.
 
-### 4.4 Bootstrap, sessions & token lifetime
+**Resolution rules** (effective reachable set for an identity, in order):
 
-- **First-admin bootstrap.** When `UserAccounts` is turned on with no `admin` account present, the server enters a one-time bootstrap: it emits a single-use bootstrap token (printed to the server log / returned by the enabling admin-API call) that the first admin presents to create the initial admin account. The bootstrap window closes once one admin exists. This is auditable (`action = 'account.bootstrap'`) and recorded with actor `'bootstrap'`. Recovery (a lost sole admin) is an Open question (PRODUCT_SPEC §10); the design keeps the config-file plane able to re-open bootstrap as the escape hatch.
-- **Sessions** (web-client login) are server-side records (§2.2 `sessions`) with an absolute expiry and a sliding `last_seen`; the browser holds an opaque session cookie, not credentials. Logout and admin-initiated revocation delete the row.
-- **Token/session lifetime** defaults: sessions expire after an inactivity window (configurable) and an absolute max; API tokens are long-lived with an optional `expires`. Exact defaults are an Open question (PRODUCT_SPEC §10); the records carry the fields so the policy is data, not code.
+1. **Admins bypass sharing entirely** (`Full`) — otherwise an admin could lose access to the
+   library they administer, and share management would need its own recursive share.
+2. **Union the grants**: direct account shares ∪ shares to every group the account belongs to.
+   The most permissive access wins per resource (`write` beats `read`).
+3. **Intersect with any account/token ceiling** — grants never widen a ceiling.
+4. **`write` access still requires `Scope::Write`.** The share controls *which* resources; the
+   role controls *whether* the identity may write at all. Two independent gates, both must pass —
+   guards keep checking scopes, never roles.
+5. **Collection ⊅ source.** A shared collection grants its member assets only, not their whole
+   source. A shared source grants its assets and any collection view over them. A shared *smart*
+   folder grants the folder itself, but its results stay intersected with the identity's
+   source/manual-collection grants — a saved query is never a widening instrument.
+
+For v1 scoping **bottoms out at source and collection level** (not per-asset — an Open question, PRODUCT_SPEC §10). The library service ([03](03-library-service-and-api.md)) receives the `AuthContext` and applies the visibility filter as a query predicate; federated fan-out ([07](07-sources-and-federation.md)) restricts which peers/sources are consulted accordingly. Enforcement is in the engine's query path, not bolted onto each handler, so it cannot be forgotten per endpoint — and it covers the whole leak surface: search, similarity (filtered at the candidate set, not post-top-k), dedup groups (re-formed after filtering; a group of one is not a duplicate), stats/tag aggregates, folder trees, thumbnails/content by id, exports, jobs/events, and MCP (same engine, same predicate).
+
+**The cross-database seam.** Identity (accounts, groups, shares) lives in `server.db`; sources and collections live in `library.db`. A share's `resource_id` is therefore a **soft reference** — no FK can enforce it. The layering resolution: shares are resolved **at auth time, in the server**, into a finished `Visibility` value carried on `AuthContext`; the engine never learns what an account or group is. Deleting a source/collection garbage-collects its share rows; ids are UUIDs and never recycled, so a missed GC is clutter, never a grant to a future resource. A share change takes effect on the next request; long-lived subscriptions (the WS stream) watch a generation counter and re-resolve.
+
+**Restricted identities and library-wide operations.** Operations that inherently span the catalog — source add/remove, scans, analysis, blocklist edits, collection creation — require `Full` visibility; the per-resource grant model has no meaningful subset semantics for them in v1.
+
+### 4.4 First-run claim, sessions & token lifetime *(amended 2026-07-30, issue #42)*
+
+- **First account becomes admin (the claim).** *(Replaces v0.1's single-use bootstrap token as the
+  primary flow.)* When `UserAccounts` is on and **zero accounts exist**, the instance is
+  **unclaimed**: the first account created through `POST /api/v1/auth/claim` is made `admin` and
+  closes the window permanently. The first-run race (the Jellyfin/Grafana land-grab CVE class) is
+  mitigated three ways, together:
+  - **Localhost-only claim by default** — acceptance is bound to a loopback peer address; a remote
+    request to an unclaimed instance is refused, not served a signup form.
+  - **Off-box claim = token redemption** — the bootstrap owner token (minted whenever a
+    credentialed gate goes up with no admin credential) presented as an Admin bearer authorises a
+    claim from anywhere; the v0.1 token flow survives as exactly this path.
+  - **Loud unclaimed state** — the server logs a recurring warning while unclaimed and
+    `/admin/api/status` reports `unclaimed: true`; an exposed unclaimed instance is never silent.
+
+  The claim is auditable (`action = 'account.claim'`). Recovery for a lost sole admin stays the
+  **config-file escape hatch** (ADR 0009 §3): `[accounts] reopen_claim = true` re-opens the window
+  for one boot. Turning `UserAccounts` on raises the **effective** auth mode to at least `Token`
+  (accounts and unauthenticated owner trust never coexist); `Anonymous` is preserved as
+  public-read + login-to-elevate.
+- **Sessions** (web-client login) are server-side records (§2.2 `sessions`) with an absolute expiry and a sliding `last_seen`; the browser holds an opaque session cookie (`HttpOnly`, `SameSite=Strict`), not credentials, plus a double-submit CSRF token echoed in `x-dam-csrf` on cookie-authenticated writes (ADR 0009 §4). Logout and admin-initiated revocation delete the row. Account lockout: 10 failed logins / 15-minute window per username.
+- **Token/session lifetime** (resolved, ADR 0009 §3): sessions expire after **14 days of inactivity** with a **90-day absolute ceiling**; API tokens are long-lived with an optional `expires`. Tokens remain independent credentials at or below their issuing authority's ceiling — never above.
 
 ### 4.5 Audit log
 
@@ -303,13 +361,27 @@ PUT    /admin/flags/{key}           → set a flag (body: value + expected versi
                                        changes require an explicit `confirm` field (the
                                        machine form of the UI's warn-and-confirm, §3.4).
 
-# Accounts (present only when UserAccounts is on)
+# Accounts (present only when UserAccounts is on; off ⇒ 404)
 GET    /admin/accounts              → list (no hashes)
-POST   /admin/accounts              → create (name, initial credential, role, visibility)
-PUT    /admin/accounts/{id}         → update role / visibility / disabled
+POST   /admin/accounts              → create (name, initial credential, role)
+PUT    /admin/accounts/{id}         → update role / display name / disabled / password
+                                       (password change revokes the account's sessions;
+                                        the last enabled admin cannot be demoted/disabled)
 DELETE /admin/accounts/{id}         → remove (cannot remove the last admin)
-POST   /admin/accounts/{id}/password→ set/reset credential (argon2id rehash)
-POST   /admin/bootstrap             → redeem the first-admin bootstrap token (§4.4)
+DELETE /admin/accounts/{id}/sessions→ revoke all of an account's sessions
+
+# Groups & shares (issue #42; admin-only writes in v1 — editor self-sharing needs an
+# ownership concept the frozen scope doesn't have; revisit post-v1)
+GET    /admin/groups                → list, with member account ids
+POST   /admin/groups                → create (name)
+DELETE /admin/groups/{id}           → remove (memberships + its shares cascade)
+PUT    /admin/groups/{id}/members   → replace the membership set
+GET    /admin/shares                → list grants
+POST   /admin/shares                → grant (source|collection, account xor group, read|write)
+DELETE /admin/shares/{id}           → revoke (takes effect on the next request)
+
+# First-run claim (public route, not admin — gated by loopback / bootstrap-token bearer, §4.4)
+POST   /api/v1/auth/claim           → create the first admin account while unclaimed
 
 # Tokens / API keys
 GET    /admin/tokens                → list (labels, scopes, expiry; never secrets)

@@ -7,18 +7,22 @@ import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 import {
   admin,
+  type AccountInfo,
   type AdminStatus,
   type AuditEntry,
   type CacheTarget,
   type FlagInfo,
   type FlagKey,
   type FlagValue,
+  type GroupInfo,
   type NewTokenReply,
   type Scope,
   type SetFlagReply,
   type StorageUsage,
   type TokenInfo,
 } from "@/api/admin";
+import { authApi } from "@/api/auth";
+import type { AccountRole, SessionInfo } from "@/api/types";
 import { ApiError } from "@/api/client";
 import { useScan, useWhoami } from "@/api/queries";
 import { getServer, setServer } from "@/lib/server";
@@ -233,6 +237,22 @@ export function Settings() {
         </FlagCard>
 
         <FlagCard
+          title="User accounts"
+          hint="Full login accounts with groups and sharing; raises the auth gate to at least token."
+          flag={flag("user_accounts")}
+        >
+          <Toggle
+            label="User accounts"
+            checked={flag("user_accounts")?.value === true}
+            disabled={busyFlag !== null}
+            onChange={(v) => {
+              const f = flag("user_accounts");
+              if (f) void setFlag(f.key, v, f.version);
+            }}
+          />
+        </FlagCard>
+
+        <FlagCard
           title="Auto-generate previews"
           hint="Hosted mode: the server renders thumbnails + 3D previews on ingest so clients hit ready data. Off defers rendering to first request (lower-power hosts)."
           flag={flag("auto_thumbnail")}
@@ -267,11 +287,20 @@ export function Settings() {
 
       <StorageSection usage={usage} onChange={refresh} />
 
+      {/* User accounts + groups (issue #42) — only while the flag is on (the routes 404 off). */}
+      {flag("user_accounts")?.value === true && (
+        <AccountsAndGroups currentAccountId={whoami.data?.account?.account_id ?? null} />
+      )}
+
       <TokensSection
         tokens={tokens}
         currentIdentity={whoami.data?.identity ?? null}
         onChange={() => void refresh({ withUsage: false })}
       />
+
+      {/* The signed-in account's own sessions (issue #42) — self-service, not an admin surface,
+          but Settings is where credential management lives today. */}
+      {whoami.data?.account && <MySessionsSection />}
 
       <section className="flex flex-col gap-2">
         <h2 className="font-medium text-fg-muted">Audit log</h2>
@@ -333,6 +362,12 @@ function StatusCard({ status }: { status: AdminStatus }) {
         <Field label="MCP" value={status.mcp} />
         <Field label="Network writes" value={String(status.network_writes)} />
         <Field label="Tokens" value={String(status.token_count)} />
+        {status.account_count != null && (
+          <Field
+            label="Accounts"
+            value={status.unclaimed ? `${status.account_count} (unclaimed)` : String(status.account_count)}
+          />
+        )}
       </div>
       {status.exposed_without_auth && (
         <p className="mt-2 text-warn">
@@ -844,6 +879,473 @@ function TokensSection({
             </div>
           );
         })}
+      </div>
+    </section>
+  );
+}
+
+// ── user accounts / groups (issue #42) ───────────────────────────────────────
+
+const ROLES: AccountRole[] = ["admin", "editor", "viewer"];
+
+/** Loads accounts + groups once (they cross-reference: group membership lists accounts) and feeds
+ *  both admin panes. Only mounted while the `user_accounts` flag is on — the routes 404 off. */
+function AccountsAndGroups({ currentAccountId }: { currentAccountId: string | null }) {
+  const [accounts, setAccounts] = useState<AccountInfo[]>([]);
+  const [groups, setGroups] = useState<GroupInfo[]>([]);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      const [a, g] = await Promise.all([admin.accounts(), admin.groups()]);
+      setAccounts(a);
+      setGroups(g);
+      setError(null);
+    } catch (e) {
+      setError(errorMessage(e));
+    }
+  }, []);
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  return (
+    <>
+      {error && <p className="text-danger">{error}</p>}
+      <AccountsSection accounts={accounts} currentAccountId={currentAccountId} onChange={load} />
+      <GroupsSection groups={groups} accounts={accounts} onChange={load} />
+    </>
+  );
+}
+
+function AccountsSection({
+  accounts,
+  currentAccountId,
+  onChange,
+}: {
+  accounts: AccountInfo[];
+  /** The signed-in account (from /whoami), so its row is flagged — don't lock yourself out. */
+  currentAccountId: string | null;
+  onChange: () => void;
+}) {
+  const { confirm, prompt } = useDialogs();
+  // Conflicts (409 — e.g. the last-admin guard) and other failures surface here, visibly, instead
+  // of only as a transient toast.
+  const [err, setErr] = useState<string | null>(null);
+  // Which row action is in flight — disables the row's controls against double-submits (issue #23).
+  const [busy, setBusy] = useState<string | null>(null);
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [role, setRole] = useState<AccountRole>("viewer");
+  const [creating, setCreating] = useState(false);
+
+  const run = async (key: string, fn: () => Promise<string | null>) => {
+    setBusy(key);
+    setErr(null);
+    try {
+      const msg = await fn();
+      onChange();
+      if (msg) toast.success(msg);
+    } catch (e) {
+      setErr(errorMessage(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const create = async () => {
+    setCreating(true);
+    setErr(null);
+    try {
+      const a = await admin.createAccount({ username: username.trim(), password, role });
+      setUsername("");
+      setPassword("");
+      setRole("viewer");
+      onChange();
+      toast.success(`Account “${a.username}” created`);
+    } catch (e) {
+      setErr(errorMessage(e));
+    } finally {
+      setCreating(false);
+    }
+  };
+
+  const resetPassword = async (a: AccountInfo) => {
+    const pw = await prompt({
+      title: `Reset password for “${a.username}”`,
+      message: "Their current sessions keep working; only the password changes.",
+      password: true,
+      placeholder: "New password",
+      confirmLabel: "Reset password",
+    });
+    if (!pw) return;
+    void run(`pw:${a.account_id}`, async () => {
+      await admin.updateAccount(a.account_id, { password: pw });
+      return "Password reset";
+    });
+  };
+
+  const signOutEverywhere = (a: AccountInfo) =>
+    run(`sess:${a.account_id}`, async () => {
+      const r = await admin.revokeAccountSessions(a.account_id);
+      return `Signed out ${r.revoked} session${r.revoked === 1 ? "" : "s"}`;
+    });
+
+  const remove = async (a: AccountInfo) => {
+    const isSelf = a.account_id === currentAccountId;
+    if (
+      !(await confirm({
+        title: `Delete account “${a.username}”?`,
+        message: isSelf
+          ? "This is the account you're signed in with — deleting it signs this browser out immediately. This cannot be undone."
+          : "Their sessions end immediately and any shares granted to them are removed. This cannot be undone.",
+        danger: true,
+        confirmLabel: "Delete account",
+      }))
+    )
+      return;
+    void run(`del:${a.account_id}`, async () => {
+      await admin.deleteAccount(a.account_id);
+      return "Account deleted";
+    });
+  };
+
+  return (
+    <section className="flex flex-col gap-2">
+      <h2 className="font-medium text-fg-muted">User accounts</h2>
+
+      <div className="flex flex-col gap-2 rounded border border-border p-3">
+        <div className="flex flex-wrap items-center gap-2">
+          <input
+            className="field min-w-32 flex-1"
+            placeholder="Username"
+            autoComplete="off"
+            spellCheck={false}
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+          />
+          <input
+            className="field min-w-32 flex-1"
+            type="password"
+            placeholder="Password"
+            autoComplete="new-password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+          />
+          <Choice
+            label="Role for the new account"
+            value={role}
+            options={ROLES}
+            disabled={creating}
+            onChange={(v) => setRole(v as AccountRole)}
+          />
+          <button
+            type="button"
+            disabled={!username.trim() || !password || creating}
+            onClick={() => void create()}
+            className="btn btn-accent disabled:opacity-40"
+          >
+            {creating ? "Creating…" : "Create account"}
+          </button>
+        </div>
+      </div>
+
+      {err && <p className="text-danger">{err}</p>}
+
+      <div className="rounded border border-border">
+        {accounts.length === 0 && <div className="px-3 py-2 text-fg-dim">(no accounts)</div>}
+        {accounts.map((a) => {
+          const isSelf = a.account_id === currentAccountId;
+          const rowBusy = busy !== null && busy.endsWith(`:${a.account_id}`);
+          return (
+            <div
+              key={a.account_id}
+              className="flex flex-wrap items-center gap-3 border-b border-border px-3 py-1.5 last:border-0"
+            >
+              <span className="flex w-40 min-w-0 items-center gap-1.5 truncate font-medium">
+                <span className="truncate" title={a.display_name ?? a.username}>
+                  {a.username}
+                </span>
+                {isSelf && (
+                  <span
+                    className="shrink-0 rounded bg-accent-muted px-1 text-[10px] tracking-wide text-accent uppercase"
+                    title="The account you're signed in with"
+                  >
+                    you
+                  </span>
+                )}
+              </span>
+              <Choice
+                label={`Role for ${a.username}`}
+                value={a.role}
+                options={ROLES}
+                disabled={rowBusy}
+                onChange={(v) =>
+                  void run(`role:${a.account_id}`, async () => {
+                    await admin.updateAccount(a.account_id, { role: v as AccountRole });
+                    return null;
+                  })
+                }
+              />
+              <label className="flex items-center gap-1.5 text-xs text-fg-dim">
+                <Toggle
+                  label={`${a.username} enabled`}
+                  checked={!a.disabled}
+                  disabled={rowBusy}
+                  onChange={(v) =>
+                    void run(`dis:${a.account_id}`, async () => {
+                      await admin.updateAccount(a.account_id, { disabled: !v });
+                      return null;
+                    })
+                  }
+                />
+                <span title="Disabled accounts can't sign in; their sessions stop working">
+                  {a.disabled ? "disabled" : "enabled"}
+                </span>
+              </label>
+              <span className="flex-1 text-right text-xs text-fg-dim">
+                {a.last_login
+                  ? `signed in ${new Date(a.last_login).toLocaleDateString()}`
+                  : "never signed in"}
+              </span>
+              <button
+                type="button"
+                disabled={rowBusy}
+                onClick={() => void resetPassword(a)}
+                className="text-fg-muted hover:underline disabled:opacity-40"
+              >
+                reset password
+              </button>
+              <button
+                type="button"
+                disabled={rowBusy}
+                onClick={() => void signOutEverywhere(a)}
+                className="text-fg-muted hover:underline disabled:opacity-40"
+                title="Revoke every live session of this account"
+              >
+                sign out everywhere
+              </button>
+              <button
+                type="button"
+                disabled={rowBusy}
+                onClick={() => void remove(a)}
+                className="text-danger hover:underline disabled:opacity-40"
+              >
+                delete
+              </button>
+            </div>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
+function GroupsSection({
+  groups,
+  accounts,
+  onChange,
+}: {
+  groups: GroupInfo[];
+  accounts: AccountInfo[];
+  onChange: () => void;
+}) {
+  const { confirm, prompt } = useDialogs();
+  const [err, setErr] = useState<string | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+
+  const run = async (key: string, fn: () => Promise<string | null>) => {
+    setBusy(key);
+    setErr(null);
+    try {
+      const msg = await fn();
+      onChange();
+      if (msg) toast.success(msg);
+    } catch (e) {
+      setErr(errorMessage(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const create = async () => {
+    const name = (
+      await prompt({ title: "New group", placeholder: "Name", confirmLabel: "Create" })
+    )?.trim();
+    if (!name) return;
+    void run("create", async () => {
+      await admin.createGroup(name);
+      return `Group “${name}” created`;
+    });
+  };
+
+  const remove = async (g: GroupInfo) => {
+    if (
+      !(await confirm({
+        title: `Delete group “${g.name}”?`,
+        message: "Shares granted to this group are removed. Its member accounts are untouched.",
+        danger: true,
+        confirmLabel: "Delete group",
+      }))
+    )
+      return;
+    void run(`del:${g.group_id}`, async () => {
+      await admin.deleteGroup(g.group_id);
+      return "Group deleted";
+    });
+  };
+
+  /** Membership edits PUT the *whole* member set (the API replaces, not patches). */
+  const toggleMember = (g: GroupInfo, accountId: string, on: boolean) => {
+    const next = on ? [...g.members, accountId] : g.members.filter((m) => m !== accountId);
+    void run(`members:${g.group_id}`, async () => {
+      await admin.setGroupMembers(g.group_id, next);
+      return null;
+    });
+  };
+
+  return (
+    <section className="flex flex-col gap-2">
+      <div className="flex items-center justify-between">
+        <h2 className="font-medium text-fg-muted">Groups</h2>
+        <button type="button" className="btn" disabled={busy === "create"} onClick={() => void create()}>
+          New group
+        </button>
+      </div>
+
+      {err && <p className="text-danger">{err}</p>}
+
+      {groups.length === 0 && (
+        <div className="rounded border border-border px-3 py-2 text-fg-dim">
+          (no groups — share with whole teams by grouping accounts)
+        </div>
+      )}
+      {groups.map((g) => (
+        <div key={g.group_id} className="flex flex-col gap-2 rounded border border-border p-3">
+          <div className="flex items-center justify-between gap-3">
+            <span className="font-medium">{g.name}</span>
+            <button
+              type="button"
+              disabled={busy === `del:${g.group_id}`}
+              onClick={() => void remove(g)}
+              className="text-danger hover:underline disabled:opacity-40"
+            >
+              delete
+            </button>
+          </div>
+          {accounts.length === 0 ? (
+            <p className="text-xs text-fg-dim">(no accounts to add)</p>
+          ) : (
+            <div className="flex flex-wrap gap-3">
+              {accounts.map((a) => (
+                <label key={a.account_id} className="flex items-center gap-1 text-xs">
+                  <input
+                    type="checkbox"
+                    checked={g.members.includes(a.account_id)}
+                    disabled={busy === `members:${g.group_id}`}
+                    onChange={(e) => toggleMember(g, a.account_id, e.target.checked)}
+                  />
+                  {a.username}
+                </label>
+              ))}
+            </div>
+          )}
+        </div>
+      ))}
+    </section>
+  );
+}
+
+/** The signed-in account's own sessions (issue #42): every browser/device holding a live session,
+ *  the current one marked, each revocable. Self-service — any signed-in account sees its own list
+ *  (the server scopes it); it just lives on the Settings page alongside credential management. */
+function MySessionsSection() {
+  const { confirm } = useDialogs();
+  const [sessions, setSessions] = useState<SessionInfo[]>([]);
+  const [err, setErr] = useState<string | null>(null);
+  const [revoking, setRevoking] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      setSessions(await authApi.sessions());
+      setErr(null);
+    } catch (e) {
+      setErr(errorMessage(e));
+    }
+  }, []);
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const revoke = async (s: SessionInfo) => {
+    if (
+      s.current &&
+      !(await confirm({
+        title: "Sign out this session?",
+        message: "This is the session you're using — revoking it signs this browser out.",
+        danger: true,
+        confirmLabel: "Sign out",
+      }))
+    )
+      return;
+    setRevoking(s.session_id);
+    try {
+      await authApi.revokeSession(s.session_id);
+      if (s.current) {
+        location.reload();
+        return;
+      }
+      await load();
+      toast.success("Session revoked");
+    } catch (e) {
+      toast.error(errorMessage(e));
+    } finally {
+      setRevoking(null);
+    }
+  };
+
+  return (
+    <section className="flex flex-col gap-2">
+      <h2 className="font-medium text-fg-muted">My sessions</h2>
+      {err && <p className="text-danger">{err}</p>}
+      <div className="rounded border border-border">
+        {sessions.length === 0 && !err && (
+          <div className="px-3 py-2 text-fg-dim">(no sessions)</div>
+        )}
+        {sessions.map((s) => (
+          <div
+            key={s.session_id}
+            className="flex items-center gap-3 border-b border-border px-3 py-1.5 last:border-0"
+          >
+            <span className="flex min-w-0 flex-1 items-center gap-1.5">
+              <span className="truncate" title={s.user_agent ?? undefined}>
+                {s.user_agent ?? "(unknown client)"}
+              </span>
+              {s.current && (
+                <span
+                  className="shrink-0 rounded bg-accent-muted px-1 text-[10px] tracking-wide text-accent uppercase"
+                  title="The session this browser is using"
+                >
+                  this session
+                </span>
+              )}
+            </span>
+            <span className="text-xs text-fg-dim">
+              started {new Date(s.created).toLocaleDateString()}
+            </span>
+            <span className="text-xs text-fg-dim">
+              seen {new Date(s.last_seen).toLocaleString()}
+            </span>
+            <button
+              type="button"
+              disabled={revoking === s.session_id}
+              onClick={() => void revoke(s)}
+              className="text-danger hover:underline disabled:opacity-40"
+            >
+              {revoking === s.session_id ? "revoking…" : "revoke"}
+            </button>
+          </div>
+        ))}
       </div>
     </section>
   );
