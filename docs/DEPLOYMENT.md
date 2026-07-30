@@ -39,6 +39,31 @@ Keep the server on localhost and let a reverse proxy (Caddy, nginx, Traefik) ter
 proxy to `127.0.0.1:7878`. No `--insecure` is needed because the server itself stays on loopback.
 Proxy both the REST paths and the `/api/v1/ws` WebSocket upgrade.
 
+> **If you use user accounts behind a proxy, set two keys.** From the server's point of view every
+> proxied request arrives from `127.0.0.1` over plaintext HTTP, so it cannot tell a local operator
+> from an internet visitor, nor an HTTPS browser from a plaintext one. Add to the config file:
+>
+> ```toml
+> [server]
+> secure_cookies = true        # the browser really is on HTTPS — mark the session cookie Secure
+>
+> [accounts]
+> require_claim_token = true   # only the bootstrap owner token may claim this instance
+> ```
+>
+> 3DAM already refuses the open first-run claim for any request carrying `X-Forwarded-For`,
+> `X-Real-IP`, or `Forwarded` — but a proxy configured to strip those leaves no signal, and
+> `require_claim_token` closes the path unconditionally. See [ADR 0014](adr/0014-first-run-claim.md).
+> To claim such an instance, redeem the bootstrap owner token written to
+> `<data>/bootstrap-owner-token.txt`:
+>
+> ```bash
+> curl -sX POST https://host/api/v1/auth/claim \
+>   -H "authorization: Bearer $(cat /var/lib/3dam/bootstrap-owner-token.txt)" \
+>   -H 'content-type: application/json' \
+>   -d '{"username":"owner","password":"a-long-passphrase"}'
+> ```
+
 ## Authentication
 
 Turn on token auth so only holders of a bearer token reach the API/MCP/admin surface:

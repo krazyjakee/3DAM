@@ -325,17 +325,23 @@ For v1 scoping **bottoms out at source and collection level** (not per-asset —
   **unclaimed**: the first account created through `POST /api/v1/auth/claim` is made `admin` and
   closes the window permanently. The first-run race (the Jellyfin/Grafana land-grab CVE class) is
   mitigated three ways, together:
-  - **Localhost-only claim by default** — acceptance is bound to a loopback peer address; a remote
-    request to an unclaimed instance is refused, not served a signup form.
+  - **Localhost-only claim by default** — acceptance is bound to a loopback **peer address** (never
+    the bind address, which is loopback for every visitor behind a same-host reverse proxy), and is
+    refused outright for any request carrying `X-Forwarded-For` / `X-Real-IP` / `Forwarded`, or when
+    `[accounts] require_claim_token = true`. A remote request to an unclaimed instance is refused,
+    not served a signup form. See [ADR 0014](../adr/0014-first-run-claim.md).
   - **Off-box claim = token redemption** — the bootstrap owner token (minted whenever a
     credentialed gate goes up with no admin credential) presented as an Admin bearer authorises a
     claim from anywhere; the v0.1 token flow survives as exactly this path.
   - **Loud unclaimed state** — the server logs a recurring warning while unclaimed and
     `/admin/api/status` reports `unclaimed: true`; an exposed unclaimed instance is never silent.
 
-  The claim is auditable (`action = 'account.claim'`). Recovery for a lost sole admin stays the
-  **config-file escape hatch** (ADR 0009 §3): `[accounts] reopen_claim = true` re-opens the window
-  for one boot. Turning `UserAccounts` on raises the **effective** auth mode to at least `Token`
+  The claim is auditable (`action = 'account.claim'`) and **atomic**: the unclaimed check and the
+  account insert share one `BEGIN IMMEDIATE` transaction, so two racing claims with different
+  usernames cannot both win. Recovery for a lost sole admin stays the **config-file escape hatch**
+  (ADR 0009 §3): `[accounts] reopen_claim = true` re-opens the window for one boot — existing
+  accounts keep working, so the client keeps the login screen primary and offers the claim form as a
+  secondary path. Turning `UserAccounts` on raises the **effective** auth mode to at least `Token`
   (accounts and unauthenticated owner trust never coexist); `Anonymous` is preserved as
   public-read + login-to-elevate.
 - **Sessions** (web-client login) are server-side records (§2.2 `sessions`) with an absolute expiry and a sliding `last_seen`; the browser holds an opaque session cookie (`HttpOnly`, `SameSite=Strict`), not credentials, plus a double-submit CSRF token echoed in `x-dam-csrf` on cookie-authenticated writes (ADR 0009 §4). Logout and admin-initiated revocation delete the row. Account lockout: 10 failed logins / 15-minute window per username.
@@ -380,7 +386,7 @@ GET    /admin/shares                → list grants
 POST   /admin/shares                → grant (source|collection, account xor group, read|write)
 DELETE /admin/shares/{id}           → revoke (takes effect on the next request)
 
-# First-run claim (public route, not admin — gated by loopback / bootstrap-token bearer, §4.4)
+# First-run claim (public route, not admin — gated by a direct loopback peer / bootstrap-token bearer, §4.4)
 POST   /api/v1/auth/claim           → create the first admin account while unclaimed
 
 # Tokens / API keys
