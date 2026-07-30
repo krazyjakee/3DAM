@@ -9,17 +9,28 @@ impl Store {
     /// Returns the id and whether it was newly inserted.
     pub fn upsert_asset(&self, a: &NewAsset) -> Result<(AssetId, bool), LibError> {
         let conn = self.conn.lock().unwrap();
-        let existing: Option<Vec<u8>> = conn
+        // The previous hash and media type come back with the id: both decide whether the derived
+        // layer this row already carries is still about the same file (see below).
+        let existing: Option<(Vec<u8>, Option<Vec<u8>>, String)> = conn
             .query_row(
-                "SELECT id FROM asset WHERE source_id = ?1 AND path = ?2",
+                "SELECT id, content_hash, media_type FROM asset WHERE source_id = ?1 AND path = ?2",
                 params![a.source_id.as_bytes().to_vec(), a.path],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()
             .map_err(internal)?;
         let hash_blob = a.content_hash.map(|h| h.as_bytes().to_vec());
         let now = now_ms();
-        let (id, is_new) = if let Some(id_blob) = existing {
+        let (id, is_new) = if let Some((id_blob, prev_hash, prev_media)) = existing {
+            // Same path, different bytes: everything the analyse pass derived (embedding, class,
+            // indexed document text) describes the *old* file. Only a Some→Some change counts —
+            // a row that simply had no hash before is not evidence the file was edited, and
+            // resetting unconditionally would re-analyse the whole library on every scan.
+            let content_changed = matches!((&prev_hash, &hash_blob), (Some(p), Some(n)) if p != n);
+            // A reclassification (the content probe finding an audio-only `.mp4`, or ffprobe
+            // becoming available between scans) is the same problem plus one: the derived rows are
+            // in the wrong tables entirely.
+            let media_changed = prev_media != a.media_type.as_str();
             conn.execute(
                 "UPDATE asset SET content_hash = ?2, filename = ?3, size_bytes = ?4,
                     source_modified_at = ?5, scanned_at = ?6, media_type = ?7, format = ?8,
@@ -37,6 +48,42 @@ impl Store {
                 ],
             )
             .map_err(internal)?;
+            if media_changed {
+                // Drop the attr row(s) the old classification owned, so exactly one of the joined
+                // tables stays non-NULL (`GRID_SELECT`'s invariant) — a video that turned out to be
+                // audio-only must not keep reporting the video row's duration — and the embeddings,
+                // which are all in the old media's space and can never be re-ranked against the new
+                // one anyway. The FTS body text goes with them for the same reason.
+                for media in MediaType::ALL.iter().filter(|m| **m != a.media_type) {
+                    conn.execute(
+                        &format!("DELETE FROM {} WHERE asset_id = ?1", attr_table(*media)),
+                        params![id_blob],
+                    )
+                    .map_err(internal)?;
+                }
+                conn.execute(
+                    "DELETE FROM embedding WHERE asset_id = ?1",
+                    params![id_blob],
+                )
+                .map_err(internal)?;
+                self.embed_gen
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                conn.execute(
+                    "UPDATE asset_fts SET text = '' WHERE rowid = (SELECT rowid FROM asset WHERE id = ?1)",
+                    params![id_blob],
+                )
+                .map_err(internal)?;
+            }
+            if content_changed || media_changed {
+                // Re-open the analyse gate (`analysis_version < PIPELINE_VERSION`, §7.2). The scan
+                // has already refreshed the cheap tier; without this the expensive tier would keep
+                // the stale derivation forever, because the version alone still looks current.
+                conn.execute(
+                    "UPDATE asset SET analysis_version = 0, analysed_at = NULL WHERE id = ?1",
+                    params![id_blob],
+                )
+                .map_err(internal)?;
+            }
             (blob_to_asset_id(&id_blob), false)
         } else {
             let id = AssetId::new();
@@ -454,5 +501,119 @@ impl Store {
             tags: Vec::new(),
             collections: Vec::new(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dam_sources::SourceConnection;
+
+    fn scanned(src: SourceId, path: &str, media: MediaType, hash: u8) -> NewAsset {
+        NewAsset {
+            source_id: src,
+            path: path.to_string(),
+            filename: path.rsplit('/').next().unwrap().to_string(),
+            content_hash: Some(ContentHash([hash; 32])),
+            size_bytes: Some(1),
+            source_modified_at: None,
+            scanned_at: now_ms(),
+            media_type: media,
+            format: "mp4".into(),
+        }
+    }
+
+    fn store_and_source() -> (Store, SourceId) {
+        let store = Store::open_in_memory().unwrap();
+        let src = store
+            .add_source(
+                &SourceConnection::LocalFs {
+                    root: "/tmp".into(),
+                },
+                "t",
+                false,
+            )
+            .unwrap();
+        (store, src)
+    }
+
+    fn count(store: &Store, sql: &str) -> i64 {
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(sql, [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// The analyse gate is `analysis_version < PIPELINE_VERSION`, and a re-scan of an edited file
+    /// writes a new content hash but the *same* version — so without the reset the expensive tier
+    /// would keep a derivation of bytes that no longer exist (a document's indexed body text being
+    /// the visible case). Equally, resetting on every scan would re-analyse the whole library
+    /// nightly, so only a genuine hash change counts.
+    #[test]
+    fn rescan_reopens_the_analyse_gate_only_when_the_bytes_changed() {
+        let (store, src) = store_and_source();
+        let (id, is_new) = store
+            .upsert_asset(&scanned(src, "docs/spec.md", MediaType::Document, 1))
+            .unwrap();
+        assert!(is_new);
+        store.mark_analysed(&id, 3).unwrap();
+        let due = || store.list_analysis_targets(3, false, &[]).unwrap().len();
+        assert_eq!(due(), 0, "just analysed");
+
+        // An unchanged file re-scanned: same hash, nothing to redo.
+        store
+            .upsert_asset(&scanned(src, "docs/spec.md", MediaType::Document, 1))
+            .unwrap();
+        assert_eq!(due(), 0, "an unchanged rescan must not re-analyse");
+
+        // Edited in place — same path, new bytes.
+        store
+            .upsert_asset(&scanned(src, "docs/spec.md", MediaType::Document, 2))
+            .unwrap();
+        assert_eq!(due(), 1, "an edited file must be re-analysed");
+    }
+
+    /// A media-type flip (the content probe finding an audio-only `.mp4`, or ffprobe appearing
+    /// between scans) leaves derived rows in the wrong tables. `GRID_SELECT` COALESCEs duration
+    /// across `audio_attr`/`video_attr` assuming exactly one is non-NULL, so a surviving row shows
+    /// up as a stale duration on the wrong asset.
+    #[test]
+    fn reclassification_drops_the_previous_media_s_derived_rows() {
+        let (store, src) = store_and_source();
+        let (id, _) = store
+            .upsert_asset(&scanned(src, "clip.mp4", MediaType::Video, 1))
+            .unwrap();
+        store
+            .set_media_attrs(
+                &id,
+                &MediaAttributes::Video(VideoAttributes {
+                    duration_ms: Some(1234),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        store
+            .set_embedding(&id, "video-stats-v1", MediaType::Video, &[1.0, 0.0], "t@1")
+            .unwrap();
+        store.mark_analysed(&id, 3).unwrap();
+
+        // The probe settles it as audio-only on the next scan; the bytes are identical.
+        store
+            .upsert_asset(&scanned(src, "clip.mp4", MediaType::Audio, 1))
+            .unwrap();
+
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM video_attr"), 0);
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM embedding"),
+            0,
+            "the old vector is in a space the new media can never be ranked in"
+        );
+        assert_eq!(
+            store.list_analysis_targets(3, false, &[]).unwrap().len(),
+            1,
+            "the new media type has to derive its own attributes"
+        );
     }
 }

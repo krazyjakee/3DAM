@@ -178,6 +178,25 @@ impl Store {
         Ok(())
     }
 
+    /// Drop an asset's embedding in one space. The counterpart to [`Self::set_embedding`] for the
+    /// case where re-analysis produces *no* vector (a document whose new revision has no readable
+    /// text): leaving the previous one indexed would keep ranking the asset on content it no longer
+    /// has. A no-op when there was nothing there.
+    pub fn clear_embedding(&self, id: &AssetId, space_id: &str) -> Result<(), LibError> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn
+            .execute(
+                "DELETE FROM embedding WHERE asset_id = ?1 AND space_id = ?2",
+                params![id.as_bytes().to_vec(), space_id],
+            )
+            .map_err(internal)?;
+        if n > 0 {
+            self.embed_gen
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
     /// Record that an asset is now analysed at `version` (the Plan gate reads this, §7.2).
     pub fn mark_analysed(&self, id: &AssetId, version: i64) -> Result<(), LibError> {
         let conn = self.conn.lock().unwrap();

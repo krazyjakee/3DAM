@@ -286,7 +286,8 @@ function VideoPreview({ src }: { src: string }) {
       {probeMissing && (
         <p className="px-3 py-2 text-[11px] text-fg-dim">
           No video decoder on the server — playback works, but duration, codec and poster-frame
-          thumbnails need <span className="font-mono">ffmpeg</span> installed where 3DAM runs.
+          thumbnails need <span className="font-mono">ffmpeg</span> installed where 3DAM runs. 3DAM
+          looks for it once per run, so restart the server after installing it.
         </p>
       )}
     </div>

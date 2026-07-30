@@ -26,6 +26,10 @@ pub const MAX_TEXT_BYTES: usize = 1024 * 1024;
 /// Characters of leading text kept as the inspector/grid excerpt.
 const EXCERPT_CHARS: usize = 280;
 
+/// Page ceiling for PDF body extraction. [`MAX_TEXT_BYTES`] is the real bound, but a generated PDF
+/// of a hundred thousand near-empty pages would reach it slowly if at all; this caps the work.
+const MAX_TEXT_PAGES: usize = 2_000;
+
 /// Bytes of a plaintext file read for the cheap tier. Word count on a huge log file is not worth a
 /// full read at ingest; the analyse pass gets the whole thing (up to [`MAX_TEXT_BYTES`]).
 const CHEAP_READ_BYTES: usize = 128 * 1024;
@@ -148,6 +152,11 @@ fn strip_rtf(src: &str) -> String {
 // ── OOXML / ODF (ZIP + XML containers) ─────────────────────────────────────
 
 /// Read one entry out of a ZIP container as a UTF-8 string.
+///
+/// The read is capped, so the cut can land mid-sequence in a multi-byte character. Decoding is
+/// lossy for the same reason [`read_text_capped`] is: a split character at the tail must cost one
+/// replacement char, not the whole document's text, word count and excerpt. (OOXML/ODF parts are
+/// always UTF-8 by specification, so there is no encoding to sniff — only a truncation to survive.)
 fn zip_entry(path: &Path, name: &str) -> Option<String> {
     let f = std::fs::File::open(path).ok()?;
     let mut zip = zip::ZipArchive::new(f).ok()?;
@@ -157,7 +166,7 @@ fn zip_entry(path: &Path, name: &str) -> Option<String> {
         .take(MAX_TEXT_BYTES as u64)
         .read_to_end(&mut buf)
         .ok()?;
-    String::from_utf8(buf).ok()
+    Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
 /// Concatenate every text node in an XML document, inserting breaks at the elements that mean
@@ -308,8 +317,11 @@ pub fn metadata(path: &Path, format: &str) -> DocumentAttributes {
             attrs.page_count = Some(pages.len() as i64);
             attrs.title = pdf_info(&doc, b"Title");
             attrs.author = pdf_info(&doc, b"Author");
-            // Text from the first few pages only — enough for an excerpt without paying for a
-            // 400-page manual at ingest. The analyse pass reads the rest.
+            // Honest about the one cost this arm can't avoid: `Document::load` parses the whole
+            // file, so a PDF is the one cheap-tier extraction proportional to file size rather than
+            // to header size. lopdf has no partial-parse entry point that still yields the page
+            // tree and `/Info`. Only the *text* is bounded — the first few pages, enough for an
+            // excerpt without paying to lay out a 400-page manual. The analyse pass reads the rest.
             let first: Vec<u32> = pages.keys().take(3).copied().collect();
             if let Ok(text) = doc.extract_text(&first) {
                 let text = normalise(&text);
@@ -374,8 +386,22 @@ pub fn extract_text(path: &Path, format: &str) -> Option<String> {
     let raw = match format {
         "pdf" => {
             let doc = lopdf::Document::load(path).ok()?;
-            let pages: Vec<u32> = doc.get_pages().keys().copied().collect();
-            doc.extract_text(&pages).ok()?
+            // Page at a time, stopping at the cap. Extracting every page first and truncating
+            // afterwards would materialise the whole of a 2000-page manual (several times over,
+            // once normalised) just to keep the first megabyte — every other format here bounds at
+            // read time, and so does this one now. A page that fails to extract is skipped, not
+            // fatal: one bad content stream shouldn't cost the rest of the document.
+            let mut out = String::new();
+            for page in doc.get_pages().keys().take(MAX_TEXT_PAGES) {
+                if out.len() >= MAX_TEXT_BYTES {
+                    break;
+                }
+                if let Ok(text) = doc.extract_text(&[*page]) {
+                    out.push_str(&text);
+                    out.push('\n');
+                }
+            }
+            out
         }
         "docx" => xml_text(&zip_entry(path, "word/document.xml")?),
         "odt" => xml_text(&zip_entry(path, "content.xml")?),

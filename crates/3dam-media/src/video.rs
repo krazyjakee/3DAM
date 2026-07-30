@@ -92,8 +92,8 @@ fn parse_rational(s: &str) -> Option<f32> {
 /// media types, and the audio decode matrix already claims `mp4`. `None` means "no prober, can't
 /// tell" — the caller applies the documented extension fallback rather than guessing here.
 ///
-/// A cover-art JPEG inside an audio file appears as a video stream, so an image-ish codec with no
-/// real frame rate is not counted as video.
+/// A cover-art JPEG inside an audio file appears as a video stream, so an image-ish codec carrying
+/// a single frame is not counted as video.
 pub fn has_video_stream(path: &Path) -> Option<bool> {
     let v = probe(path)?;
     let Some(s) = stream_of(&v, "video") else {
@@ -107,8 +107,13 @@ pub fn has_video_stream(path: &Path) -> Option<bool> {
             .and_then(|d| d.get("attached_pic"))
             .and_then(|a| a.as_i64())
             .unwrap_or(0);
-        let frames = as_i64(s.get("nb_frames")).unwrap_or(0);
-        if cover == 1 || frames <= 1 {
+        // `nb_frames` is absent for fragmented/streamed containers, and "unknown" is not "one":
+        // defaulting it to zero would demote a real MJPEG track to audio. Only an explicitly
+        // single-frame (or empty) track is cover art. The disposition check above doesn't cover
+        // this on its own — art muxed with `-disposition:v 0` reports `nb_frames="1"` and
+        // `attached_pic=0` — so the frame count is still load-bearing, just no longer guessed.
+        let frames = as_i64(s.get("nb_frames"));
+        if cover == 1 || matches!(frames, Some(n) if n <= 1) {
             return Some(false);
         }
     }

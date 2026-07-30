@@ -668,7 +668,8 @@ fn get_prompt(params: Value) -> Result<Value, RpcError> {
     }))
 }
 
-const INSTRUCTIONS: &str = "3dam is a local-first game-asset manager (audio, images, 3D models). \
+const INSTRUCTIONS: &str = "3dam is a local-first game-asset manager (audio, images, 3D models, \
+plus the video and documents that sit alongside them). \
 Use `search` and `find_similar` to explore the catalog, `get_asset` for full metadata including \
 license, and `find_duplicates` for dedup review. Write tools (tag/add_source/scan/convert/export) \
 are non-destructive and only available when the server enables them.";

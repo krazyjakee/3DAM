@@ -13,12 +13,15 @@ use dam_api::service::Visibility;
 use dam_api::LibError;
 use dam_sources::SourceConnection;
 use rusqlite::types::Value;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::path::Path;
 use std::sync::Mutex;
 use uuid::Uuid;
 
 const QUERY_MAX_LIMIT: u32 = 500;
+
+/// How long a writer waits for another process's write lock before giving up (see [`Store::migrate`]).
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 // Time and the opaque-internal error wrapper are shared workspace-wide (dam-api). Re-export
 // `now_ms` because `dam_store::now_ms` is part of this crate's surface (used by 3dam-core).
@@ -94,6 +97,12 @@ impl Store {
     }
 
     fn from_conn(conn: Connection, synonyms: search::SynonymMap) -> Result<Store, LibError> {
+        // One data dir can legitimately be open in two processes (the desktop shell and a CLI run).
+        // WAL lets their readers overlap, but writers still serialise, and rusqlite's default is to
+        // fail instantly with `SQLITE_BUSY` rather than wait. Waiting is what we want everywhere:
+        // the contended windows here are short (a migration step, a scan batch), and a spurious
+        // "database is locked" would surface as a failed job.
+        conn.busy_timeout(BUSY_TIMEOUT).map_err(internal)?;
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(internal)?;
         conn.pragma_update(None, "synchronous", "NORMAL")
@@ -111,6 +120,16 @@ impl Store {
         Ok(store)
     }
 
+    /// Apply pending schema steps, forward-only (`PRAGMA user_version`).
+    ///
+    /// Two processes may open the same data dir at the same moment (the desktop shell boots its
+    /// in-process server while a CLI run starts), and both would otherwise read the same old
+    /// version outside any transaction and replay the same steps — the loser failing on "table
+    /// already exists" with a half-applied schema behind it. So each step takes an **immediate**
+    /// transaction (rusqlite's default `BEGIN` is deferred, and only upgrades to a write lock at
+    /// the first write — far too late) and re-reads `user_version` *inside* it. Whoever gets the
+    /// write lock applies the step; the other waits out `busy_timeout`, sees the new version, and
+    /// skips. Idempotent either way.
     fn migrate(&self) -> Result<(), LibError> {
         let mut conn = self.conn.lock().unwrap();
         let current: i64 = conn
@@ -124,14 +143,24 @@ impl Store {
         }
         for (i, step) in schema::MIGRATIONS.iter().enumerate() {
             let version = (i + 1) as i64;
-            if version > current {
-                let tx = conn.transaction().map_err(internal)?;
-                tx.execute_batch(step).map_err(internal)?;
-                tx.pragma_update(None, "user_version", version)
-                    .map_err(internal)?;
-                tx.commit().map_err(internal)?;
-                tracing::info!(version, "applied migration");
+            if version <= current {
+                continue;
             }
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(internal)?;
+            let applied: i64 = tx
+                .pragma_query_value(None, "user_version", |r| r.get(0))
+                .map_err(internal)?;
+            if applied >= version {
+                tracing::debug!(version, "migration already applied by another process");
+                continue;
+            }
+            tx.execute_batch(step).map_err(internal)?;
+            tx.pragma_update(None, "user_version", version)
+                .map_err(internal)?;
+            tx.commit().map_err(internal)?;
+            tracing::info!(version, "applied migration");
         }
         Ok(())
     }

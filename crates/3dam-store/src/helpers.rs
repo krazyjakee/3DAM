@@ -22,6 +22,19 @@ pub(crate) const GRID_SELECT: &str = "SELECT asset.id, filename, media_type, for
         model_attr.triangle_count, audio_attr.class, asset.flags,
         document_attr.page_count, document_attr.word_count";
 
+/// The attribute table a media type owns. The tables are exclusive — an asset has a row in exactly
+/// one of them — which is the invariant [`GRID_SELECT`] `COALESCE`s on, so anything that changes an
+/// asset's media type has to clear the row it left behind.
+pub(crate) fn attr_table(media: MediaType) -> &'static str {
+    match media {
+        MediaType::Audio => "audio_attr",
+        MediaType::Image => "image_attr",
+        MediaType::Model => "model_attr",
+        MediaType::Video => "video_attr",
+        MediaType::Document => "document_attr",
+    }
+}
+
 /// The per-media attribute LEFT JOINs the grid select depends on (dimensions / duration / tris /
 /// page count).
 pub(crate) const ATTR_JOINS: &str = "LEFT JOIN image_attr ON image_attr.asset_id = asset.id

@@ -70,7 +70,11 @@ pub fn content_type_for(media: MediaType, format: &str) -> &'static str {
         "mp3" => "audio/mpeg",
         "flac" => "audio/flac",
         "ogg" => "audio/ogg",
-        "aac" | "m4a" | "mp4" => "audio/mp4",
+        // `mov`/`m4v` land here only when the content probe has already reclassified the file as
+        // audio-only (it keeps the original format token) — the video arm above caught every other
+        // case. Serving those as `application/octet-stream` would make the one file the probe
+        // exists to detect the one file that won't play.
+        "aac" | "m4a" | "mp4" | "mov" | "m4v" => "audio/mp4",
         // image
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",

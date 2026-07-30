@@ -31,17 +31,28 @@ pub const PIPELINE_VERSION: i64 = 3;
 
 /// Embedding-space ids (§2.1). Model-free descriptors in v1 — see module docs. One logical index per
 /// media type; vectors from different spaces are never cross-ranked (§3.1).
-const IMAGE_SPACE: &str = "image-stats-v1";
-const AUDIO_SPACE: &str = "audio-stats-v1";
-const MODEL_SPACE: &str = "model-stats-v1";
-/// Video: container shape only (see [`analyze_video`]) — a weak descriptor, honestly named.
-const VIDEO_SPACE: &str = "video-stats-v1";
-/// Documents: hashed bag-of-words over the extracted text (`dam_media::text_descriptor`). Text is
-/// the one media type where the model-free descriptor is genuinely useful rather than a
-/// placeholder, because lexical overlap *is* a real similarity signal for prose. The model-backed
-/// text encoder is a later feature-gated bump into its own space (issue #47), never a redefinition
-/// of this one.
-const TEXT_SPACE: &str = "text-hash-v1";
+///
+/// This match is the **only** place the model-free space names are written. The analyse pass embeds
+/// into it and [`crate::EmbeddedLibrary::embedding_spaces`] advertises it to peers, so a peer can
+/// never gate cross-peer similarity on a name nothing was ever written under. Deliberately a match
+/// rather than a `format!` over the media name: the mapping is not derivable (documents rank in a
+/// hashed-text space, not a stats one), and being exhaustive means a sixth media type is a compile
+/// error here rather than a silently missing space.
+pub(crate) fn model_free_space(media: MediaType) -> &'static str {
+    match media {
+        MediaType::Image => "image-stats-v1",
+        MediaType::Audio => "audio-stats-v1",
+        MediaType::Model => "model-stats-v1",
+        // Video: container shape only (see [`analyze_video`]) — a weak descriptor, honestly named.
+        MediaType::Video => "video-stats-v1",
+        // Documents: hashed bag-of-words over the extracted text (`dam_media::text_descriptor`).
+        // Text is the one media type where the model-free descriptor is genuinely useful rather
+        // than a placeholder, because lexical overlap *is* a real similarity signal for prose. The
+        // model-backed text encoder is a later feature-gated bump into its own space (issue #47),
+        // never a redefinition of this one.
+        MediaType::Document => "text-hash-v1",
+    }
+}
 
 const PROGRESS_EVERY: u64 = 8;
 
@@ -212,7 +223,7 @@ fn analyze_image(store: &Store, t: &AnalysisTarget, abs: &Path) -> Result<(), St
     store
         .set_embedding(
             &t.id,
-            IMAGE_SPACE,
+            model_free_space(MediaType::Image),
             MediaType::Image,
             &f.embedding,
             "image-stats@1",
@@ -247,7 +258,13 @@ fn analyze_audio(
         a.bit_depth.unwrap_or(0) as f32 / 24.0,
     ]);
     store
-        .set_embedding(&t.id, AUDIO_SPACE, MediaType::Audio, &vec, "audio-stats@1")
+        .set_embedding(
+            &t.id,
+            model_free_space(MediaType::Audio),
+            MediaType::Audio,
+            &vec,
+            "audio-stats@1",
+        )
         .map_err(|e| e.to_string())?;
     // Classify from *measured* DSP signals, not duration (§4.2). A full decode yields loopability
     // (authored `smpl` loop points, else a seamless wrap boundary), tonality + key, tempo, and
@@ -337,7 +354,13 @@ fn analyze_model(
         m.has_uvs.unwrap_or(false) as u8 as f32,
     ]);
     store
-        .set_embedding(&t.id, MODEL_SPACE, MediaType::Model, &vec, "model-stats@1")
+        .set_embedding(
+            &t.id,
+            model_free_space(MediaType::Model),
+            MediaType::Model,
+            &vec,
+            "model-stats@1",
+        )
         .map_err(|e| e.to_string())?;
     // Category guess from triangle budget (§5): a coarse low/mid/high-poly bucket.
     let class = match m.triangle_count {
@@ -404,7 +427,13 @@ fn analyze_video(
         v.has_audio.unwrap_or(false) as u8 as f32,
     ]);
     store
-        .set_embedding(&t.id, VIDEO_SPACE, MediaType::Video, &vec, "video-stats@1")
+        .set_embedding(
+            &t.id,
+            model_free_space(MediaType::Video),
+            MediaType::Video,
+            &vec,
+            "video-stats@1",
+        )
         .map_err(|e| e.to_string())?;
 
     // Duration is the one axis that reliably separates the kinds of video a game project holds.
@@ -457,19 +486,33 @@ fn analyze_document(
 
     // A scanned-image PDF with no text layer legitimately yields nothing. That is not an error —
     // it is a document we can describe but not read, and it stays findable by filename and tags.
-    let Some(text) = dam_media::extract_text(abs, &det.format) else {
+    // The empty string is still *written*: this pass also runs when a document is replaced by an
+    // edited version, and returning early here would leave the previous body indexed forever,
+    // matching searches for prose the file no longer contains.
+    let text = dam_media::extract_text(abs, &det.format).unwrap_or_default();
+    if text.is_empty() {
         tracing::debug!(asset = %t.id, "no extractable text; indexing by name only");
-        return Ok(());
-    };
+    }
 
     store
         .set_document_text(&t.id, &text)
         .map_err(|e| e.to_string())?;
 
-    if let Some(vec) = dam_media::text_descriptor(&text) {
-        store
-            .set_embedding(&t.id, TEXT_SPACE, MediaType::Document, &vec, "text-hash@1")
-            .map_err(|e| e.to_string())?;
+    // `text_descriptor` returns `None` for text with no usable tokens, so an unreadable document
+    // never gets a vector — but a *stale* one from a previous version must not survive either.
+    match dam_media::text_descriptor(&text) {
+        Some(vec) => store
+            .set_embedding(
+                &t.id,
+                model_free_space(MediaType::Document),
+                MediaType::Document,
+                &vec,
+                "text-hash@1",
+            )
+            .map_err(|e| e.to_string())?,
+        None => store
+            .clear_embedding(&t.id, model_free_space(MediaType::Document))
+            .map_err(|e| e.to_string())?,
     }
 
     // Classify by what the document *is* to a project. Filename is the strongest signal here —

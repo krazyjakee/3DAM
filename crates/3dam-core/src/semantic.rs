@@ -96,6 +96,11 @@ impl Composite {
         match media {
             MediaType::Audio => self.clap.as_deref(),
             MediaType::Image | MediaType::Model => self.siglip.as_deref(),
+            // Deliberate: neither checkpoint covers video or prose, and inventing one (feeding a
+            // poster frame to SigLIP, say) would make the space heterogeneous. Both already rank in
+            // their model-free spaces (`video-stats-v1` / `text-hash-v1`); a video encoder or a
+            // model-backed text encoder is a later bump into its own space, not a reuse of these.
+            MediaType::Video | MediaType::Document => None,
         }
     }
 }

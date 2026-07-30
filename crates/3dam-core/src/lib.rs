@@ -651,10 +651,16 @@ impl EmbeddedLibrary {
     /// its media with the model-backed space id.
     pub fn embedding_spaces(&self) -> std::collections::BTreeMap<String, String> {
         let mut spaces = std::collections::BTreeMap::new();
-        for media in [MediaType::Audio, MediaType::Image, MediaType::Model] {
+        for &media in MediaType::ALL {
+            // A loaded model that doesn't cover this media reports an empty space id (the composite
+            // has no checkpoint for video or prose); fall back to the model-free space the analyse
+            // pass actually wrote into, so the advertised name is never one nothing was indexed under.
             let id = match &self.semantic {
-                Some(m) => m.space_id(media),
-                None => format!("{}-stats-v1", media.as_str()),
+                Some(m) => match m.space_id(media) {
+                    s if s.is_empty() => analysis::model_free_space(media).to_string(),
+                    s => s,
+                },
+                None => analysis::model_free_space(media).to_string(),
             };
             spaces.insert(media.as_str().to_string(), id);
         }

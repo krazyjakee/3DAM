@@ -92,7 +92,17 @@ const AMBIGUOUS_CONTAINERS: &[&str] = &["mp4", "mov", "m4v"];
 /// every walked entry including the progress pre-count, so it must not spawn a process or open a
 /// file. Where the extension genuinely doesn't determine the answer, see [`refine_with_content`].
 pub fn detect(path: &Path) -> Option<Detected> {
-    let e = ext(path)?;
+    let Some(e) = ext(path) else {
+        // Extension-less licence files (`LICENSE`, `COPYING`, `NOTICE`) are the one case where the
+        // *name* determines the type. They are also the dominant real-world spelling — bare
+        // `LICENSE` is far more common than `LICENSE.txt` — so treating them as undetectable would
+        // leave the licence surface with nothing to cite for most projects, which is one of the
+        // motivations for cataloguing documents at all. They are plaintext; read them as such.
+        return is_licence_evidence(path).then(|| Detected {
+            media: MediaType::Document,
+            format: "txt".to_string(),
+        });
+    };
     let media = match e.as_str() {
         // audio. `.m4a` is the audio-only ISO-BMFF extension by convention and is not probed —
         // an `.m4a` carrying a video track is a file that has already lied about itself.
@@ -166,9 +176,12 @@ const NOISE_DIRS: &[&str] = &[
 ///   are in — a texture under `build/` is still a texture, and silently omitting it would be a far
 ///   worse failure than over-indexing a readme.
 /// - Documents are dropped when they sit under a dependency/build/VCS directory. That is where
-///   generated and third-party noise lives, and nothing there is authored by the project. A
-///   `LICENSE.txt` at the root of a purchased asset pack — precisely the evidence the licence
-///   surface needs to point at — is untouched, because it is not in one of those directories.
+///   generated and third-party noise lives, and nothing there is authored by the project.
+/// - **Except** licence evidence, at any depth. A purchased asset pack unpacked into `vendor/` puts
+///   its `LICENSE.txt` under a noise directory, and that file is precisely what the licence surface
+///   has to point at — dropping it would silently remove the evidence for a licence claim, which is
+///   a worse failure than indexing a few dependency readmes. So [`LICENCE_EVIDENCE`] names are kept
+///   wherever they are.
 pub fn detect_for_ingest(rel_path: &Path) -> Option<Detected> {
     let det = detect(rel_path)?;
     if det.media != MediaType::Document {
@@ -180,7 +193,26 @@ pub fn detect_for_ingest(rel_path: &Path) -> Option<Detected> {
         .flat_map(|p| p.components())
         .filter_map(|c| c.as_os_str().to_str())
         .any(|seg| NOISE_DIRS.contains(&seg.to_ascii_lowercase().as_str()));
-    (!in_noise_dir).then_some(det)
+    (!in_noise_dir || is_licence_evidence(rel_path)).then_some(det)
+}
+
+/// Filename stems that carry licence/attribution evidence. Matched case-insensitively against the
+/// first word of the filename, so `LICENSE`, `LICENSE.txt` and `LICENCE-MIT.md` all qualify.
+///
+/// `readme` is deliberately **not** here. A readme sometimes mentions licence terms, but it is also
+/// the single highest-volume filename in any dependency tree — one `npm install` is thousands of
+/// them — so admitting it would undo the very policy this exception is carved out of and drown the
+/// catalog (the risk the epic flags). Licence files are far rarer and are the actual evidence the
+/// licence surface needs to cite, so the exception stays narrow enough to be worth its cost.
+const LICENCE_EVIDENCE: &[&str] = &["license", "licence", "copying", "notice", "eula"];
+
+fn is_licence_evidence(rel_path: &Path) -> bool {
+    let name = rel_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    let base = name.split(['.', '-', '_']).next().unwrap_or_default();
+    LICENCE_EVIDENCE.contains(&base.to_ascii_lowercase().as_str())
 }
 
 /// Settle a provisional [`detect`] result against the file's actual bytes.
@@ -345,6 +377,34 @@ mod tests {
     }
 
     #[test]
+    fn extensionless_licence_files_are_documents() {
+        // The dominant real-world spelling has no extension at all, and the licence surface has to
+        // be able to cite it. Read as plaintext.
+        for p in [
+            "LICENSE",
+            "COPYING",
+            "NOTICE",
+            "licence",
+            "LICENSE-MIT",
+            "EULA",
+        ] {
+            let d = detect(Path::new(p)).unwrap_or_else(|| panic!("{p} should be detected"));
+            assert_eq!(d.media, MediaType::Document, "{p}");
+            assert_eq!(d.format, "txt", "{p}");
+        }
+        // The name is only load-bearing when there is no extension — this must not become a
+        // general "sniff every extension-less file" rule.
+        assert_eq!(detect(Path::new("Makefile")), None);
+        assert_eq!(detect(Path::new("some-binary")), None);
+        assert_eq!(detect(Path::new("CHANGELOG")), None);
+        // And an extension still wins where present.
+        assert_eq!(
+            detect(Path::new("LICENSE.md")).map(|d| d.format),
+            Some("md".to_string())
+        );
+    }
+
+    #[test]
     fn ambiguous_containers_default_to_video_and_refine_is_a_no_op_without_bytes() {
         // `detect` is extension-only and infallible — it must never touch the filesystem, because
         // during a scan it is handed a *relative* logical path (a fetched remote file has a random
@@ -386,11 +446,27 @@ mod tests {
 
         // Dependency/build/VCS noise does not.
         assert_eq!(ingest("node_modules/left-pad/README.md"), None);
-        assert_eq!(ingest("web/node_modules/x/LICENSE"), None);
         assert_eq!(ingest("target/debug/notes.txt"), None);
         assert_eq!(ingest(".git/COMMIT_EDITMSG.txt"), None);
         // Case-insensitive on the directory segment.
         assert_eq!(ingest("Build/readme.md"), None);
+
+        // …except licence evidence, which survives at any depth: an asset pack unpacked into
+        // `vendor/` still has to be able to answer "what am I allowed to do with this?".
+        assert_eq!(
+            ingest("vendor/kenney-pack/LICENSE.txt"),
+            Some(MediaType::Document),
+            "licence evidence must survive a noise directory — it's what the licence surface cites"
+        );
+        assert_eq!(
+            ingest("web/node_modules/x/LICENCE-MIT.md"),
+            Some(MediaType::Document)
+        );
+        assert_eq!(ingest("target/COPYING"), Some(MediaType::Document));
+        // But a readme is not licence evidence, and it is the highest-volume filename in a
+        // dependency tree — admitting it would undo the policy (asserted above, and again here at
+        // depth) rather than narrowly carve out of it.
+        assert_eq!(ingest("vendor/pack/readme.md"), None);
 
         // Real assets are never dropped, wherever they live — a texture under build/ is a texture.
         assert_eq!(

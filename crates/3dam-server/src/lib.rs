@@ -839,36 +839,76 @@ fn content_response(content: AssetContent, cache_control: &'static str) -> Respo
         .into_response()
 }
 
-/// A single byte range resolved against a known length.
+/// What a `Range` header resolves to against a known length — the three outcomes RFC 9110 §14.2
+/// distinguishes, which are *not* two: "I can't parse this" and "this asks for bytes you don't
+/// have" get different answers, and conflating them 416s a client that only sent us a typo.
+#[derive(Debug, PartialEq, Eq)]
+enum RangeSpec {
+    /// A valid single range that overlaps the representation: serve `206` with these bounds.
+    Satisfiable(u64, u64),
+    /// Syntactically valid but starting past the end of the representation: `416`, the one case
+    /// the status is for.
+    Unsatisfiable,
+    /// Unparsable (`bytes=abc-def`, `bytes=50-10`, an overflowing number), or a form we don't
+    /// implement. RFC 9110 requires an unsatisfiable-*looking* but invalid spec to be **ignored**
+    /// — "a server MUST ignore a Range header field that contains a range unit it does not
+    /// understand" — so these fall through to the full `200`.
+    Ignore,
+}
+
+/// Resolve a single byte range against a known length.
 ///
 /// Only the single-range form is supported. Multi-range (`bytes=0-99,200-299`) requires a
 /// `multipart/byteranges` body, is not used by any media element, and is explicitly optional in
-/// RFC 9110 §14.2 — a server may answer it with the whole representation, which is what falling
-/// through to a 200 here does.
-fn parse_range(spec: &str, len: u64) -> Option<(u64, u64)> {
-    let spec = spec.trim().strip_prefix("bytes=")?;
+/// RFC 9110 §14.2 — a server may answer it with the whole representation, which is what
+/// [`RangeSpec::Ignore`] does.
+///
+/// Total: every arithmetic path saturates, so a zero-length representation or an absurd offset
+/// returns an answer rather than panicking.
+fn parse_range(spec: &str, len: u64) -> RangeSpec {
+    let Some(spec) = spec.trim().strip_prefix("bytes=") else {
+        return RangeSpec::Ignore;
+    };
     if spec.contains(',') {
-        return None;
+        return RangeSpec::Ignore;
     }
-    let (start, end) = spec.split_once('-')?;
+    let Some((start, end)) = spec.split_once('-') else {
+        return RangeSpec::Ignore;
+    };
     let (start, end) = (start.trim(), end.trim());
     let (first, last) = if start.is_empty() {
-        // Suffix form `bytes=-N`: the final N bytes.
-        let n: u64 = end.parse().ok()?;
+        // Suffix form `bytes=-N`: the final N bytes. `-0` asks for nothing, which is valid syntax
+        // and cannot be satisfied.
+        let Ok(n) = end.parse::<u64>() else {
+            return RangeSpec::Ignore;
+        };
         if n == 0 {
-            return None;
+            return RangeSpec::Unsatisfiable;
         }
-        (len.saturating_sub(n), len - 1)
+        (len.saturating_sub(n), len.saturating_sub(1))
     } else {
-        let first: u64 = start.parse().ok()?;
+        let Ok(first) = start.parse::<u64>() else {
+            return RangeSpec::Ignore;
+        };
         let last = if end.is_empty() {
-            len - 1
+            len.saturating_sub(1)
         } else {
-            end.parse::<u64>().ok()?.min(len - 1)
+            let Ok(last) = end.parse::<u64>() else {
+                return RangeSpec::Ignore;
+            };
+            // A last-byte-pos below first-byte-pos makes the spec invalid, not unsatisfiable.
+            // Checked before clamping, so `bytes=150-140` against a short body is still a typo.
+            if last < first {
+                return RangeSpec::Ignore;
+            }
+            last.min(len.saturating_sub(1))
         };
         (first, last)
     };
-    (first <= last && first < len).then_some((first, last))
+    if len == 0 || first >= len {
+        return RangeSpec::Unsatisfiable;
+    }
+    RangeSpec::Satisfiable(first, last)
 }
 
 /// Serve asset bytes with **range support**.
@@ -902,17 +942,8 @@ fn ranged_content_response(
         return res;
     };
 
-    // A range against an empty body can never be satisfied.
-    if len == 0 {
-        return (
-            StatusCode::RANGE_NOT_SATISFIABLE,
-            [(header::CONTENT_RANGE, "bytes */0".to_string())],
-        )
-            .into_response();
-    }
-
     match parse_range(spec, len) {
-        Some((first, last)) => {
+        RangeSpec::Satisfiable(first, last) => {
             let slice = content.bytes[first as usize..=last as usize].to_vec();
             (
                 StatusCode::PARTIAL_CONTENT,
@@ -926,14 +957,14 @@ fn ranged_content_response(
             )
                 .into_response()
         }
-        // Syntactically valid but unsatisfiable (start past the end) must be 416; anything we
-        // simply don't implement (multi-range) degrades to the full representation.
-        None if spec.trim_start().starts_with("bytes=") && !spec.contains(',') => (
+        // Valid but past the end (including any range against an empty body) is the one case 416
+        // describes; a malformed or unimplemented spec is ignored, per `RangeSpec`.
+        RangeSpec::Unsatisfiable => (
             StatusCode::RANGE_NOT_SATISFIABLE,
             [(header::CONTENT_RANGE, format!("bytes */{len}"))],
         )
             .into_response(),
-        None => {
+        RangeSpec::Ignore => {
             let mut res = content_response(content, cache_control);
             res.headers_mut().insert(
                 header::ACCEPT_RANGES,
@@ -1467,7 +1498,11 @@ async fn mcp_http(State(st): State<AppState>, headers: HeaderMap, body: Body) ->
 
 #[cfg(test)]
 mod tests {
-    use super::parse_range;
+    use super::{parse_range, RangeSpec};
+
+    fn sat(first: u64, last: u64) -> RangeSpec {
+        RangeSpec::Satisfiable(first, last)
+    }
 
     /// RFC 9110 §14.1.2 range forms, plus the ones a `<video>` element actually sends when it
     /// seeks. Getting these wrong is not a subtle bug — a browser that asks for `bytes=500-` and
@@ -1475,38 +1510,51 @@ mod tests {
     #[test]
     fn parses_the_range_forms_a_video_element_sends() {
         // Opening probe: some bytes from the front.
-        assert_eq!(parse_range("bytes=0-1023", 4096), Some((0, 1023)));
+        assert_eq!(parse_range("bytes=0-1023", 4096), sat(0, 1023));
         // Seek: open-ended from an offset.
-        assert_eq!(parse_range("bytes=500-", 4096), Some((500, 4095)));
+        assert_eq!(parse_range("bytes=500-", 4096), sat(500, 4095));
         // Suffix: the last N bytes (MP4 `moov` atom at the tail).
-        assert_eq!(parse_range("bytes=-500", 4096), Some((3596, 4095)));
+        assert_eq!(parse_range("bytes=-500", 4096), sat(3596, 4095));
         // A suffix longer than the file clamps to the whole file rather than underflowing.
-        assert_eq!(parse_range("bytes=-9999", 100), Some((0, 99)));
+        assert_eq!(parse_range("bytes=-9999", 100), sat(0, 99));
         // An end past EOF clamps to the last byte.
-        assert_eq!(parse_range("bytes=0-99999", 100), Some((0, 99)));
+        assert_eq!(parse_range("bytes=0-99999", 100), sat(0, 99));
         // Whole file, explicitly.
-        assert_eq!(parse_range("bytes=0-", 10), Some((0, 9)));
+        assert_eq!(parse_range("bytes=0-", 10), sat(0, 9));
         // Single byte.
-        assert_eq!(parse_range("bytes=5-5", 10), Some((5, 5)));
+        assert_eq!(parse_range("bytes=5-5", 10), sat(5, 5));
         // Tolerate the optional whitespace the grammar allows.
-        assert_eq!(parse_range(" bytes=0-1 ", 10), Some((0, 1)));
+        assert_eq!(parse_range(" bytes=0-1 ", 10), sat(0, 1));
     }
 
+    /// The distinction RFC 9110 §14.2 draws and that a single `Option` cannot express: a *valid*
+    /// range past the end of the representation is a 416; a spec we cannot parse must be ignored
+    /// (answered with the whole representation), because 416ing a typo strands a client that would
+    /// have been perfectly happy with a 200.
     #[test]
-    fn rejects_unsatisfiable_and_unsupported_ranges() {
-        // Start past the end — the caller turns this into a 416.
-        assert_eq!(parse_range("bytes=100-200", 100), None);
-        assert_eq!(parse_range("bytes=100-", 100), None);
-        // Inverted range.
-        assert_eq!(parse_range("bytes=50-10", 100), None);
-        // A zero-length suffix requests nothing.
-        assert_eq!(parse_range("bytes=-0", 100), None);
+    fn separates_unsatisfiable_from_malformed_ranges() {
+        // Valid syntax, entirely past the end — the caller turns this into a 416.
+        assert_eq!(parse_range("bytes=100-200", 100), RangeSpec::Unsatisfiable);
+        assert_eq!(parse_range("bytes=100-", 100), RangeSpec::Unsatisfiable);
+        // A zero-length suffix is well-formed and requests nothing.
+        assert_eq!(parse_range("bytes=-0", 100), RangeSpec::Unsatisfiable);
+        // Any range against an empty representation. Non-panicking: every offset saturates.
+        assert_eq!(parse_range("bytes=0-", 0), RangeSpec::Unsatisfiable);
+        assert_eq!(parse_range("bytes=-1", 0), RangeSpec::Unsatisfiable);
+
+        // Malformed specs are ignored, not rejected.
+        assert_eq!(parse_range("bytes=50-10", 100), RangeSpec::Ignore);
+        assert_eq!(parse_range("bytes=abc-def", 100), RangeSpec::Ignore);
+        assert_eq!(parse_range("bytes=", 100), RangeSpec::Ignore);
+        assert_eq!(parse_range("", 100), RangeSpec::Ignore);
+        // Not a byte range unit at all.
+        assert_eq!(parse_range("items=0-9", 100), RangeSpec::Ignore);
+        // Overflows a u64 rather than wrapping into a plausible offset.
+        assert_eq!(
+            parse_range("bytes=99999999999999999999999-", 100),
+            RangeSpec::Ignore
+        );
         // Multi-range: legal to decline, so we fall back to the full representation.
-        assert_eq!(parse_range("bytes=0-9,20-29", 100), None);
-        // Not a byte range / malformed.
-        assert_eq!(parse_range("items=0-9", 100), None);
-        assert_eq!(parse_range("bytes=abc-def", 100), None);
-        assert_eq!(parse_range("bytes=", 100), None);
-        assert_eq!(parse_range("", 100), None);
+        assert_eq!(parse_range("bytes=0-9,20-29", 100), RangeSpec::Ignore);
     }
 }
