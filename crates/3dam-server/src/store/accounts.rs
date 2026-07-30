@@ -119,28 +119,81 @@ impl ServerStore {
         self.audit(actor, "account.claim_reopened", None, None)
     }
 
-    /// Redeem the claim: create the first (admin) account and close the window. The *caller*
-    /// (the auth route) is responsible for the loopback / admin-bearer gate — this is the state
-    /// transition only, and it re-checks unclaimed under the lock so two racing claims can't both
-    /// win.
+    /// Redeem the claim: create the first (admin) account and close the window. The *caller* (the
+    /// auth route) owns the loopback / admin-bearer gate — this is the state transition only.
+    ///
+    /// **Atomic by construction.** The unclaimed check, the account insert, and the closing of the
+    /// re-opened window all happen inside one `BEGIN IMMEDIATE` transaction, held across a single
+    /// acquisition of the connection mutex. The earlier shape re-checked through `unclaimed()`
+    /// (which takes and releases the lock), then hashed the password for tens of milliseconds, then
+    /// re-acquired to insert — a window wide enough for two concurrent claims with different
+    /// usernames to both succeed and both become admin. The argon2 hash stays *outside* the
+    /// transaction (below), so the KDF never holds the server's only DB connection.
     pub fn claim(&self, req: &ClaimRequest, actor: &str) -> Result<AccountInfo, LibError> {
-        if !self.unclaimed() {
-            return Err(LibError::Conflict(
-                "this instance is already claimed".into(),
+        if !self.user_accounts() {
+            return Err(LibError::NotFound("user accounts are disabled".into()));
+        }
+        if !valid_username(&req.username) {
+            return Err(LibError::BadRequest(
+                "username must be 1–64 chars of letters, digits, '-', '_', '.', '@'".into(),
             ));
         }
-        let info = self.create_account(
-            &NewAccount {
-                username: req.username.clone(),
-                password: req.password.clone(),
-                display_name: req.display_name.clone(),
-                role: Role::Admin,
-            },
-            actor,
-        )?;
-        self.claim_reopened.store(false, Ordering::Relaxed);
-        self.audit(actor, "account.claim", Some(&info.account_id), None)?;
-        Ok(info)
+        // Hash first, lock second: an expensive KDF must never run under the connection mutex.
+        // A hash computed for a claim that then loses the race is simply discarded.
+        let phc = hash_password(&req.password)?;
+        let account_id = uuid::Uuid::now_v7().simple().to_string();
+        let now = now_ms();
+        {
+            let mut conn = self.conn.lock().unwrap();
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(internal)?;
+            let n: i64 = tx
+                .query_row("SELECT COUNT(*) FROM account", [], |r| r.get(0))
+                .map_err(internal)?;
+            // The config escape hatch re-opens the window for one claim; the mutex serialises us,
+            // so clearing it here (before commit) is what makes it one-shot.
+            let reopened = self.claim_reopened.load(Ordering::Relaxed);
+            if n != 0 && !reopened {
+                return Err(LibError::Conflict(
+                    "this instance is already claimed".into(),
+                ));
+            }
+            let inserted = tx
+                .execute(
+                    "INSERT OR IGNORE INTO account
+                     (account_id, username, display_name, password_hash, role, disabled, created)
+                     VALUES (?1, ?2, ?3, ?4, 'admin', 0, ?5)",
+                    params![account_id, req.username, req.display_name, phc, now],
+                )
+                .map_err(internal)?;
+            if inserted == 0 {
+                return Err(LibError::Conflict(format!(
+                    "username '{}' is taken",
+                    req.username
+                )));
+            }
+            Self::audit_row(
+                &tx,
+                actor,
+                "account.create",
+                Some(&account_id),
+                Some(serde_json::json!({ "username": req.username, "role": Role::Admin })),
+            )?;
+            Self::audit_row(&tx, actor, "account.claim", Some(&account_id), None)?;
+            tx.commit().map_err(internal)?;
+            self.claim_reopened.store(false, Ordering::Relaxed);
+        }
+        self.bump_visibility_gen();
+        Ok(AccountInfo {
+            account_id,
+            username: req.username.clone(),
+            display_name: req.display_name.clone(),
+            role: Role::Admin,
+            disabled: false,
+            created: now,
+            last_login: None,
+        })
     }
 
     // ── account CRUD (tech-spec 10 §5) ───────────────────────────────────────
@@ -330,6 +383,13 @@ impl ServerStore {
 
     /// Verify a username/password and mint a session. Lockout applies per username; a failure is
     /// recorded whether the username exists or not, so probing behaves identically either way.
+    ///
+    /// **The argon2id verify runs outside the connection mutex** (three short critical sections:
+    /// lockout+row read, hash, record outcome). Holding the server's single `server.db` lock across
+    /// a deliberately-expensive KDF turned a burst of wrong-password attempts into a whole-server
+    /// stall — and the lockout counter is per *username*, so varying the username defeats it. The
+    /// callers additionally run this on `spawn_blocking` so the KDF never occupies a tokio worker
+    /// (CLAUDE.md golden rule 5). `create_account` already hashed outside the lock; this mirrors it.
     pub fn login(
         &self,
         username: &str,
@@ -337,35 +397,40 @@ impl ServerStore {
         user_agent: Option<&str>,
     ) -> Result<(NewSession, AccountIdentity), LibError> {
         let now = now_ms();
-        let conn = self.conn.lock().unwrap();
-        // Lockout check first — a locked account rejects even a correct password.
-        let failures: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM login_failure WHERE username = ?1 AND at > ?2",
-                params![username, now - LOCKOUT_WINDOW_MS],
-                |r| r.get(0),
-            )
-            .map_err(internal)?;
-        if failures >= LOCKOUT_MAX_FAILURES {
-            Self::audit_row(&conn, "system", "account.lockout", Some(username), None)?;
-            return Err(LibError::RateLimited {
-                retry_after: (LOCKOUT_WINDOW_MS / 1000) as u32,
-            });
-        }
-        let row: Option<(String, Option<String>, String, i64)> = conn
-            .query_row(
+        // ── 1. Locked out? Which credential row? (lock held briefly) ──
+        let row: Option<(String, Option<String>, String, i64)> = {
+            let conn = self.conn.lock().unwrap();
+            // Lockout check first — a locked account rejects even a correct password.
+            let failures: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM login_failure WHERE username = ?1 AND at > ?2",
+                    params![username, now - LOCKOUT_WINDOW_MS],
+                    |r| r.get(0),
+                )
+                .map_err(internal)?;
+            if failures >= LOCKOUT_MAX_FAILURES {
+                Self::audit_row(&conn, "system", "account.lockout", Some(username), None)?;
+                return Err(LibError::RateLimited {
+                    retry_after: (LOCKOUT_WINDOW_MS / 1000) as u32,
+                });
+            }
+            conn.query_row(
                 "SELECT account_id, password_hash, role, disabled FROM account WHERE username = ?1",
                 params![username],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()
-            .map_err(internal)?;
+            .map_err(internal)?
+        };
+        // ── 2. The KDF, with no lock held ──
         let ok = match &row {
             Some((_, Some(phc), _, 0)) => verify_password(password, phc),
-            // Unknown user / OIDC-only / disabled: burn a comparable amount of time is overkill at
-            // this scale; the lockout counter is the meaningful defence.
+            // Unknown user / OIDC-only / disabled: burning a comparable amount of time is overkill
+            // at this scale; the lockout counter is the meaningful defence.
             _ => false,
         };
+        // ── 3. Record the outcome (lock re-acquired) ──
+        let conn = self.conn.lock().unwrap();
         if !ok {
             conn.execute(
                 "INSERT INTO login_failure (username, at) VALUES (?1, ?2)",
@@ -739,9 +804,16 @@ impl ServerStore {
         }
         // The resource id must at least be a well-formed uuid — the resource itself lives across
         // the database boundary in library.db (soft reference; the route layer validates liveness).
-        if uuid::Uuid::parse_str(&req.resource_id).is_err() {
-            return Err(LibError::BadRequest("invalid resource id".into()));
-        }
+        //
+        // **Canonicalised on the way in.** `Uuid::parse_str` is permissive (hyphenated, simple,
+        // braced, urn:…), but every *other* participant compares the stored string literally: the
+        // orphan GC binds `SourceId::to_string()`, and the web share list filters on string
+        // equality. A share stored in a non-canonical spelling would be live (visibility resolution
+        // re-parses) yet invisible in the UI and immune to GC — an unrevocable grant. Storing the
+        // canonical hyphenated form makes all three agree by construction.
+        let resource_id = uuid::Uuid::parse_str(&req.resource_id)
+            .map_err(|_| LibError::BadRequest("invalid resource id".into()))?
+            .to_string();
         let share_id = uuid::Uuid::now_v7().simple().to_string();
         let now = now_ms();
         {
@@ -781,7 +853,7 @@ impl ServerStore {
                 params![
                     share_id,
                     req.resource.as_str(),
-                    req.resource_id,
+                    resource_id,
                     req.account_id,
                     req.group_id,
                     req.access.as_str(),
@@ -797,7 +869,7 @@ impl ServerStore {
                 Some(&share_id),
                 Some(serde_json::json!({
                     "resource": req.resource,
-                    "resource_id": req.resource_id,
+                    "resource_id": resource_id,
                     "account_id": req.account_id,
                     "group_id": req.group_id,
                     "access": req.access,
@@ -808,7 +880,7 @@ impl ServerStore {
         Ok(ShareInfo {
             share_id,
             resource: req.resource,
-            resource_id: req.resource_id.clone(),
+            resource_id,
             account_id: req.account_id.clone(),
             group_id: req.group_id.clone(),
             access: req.access,
@@ -993,6 +1065,69 @@ mod tests {
             "test",
         )
         .unwrap()
+    }
+
+    /// Two claims racing with *different* usernames: exactly one may win. The username uniqueness
+    /// constraint cannot settle this (the usernames differ), so the guarantee rests entirely on the
+    /// `BEGIN IMMEDIATE` transaction around the count-check + insert. The previous shape re-checked
+    /// through `unclaimed()` (lock taken and released), then spent tens of milliseconds in argon2,
+    /// then re-acquired to insert — and both racers became admin.
+    #[test]
+    fn concurrent_claims_cannot_both_win() {
+        let s = std::sync::Arc::new(store());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let winners = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let (s, barrier, winners) = (s.clone(), barrier.clone(), winners.clone());
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                let r = s.claim(
+                    &ClaimRequest {
+                        username: format!("racer{i}"),
+                        password: "password123".into(),
+                        display_name: None,
+                    },
+                    "test",
+                );
+                match r {
+                    Ok(a) => {
+                        assert_eq!(a.role, Role::Admin);
+                        winners.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(LibError::Conflict(_)) => {}
+                    Err(e) => panic!("unexpected claim error: {e:?}"),
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(winners.load(Ordering::Relaxed), 1, "the claim is one-shot");
+        assert_eq!(s.count_accounts().unwrap(), 1);
+        assert!(!s.unclaimed());
+    }
+
+    /// The re-opened window (recovery hatch) is one-shot too: it survives the lock/hash/insert
+    /// sequence exactly once, then closes.
+    #[test]
+    fn reopened_claim_window_admits_exactly_one() {
+        let s = store();
+        acct(&s, "root", Role::Admin);
+        assert!(!s.unclaimed());
+        s.reopen_claim("config-file").unwrap();
+        assert!(s.unclaimed());
+        let mk = |n: &str| ClaimRequest {
+            username: n.into(),
+            password: "password123".into(),
+            display_name: None,
+        };
+        assert_eq!(s.claim(&mk("rescue"), "test").unwrap().role, Role::Admin);
+        assert!(matches!(
+            s.claim(&mk("second"), "test"),
+            Err(LibError::Conflict(_))
+        ));
+        assert_eq!(s.count_accounts().unwrap(), 2);
     }
 
     /// The full first-run claim state machine: unclaimed → first claim wins admin → window closes.

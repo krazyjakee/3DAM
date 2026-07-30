@@ -10,6 +10,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use dam_api::accounts::*;
 use dam_api::admin::*;
+use dam_api::dto::{CollectionKind, SourceKind};
 use dam_api::service::{AuthContext, LibraryService};
 use dam_api::LibError;
 
@@ -28,19 +29,7 @@ fn actor_of(ctx: &AuthContext) -> String {
     }
 }
 
-/// Route-level flag guard for the accounts/groups/shares admin plane: `UserAccounts` off ⇒ the
-/// surface is absent (404, ADR 0004), same as the `/api/v1/auth` routes.
-fn require_accounts(st: &AppState) -> Result<(), ApiError> {
-    if st.store.user_accounts() {
-        Ok(())
-    } else {
-        Err(ApiError(LibError::NotFound(
-            "user accounts are disabled".into(),
-        )))
-    }
-}
-
-pub fn routes() -> Router<AppState> {
+pub fn routes(st: AppState) -> Router<AppState> {
     Router::new()
         .route("/admin/api/status", get(status))
         .route("/admin/api/flags", get(list_flags))
@@ -66,7 +55,14 @@ pub fn routes() -> Router<AppState> {
             "/admin/api/maintenance/factory-reset",
             axum::routing::post(factory_reset),
         )
-        // ── accounts / groups / shares (phase 6, issue #42) — 404 while UserAccounts is off ──
+        .merge(accounts_routes(st))
+}
+
+/// The accounts / groups / shares block of the admin plane — every route gated identically on the
+/// `UserAccounts` flag, so the guard is one `route_layer` here rather than a `require_accounts(&st)?`
+/// line pasted into each of the twelve handlers (ADR 0004: off ⇒ the surface is absent).
+fn accounts_routes(st: AppState) -> Router<AppState> {
+    let r = Router::new()
         .route(
             "/admin/api/accounts",
             get(list_accounts).post(create_account),
@@ -92,7 +88,8 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/admin/api/shares/{id}",
             axum::routing::delete(delete_share),
-        )
+        );
+    crate::gate_accounts(r, st)
 }
 
 fn parse_key(key: &str) -> Result<FlagKey, ApiError> {
@@ -171,7 +168,6 @@ async fn list_accounts(
     AdminAuth(_ctx): AdminAuth,
     State(st): State<AppState>,
 ) -> Result<Json<Vec<AccountInfo>>, ApiError> {
-    require_accounts(&st)?;
     Ok(Json(st.store.list_accounts()?))
 }
 
@@ -180,8 +176,13 @@ async fn create_account(
     State(st): State<AppState>,
     Json(req): Json<NewAccount>,
 ) -> Result<Json<AccountInfo>, ApiError> {
-    require_accounts(&st)?;
-    Ok(Json(st.store.create_account(&req, &actor_of(&ctx))?))
+    // argon2id hashing belongs on the blocking pool, not a tokio worker (CLAUDE.md golden rule 5).
+    let (store, actor) = (st.store.clone(), actor_of(&ctx));
+    Ok(Json(
+        tokio::task::spawn_blocking(move || store.create_account(&req, &actor))
+            .await
+            .map_err(|e| ApiError(LibError::Internal(e.to_string())))??,
+    ))
 }
 
 async fn update_account(
@@ -190,8 +191,13 @@ async fn update_account(
     Path(id): Path<String>,
     Json(req): Json<UpdateAccount>,
 ) -> Result<Json<AccountInfo>, ApiError> {
-    require_accounts(&st)?;
-    Ok(Json(st.store.update_account(&id, &req, &actor_of(&ctx))?))
+    // A password change hashes with argon2id — off the async runtime (CLAUDE.md golden rule 5).
+    let (store, actor) = (st.store.clone(), actor_of(&ctx));
+    Ok(Json(
+        tokio::task::spawn_blocking(move || store.update_account(&id, &req, &actor))
+            .await
+            .map_err(|e| ApiError(LibError::Internal(e.to_string())))??,
+    ))
 }
 
 async fn delete_account(
@@ -199,7 +205,6 @@ async fn delete_account(
     State(st): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<axum::http::StatusCode, ApiError> {
-    require_accounts(&st)?;
     st.store.delete_account(&id, &actor_of(&ctx))?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
@@ -209,7 +214,6 @@ async fn revoke_account_sessions(
     State(st): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_accounts(&st)?;
     let n = st.store.revoke_account_sessions(&id, &actor_of(&ctx))?;
     Ok(Json(serde_json::json!({ "revoked": n })))
 }
@@ -218,7 +222,6 @@ async fn list_groups(
     AdminAuth(_ctx): AdminAuth,
     State(st): State<AppState>,
 ) -> Result<Json<Vec<GroupInfo>>, ApiError> {
-    require_accounts(&st)?;
     Ok(Json(st.store.list_groups()?))
 }
 
@@ -227,7 +230,6 @@ async fn create_group(
     State(st): State<AppState>,
     Json(req): Json<NewGroup>,
 ) -> Result<Json<GroupInfo>, ApiError> {
-    require_accounts(&st)?;
     Ok(Json(st.store.create_group(&req, &actor_of(&ctx))?))
 }
 
@@ -236,7 +238,6 @@ async fn delete_group(
     State(st): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<axum::http::StatusCode, ApiError> {
-    require_accounts(&st)?;
     st.store.delete_group(&id, &actor_of(&ctx))?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
@@ -247,7 +248,6 @@ async fn set_group_members(
     Path(id): Path<String>,
     Json(req): Json<GroupMembers>,
 ) -> Result<Json<GroupInfo>, ApiError> {
-    require_accounts(&st)?;
     Ok(Json(st.store.set_group_members(
         &id,
         &req.account_ids,
@@ -259,7 +259,6 @@ async fn list_shares(
     AdminAuth(_ctx): AdminAuth,
     State(st): State<AppState>,
 ) -> Result<Json<Vec<ShareInfo>>, ApiError> {
-    require_accounts(&st)?;
     Ok(Json(st.store.list_shares()?))
 }
 
@@ -268,10 +267,24 @@ async fn create_share(
     State(st): State<AppState>,
     Json(req): Json<NewShare>,
 ) -> Result<Json<ShareInfo>, ApiError> {
-    require_accounts(&st)?;
     // Liveness check across the database boundary: the shared resource must exist in the catalog
     // *now* (the store only validates uuid shape; ids are never recycled, so this can't be raced
     // into granting a future resource).
+    //
+    // It must also be a resource a share can actually *grant*. Two shapes pass the liveness check
+    // yet grant nothing, and a share that is accepted but inert is worse than a refusal — the
+    // operator believes access was given:
+    //
+    //  - a **smart collection**: `push_visibility` expands a granted collection only through
+    //    `collection_member`, and a smart folder's membership is a live query, so it has no rows
+    //    there — ever. The grant would be permanently empty.
+    //  - a **federated peer source**: the engine skips the peer path for any restricted context
+    //    (`is_full()` guards on query / get_asset / read_content / read_thumbnail), so the grantee
+    //    would see the source in the sidebar with a non-zero count from the proxied stats — over a
+    //    permanently empty grid.
+    //
+    // Both are v1 gaps in *reach*, not sharing bugs; when the engine can evaluate a peer or a
+    // smart query under a ceiling, these rejections come out.
     let ectx = dam_api::service::AuthContext::embedded();
     match req.resource {
         ShareResource::Source => {
@@ -279,14 +292,24 @@ async fn create_share(
                 .resource_id
                 .parse::<dam_api::id::SourceId>()
                 .map_err(|_| ApiError(LibError::BadRequest("invalid source id".into())))?;
-            st.lib.get_source(&ectx, &id).await?;
+            let source = st.lib.get_source(&ectx, &id).await?;
+            if source.kind == SourceKind::Federated {
+                return Err(ApiError(LibError::BadRequest(
+                    "a federated peer source cannot be shared: reads against a peer are not                      evaluated under a visibility ceiling in v1, so the grant would show an empty                      library".into(),
+                )));
+            }
         }
         ShareResource::Collection => {
             let id = req
                 .resource_id
                 .parse::<dam_api::id::CollectionId>()
                 .map_err(|_| ApiError(LibError::BadRequest("invalid collection id".into())))?;
-            st.lib.get_collection(&ectx, &id).await?;
+            let coll = st.lib.get_collection(&ectx, &id).await?;
+            if coll.kind == CollectionKind::Smart {
+                return Err(ApiError(LibError::BadRequest(
+                    "a smart folder cannot be shared: its membership is a live query with no                      stored members, so the grant would reach nothing. Share the source(s) it                      draws from instead".into(),
+                )));
+            }
         }
     }
     Ok(Json(st.store.create_share(&req, &actor_of(&ctx))?))
@@ -297,7 +320,6 @@ async fn delete_share(
     State(st): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<axum::http::StatusCode, ApiError> {
-    require_accounts(&st)?;
     st.store.delete_share(&id, &actor_of(&ctx))?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }

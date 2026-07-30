@@ -4,17 +4,20 @@
 //!
 //! Driven through the real axum router in-process (`ServiceExt::oneshot`, no socket). The store is
 //! shared so flag flips and share edits are visible to the next request — the same live path the
-//! admin UI uses. There is no ConnectInfo in the oneshot seam, so the claim gate resolves loopback
-//! from the bind posture: `harness(true)` behaves like a loopback bind, `harness(false)` like an
-//! exposed one with an unknown peer.
+//! admin UI uses. The oneshot seam crosses no socket, so the harness injects the `ConnectInfo`
+//! extension the serve stack would register: `harness(true)` presents a loopback peer, and
+//! `harness(false)` a public one. The claim gate reads that peer and nothing else about the bind
+//! (ADR 0014 — a loopback *bind* is not evidence of a local caller behind a same-host proxy).
 
 use axum::body::Body;
+use axum::extract::ConnectInfo;
 use axum::http::{HeaderMap, Request, StatusCode};
 use dam_api::dto::*;
 use dam_api::service::{AuthContext, LibraryService};
 use dam_core::EmbeddedLibrary;
 use dam_server::{router, ServerStore};
 use serde_json::{json, Value};
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -35,14 +38,25 @@ fn unique_tmp() -> std::path::PathBuf {
     ))
 }
 
-async fn harness(localhost_only: bool) -> (axum::Router, Arc<ServerStore>, Arc<EmbeddedLibrary>) {
+/// Build the in-process router with a synthetic peer address. `local_peer` chooses between a
+/// loopback client (the desktop / `curl localhost` case) and an off-box one.
+async fn harness(local_peer: bool) -> (axum::Router, Arc<ServerStore>, Arc<EmbeddedLibrary>) {
     let lib = Arc::new(
         EmbeddedLibrary::open_with(&unique_tmp(), dam_core::ResourceOptions::ungoverned())
             .await
             .unwrap(),
     );
     let store = Arc::new(ServerStore::open_in_memory().unwrap());
-    let app = router(lib.clone(), store.clone(), "127.0.0.1:7878", localhost_only);
+    let peer: SocketAddr = if local_peer {
+        "127.0.0.1:54321".parse().unwrap()
+    } else {
+        // TEST-NET-3 (RFC 5737) — unambiguously not loopback.
+        "203.0.113.9:54321".parse().unwrap()
+    };
+    // `Extension` as a layer inserts into request extensions, which is exactly where
+    // `into_make_service_with_connect_info` puts `ConnectInfo` on the real serve path.
+    let app = router(lib.clone(), store.clone(), "127.0.0.1:7878", local_peer)
+        .layer(axum::Extension(ConnectInfo(peer)));
     (app, store, lib)
 }
 
@@ -330,23 +344,46 @@ async fn asset_id_by_name(app: &axum::Router, admin: &Session, name: &str) -> St
 
 // ── the surface is absent while the flag is off ──────────────────────────────
 
+/// **Every** gated route, not a sample: the guard is one `route_layer` per block now, and the point
+/// of this test is to notice if a route ever escapes its block. Mutating endpoints matter most — a
+/// reachable `POST /admin/api/shares` with the flag off would write grants nothing can display.
 #[tokio::test]
 async fn accounts_surface_absent_when_flag_off() {
     let (app, _store, _lib) = harness(true).await;
+    let id = "00000000-0000-0000-0000-000000000000";
     for (method, uri) in [
-        ("GET", "/api/v1/auth/status"),
-        ("POST", "/api/v1/auth/claim"),
-        ("POST", "/api/v1/auth/login"),
-        ("GET", "/admin/api/accounts"),
-        ("GET", "/admin/api/groups"),
-        ("GET", "/admin/api/shares"),
+        // /api/v1/auth — the whole public accounts surface
+        ("GET", "/api/v1/auth/status".to_string()),
+        ("POST", "/api/v1/auth/claim".to_string()),
+        ("POST", "/api/v1/auth/login".to_string()),
+        ("POST", "/api/v1/auth/logout".to_string()),
+        ("GET", "/api/v1/auth/sessions".to_string()),
+        ("DELETE", format!("/api/v1/auth/sessions/{id}")),
+        // /admin/api accounts block — reads *and* every mutation
+        ("GET", "/admin/api/accounts".to_string()),
+        ("POST", "/admin/api/accounts".to_string()),
+        ("PUT", format!("/admin/api/accounts/{id}")),
+        ("DELETE", format!("/admin/api/accounts/{id}")),
+        ("DELETE", format!("/admin/api/accounts/{id}/sessions")),
+        ("GET", "/admin/api/groups".to_string()),
+        ("POST", "/admin/api/groups".to_string()),
+        ("DELETE", format!("/admin/api/groups/{id}")),
+        ("PUT", format!("/admin/api/groups/{id}/members")),
+        ("GET", "/admin/api/shares".to_string()),
+        ("POST", "/admin/api/shares".to_string()),
+        ("DELETE", format!("/admin/api/shares/{id}")),
     ] {
-        let body = (method == "POST").then(|| json!({"username": "x", "password": "yyyyyyyy"}));
-        let (st, _) = call(&app, method, uri, None, body).await;
+        let body = (method != "GET" && method != "DELETE").then(|| {
+            json!({
+                "username": "x", "password": "yyyyyyyy", "name": "x", "account_ids": [],
+                "resource": "source", "resource_id": id, "account_id": id, "access": "read",
+            })
+        });
+        let (st, _) = call(&app, method, &uri, None, body).await;
         assert_eq!(
             st,
             StatusCode::NOT_FOUND,
-            "{method} {uri} must 404 while off"
+            "{method} {uri} must 404 while the flag is off"
         );
     }
 }
@@ -402,7 +439,7 @@ async fn claim_flow_first_account_becomes_admin_and_window_closes() {
 
 #[tokio::test]
 async fn remote_claim_refused_without_bootstrap_token() {
-    // Exposed bind, unknown peer (no ConnectInfo in the oneshot seam) — not loopback.
+    // Off-box peer — not loopback.
     let (app, _store, _lib) = harness(false).await;
     let bootstrap = enable_accounts(&app).await.expect("bootstrap token minted");
 
@@ -1116,8 +1153,11 @@ async fn leak_audit_export_respects_the_ceiling() {
 
     let mut scope = dam_api::VisibilityScope::default();
     scope.sources.insert(shared.parse().unwrap());
-    let restricted = AuthContext::connected(Some("vera".into()), dam_api::Role::Editor.scopes())
-        .with_visibility(dam_api::Visibility::Restricted(scope));
+    let restricted = AuthContext::connected(
+        Some("vera".into()),
+        dam_api::Role::Editor.scopes(),
+        dam_api::Visibility::Restricted(scope),
+    );
 
     let out = unique_tmp();
     std::fs::create_dir_all(&out).unwrap();
@@ -1218,4 +1258,451 @@ async fn last_admin_cannot_be_demoted_and_share_gc_runs_on_source_removal() {
         "orphaned share rows must be GC'd"
     );
     let _ = vera_id; // world fixture
+}
+
+// ── the claim gate rests on the peer socket, not the bind (ADR 0014) ─────────
+
+#[tokio::test]
+async fn forwarded_headers_disqualify_the_open_claim() {
+    // The dangerous shape: a loopback *peer* (exactly what a same-host reverse proxy presents) on a
+    // loopback bind. Everything the server can observe about the socket says "local", so the only
+    // remaining signal is the forwarding header the proxy added.
+    let (app, _store, _lib) = harness(true).await;
+    let bootstrap = enable_accounts(&app).await.expect("bootstrap token minted");
+    let body = json!({"username": "attacker", "password": "password123"});
+
+    for header in ["x-forwarded-for", "x-real-ip", "forwarded"] {
+        let value = if header == "forwarded" {
+            "for=203.0.113.9"
+        } else {
+            "203.0.113.9"
+        };
+        let (st, _h, reply) = send(
+            &app,
+            "POST",
+            "/api/v1/auth/claim",
+            &[(header.into(), value.into())],
+            Some(body.clone()),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::FORBIDDEN,
+            "a request carrying {header} must not take the open claim path: {reply}"
+        );
+    }
+    // The instance is still unclaimed — nothing was created by the refused attempts.
+    let (_, status) = call(&app, "GET", "/api/v1/auth/status", None, None).await;
+    assert_eq!(status["unclaimed"], true);
+
+    // The documented off-box route still works *through the proxy*: an Admin-scoped bearer claims
+    // from anywhere, forwarded header or not.
+    let (st, headers, reply) = send(
+        &app,
+        "POST",
+        "/api/v1/auth/claim",
+        &[
+            ("x-forwarded-for".into(), "203.0.113.9".into()),
+            ("authorization".into(), format!("Bearer {bootstrap}")),
+        ],
+        Some(json!({"username": "owner", "password": "password123"})),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "token redemption must survive a proxy: {reply}"
+    );
+    assert_eq!(reply["account"]["role"], "admin");
+    let _ = session_from_reply(&headers, &reply);
+}
+
+#[tokio::test]
+async fn direct_loopback_peer_still_claims_openly() {
+    // The friendly path is untouched: no forwarding header, real loopback peer → open claim.
+    let (app, _store, _lib) = harness(true).await;
+    enable_accounts(&app).await;
+    let _admin = claim(&app, "owner").await;
+    let (_, status) = call(&app, "GET", "/api/v1/auth/status", None, None).await;
+    assert_eq!(status["unclaimed"], false);
+}
+
+// ── flag exposure confirmation (ADR 0004) ───────────────────────────────────
+
+#[tokio::test]
+async fn turning_accounts_off_needs_confirmation_while_it_is_the_only_gate() {
+    let (app, store, _lib) = harness(true).await;
+    enable_accounts(&app).await;
+    let admin = claim(&app, "owner").await;
+    // `authentication` is still Off — accounts alone raise the effective gate to Token, so dropping
+    // them world-opens the catalog *and* the admin plane in one flip.
+    assert_eq!(store.auth_mode(), dam_api::admin::AuthMode::Off);
+
+    let off = |confirm: bool| json!({"value": false, "expected_version": null, "confirm": confirm});
+    let (st, body) = call(
+        &app,
+        "PUT",
+        "/admin/api/flags/user_accounts",
+        Some(&admin),
+        Some(off(false)),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "unconfirmed accounts-off must be refused: {body}"
+    );
+    assert!(store.user_accounts(), "the flag must not have moved");
+
+    // The UI hint says so too.
+    let (_, flags) = call(&app, "GET", "/admin/api/flags", Some(&admin), None).await;
+    let accounts_flag = flags
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["key"] == "user_accounts")
+        .unwrap();
+    assert_eq!(accounts_flag["exposure_increasing"], true);
+
+    // Confirmed, it goes through — and the surface disappears with it.
+    let (st, body) = call(
+        &app,
+        "PUT",
+        "/admin/api/flags/user_accounts",
+        Some(&admin),
+        Some(off(true)),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "confirmed flip must succeed: {body}");
+    assert!(!store.user_accounts());
+}
+
+#[tokio::test]
+async fn accounts_off_is_an_ordinary_toggle_once_auth_stands_on_its_own() {
+    let (app, store, _lib) = harness(true).await;
+    enable_accounts(&app).await;
+    let admin = claim(&app, "owner").await;
+    // Raise the *raw* auth flag: now the token gate survives an accounts-off flip, so the flip
+    // stops being exposure-increasing.
+    let (st, _) = call(
+        &app,
+        "PUT",
+        "/admin/api/flags/authentication",
+        Some(&admin),
+        Some(json!({"value": "token", "expected_version": null, "confirm": true})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, body) = call(
+        &app,
+        "PUT",
+        "/admin/api/flags/user_accounts",
+        Some(&admin),
+        Some(json!({"value": false, "expected_version": null, "confirm": false})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "no confirmation needed here: {body}");
+    assert!(!store.user_accounts());
+}
+
+// ── collection membership on the asset record honours the ceiling ────────────
+
+#[tokio::test]
+async fn asset_record_hides_unreachable_collection_ids() {
+    let (app, _s, _l, admin, vera, _shared, _secret, vera_id) = leak_world().await;
+    let secret_id = asset_id_by_name(&app, &admin, "secret_wall.png").await;
+
+    // Two collections both holding the hidden asset; only the first is shared with vera.
+    let mut ids = Vec::new();
+    for name in ["Shared picks", "Private picks"] {
+        let (st, body) = call(
+            &app,
+            "POST",
+            "/api/v1/collections",
+            Some(&admin),
+            Some(json!({"name": name, "kind": "manual"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{body}");
+        let cid = body["id"].as_str().unwrap().to_string();
+        let (st, _) = call(
+            &app,
+            "POST",
+            &format!("/api/v1/collections/{cid}/members"),
+            Some(&admin),
+            Some(json!({"add": [secret_id]})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::NO_CONTENT);
+        ids.push(cid);
+    }
+    let (shared_cid, private_cid) = (ids[0].clone(), ids[1].clone());
+    share(
+        &app,
+        &admin,
+        "collection",
+        &shared_cid,
+        ("account_id", &vera_id),
+        "read",
+    )
+    .await;
+
+    // Vera reaches the asset through the shared collection…
+    let (st, body) = call(
+        &app,
+        "GET",
+        &format!("/api/v1/assets/{secret_id}"),
+        Some(&vera),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let listed: Vec<&str> = body["collections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c.as_str().unwrap())
+        .collect();
+    // …and learns about that collection only. The other one 404s by id, so naming it on the record
+    // would be the record contradicting the ceiling.
+    assert_eq!(listed, vec![shared_cid.as_str()], "leaked: {body}");
+    let (st, _) = call(
+        &app,
+        "GET",
+        &format!("/api/v1/collections/{private_cid}"),
+        Some(&vera),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    // The admin, unrestricted, still sees both.
+    let (_, body) = call(
+        &app,
+        "GET",
+        &format!("/api/v1/assets/{secret_id}"),
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(body["collections"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn manual_collection_count_is_ceiling_filtered() {
+    let (app, _s, _l, admin, vera, _shared, _secret, vera_id) = leak_world().await;
+    let secret_id = asset_id_by_name(&app, &admin, "secret_wall.png").await;
+    let visible_id = asset_id_by_name(&app, &admin, "brick_red.png").await;
+
+    let (st, body) = call(
+        &app,
+        "POST",
+        "/api/v1/collections",
+        Some(&admin),
+        Some(json!({"name": "Mixed", "kind": "manual"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let cid = body["id"].as_str().unwrap().to_string();
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/api/v1/collections/{cid}/members"),
+        Some(&admin),
+        Some(json!({"add": [secret_id, visible_id]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    share(
+        &app,
+        &admin,
+        "collection",
+        &cid,
+        ("account_id", &vera_id),
+        "read",
+    )
+    .await;
+
+    // The collection share grants its members, so vera reaches both — count 2, matching the grid.
+    let (_, body) = call(
+        &app,
+        "GET",
+        &format!("/api/v1/collections/{cid}"),
+        Some(&vera),
+        None,
+    )
+    .await;
+    assert_eq!(body["count"], 2);
+
+    // Now revoke the collection share and grant the source instead: vera reaches only brick_red,
+    // and the count must follow the grid rather than announce the hidden member.
+    let shares = call(&app, "GET", "/admin/api/shares", Some(&admin), None)
+        .await
+        .1;
+    let sid = shares
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["resource"] == "collection")
+        .unwrap()["share_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (st, _) = call(
+        &app,
+        "DELETE",
+        &format!("/admin/api/shares/{sid}"),
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    let (_, list) = call(&app, "GET", "/api/v1/collections", Some(&vera), None).await;
+    let seen = list.as_array().unwrap();
+    assert_eq!(seen.len(), 1, "reachable as a view over the shared source");
+    assert_eq!(
+        seen[0]["count"], 1,
+        "count must not be a cardinality oracle"
+    );
+}
+
+// ── share ids are canonical, so the UI and the orphan GC agree ───────────────
+
+#[tokio::test]
+async fn share_resource_id_is_canonicalised() {
+    let (app, store, _l, admin, _vera, shared, _secret, vera_id) = leak_world().await;
+    // The same source id in its unhyphenated ("simple") spelling — `Uuid::parse_str` accepts it.
+    let simple = shared.replace('-', "");
+    assert_ne!(simple, shared);
+    let (st, body) = call(
+        &app,
+        "POST",
+        "/admin/api/shares",
+        Some(&admin),
+        Some(json!({
+            "resource": "source", "resource_id": simple,
+            "account_id": vera_id, "access": "read",
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    // Stored and echoed canonically — string-equality consumers (the web share list, the orphan GC)
+    // would otherwise never match it, leaving a live grant that cannot be seen or revoked.
+    assert_eq!(body["resource_id"], shared);
+    assert!(store
+        .list_shares()
+        .unwrap()
+        .iter()
+        .all(|s| s.resource_id == shared));
+
+    // And the GC, which binds the canonical form, actually reaches it.
+    let (st, _) = call(
+        &app,
+        "DELETE",
+        &format!("/api/v1/sources/{shared}"),
+        Some(&admin),
+        Some(json!({"keep_metadata": false})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    assert!(
+        store.list_shares().unwrap().is_empty(),
+        "a non-canonically-spelled share must still be GC-able"
+    );
+}
+
+// ── shares that would grant nothing are refused, not accepted-and-inert ──────
+
+#[tokio::test]
+async fn smart_collection_cannot_be_shared() {
+    let (app, _s, lib, admin, _vera, _shared, _secret, vera_id) = leak_world().await;
+    // Smart folders are CLI-created in v1 — go through the engine directly.
+    let smart = lib
+        .create_collection(
+            &AuthContext::embedded(),
+            NewCollection {
+                name: "All images".into(),
+                kind: CollectionKind::Smart,
+                query: Some(QueryRequest::default()),
+            },
+        )
+        .await
+        .unwrap();
+    let (st, body) = call(
+        &app,
+        "POST",
+        "/admin/api/shares",
+        Some(&admin),
+        Some(json!({
+            "resource": "collection", "resource_id": smart.to_string(),
+            "account_id": vera_id, "access": "read",
+        })),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "a smart folder grants nothing — refuse rather than record an inert share: {body}"
+    );
+    assert!(body["message"].as_str().unwrap().contains("smart folder"));
+}
+
+#[tokio::test]
+async fn federated_peer_source_cannot_be_shared() {
+    // Needs a *real* peer: the federated `add_source` handshakes over HTTP, so the oneshot seam
+    // can't stand in. Bind a second server on an ephemeral port with the federation flag on.
+    let peer_lib = Arc::new(
+        EmbeddedLibrary::open_with(&unique_tmp(), dam_core::ResourceOptions::ungoverned())
+            .await
+            .unwrap(),
+    );
+    let peer_store = Arc::new(ServerStore::open_in_memory().unwrap());
+    peer_store
+        .set_flag(
+            dam_api::admin::FlagKey::Federation,
+            dam_api::admin::SetFlag {
+                value: dam_api::admin::FlagValue::Bool(true),
+                expected_version: None,
+                confirm: true,
+            },
+            "test",
+        )
+        .unwrap();
+    let peer_app = router(peer_lib, peer_store, "127.0.0.1:0", true);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer_addr = listener.local_addr().unwrap();
+    let peer_task = tokio::spawn(async move { axum::serve(listener, peer_app).await.unwrap() });
+
+    let (app, _s, lib, admin, _vera, _shared, _secret, vera_id) = leak_world().await;
+    let peer_sid = lib
+        .add_source(
+            &AuthContext::embedded(),
+            AddSource {
+                kind: SourceKind::Federated,
+                uri: format!("http://{peer_addr}"),
+                name: Some("peer".into()),
+                options: SourceOptions::default(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let (st, body) = call(
+        &app,
+        "POST",
+        "/admin/api/shares",
+        Some(&admin),
+        Some(json!({
+            "resource": "source", "resource_id": peer_sid.to_string(),
+            "account_id": vera_id, "access": "read",
+        })),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::BAD_REQUEST,
+        "peer reads bypass the ceiling, so the grant would be an empty grid under a real count: {body}"
+    );
+    assert!(body["message"].as_str().unwrap().contains("federated peer"));
+    peer_task.abort();
 }

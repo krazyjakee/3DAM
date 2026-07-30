@@ -20,7 +20,7 @@ use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 use axum::http::HeaderMap;
 use dam_api::admin::AuthMode;
-use dam_api::service::{AuthContext, Scope, Scopes};
+use dam_api::service::{AuthContext, Scope, Scopes, Visibility};
 use dam_api::LibError;
 
 /// The session cookie name. `HttpOnly`; value `<session_id>.<secret>`.
@@ -112,8 +112,10 @@ pub fn resolve(
 ) -> Result<Resolved, LibError> {
     let verify_token = |secret: &str| -> Result<Resolved, LibError> {
         match store.verify_token(secret)? {
+            // A token is an operator-issued credential with no share graph behind it: its reach is
+            // the whole library, capped only by its scopes (tech-spec 10 §4.3).
             Some((label, scopes)) => Ok(Resolved {
-                ctx: AuthContext::connected(Some(label), scopes),
+                ctx: AuthContext::connected(Some(label), scopes, Visibility::Full),
                 session: None,
             }),
             None => Err(LibError::Unauthorized),
@@ -127,8 +129,7 @@ pub fn resolve(
             return Ok(None); // expired/garbage cookie falls through to the mode default
         };
         let vis = store.resolve_visibility(&ident)?;
-        let ctx = AuthContext::connected(Some(ident.username.clone()), ident.role.scopes())
-            .with_visibility(vis)
+        let ctx = AuthContext::connected(Some(ident.username.clone()), ident.role.scopes(), vis)
             .with_account(ident.clone());
         Ok(Some(Resolved {
             ctx,
@@ -143,7 +144,7 @@ pub fn resolve(
         // Off: no credential inspected; the unauthenticated caller is the local owner (full trust),
         // so a localhost operator is never locked out of their own admin surface.
         AuthMode::Off => Ok(Resolved {
-            ctx: AuthContext::connected(None, Scopes::owner()),
+            ctx: AuthContext::connected(None, Scopes::owner(), Visibility::Full),
             session: None,
         }),
         // Anonymous: a valid credential elevates; otherwise the fixed anonymous scope set.
@@ -157,7 +158,7 @@ pub fn resolve(
                 }
             }
             Ok(Resolved {
-                ctx: AuthContext::connected(None, Scopes::anonymous()),
+                ctx: AuthContext::connected(None, Scopes::anonymous(), Visibility::Full),
                 session: None,
             })
         }

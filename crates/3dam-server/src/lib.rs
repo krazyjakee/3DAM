@@ -78,6 +78,12 @@ pub(crate) struct AppState {
     pub bind: String,
     pub localhost_only: bool,
     pub tls: bool,
+    /// Force `Secure` on session/CSRF cookies regardless of the local TLS posture — the operator's
+    /// declaration that a TLS-terminating proxy sits in front (`[server] secure_cookies`).
+    pub secure_cookies: bool,
+    /// Refuse the *open* (loopback-peer) first-run claim path outright, so only bootstrap-token
+    /// redemption can claim (`[accounts] require_claim_token`; ADR 0014).
+    pub require_claim_token: bool,
     /// Flips `false → true` once when shutdown begins, so long-lived handlers (the `/api/v1/ws`
     /// loop) can stop awaiting and close cleanly instead of pinning the graceful drain open.
     pub shutdown: watch::Receiver<bool>,
@@ -160,6 +166,26 @@ fn write_secret_file(path: &std::path::Path, secret: &str) -> std::io::Result<()
     }
 }
 
+/// Wrap a sub-router in the **one** `UserAccounts` flag gate (ADR 0004: off *unmounts* the route —
+/// a 404, not a 403, decided before auth so a disabled surface cannot be probed). Both gated blocks
+/// — all of `/api/v1/auth` and the accounts/groups/shares block of `/admin/api` — pass through here,
+/// so the check exists once instead of being pasted into eighteen handler bodies where the
+/// nineteenth would forget it.
+pub(crate) fn gate_accounts(router: Router<AppState>, state: AppState) -> Router<AppState> {
+    router.route_layer(axum::middleware::from_fn_with_state(state, accounts_gate))
+}
+
+async fn accounts_gate(
+    State(st): State<AppState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    match st.store.require_user_accounts() {
+        Ok(()) => next.run(req).await,
+        Err(e) => ApiError(e).into_response(),
+    }
+}
+
 /// Assemble the router over a fully-built [`AppState`].
 pub(crate) fn build_router(state: AppState) -> Router {
     Router::new()
@@ -221,9 +247,9 @@ pub(crate) fn build_router(state: AppState) -> Router {
         // The MCP endpoint (tech-spec 11): present, but the handler 404s when the flag is Off.
         .route("/mcp", post(mcp_http))
         // User accounts: claim/login/sessions (phase 6, issue #42) — 404 while the flag is off.
-        .merge(authn::routes())
+        .merge(authn::routes(state.clone()))
         // The admin API (tech-spec 10 §5), guarded by the AdminAuth extractor.
-        .merge(admin::routes())
+        .merge(admin::routes(state.clone()))
         // SPA fallback: any non-API GET serves the embedded web client (tech-spec 09 §A.4).
         .fallback(static_handler)
         .layer(TraceLayer::new_for_http())
@@ -256,6 +282,8 @@ pub fn router(
         bind,
         localhost_only,
         tls: false,
+        secure_cookies: false,
+        require_claim_token: false,
         shutdown,
         // The test seam is ready the moment it's built (no async pipeline warm-up to await).
         ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
@@ -314,7 +342,7 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
     // from the machine that owns the config file. Audited, and loud below via the unclaimed beat.
     if file.accounts.reopen_claim == Some(true) {
         store.reopen_claim("config-file")?;
-        eprintln!("  ⚠ [accounts] reopen_claim: the claim window is OPEN — the next localhost signup becomes admin");
+        eprintln!("  ⚠ [accounts] reopen_claim: the claim window is OPEN — the next signup from this machine becomes admin");
     }
 
     // Hosted-mode background pipeline (issue #71): proactively drain thumbnails + analysis on ingest
@@ -336,6 +364,8 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
         bind: addr.to_string(),
         localhost_only,
         tls,
+        secure_cookies: file.server.secure_cookies == Some(true),
+        require_claim_token: file.accounts.require_claim_token == Some(true),
         shutdown: shutdown_rx,
         ready: ready.clone(),
     };
@@ -399,8 +429,10 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
                     break;
                 }
                 tracing::warn!(
-                    "user accounts are on but UNCLAIMED — the first signup from localhost \
-                     becomes admin; claim it now (web UI) or via POST /api/v1/auth/claim"
+                    "user accounts are on but UNCLAIMED — the first signup from a process on this \
+                     machine becomes admin; claim it now (web UI) or via POST /api/v1/auth/claim. \
+                     Behind a reverse proxy set [accounts] require_claim_token and redeem the \
+                     bootstrap owner token instead"
                 );
             }
         });
@@ -593,6 +625,11 @@ async fn desktop_setup(
         bind: actual.to_string(),
         localhost_only: true,
         tls: false,
+        // The desktop shell is a webview on a genuinely local loopback socket: no proxy in front
+        // (so no forced `Secure` over plaintext http://127.0.0.1, which browsers would then drop)
+        // and the open claim path is exactly right for the solo-dev first run (ADR 0013/0014).
+        secure_cookies: false,
+        require_claim_token: false,
         shutdown,
         ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
     };
@@ -705,6 +742,11 @@ async fn version(State(st): State<AppState>) -> Json<serde_json::Value> {
         // first-run claim screen while unclaimed) instead of the bare token prompt.
         "accounts": st.store.user_accounts(),
         "unclaimed": st.store.unclaimed(),
+        // How many accounts exist. `unclaimed` alone can't distinguish "brand new instance" from
+        // "the operator re-opened the claim window to recover a lost admin" — and in the second
+        // case every existing user can still sign in, so the client must not replace the login
+        // screen with a claim form. Reveals only a cardinality the claim screen itself implies.
+        "account_count": st.store.count_accounts().unwrap_or(0),
         "capabilities": ["query", "sources", "scan", "stats", "ws", "web", "thumbnail", "convert",
                          "analyze", "similar", "duplicates", "suggestions", "collections", "export",
                          "auth", "flags", "mcp", "accounts"],

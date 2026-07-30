@@ -362,13 +362,13 @@ fn confirm_or_bail(confirm: bool, what: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Embedded twin of the HTTP routes' flag guard: the accounts surface is off-by-default and off
-/// means absent, so refuse before touching the store.
+/// The CLI end of the one `UserAccounts` guard. The predicate itself lives on the store
+/// (`ServerStore::require_user_accounts`, also the HTTP router's single `route_layer`); this only
+/// translates its `NotFound` into the CLI's error channel with an actionable hint.
 fn require_accounts(store: &dam_server::ServerStore) -> anyhow::Result<()> {
-    if !store.user_accounts() {
-        anyhow::bail!("user accounts are disabled (enable the user_accounts flag first)");
-    }
-    Ok(())
+    store.require_user_accounts().map_err(|_| {
+        anyhow::anyhow!("user accounts are disabled (enable the user_accounts flag first)")
+    })
 }
 
 fn parse_role(s: &str) -> anyhow::Result<Role> {

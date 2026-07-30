@@ -87,10 +87,23 @@ impl FlagState {
 }
 
 /// Whether applying `new` (over `old`) increases the server's exposure and so needs an explicit
-/// `confirm` (tech-spec 10 §5, DESIGN_GUIDELINES §3.6): removing auth, enabling MCP write tools, or
-/// opening network writes. The `key` disambiguates the `bool` flags — the hosted-mode pipeline
-/// toggles are workload, never exposure, so they never require confirmation.
-pub fn is_exposure_increasing(key: FlagKey, new: FlagValue, old: FlagValue) -> bool {
+/// `confirm` (tech-spec 10 §5, DESIGN_GUIDELINES §3.6): removing auth, enabling MCP write tools,
+/// opening network writes, or dropping the accounts gate that was standing in for auth. The `key`
+/// disambiguates the `bool` flags — the hosted-mode pipeline toggles are workload, never exposure,
+/// so they never require confirmation.
+///
+/// `raw_auth` is the *stored* `Authentication` value, which the `UserAccounts` arm needs: accounts-on
+/// raises the effective mode from `Off` to `Token` ([`ServerStore::effective_auth_mode`]), so on an
+/// instance configured `authentication = off` the accounts flag is the **only** thing demanding a
+/// credential. Turning it off there drops the effective mode back to `Off`, which resolves every
+/// anonymous request to `Scopes::owner()` with `Visibility::Full` — the catalog *and* the
+/// `/admin/api` plane world-open in one unconfirmed flip.
+pub fn is_exposure_increasing(
+    key: FlagKey,
+    new: FlagValue,
+    old: FlagValue,
+    raw_auth: AuthMode,
+) -> bool {
     match (key, new, old) {
         (FlagKey::Authentication, FlagValue::Auth(AuthMode::Off), FlagValue::Auth(o)) => {
             o != AuthMode::Off
@@ -99,16 +112,26 @@ pub fn is_exposure_increasing(key: FlagKey, new: FlagValue, old: FlagValue) -> b
             o != McpMode::ReadWrite
         }
         (FlagKey::NetworkWrites, FlagValue::Bool(true), FlagValue::Bool(false)) => true,
+        // Accounts *off* is the exposure-increasing direction, and only while the raise is
+        // load-bearing (raw auth `Off`). With auth already at `Anonymous`/`Token` the gate survives
+        // the flip, so it stays an ordinary toggle.
+        (FlagKey::UserAccounts, FlagValue::Bool(false), FlagValue::Bool(true)) => {
+            raw_auth == AuthMode::Off
+        }
         _ => false,
     }
 }
 
 /// Does flipping this flag ever increase exposure? A UI hint (`FlagInfo::exposure_increasing`) — true
-/// for the auth/MCP/network flags, false for the hosted-mode workload toggles.
+/// for the auth/MCP/network flags and for `UserAccounts` (whose *off* direction can remove the only
+/// gate on the instance), false for the hosted-mode workload toggles.
 fn flag_can_increase_exposure(key: FlagKey) -> bool {
     matches!(
         key,
-        FlagKey::Authentication | FlagKey::McpServer | FlagKey::NetworkWrites
+        FlagKey::Authentication
+            | FlagKey::McpServer
+            | FlagKey::NetworkWrites
+            | FlagKey::UserAccounts
     )
 }
 
@@ -215,6 +238,17 @@ impl ServerStore {
         self.flags.read().unwrap().user_accounts
     }
 
+    /// The single `UserAccounts` guard, shared by every gated surface: the HTTP router's one
+    /// `route_layer` (`/api/v1/auth` and the accounts block of `/admin/api`) and the CLI's embedded
+    /// accounts verbs. `NotFound`, not `Forbidden` — off ⇒ the surface is *absent* (ADR 0004).
+    pub fn require_user_accounts(&self) -> Result<(), LibError> {
+        if self.user_accounts() {
+            Ok(())
+        } else {
+            Err(LibError::NotFound("user accounts are disabled".into()))
+        }
+    }
+
     /// The auth mode requests are actually resolved under: accounts-on raises `Off` to `Token`
     /// (real identities imply a gate — issue #42), otherwise the configured mode stands.
     /// `Anonymous` is left alone: public-read + login-to-elevate is a coherent posture.
@@ -307,8 +341,10 @@ impl ServerStore {
                 "flag '{key}' value has the wrong type"
             )));
         }
-        let old_value = self.flags.read().unwrap().value(key);
-        let cur_version = self.flags.read().unwrap().version(key);
+        let (old_value, cur_version, raw_auth) = {
+            let f = self.flags.read().unwrap();
+            (f.value(key), f.version(key), f.auth)
+        };
         if let Some(expected) = req.expected_version {
             if expected != cur_version {
                 return Err(LibError::Conflict(format!(
@@ -316,7 +352,7 @@ impl ServerStore {
                 )));
             }
         }
-        if is_exposure_increasing(key, req.value, old_value) && !req.confirm {
+        if is_exposure_increasing(key, req.value, old_value, raw_auth) && !req.confirm {
             return Err(LibError::BadRequest(format!(
                 "setting '{key}' increases exposure — resend with confirm=true"
             )));

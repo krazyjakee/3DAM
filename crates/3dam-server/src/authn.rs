@@ -3,15 +3,21 @@
 //! ("off removes the surface", ADR 0004), checked before auth so a disabled surface cannot be
 //! probed.
 //!
-//! ## The claim gate (issue #42 §2)
+//! ## The claim gate (issue #42 §2, ADR 0014)
 //!
 //! An unclaimed instance (accounts on, zero accounts) is a land-grab risk — the first-run race
-//! Jellyfin/Grafana shipped as CVEs. The mitigations here, per the spec amendment to tech-spec 10
-//! §4.4:
-//! - claim acceptance is bound to a **loopback peer address** (or a loopback-only bind); a remote
-//!   request to an unclaimed instance is refused, not served a signup form;
-//! - off-box, the claim degrades to **token redemption**: a caller presenting an Admin-scoped
-//!   bearer (the bootstrap owner token minted when the gate went up) may claim from anywhere;
+//! Jellyfin/Grafana shipped as CVEs. The open claim window therefore demands **positive evidence of
+//! a local peer**, and treats any evidence to the contrary as disqualifying:
+//! - the peer socket must actually be loopback. The *bind* posture is not evidence: `localhost_only`
+//!   is just "we bound 127.0.0.1", which is precisely the deployment `docs/DEPLOYMENT.md`
+//!   recommends (loopback behind nginx/Caddy) — there every remote visitor's peer is 127.0.0.1 too;
+//! - a request carrying `X-Forwarded-For`, `X-Real-IP`, or `Forwarded` was proxied and can never
+//!   take the open path, whatever its peer address says;
+//! - `[accounts] require_claim_token = true` closes the open path entirely, for an operator who
+//!   knows they sit behind a proxy that strips those headers;
+//! - off-box (and under all of the above), the claim degrades to **token redemption**: a caller
+//!   presenting an Admin-scoped bearer (the bootstrap owner token minted when the gate went up) may
+//!   claim from anywhere. That path is unconditional — it is the documented headless route;
 //! - the unclaimed state is **loud**: `serve` logs a recurring warning and `/admin/api/status`
 //!   reports `unclaimed: true`.
 
@@ -45,8 +51,11 @@ impl<S: Send + Sync> FromRequestParts<S> for PeerAddr {
     }
 }
 
-pub fn routes() -> Router<AppState> {
-    Router::new()
+/// The whole `/api/v1/auth` surface, behind **one** router-level `UserAccounts` gate. ADR 0004 says
+/// off *unmounts* the route, and every handler here is gated identically, so the guard belongs on
+/// the router — not pasted into six handler bodies where the seventh would forget it.
+pub fn routes(st: AppState) -> Router<AppState> {
+    let r = Router::new()
         .route("/api/v1/auth/status", get(status))
         .route("/api/v1/auth/claim", post(claim))
         .route("/api/v1/auth/login", post(login))
@@ -55,25 +64,30 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/api/v1/auth/sessions/{id}",
             axum::routing::delete(revoke_session),
-        )
+        );
+    crate::gate_accounts(r, st)
 }
 
-/// Route-level flag guard: `UserAccounts` off ⇒ the surface is absent (404), not forbidden.
-fn require_enabled(st: &AppState) -> Result<(), ApiError> {
-    if st.store.user_accounts() {
-        Ok(())
-    } else {
-        Err(ApiError(LibError::NotFound(
-            "user accounts are disabled".into(),
-        )))
-    }
+/// Header names a reverse proxy adds to a forwarded request. Their **presence** is what matters
+/// here, never their value: we are not trying to recover the real client IP (that needs a trusted
+/// proxy list we deliberately don't have), only to notice that this request did not come straight
+/// off a local socket. A client that forges one of these merely locks *itself* out of the open
+/// claim path — the safe direction to fail.
+const FORWARD_HEADERS: [&str; 3] = ["x-forwarded-for", "x-real-ip", "forwarded"];
+
+fn looks_proxied(headers: &HeaderMap) -> bool {
+    FORWARD_HEADERS.iter().any(|h| headers.contains_key(*h))
 }
 
 /// The `Set-Cookie` pair for a fresh session: the `HttpOnly` session cookie and the JS-readable
 /// CSRF cookie (double-submit). `Max-Age` matches the 90-day absolute ceiling — the 14-day
-/// inactivity expiry is enforced server-side. `Secure` rides the TLS posture.
-fn session_cookies(sess: &NewSession, tls: bool) -> [String; 2] {
-    let secure = if tls { "; Secure" } else { "" };
+/// inactivity expiry is enforced server-side.
+///
+/// `secure` is `tls || [server] secure_cookies`: this process's own TLS posture, *or* the
+/// operator's declaration that a TLS-terminating proxy sits in front. Without the second term a
+/// proxied deployment would ship a 90-day session cookie with no `Secure` attribute.
+fn session_cookies(sess: &NewSession, secure: bool) -> [String; 2] {
+    let secure = if secure { "; Secure" } else { "" };
     let max_age = 90 * 24 * 60 * 60;
     [
         format!(
@@ -113,7 +127,6 @@ fn with_cookies(body: impl IntoResponse, cookies: [String; 2]) -> Response {
 /// (login vs first-run claim). Deliberately unauthenticated: it reveals only what the login page
 /// itself would.
 async fn status(State(st): State<AppState>) -> Result<Json<AccountsStatus>, ApiError> {
-    require_enabled(&st)?;
     Ok(Json(AccountsStatus {
         enabled: true,
         unclaimed: st.store.unclaimed(),
@@ -129,27 +142,39 @@ async fn claim(
     headers: HeaderMap,
     Json(req): Json<ClaimRequest>,
 ) -> Result<Response, ApiError> {
-    require_enabled(&st)?;
     if !st.store.unclaimed() {
         return Err(ApiError(LibError::Conflict(
             "this instance is already claimed".into(),
         )));
     }
-    // Gate 1: a loopback peer (or a loopback-only bind, where every peer is local by construction).
-    let loopback = st.localhost_only || peer.map(|p| p.ip().is_loopback()).unwrap_or(false);
-    // Gate 2 (off-box): an Admin-scoped bearer — the bootstrap-token redemption path.
+    // Gate 1 — the open path. Positive evidence of a local peer only: an actual loopback peer
+    // socket, no forwarding header, and no operator opt-out. The bind posture is *not* evidence
+    // (see the module docs: behind a same-host proxy it is true for every internet visitor).
+    let peer_loopback = peer.map(|p| p.ip().is_loopback()).unwrap_or(false);
+    let open_claim = peer_loopback && !looks_proxied(&headers) && !st.require_claim_token;
+    // Gate 2 — an Admin-scoped bearer: the bootstrap-token redemption path. Unconditional, so a
+    // headless/proxied/remote deployment always keeps a first-class way in (ADR 0014).
     let admin_bearer = auth::bearer_header(&headers)
         .and_then(|t| auth::resolve(&st.store, Some(t), None).ok())
         .map(|r| r.ctx.scopes.has(Scope::Admin))
         .unwrap_or(false);
-    if !loopback && !admin_bearer {
+    if !open_claim && !admin_bearer {
+        tracing::warn!(
+            peer = ?peer, proxied = looks_proxied(&headers),
+            "refused a first-run claim: not a direct loopback peer and no bootstrap owner token"
+        );
         return Err(ApiError(LibError::Forbidden(
-            "an unclaimed instance can only be claimed from localhost (or with the bootstrap \
-             owner token as a bearer credential)"
+            "an unclaimed instance can only be claimed from a process on this machine, or with \
+             the bootstrap owner token as a bearer credential (see the server log for its path)"
                 .into(),
         )));
     }
-    let account = st.store.claim(&req, "claim")?;
+    // argon2id is deliberately expensive; it belongs on the blocking pool, never on a tokio worker
+    // (CLAUDE.md golden rule 5 — the engine wraps every store call the same way).
+    let store = st.store.clone();
+    let account = tokio::task::spawn_blocking(move || store.claim(&req, "claim"))
+        .await
+        .map_err(|e| ApiError(LibError::Internal(e.to_string())))??;
     let ident = AccountIdentity {
         account_id: account.account_id.clone(),
         username: account.username.clone(),
@@ -159,7 +184,7 @@ async fn claim(
         .store
         .mint_session(&account.account_id, user_agent(&headers).as_deref())?;
     tracing::info!(username = %account.username, "instance claimed; first admin account created");
-    let cookies = session_cookies(&sess, st.tls);
+    let cookies = session_cookies(&sess, st.tls || st.secure_cookies);
     Ok(with_cookies(
         Json(LoginReply {
             account: ident,
@@ -176,13 +201,16 @@ async fn login(
     headers: HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> Result<Response, ApiError> {
-    require_enabled(&st)?;
-    let (sess, ident) = st.store.login(
-        &req.username,
-        &req.password,
-        user_agent(&headers).as_deref(),
-    )?;
-    let cookies = session_cookies(&sess, st.tls);
+    // The password verify is a KDF: run it on the blocking pool so a burst of failed logins cannot
+    // pin tokio's workers (see `ServerStore::login`, which also keeps it off the DB mutex).
+    let store = st.store.clone();
+    let ua = user_agent(&headers);
+    let (sess, ident) = tokio::task::spawn_blocking(move || {
+        store.login(&req.username, &req.password, ua.as_deref())
+    })
+    .await
+    .map_err(|e| ApiError(LibError::Internal(e.to_string())))??;
+    let cookies = session_cookies(&sess, st.tls || st.secure_cookies);
     Ok(with_cookies(
         Json(LoginReply {
             account: ident,
@@ -194,7 +222,6 @@ async fn login(
 
 /// `POST /api/v1/auth/logout` — revoke the presented session and expire the cookies.
 async fn logout(State(st): State<AppState>, headers: HeaderMap) -> Result<Response, ApiError> {
-    require_enabled(&st)?;
     let session = auth::session_user(&st.store, &headers, true)?;
     st.store
         .revoke_session(&session.account_id, &session.session_id)?;
@@ -206,7 +233,6 @@ async fn list_sessions(
     State(st): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<SessionInfo>>, ApiError> {
-    require_enabled(&st)?;
     let session = auth::session_user(&st.store, &headers, false)?;
     Ok(Json(
         st.store
@@ -220,7 +246,6 @@ async fn revoke_session(
     headers: HeaderMap,
     AxPath(id): AxPath<String>,
 ) -> Result<StatusCode, ApiError> {
-    require_enabled(&st)?;
     let session = auth::session_user(&st.store, &headers, true)?;
     st.store.revoke_session(&session.account_id, &id)?;
     Ok(StatusCode::NO_CONTENT)
