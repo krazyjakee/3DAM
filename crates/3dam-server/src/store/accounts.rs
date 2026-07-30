@@ -1176,8 +1176,12 @@ mod tests {
                 "test",
             )
             .unwrap();
-        s.set_group_members(&g.group_id, &[viewer.account_id.clone()], "test")
-            .unwrap();
+        s.set_group_members(
+            &g.group_id,
+            std::slice::from_ref(&viewer.account_id),
+            "test",
+        )
+        .unwrap();
         let gen0 = s.visibility_generation();
         s.create_share(
             &NewShare {

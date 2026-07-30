@@ -930,7 +930,11 @@ mod tests {
             ..Default::default()
         };
         let page = store
-            .query_assets_semantic(&req, Some((space.to_string(), vec![0.05, 0.98, 0.0])))
+            .query_assets_semantic(
+                &req,
+                Some((space.to_string(), vec![0.05, 0.98, 0.0])),
+                &Visibility::Full,
+            )
             .unwrap();
         let names: Vec<String> = page.items.iter().map(|s| s.name.clone()).collect();
         assert!(

@@ -95,17 +95,20 @@ async fn defaults_are_safe_and_admin_reachable_under_off() {
     assert_eq!(body["network_writes"], false);
     assert_eq!(body["exposed_without_auth"], false);
 
-    // Six live flags, all at version 0 (unset → defaults): the three exposure flags, the two
-    // hosted-mode pipeline toggles (issue #71) which default *on*, and the federation peer flag
-    // (phase 6, issue #39) which defaults *off* — off means the advertise surface is absent.
+    // Seven live flags, all at version 0 (unset → defaults): the three exposure flags, the two
+    // hosted-mode pipeline toggles (issue #71) which default *on*, the federation peer flag
+    // (phase 6, issue #39) which defaults *off* — off means the advertise surface is absent — and
+    // user accounts (phase 6, issue #42), also off, which keeps the whole accounts/groups/shares
+    // surface absent.
     let (st, flags) = call(&app, "GET", "/admin/api/flags", None, None).await;
     assert_eq!(st, StatusCode::OK);
     let flags = flags.as_array().unwrap();
-    assert_eq!(flags.len(), 6);
+    assert_eq!(flags.len(), 7);
     let flag = |key: &str| flags.iter().find(|f| f["key"] == key).unwrap();
     assert_eq!(flag("auto_thumbnail")["value"], true);
     assert_eq!(flag("auto_analyze")["value"], true);
     assert_eq!(flag("federation")["value"], false);
+    assert_eq!(flag("user_accounts")["value"], false);
     // Workload toggles never raise exposure, so they need no confirm.
     assert_eq!(flag("auto_thumbnail")["exposure_increasing"], false);
 

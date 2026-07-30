@@ -465,6 +465,7 @@ fn parse_flag_value(key: FlagKey, s: &str) -> anyhow::Result<FlagValue> {
         FlagKey::AutoThumbnail => FlagValue::Bool(parse_bool("auto_thumbnail")?),
         FlagKey::AutoAnalyze => FlagValue::Bool(parse_bool("auto_analyze")?),
         FlagKey::Federation => FlagValue::Bool(parse_bool("federation")?),
+        FlagKey::UserAccounts => FlagValue::Bool(parse_bool("user_accounts")?),
     })
 }
 
