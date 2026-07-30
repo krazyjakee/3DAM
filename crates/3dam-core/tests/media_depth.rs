@@ -249,3 +249,100 @@ async fn metadata_thumbnail_and_convert() {
 
     std::fs::remove_dir_all(&tmp).ok();
 }
+
+async fn analyze_to_done(lib: &EmbeddedLibrary, ctx: &AuthContext) {
+    let job = lib
+        .submit_analyze(ctx, AnalyzeRequest::default())
+        .await
+        .unwrap();
+    loop {
+        let j = lib.get_job(ctx, &job).await.unwrap();
+        if matches!(j.state, JobState::Done | JobState::Failed) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+}
+
+/// An edited document must be *re-read*, not just re-stat'd.
+///
+/// A re-scan writes the new content hash, but the analyse gate is a pipeline version number — so
+/// unless the changed hash re-opens that gate, the body text extracted from the previous revision
+/// stays in the FTS index forever and keeps matching searches for prose the file no longer
+/// contains. Documents are the media type where that is visible, because their text *is* the
+/// content.
+#[tokio::test]
+async fn edited_document_text_is_re_extracted() {
+    let tmp = unique_tmp();
+    let assets = tmp.join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    let doc = assets.join("design.md");
+    std::fs::write(&doc, "# Design\n\nthe corridor uses volumetric fog\n").unwrap();
+
+    let lib =
+        EmbeddedLibrary::open_with(&tmp.join("data"), dam_core::ResourceOptions::ungoverned())
+            .await
+            .unwrap();
+    let ctx = AuthContext::embedded();
+    let sid = lib
+        .add_source(
+            &ctx,
+            AddSource {
+                kind: SourceKind::LocalFs,
+                uri: assets.to_string_lossy().into_owned(),
+                name: Some("t".into()),
+                options: SourceOptions::default(),
+            },
+        )
+        .await
+        .unwrap();
+    scan_to_done(&lib, &ctx, sid).await;
+    analyze_to_done(&lib, &ctx).await;
+
+    // Body-text search only — neither word is in the filename.
+    let finds = |word: &'static str| {
+        let lib = &lib;
+        let ctx = &ctx;
+        async move {
+            !lib.query(
+                ctx,
+                QueryRequest {
+                    text: Some(word.into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .items
+            .is_empty()
+        }
+    };
+    assert!(finds("volumetric").await, "the first revision is indexed");
+
+    // Rewrite the file in place, then re-scan + re-analyse exactly as a watch/rescan would.
+    std::fs::write(&doc, "# Design\n\nthe corridor uses baked lightmaps\n").unwrap();
+    scan_to_done(&lib, &ctx, sid).await;
+    analyze_to_done(&lib, &ctx).await;
+
+    assert!(
+        finds("lightmaps").await,
+        "the new revision's text must be indexed"
+    );
+    assert!(
+        !finds("volumetric").await,
+        "the previous revision's text must not survive the edit"
+    );
+
+    // And the degenerate edit: a revision with no readable text at all (here an emptied file; in
+    // the field, a design doc replaced by a scan of a whiteboard). "Nothing extracted" has to clear
+    // the indexed body, not skip the write and leave the last readable revision in place.
+    std::fs::write(&doc, "").unwrap();
+    scan_to_done(&lib, &ctx, sid).await;
+    analyze_to_done(&lib, &ctx).await;
+    assert!(
+        !finds("lightmaps").await,
+        "a revision with no text must clear the indexed body, not keep the old one"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}

@@ -880,3 +880,49 @@ impl LibraryService for ApiClient {
         Ok(Box::pin(rx))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// [`media_from_content_type`] is the documented inverse of `dto::content_type_for`, and the
+    /// two live in different crates — nothing but this test stops them drifting. Only the media
+    /// *class* has to survive the round trip: the format token is informational, and a MIME shared
+    /// by several extensions (`audio/mp4` covers `aac`/`m4a`/`mp4`) cannot name which one it was.
+    #[test]
+    fn content_type_round_trips_to_the_same_media_class() {
+        let matrix: &[(MediaType, &[&str])] = &[
+            (
+                MediaType::Model,
+                &["glb", "gltf", "obj", "ply", "stl", "fbx"],
+            ),
+            (
+                MediaType::Audio,
+                // `mov`/`m4v` appear here too: the content probe reclassifies an audio-only
+                // ISO-BMFF file while keeping its original extension.
+                &[
+                    "wav", "mp3", "flac", "ogg", "aac", "m4a", "mp4", "mov", "m4v",
+                ],
+            ),
+            (
+                MediaType::Image,
+                &["png", "jpg", "jpeg", "webp", "gif", "bmp", "tiff"],
+            ),
+            (
+                MediaType::Video,
+                &["mp4", "m4v", "mov", "webm", "mkv", "avi", "ogv"],
+            ),
+            (
+                MediaType::Document,
+                &["pdf", "md", "txt", "rtf", "docx", "odt"],
+            ),
+        ];
+        for (media, formats) in matrix {
+            for f in *formats {
+                let ct = content_type_for(*media, f);
+                let (got, _) = media_from_content_type(ct);
+                assert_eq!(got, *media, "{f} served as {ct} came back as {got:?}");
+            }
+        }
+    }
+}
