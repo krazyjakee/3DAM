@@ -23,19 +23,21 @@ impl Store {
         Ok(id)
     }
 
-    pub fn list_collections(&self) -> Result<Vec<Collection>, LibError> {
-        self.list_collections_vis(&Visibility::Full)
-    }
-
     /// Collections reachable under a visibility ceiling (issue #42 rule 5): a collection is present
     /// iff it was shared directly, **or** it is a *view over* assets the caller can already reach
-    /// (≥1 member in a readable source). A shared collection's member count is its real count; for
-    /// a source-derived view the count still reflects all members — the assets themselves stay
-    /// filtered by the query path, so no hidden asset is enumerable through it.
+    /// (≥1 member in a readable source). There is deliberately no `Full`-forwarding wrapper — every
+    /// caller names its ceiling, so a read path cannot silently skip the filter.
+    ///
+    /// The member count is **ceiling-filtered too**: a bare `COUNT(*)` over `collection_member`
+    /// would be a cardinality oracle (a viewer seeing "1000" over a grid of 1), and it would make
+    /// manual folders behave differently from smart folders, whose live count the engine already
+    /// computes under the caller's ceiling.
     pub fn list_collections_vis(&self, vis: &Visibility) -> Result<Vec<Collection>, LibError> {
         let conn = self.conn.lock().unwrap();
+        // The count subquery sits in the SELECT list, so its binds precede the WHERE clause's.
+        let (count_sql, count_binds) = Self::member_count_sql(vis);
         let mut where_sql = String::new();
-        let mut binds: Vec<Value> = Vec::new();
+        let mut binds: Vec<Value> = count_binds;
         if let Some(scope) = vis.restricted() {
             let mut arms: Vec<String> = vec!["0=1".into()];
             if !scope.collections.is_empty() {
@@ -68,8 +70,7 @@ impl Store {
             where_sql = format!(" WHERE ({})", arms.join(" OR "));
         }
         let sql = format!(
-            "SELECT id, name, kind, query, created_at, updated_at,
-                    (SELECT COUNT(*) FROM collection_member m WHERE m.collection_id = collection.id)
+            "SELECT id, name, kind, query, created_at, updated_at, ({count_sql})
              FROM collection{where_sql} ORDER BY name COLLATE NOCASE"
         );
         let mut stmt = conn.prepare(&sql).map_err(internal)?;
@@ -120,18 +121,41 @@ impl Store {
         Ok(hit.is_some())
     }
 
-    pub fn get_collection(&self, id: &CollectionId) -> Result<Collection, LibError> {
+    /// One collection's record, with its member count filtered by the caller's ceiling (see
+    /// [`Self::list_collections_vis`] — the count must not be an oracle for hidden members).
+    /// Reachability itself is [`Self::collection_visible`]'s job, checked by the engine first.
+    pub fn get_collection(
+        &self,
+        id: &CollectionId,
+        vis: &Visibility,
+    ) -> Result<Collection, LibError> {
         let conn = self.conn.lock().unwrap();
-        conn.query_row(
-            "SELECT id, name, kind, query, created_at, updated_at,
-                    (SELECT COUNT(*) FROM collection_member m WHERE m.collection_id = collection.id)
-             FROM collection WHERE id = ?1",
-            params![id.as_bytes().to_vec()],
-            |r| Self::row_to_collection(r, true),
-        )
+        let (count_sql, mut binds) = Self::member_count_sql(vis);
+        binds.push(Value::Blob(id.as_bytes().to_vec()));
+        let sql = format!(
+            "SELECT id, name, kind, query, created_at, updated_at, ({count_sql})
+             FROM collection WHERE id = ?"
+        );
+        conn.query_row(&sql, rusqlite::params_from_iter(binds.iter()), |r| {
+            Self::row_to_collection(r, true)
+        })
         .optional()
         .map_err(internal)?
         .ok_or_else(|| LibError::NotFound(format!("collection {id}")))
+    }
+
+    /// The correlated member-count subquery for a collection row, filtered by `vis`: `COUNT(*)` over
+    /// the members whose asset the caller may actually reach. Returns the SQL (referencing the outer
+    /// `collection.id`) plus its bind values, which the caller must splice in *before* any binds of
+    /// the enclosing WHERE clause.
+    fn member_count_sql(vis: &Visibility) -> (String, Vec<Value>) {
+        let mut sql = String::from(
+            "SELECT COUNT(*) FROM collection_member m JOIN asset a ON a.id = m.asset_id \
+             WHERE m.collection_id = collection.id",
+        );
+        let mut binds: Vec<Value> = Vec::new();
+        push_visibility(vis, "a", &mut sql, &mut binds);
+        (sql, binds)
     }
 
     /// `manual_count`: whether column 6 holds the member count (used for manual collections; a smart
@@ -299,14 +323,58 @@ impl Store {
         Ok(hit.is_some())
     }
 
-    /// Collections that contain an asset (manual membership) — surfaced on the inspector record.
-    pub fn collections_for_asset(&self, id: &AssetId) -> Result<Vec<CollectionId>, LibError> {
+    /// Collections that contain an asset (manual membership) — surfaced on the inspector record,
+    /// filtered by the caller's ceiling with the same reachability rule as
+    /// [`Self::list_collections_vis`] and [`Self::collection_visible`].
+    ///
+    /// Without the filter this leaks: a viewer holding only a *collection* share reaches an asset
+    /// through the collection arm and would otherwise be handed the ids of that asset's other,
+    /// unreachable collections — while `get_collection` on those correctly 404s. An unreachable
+    /// resource is absent, not merely denied (issue #42).
+    pub fn collections_for_asset(
+        &self,
+        id: &AssetId,
+        vis: &Visibility,
+    ) -> Result<Vec<CollectionId>, LibError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT collection_id FROM collection_member WHERE asset_id = ?1")
-            .map_err(internal)?;
+        let mut binds: Vec<Value> = vec![Value::Blob(id.as_bytes().to_vec())];
+        let mut where_sql =
+            String::from("SELECT collection_id FROM collection_member WHERE asset_id = ?");
+        if let Some(scope) = vis.restricted() {
+            let mut arms: Vec<String> = vec!["0=1".into()];
+            if !scope.collections.is_empty() {
+                let ph = scope
+                    .collections
+                    .iter()
+                    .map(|_| "?")
+                    .collect::<Vec<_>>()
+                    .join(",");
+                arms.push(format!("collection_id IN ({ph})"));
+                for c in &scope.collections {
+                    binds.push(Value::Blob(c.as_bytes().to_vec()));
+                }
+            }
+            if !scope.sources.is_empty() {
+                let ph = scope
+                    .sources
+                    .iter()
+                    .map(|_| "?")
+                    .collect::<Vec<_>>()
+                    .join(",");
+                arms.push(format!(
+                    "EXISTS (SELECT 1 FROM collection_member m2 JOIN asset a ON a.id = m2.asset_id
+                             WHERE m2.collection_id = collection_member.collection_id
+                               AND a.source_id IN ({ph}))"
+                ));
+                for s in &scope.sources {
+                    binds.push(Value::Blob(s.as_bytes().to_vec()));
+                }
+            }
+            where_sql.push_str(&format!(" AND ({})", arms.join(" OR ")));
+        }
+        let mut stmt = conn.prepare(&where_sql).map_err(internal)?;
         let rows = stmt
-            .query_map(params![id.as_bytes().to_vec()], |r| {
+            .query_map(rusqlite::params_from_iter(binds.iter()), |r| {
                 Ok(CollectionId::from_bytes(
                     <[u8; 16]>::try_from(r.get::<_, Vec<u8>>(0)?.as_slice()).unwrap_or([0; 16]),
                 ))

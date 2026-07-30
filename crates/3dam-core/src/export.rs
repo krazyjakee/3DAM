@@ -119,7 +119,7 @@ fn resolve_ids(
         if !store.collection_visible(&cid, vis)? {
             return Err(LibError::NotFound(format!("collection {cid}")));
         }
-        let coll = store.get_collection(&cid)?;
+        let coll = store.get_collection(&cid, vis)?;
         return match coll.kind {
             CollectionKind::Manual => {
                 let members = store.collection_member_ids(&cid)?;

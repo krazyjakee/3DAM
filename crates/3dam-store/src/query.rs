@@ -3,13 +3,12 @@ use super::*;
 use crate::helpers::*;
 
 impl Store {
-    /// Faceted query → a page of summaries. Cursor is an offset (slice-simple; keyset later).
-    /// Unrestricted visibility — the engine's visibility-aware entry is [`Self::query_assets_semantic`].
-    pub fn query_assets(&self, req: &QueryRequest) -> Result<Page<AssetSummary>, LibError> {
-        self.query_assets_semantic(req, None, &Visibility::Full)
-    }
-
-    /// As [`query_assets`], but the engine may inject a pre-computed text-query embedding
+    /// Faceted query → a page of summaries. Cursor is an offset (slice-simple; keyset later). The
+    /// caller always names a ceiling — there is deliberately no `Full`-forwarding convenience
+    /// wrapper, because such a wrapper is exactly how a read path forgets to filter (issue #42).
+    /// The engine's entry point is this, with `ctx.visibility`.
+    ///
+    /// The engine may also inject a pre-computed text-query embedding
     /// (`(space_id, vector)`) for the query string (semantic-search M4/M5). When present and the mode
     /// is Hybrid/Semantic, it seeds a true text→asset ranked list in the fusion — the model-backed
     /// path that finds assets with zero lexical overlap. `None` (the default, and any build without a
@@ -492,6 +491,12 @@ mod tests {
     use super::*;
     use dam_sources::SourceConnection;
 
+    /// Unrestricted query — the test-local stand-in for the `Full`-forwarding wrapper that
+    /// production code deliberately no longer has (every real caller names its ceiling).
+    fn query_all(store: &Store, req: &QueryRequest) -> Result<Page<AssetSummary>, LibError> {
+        store.query_assets_semantic(req, None, &Visibility::Full)
+    }
+
     /// Insert one image asset with the given filename and return the live store.
     fn store_with(filename: &str) -> Store {
         let store = Store::open_in_memory().unwrap();
@@ -555,7 +560,7 @@ mod tests {
         let _b = mk("other.png");
 
         // Fresh assets are not favourites.
-        let all = store.query_assets(&QueryRequest::default()).unwrap().items;
+        let all = query_all(&store, &QueryRequest::default()).unwrap().items;
         assert_eq!(all.len(), 2);
         assert!(all.iter().all(|s| !s.favorite));
 
@@ -569,14 +574,14 @@ mod tests {
             }],
             ..Default::default()
         };
-        let favs = store.query_assets(&fav_req).unwrap().items;
+        let favs = query_all(&store, &fav_req).unwrap().items;
         assert_eq!(favs.len(), 1);
         assert_eq!(favs[0].name, "keep.png");
         assert!(favs[0].favorite);
 
         // Un-star; the filter is empty again.
         store.set_favorite(&a, false).unwrap();
-        assert!(store.query_assets(&fav_req).unwrap().items.is_empty());
+        assert!(query_all(&store, &fav_req).unwrap().items.is_empty());
     }
 
     /// Folder navigation (issue #66): the on-the-fly tree derived from stored paths, and the
@@ -646,7 +651,7 @@ mod tests {
                 }],
                 ..Default::default()
             };
-            store.query_assets(&req).unwrap().total.unwrap()
+            query_all(&store, &req).unwrap().total.unwrap()
         };
         assert_eq!(scoped("Environment/"), 3);
         assert_eq!(scoped("Environment/Rock/"), 2);
@@ -663,8 +668,7 @@ mod tests {
             mode,
             ..Default::default()
         };
-        store
-            .query_assets(&req)
+        query_all(store, &req)
             .unwrap()
             .items
             .into_iter()
@@ -695,7 +699,7 @@ mod tests {
     #[test]
     fn tag_name_is_searchable_and_reject_removes_it() {
         let store = store_with("clip_0001.wav");
-        let id = store.query_assets(&QueryRequest::default()).unwrap().items[0].id;
+        let id = query_all(&store, &QueryRequest::default()).unwrap().items[0].id;
         // A term that appears only as a tag, never in the filename.
         assert!(search(&store, "snare").is_empty());
         store.suggest_tag(&id, "snare", 0.9, "test@1").unwrap();
@@ -781,8 +785,7 @@ mod tests {
                 filters: vec![Filter { field, op, value }],
                 ..Default::default()
             };
-            let mut names = store
-                .query_assets(&req)
+            let mut names = query_all(&store, &req)
                 .unwrap()
                 .items
                 .into_iter()

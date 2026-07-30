@@ -121,10 +121,13 @@ impl<'de> serde::Deserialize<'de> for Scopes {
 /// the identity's shares, intersected with any account ceiling) and enforced as a query predicate
 /// inside the engine — so the engine never learns what an account or a group is, and no handler
 /// can forget to filter.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+///
+/// Deliberately **not** `Default`: `Full` is the fail-open value, and a derived default would let a
+/// future credential kind (or a `..Default::default()` struct update) inherit unrestricted reach in
+/// silence. Every construction names its ceiling.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Visibility {
     /// Unrestricted — the local owner, admins, tokens, and the embedded engine.
-    #[default]
     Full,
     /// A positive reachable set. Anything outside it is *absent* (404/empty), never a 403 — an
     /// unshared resource must not reveal its existence by erroring differently.
@@ -231,20 +234,18 @@ impl AuthContext {
             account: None,
         }
     }
-    /// A connected caller with a resolved identity and its granted scopes (tech-spec 10 §1.2).
-    pub fn connected(identity: Option<String>, scopes: Scopes) -> Self {
+    /// A connected caller with a resolved identity, granted scopes, and — **required, never
+    /// defaulted** — its visibility ceiling (tech-spec 10 §1.2, §4.3). The ceiling is a positional
+    /// argument precisely so a new credential kind cannot inherit `Full` by omission; a caller that
+    /// genuinely has unrestricted reach (a token, the local owner) says `Visibility::Full` out loud.
+    pub fn connected(identity: Option<String>, scopes: Scopes, visibility: Visibility) -> Self {
         Self {
             identity,
             embedded: false,
             scopes,
-            visibility: Visibility::Full,
+            visibility,
             account: None,
         }
-    }
-    /// Narrow this context to a resolved visibility ceiling (builder-style; server auth layer).
-    pub fn with_visibility(mut self, v: Visibility) -> Self {
-        self.visibility = v;
-        self
     }
     /// Attach the signed-in account identity (builder-style; server auth layer).
     pub fn with_account(mut self, a: AccountIdentity) -> Self {

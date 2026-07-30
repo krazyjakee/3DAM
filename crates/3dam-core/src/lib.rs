@@ -864,7 +864,11 @@ impl LibraryService for EmbeddedLibrary {
     async fn get_asset(&self, ctx: &AuthContext, id: &AssetId) -> Result<Asset, LibError> {
         self.require_asset_visible(ctx, id).await?;
         let id = *id;
-        match self.db(move |s| s.get_asset(&id)).await {
+        // The detail read is the one path that surfaces collection membership, so it carries the
+        // ceiling: an asset reached through a collection share must not enumerate the *other*
+        // collections holding it (issue #42 — unreachable is absent, not merely denied).
+        let vis = ctx.visibility.clone();
+        match self.db(move |s| s.get_asset_detail(&id, &vis)).await {
             // A merged result can name a peer-owned asset: proxy the detail read (phase 6).
             // Never for a restricted context — the ceiling can't vouch for peer-owned ids.
             Err(LibError::NotFound(_)) if ctx.visibility.is_full() => {
@@ -1266,7 +1270,7 @@ impl LibraryService for EmbeddedLibrary {
             if !s.collection_visible(&id, &vis)? {
                 return Err(LibError::NotFound(format!("collection {id}")));
             }
-            let mut c = s.get_collection(&id)?;
+            let mut c = s.get_collection(&id, &vis)?;
             // A smart folder's count is the live match count — compute it on the single-item read,
             // under the caller's ceiling so the count is never an oracle for hidden matches.
             if c.kind == CollectionKind::Smart {
@@ -1357,7 +1361,7 @@ impl LibraryService for EmbeddedLibrary {
             if !s.collection_visible(&id, &vis)? {
                 return Err(LibError::NotFound(format!("collection {id}")));
             }
-            let coll = s.get_collection(&id)?;
+            let coll = s.get_collection(&id, &vis)?;
             match coll.kind {
                 CollectionKind::Manual => {
                     let items = s.collection_summaries(&id, page.clamped(500), &vis)?;
@@ -1682,12 +1686,28 @@ impl LibraryService for EmbeddedLibrary {
         // job progress names paths, and per-asset events can't be cheaply vouched for, so only
         // reachable-source state changes and catalog resets pass. Their UIs refetch on demand.
         let stream = tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(move |r| {
-            let keep = match (&vis, r.as_ref()) {
-                (_, Err(_)) => false,
-                (Visibility::Full, Ok(_)) => true,
-                (v, Ok(LibraryEvent::SourceState { id, .. })) => v.allows_source(id),
-                (_, Ok(LibraryEvent::CatalogReset)) => true,
-                (Visibility::Restricted(_), Ok(_)) => false,
+            // Every variant is matched explicitly — no positional catch-all — so a newly added
+            // `LibraryEvent` fails to compile here instead of being silently withheld (a dead
+            // client) or silently leaked (a hole in the ceiling).
+            //
+            // The four `false` arms are a **known gap**, not a judgement that restricted identities
+            // want no live updates: `AssetSummary` and `JobStatus` carry no source/asset
+            // attribution (`dam_api::dto`), so the ceiling cannot be evaluated per event and the
+            // only safe answer is to withhold. Closing it means adding attribution — a
+            // `source_id` on `AssetSummary`, and the touched source(s) on `JobStatus` — across
+            // `dam-api`, `dam-server`, `dam-client` and `web/src/api/types.ts` together. That is a
+            // DTO contract change, deliberately not folded into the accounts PR.
+            let keep = match r.as_ref() {
+                Err(_) => false,
+                Ok(ev) => match (&vis, ev) {
+                    (Visibility::Full, _) => true,
+                    (v, LibraryEvent::SourceState { id, .. }) => v.allows_source(id),
+                    (_, LibraryEvent::CatalogReset) => true,
+                    (Visibility::Restricted(_), LibraryEvent::AssetAdded(_)) => false,
+                    (Visibility::Restricted(_), LibraryEvent::AssetChanged { .. }) => false,
+                    (Visibility::Restricted(_), LibraryEvent::AssetRemoved(_)) => false,
+                    (Visibility::Restricted(_), LibraryEvent::JobProgress(_)) => false,
+                },
             };
             async move {
                 if keep {
