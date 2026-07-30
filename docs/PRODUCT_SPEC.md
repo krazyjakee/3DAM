@@ -11,10 +11,16 @@ for the rules that constrain the choices below.
 ## 1. Product summary
 
 3DAM is a cross-platform (Linux/Windows/macOS) **Rust** application that catalogues,
-analyses, searches, and converts game assets across **audio, image, and 3D model** media
-types. It reads from local disks and network shares, builds one unified database, and uses
-content-based analysis to auto-categorise, auto-tag, find similar assets, and detect
-duplicates.
+analyses, searches, and converts game assets across **audio, image, 3D model, video, and
+document** media types. It reads from local disks and network shares, builds one unified
+database, and uses content-based analysis to auto-categorise, auto-tag, find similar assets,
+and detect duplicates.
+
+The first three are the *deep* media types — full decode, analysis, embeddings, conversion.
+**Video** and **document** are deliberately shallower (§9, phase 2b): they exist so a
+registered source can be described *completely*, because a project folder that is one-third
+unindexable is not "one catalog for the project". Each is honest about what it can do rather
+than pretending to parity — see the phase-2b entry for the specific limits.
 
 It ships as **one executable with three roles**:
 
@@ -49,7 +55,9 @@ capability you have not deliberately switched on.
 ## 2. Goals and non-goals
 
 ### Goals
-- One database and one browser for sound, image, and 3D assets.
+- One database and one browser for sound, image, and 3D assets — plus the **video and
+  documents** that live alongside them in a real project folder, so a source is catalogued
+  completely rather than partially (§9 phase 2b).
 - Content-aware automation: categorisation, tagging, similarity, de-duplication.
 - Fast on very large libraries (design target: **1M+ assets**).
 - Local-first, non-destructive, open, no subscription, no telemetry.
@@ -85,7 +93,12 @@ capability you have not deliberately switched on.
   discovery are a documented future direction (§9), not initial scope.
 - Not a **content creation / editing** tool — 3DAM manages and converts assets; it does not
   author them (no DAW, no image editor, no modeller).
-- Not a **general-purpose DAM** for documents/video — game audio, images, and 3D only in v1.
+- Not a **general-purpose DAM**, and not a video or document management system. 3DAM
+  catalogues the video and documents it finds *in a game project* (cutscenes, stingers,
+  reference footage, design docs, licence files, store receipts) so a source is described
+  completely — see §9 phase 2b. It does **not** aspire to parity with the deep media types:
+  no video transcoding, no editing, no document authoring, no versioning or approval
+  workflow. Audio, image, and 3D remain the media types 3DAM is *for*.
 - Not a **real-time collaborative** editor — the server enables shared *access* to a
   library; concurrent multi-user editing and sync are out of scope for v1.
 
@@ -670,6 +683,40 @@ Choices to be validated by spikes; listed to establish direction, not to lock in
    store, basic grid/table browser + text search, CLI `scan`/`search`.
 2. **Media depth:** per-type decode + preview (waveform, image, 3D viewer), thumbnail
    cache, conversion pipeline (CLI-first).
+2b. **Media breadth — video + documents:** a fourth and fifth `MediaType` so a source is
+   catalogued *completely*. Deliberately shallower than the three deep types, and numbered
+   `2b` rather than inserted as a new phase because it re-enters phase 2's capability line
+   (media handlers) and renumbering would invalidate the `phase-6`/`phase-7`/`phase-8`
+   labels already in use on issues. In wall-clock it lands after phase 6.
+   - **Video** — detect `mp4`/`mov`/`mkv`/`webm`/`avi`/`m4v`/`ogv`, disambiguating
+     `mp4`/`m4a` from the audio matrix by inspecting tracks rather than trusting the
+     extension; cheap tier (duration, dimensions, fps, codec, container, bitrate,
+     has-audio); a poster-frame thumbnail at ~10% duration; preview is the browser's native
+     `<video>` over the existing content route with range support — no WASM island. Decode
+     is a **discovered `ffmpeg`/`ffprobe` binary**, degrading to a typed tile with
+     filesystem-only metadata when absent ([ADR 0014](adr/0014-video-decode-backend.md)).
+     No transcoding: video is not a convert-pipeline target.
+   - **Documents** — detect `pdf`/`md`/`txt`/`rtf`/`docx`/`odt`; cheap tier (page/word
+     count, title/author where the container carries it, encoding, plus a short excerpt).
+     The tile is an **excerpt card rendered in the DOM** from that excerpt, and the preview
+     is an inspector text panel — neither is a server-side raster and neither is a WASM
+     island. Rasterising a PDF's first page server-side was considered and declined: it
+     needs a native PDF renderer (pdfium) and a font stack — the same dependency class
+     [ADR 0014](adr/0014-video-decode-backend.md) declined for video — to produce a tile
+     strictly worse than typeset DOM text that themes and stays selectable.
+     `csv`/`json` are **excluded** — they are structured data, not prose, and belong to a
+     later "data" type if they are ever wanted. Ingest applies an **ignore policy** so a
+     source tree's `README`s, `.gitignore`s, and vendored licence boilerplate cannot drown
+     the catalog.
+   - **Documents are the first media type whose content is language**, so they join search
+     differently: extracted text becomes a column on the existing `asset_fts` index, ranked
+     in two levels — a categorical tier that puts any filename/token/tag match above every
+     body-text-only match, then weighted bm25 within each tier. The tier is not belt-and-braces:
+     bm25 saturates term frequency, so a document that repeats a word enough times reaches the
+     same score ceiling as a filename match and no fixed weight separates them. Similarity comes
+     from a **text** embedding space. Cross-media similarity between a
+     document and an image is meaningless and is never offered — the `EmbeddingSpace` seam
+     already keys on media, and the UI scopes accordingly.
 3. **Automation:** feature extraction + embeddings per media type, similarity search,
    auto-tag/auto-categorise, duplicate detection, review UX.
 4. **Reach:** SFTP + SMB sources, watch/auto-rescan, smart folders, export/manifests,

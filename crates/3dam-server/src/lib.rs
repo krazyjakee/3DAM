@@ -731,6 +731,33 @@ fn serve_embedded(path: &str) -> Option<Response> {
 }
 
 async fn version(State(st): State<AppState>) -> Json<serde_json::Value> {
+    let mut capabilities = vec![
+        "query",
+        "sources",
+        "scan",
+        "stats",
+        "ws",
+        "web",
+        "thumbnail",
+        "convert",
+        "analyze",
+        "similar",
+        "duplicates",
+        "suggestions",
+        "collections",
+        "export",
+        "auth",
+        "flags",
+        "mcp",
+        "accounts",
+    ];
+    // Video decode is a *discovered* ffmpeg, not a compiled-in feature (ADR 0014), so whether this
+    // server can describe a video or render its poster frame is a property of the machine it runs
+    // on — something no client can infer from the build. Advertising it here lets the UI say
+    // "no decoder installed" instead of leaving an empty tile that reads as a bug.
+    if dam_core::video_probe_available() {
+        capabilities.push("video_probe");
+    }
     Json(serde_json::json!({
         "api": "v1",
         "server": concat!("3dam ", env!("CARGO_PKG_VERSION")),
@@ -747,9 +774,7 @@ async fn version(State(st): State<AppState>) -> Json<serde_json::Value> {
         // case every existing user can still sign in, so the client must not replace the login
         // screen with a claim form. Reveals only a cardinality the claim screen itself implies.
         "account_count": st.store.count_accounts().unwrap_or(0),
-        "capabilities": ["query", "sources", "scan", "stats", "ws", "web", "thumbnail", "convert",
-                         "analyze", "similar", "duplicates", "suggestions", "collections", "export",
-                         "auth", "flags", "mcp", "accounts"],
+        "capabilities": capabilities,
     }))
 }
 
@@ -814,14 +839,125 @@ fn content_response(content: AssetContent, cache_control: &'static str) -> Respo
         .into_response()
 }
 
+/// A single byte range resolved against a known length.
+///
+/// Only the single-range form is supported. Multi-range (`bytes=0-99,200-299`) requires a
+/// `multipart/byteranges` body, is not used by any media element, and is explicitly optional in
+/// RFC 9110 §14.2 — a server may answer it with the whole representation, which is what falling
+/// through to a 200 here does.
+fn parse_range(spec: &str, len: u64) -> Option<(u64, u64)> {
+    let spec = spec.trim().strip_prefix("bytes=")?;
+    if spec.contains(',') {
+        return None;
+    }
+    let (start, end) = spec.split_once('-')?;
+    let (start, end) = (start.trim(), end.trim());
+    let (first, last) = if start.is_empty() {
+        // Suffix form `bytes=-N`: the final N bytes.
+        let n: u64 = end.parse().ok()?;
+        if n == 0 {
+            return None;
+        }
+        (len.saturating_sub(n), len - 1)
+    } else {
+        let first: u64 = start.parse().ok()?;
+        let last = if end.is_empty() {
+            len - 1
+        } else {
+            end.parse::<u64>().ok()?.min(len - 1)
+        };
+        (first, last)
+    };
+    (first <= last && first < len).then_some((first, last))
+}
+
+/// Serve asset bytes with **range support**.
+///
+/// Range matters far more here than it did for images and meshes: a browser `<video>` element
+/// issues a range request to seek, and several will refuse to show a scrub bar (or to play at all,
+/// on Safari) against a server that answers `200` to every request. Video is served as original
+/// bytes through this one route — there is no transcoding and no WASM island — so this is what
+/// makes video preview work at all (PRODUCT_SPEC §9 phase 2b).
+///
+/// `Accept-Ranges: bytes` is advertised on every response, including the unranged `200`, so the
+/// client knows seeking is available before it tries.
+///
+/// Note this slices bytes already resident in memory: `read_content` materialises the whole asset,
+/// per the transport design in ADR 0012. Range therefore buys correct seek semantics and bounded
+/// *response* size, not bounded server memory — streaming a large file straight from the source
+/// would be a change to the `LibraryService` seam, and is the natural follow-up if video libraries
+/// get big.
+fn ranged_content_response(
+    content: AssetContent,
+    cache_control: &'static str,
+    range_header: Option<&str>,
+) -> Response {
+    let len = content.bytes.len() as u64;
+    let Some(spec) = range_header else {
+        let mut res = content_response(content, cache_control);
+        res.headers_mut().insert(
+            header::ACCEPT_RANGES,
+            header::HeaderValue::from_static("bytes"),
+        );
+        return res;
+    };
+
+    // A range against an empty body can never be satisfied.
+    if len == 0 {
+        return (
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            [(header::CONTENT_RANGE, "bytes */0".to_string())],
+        )
+            .into_response();
+    }
+
+    match parse_range(spec, len) {
+        Some((first, last)) => {
+            let slice = content.bytes[first as usize..=last as usize].to_vec();
+            (
+                StatusCode::PARTIAL_CONTENT,
+                [
+                    (header::CONTENT_TYPE, content.content_type),
+                    (header::CACHE_CONTROL, cache_control.to_string()),
+                    (header::ACCEPT_RANGES, "bytes".to_string()),
+                    (header::CONTENT_RANGE, format!("bytes {first}-{last}/{len}")),
+                ],
+                Body::from(slice),
+            )
+                .into_response()
+        }
+        // Syntactically valid but unsatisfiable (start past the end) must be 416; anything we
+        // simply don't implement (multi-range) degrades to the full representation.
+        None if spec.trim_start().starts_with("bytes=") && !spec.contains(',') => (
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            [(header::CONTENT_RANGE, format!("bytes */{len}"))],
+        )
+            .into_response(),
+        None => {
+            let mut res = content_response(content, cache_control);
+            res.headers_mut().insert(
+                header::ACCEPT_RANGES,
+                header::HeaderValue::from_static("bytes"),
+            );
+            res
+        }
+    }
+}
+
 async fn asset_content(
     Reader(ctx): Reader,
     State(st): State<AppState>,
     AxPath(id): AxPath<String>,
+    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let id: AssetId = parse_id(&id, "asset")?;
     let content = st.lib.read_content(&ctx, &id).await?;
-    Ok(content_response(content, "private, max-age=60"))
+    let range = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
+    Ok(ranged_content_response(
+        content,
+        "private, max-age=60",
+        range,
+    ))
 }
 
 async fn asset_related(
@@ -1326,5 +1462,51 @@ async fn mcp_http(State(st): State<AppState>, headers: HeaderMap, body: Body) ->
         Some(resp) => (StatusCode::OK, Json(resp)).into_response(),
         // A notification has no reply — acknowledge with 202 (Streamable HTTP allows an empty body).
         None => StatusCode::ACCEPTED.into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_range;
+
+    /// RFC 9110 §14.1.2 range forms, plus the ones a `<video>` element actually sends when it
+    /// seeks. Getting these wrong is not a subtle bug — a browser that asks for `bytes=500-` and
+    /// gets the whole file back either replays from the start or refuses to scrub.
+    #[test]
+    fn parses_the_range_forms_a_video_element_sends() {
+        // Opening probe: some bytes from the front.
+        assert_eq!(parse_range("bytes=0-1023", 4096), Some((0, 1023)));
+        // Seek: open-ended from an offset.
+        assert_eq!(parse_range("bytes=500-", 4096), Some((500, 4095)));
+        // Suffix: the last N bytes (MP4 `moov` atom at the tail).
+        assert_eq!(parse_range("bytes=-500", 4096), Some((3596, 4095)));
+        // A suffix longer than the file clamps to the whole file rather than underflowing.
+        assert_eq!(parse_range("bytes=-9999", 100), Some((0, 99)));
+        // An end past EOF clamps to the last byte.
+        assert_eq!(parse_range("bytes=0-99999", 100), Some((0, 99)));
+        // Whole file, explicitly.
+        assert_eq!(parse_range("bytes=0-", 10), Some((0, 9)));
+        // Single byte.
+        assert_eq!(parse_range("bytes=5-5", 10), Some((5, 5)));
+        // Tolerate the optional whitespace the grammar allows.
+        assert_eq!(parse_range(" bytes=0-1 ", 10), Some((0, 1)));
+    }
+
+    #[test]
+    fn rejects_unsatisfiable_and_unsupported_ranges() {
+        // Start past the end — the caller turns this into a 416.
+        assert_eq!(parse_range("bytes=100-200", 100), None);
+        assert_eq!(parse_range("bytes=100-", 100), None);
+        // Inverted range.
+        assert_eq!(parse_range("bytes=50-10", 100), None);
+        // A zero-length suffix requests nothing.
+        assert_eq!(parse_range("bytes=-0", 100), None);
+        // Multi-range: legal to decline, so we fall back to the full representation.
+        assert_eq!(parse_range("bytes=0-9,20-29", 100), None);
+        // Not a byte range / malformed.
+        assert_eq!(parse_range("items=0-9", 100), None);
+        assert_eq!(parse_range("bytes=abc-def", 100), None);
+        assert_eq!(parse_range("bytes=", 100), None);
+        assert_eq!(parse_range("", 100), None);
     }
 }

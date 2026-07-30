@@ -4,7 +4,7 @@ Guidance for AI agents (and humans) working in this repository. Read this before
 
 ## What 3DAM is
 
-3DAM is a cross-platform, Rust-first **game-asset manager** for **audio, image, and 3D** assets. It unifies them into one local SQLite catalog and layers **content-based automation** on top: metadata extraction, thumbnails, embeddings, similarity search, auto-tagging, and deduplication. It is local-first, non-destructive, and federation-ready.
+3DAM is a cross-platform, Rust-first **game-asset manager** for **audio, image, and 3D** assets — plus the **video and documents** that sit alongside them in a project folder ([PRODUCT_SPEC §9 phase 2b](docs/PRODUCT_SPEC.md); those two are deliberately shallower than the three deep types). It unifies them into one local SQLite catalog and layers **content-based automation** on top: metadata extraction, thumbnails, embeddings, similarity search, auto-tagging, and deduplication. It is local-first, non-destructive, and federation-ready.
 
 **One binary, four roles.** The `3dam` binary dispatches on `argv[1]`:
 - (no arg) → **GUI** (native desktop: a Tauri webview shell over the embedded web client, [ADR 0013](docs/adr/0013-desktop-shell-tauri.md))
@@ -42,7 +42,7 @@ Every role talks to the same engine through one trait, `LibraryService`, so the 
 | **`FileSource`** trait + `open_source()` | `crates/3dam-sources/src/lib.rs` | `LocalFsSource`, `SftpSource` (russh), `SmbSource` (smb) | Decouples scan/ingest from the I/O protocol. `walk()` yields entries; `fetch()` materialises bytes (in-place for local, temp file for remote). New sources (S3, peers) plug in here. |
 | **`Backend` / `open_backend()`** | `crates/3dam-frontend/src/lib.rs` | `Embedded { data_dir }` vs `Connected { endpoint, token }` | Single point where CLI/GUI resolve embedded-vs-remote from `--data` / `--connect` / `--token`. |
 | **`Role` / `classify()`** | `crates/3dam-frontend/src/lib.rs` | `Gui` / `Serve` / `Mcp` / `Cli` | One binary, four entry points — chosen by peeking at `argv`, no features or rebuild. |
-| **EmbeddingSpace** (data-level) | `embedding` table, `dam-store` schema V3 | model-free v1 vectors; SigLIP/CLAP later | `space_id` = `model@version+media+dim+metric`. Isolates embedding generations so a model bump invalidates only its slice. Powers `similar` / dedup. Model-backed extractors are a later feature-gated bump behind this seam. |
+| **EmbeddingSpace** (data-level) | `embedding` table, `dam-store` schema V3+ | model-free v1 vectors; SigLIP/CLAP later | `space_id` = `model@version+media+dim+metric`. Isolates embedding generations so a model bump invalidates only its slice. Powers `similar` / dedup. Model-backed extractors are a later feature-gated bump behind this seam. |
 
 ### Crate map (`crates/`)
 
@@ -52,7 +52,7 @@ Packages are named `dam-*` (Cargo forbids leading digits); directories are brand
 |---|---|---|---|
 | `3dam-api` | `dam-api` | The seam: `LibraryService` trait, DTOs, `AuthContext`, `Scope`/`Scopes`, events | Foundational. serde-only, no other `dam-*` deps. |
 | `3dam-store` | `dam-store` | Synchronous SQLite catalog (`library.db`); schema + migrations | Private to `dam-core`. Never exposed to frontends. |
-| `3dam-media` | `dam-media` | `detect()` / `extract_metadata()` (cheap tier) / `render_thumbnail()` (images) / convert / feature extraction | symphonia (audio), image (image), gltf (3D). |
+| `3dam-media` | `dam-media` | `detect()` / `detect_for_ingest()` / `extract_metadata()` (cheap tier) / `render_thumbnail()` (images + video poster frames) / `extract_text()` / convert / feature extraction | symphonia (audio), image (image), gltf (3D), a **discovered `ffprobe`/`ffmpeg`** (video, [ADR 0014](docs/adr/0014-video-decode-backend.md)), lopdf + zip/quick-xml (documents). |
 | `3dam-sources` | `dam-sources` | `FileSource` + local/SFTP/SMB; `SourceConnection` | SFTP/SMB behind cargo features. |
 | `3dam-core` | `dam-core` | **The engine.** `EmbeddedLibrary` impls `LibraryService`; scan/analyze/convert/export jobs, watch/auto-rescan, events, thumbnail cache | Pure logic — no UI, transport, or GPU. |
 | `3dam-client` | `dam-client` | `ApiClient` impls `LibraryService` over HTTP/WS | The "connected" backend (CLI/GUI `--connect`). |
@@ -73,7 +73,7 @@ Packages are named `dam-*` (Cargo forbids leading digits); directories are brand
 - Data dir: platform default (see `dam-core/src/paths.rs`), overridable with `--data`.
 - `library.db` — the catalog (assets, sources, jobs, collections, tags, embeddings). Owned by `dam-store`, private to the engine.
 - `server.db` — server config, tokens, feature flags, audit log. Owned by `dam-server`.
-- **Schema is forward-only** (`PRAGMA user_version`), currently **V3** (V1 catalog → V2 audio codec/container → V3 `embedding` table). A DB from a *newer* schema is rejected rather than downgraded. When you change the schema, add a numbered migration in `dam-store/src/schema.rs` and bump the version — never edit an existing migration.
+- **Schema is forward-only** (`PRAGMA user_version`), currently **V10**: V1 catalog → V2 audio codec/container → V3 `embedding` table → V4/V5 model dependency bytes → V6 `asset_fts` FTS5 index → V7 FTS rebuilt with a `tags` column → V8 audio waveform peaks → V9 `video_attr` + `document_attr` → V10 FTS rebuilt with a `text` column. A DB from a *newer* schema is rejected rather than downgraded. When you change the schema, add a numbered migration in `dam-store/src/schema.rs` and bump the version — never edit an existing migration.
 
 ---
 
@@ -166,6 +166,9 @@ pnpm wasm         # cargo xtask wasm
 - **The desktop app is a webview, not a native toolkit.** `dam-desktop` (Tauri) renders the embedded web client — "native GUI work" is almost always `web/` work. The webview loads an `http://127.0.0.1` origin, so Tauri IPC is deliberately unavailable in page JS; native affordances need explicit capability plumbing (ADR 0013). The egui client (`3dam-gui`) was removed at ADR 0013 — it lives in git history, don't resurrect pieces of it casually.
 - **The native renderer is real (no longer a stub).** `dam-render` produces textured-PBR turntable thumbnails + the `DMSH` preview blob (consumed by the web/WASM viewer), behind dam-core's `render` feature.
 - **Embeddings are model-free in v1.** Similarity/dedup work off a v1 vector behind the EmbeddingSpace seam. SigLIP (image/3D, candle) and CLAP (audio, ort/ONNX) are a later feature-gated bump — see `spikes/embedding-models/` and [ADR 0006](docs/adr/0006-inference-candle.md).
+- **Video decode is an *optional external binary*, not a linked library.** `dam-media` discovers `ffprobe`/`ffmpeg` on `PATH` at runtime (override with `DAM_FFPROBE`/`DAM_FFMPEG`) and degrades in tiers: nothing installed → the video is still catalogued, browsable, and playable in the browser but has no metadata and shows a typed tile; `ffprobe` → full cheap tier; both → poster-frame thumbnails. There is deliberately **no cargo feature** for this — nothing is gated at build time, so the same binary upgrades itself when a user installs ffmpeg ([ADR 0014](docs/adr/0014-video-decode-backend.md)). Video is not a convert target.
+- **`detect()` vs `detect_for_ingest()`.** The first answers "what is this file?"; the second answers "should the catalog hold it?" and is what a **scan** must call. It drops **documents** (never other media) found under dependency/build/VCS directories, so one `npm install` can't bury a project's assets under thousands of `README.md`s. A root `LICENSE.txt` is deliberately kept — the licence surface points at it.
+- **Documents put their text in the FTS index, not in a base-table column.** `asset_fts` has a `text` column (schema V10) written by the analyse pass, and search ranks in **two levels**: a categorical tier (`search::NAME_SCOPED_TIER`) that puts any filename/token/tag match above every body-text-only match, then weighted bm25 (`search::FTS_RANK`) within the tier. Don't collapse that to weights alone — bm25 saturates term frequency, so a sufficiently repetitive document ties any finite filename weight. Because the text lives only inside the index, any future FTS rebuild must stash and restore it — V7 and V10 are the worked precedents.
 - **Newer-schema DBs are rejected.** If you bump the schema and then run an older binary against that DB, it refuses to open by design.
 - **Release CI is a scaffold.** `.github/workflows/release.yml` is `workflow_dispatch`-only until the app is production-ready; it is not wired to tag pushes yet.
 
@@ -178,5 +181,5 @@ pnpm wasm         # cargo xtask wasm
 - `docs/ROADMAP.md` — status against §9 (phases 1–5 shipped; 6 federation/auth & 7 polish/scale later; 8 beyond v1).
 - `docs/DESIGN_GUIDELINES.md` — dark-first, information-dense UI rules (governs both clients).
 - `docs/tech-spec/00`–`15` — numbered deep specs. Crate descriptions cite them (e.g. 01 architecture, 03 LibraryService/API, 05 analysis, 09 server/web, 12 GUI, 13 CLI, 14 concurrency).
-- `docs/adr/0001`–`0013` — decisions (render backend, crate split, MCP, feature flags, egui [superseded], candle, tokio+rayon, React stack, v1 scope, package naming, Assimp, prefetch, Tauri desktop shell).
+- `docs/adr/0001`–`0014` — decisions (render backend, crate split, MCP, feature flags, egui [superseded], candle, tokio+rayon, React stack, v1 scope, package naming, Assimp, prefetch, Tauri desktop shell, video decode backend).
 - `spikes/` — validation experiments that gate/inform ADRs (vector-index, headless-render, embedding-models, cross-peer-similarity).

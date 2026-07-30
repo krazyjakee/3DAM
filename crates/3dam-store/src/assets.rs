@@ -151,6 +151,50 @@ impl Store {
                 )
                 .map_err(internal)?;
             }
+            MediaAttributes::Video(v) => {
+                conn.execute(
+                    "INSERT INTO video_attr (asset_id, duration_ms, width, height, fps, codec,
+                        container, bitrate, has_audio)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                     ON CONFLICT(asset_id) DO UPDATE SET
+                        duration_ms=excluded.duration_ms, width=excluded.width, height=excluded.height,
+                        fps=excluded.fps, codec=excluded.codec, container=excluded.container,
+                        bitrate=excluded.bitrate, has_audio=excluded.has_audio",
+                    params![
+                        key,
+                        v.duration_ms,
+                        v.width,
+                        v.height,
+                        v.fps.map(|f| f as f64),
+                        v.codec,
+                        v.container,
+                        v.bitrate,
+                        v.has_audio.map(|b| b as i64),
+                    ],
+                )
+                .map_err(internal)?;
+            }
+            MediaAttributes::Document(d) => {
+                conn.execute(
+                    "INSERT INTO document_attr (asset_id, page_count, word_count, title, author,
+                        encoding, excerpt)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                     ON CONFLICT(asset_id) DO UPDATE SET
+                        page_count=excluded.page_count, word_count=excluded.word_count,
+                        title=excluded.title, author=excluded.author, encoding=excluded.encoding,
+                        excerpt=excluded.excerpt",
+                    params![
+                        key,
+                        d.page_count,
+                        d.word_count,
+                        d.title,
+                        d.author,
+                        d.encoding,
+                        d.excerpt,
+                    ],
+                )
+                .map_err(internal)?;
+            }
             MediaAttributes::None => {}
         }
         Ok(())
@@ -245,6 +289,52 @@ impl Store {
                 .ok()
                 .flatten()
                 .map(MediaAttributes::Model)
+                .unwrap_or(MediaAttributes::None),
+            MediaType::Video => conn
+                .query_row(
+                    "SELECT duration_ms, width, height, fps, codec, container, bitrate, has_audio, class
+                     FROM video_attr WHERE asset_id = ?1",
+                    params![id_blob],
+                    |r| {
+                        Ok(VideoAttributes {
+                            duration_ms: r.get(0)?,
+                            width: r.get(1)?,
+                            height: r.get(2)?,
+                            fps: r.get::<_, Option<f64>>(3)?.map(|v| v as f32),
+                            codec: r.get(4)?,
+                            container: r.get(5)?,
+                            bitrate: r.get(6)?,
+                            has_audio: r.get::<_, Option<i64>>(7)?.map(|v| v != 0),
+                            class: r.get(8)?,
+                        })
+                    },
+                )
+                .optional()
+                .ok()
+                .flatten()
+                .map(MediaAttributes::Video)
+                .unwrap_or(MediaAttributes::None),
+            MediaType::Document => conn
+                .query_row(
+                    "SELECT page_count, word_count, title, author, encoding, excerpt, class
+                     FROM document_attr WHERE asset_id = ?1",
+                    params![id_blob],
+                    |r| {
+                        Ok(DocumentAttributes {
+                            page_count: r.get(0)?,
+                            word_count: r.get(1)?,
+                            title: r.get(2)?,
+                            author: r.get(3)?,
+                            encoding: r.get(4)?,
+                            excerpt: r.get(5)?,
+                            class: r.get(6)?,
+                        })
+                    },
+                )
+                .optional()
+                .ok()
+                .flatten()
+                .map(MediaAttributes::Document)
                 .unwrap_or(MediaAttributes::None),
         }
     }

@@ -8,17 +8,27 @@ pub(crate) fn parse_connection(blob: &str) -> Result<SourceConnection, LibError>
         .map_err(|e| LibError::Internal(format!("corrupt source connection: {e}")))
 }
 
-/// The SELECT column list every grid/summary query shares — thirteen columns in the exact order
+/// The SELECT column list every grid/summary query shares — fifteen columns in the exact order
 /// `row_to_summary` reads them. Callers append their own `FROM …`, `{ATTR_JOINS}`, WHERE and ORDER.
+///
+/// Video reuses the dimension and duration slots via `COALESCE` rather than claiming its own
+/// columns: a video's `1920×1080` and `1:30` mean exactly what an image's and an audio clip's do,
+/// and only one of the joined rows can be non-NULL for a given asset (media type is exclusive).
 pub(crate) const GRID_SELECT: &str = "SELECT asset.id, filename, media_type, format,
         size_bytes + COALESCE(model_attr.dependency_bytes, 0), license_id, license_status,
-        image_attr.width, image_attr.height, audio_attr.duration_ms, model_attr.triangle_count,
-        audio_attr.class, asset.flags";
+        COALESCE(image_attr.width, video_attr.width),
+        COALESCE(image_attr.height, video_attr.height),
+        COALESCE(audio_attr.duration_ms, video_attr.duration_ms),
+        model_attr.triangle_count, audio_attr.class, asset.flags,
+        document_attr.page_count, document_attr.word_count";
 
-/// The per-media attribute LEFT JOINs the grid select depends on (dimensions / duration / tris).
+/// The per-media attribute LEFT JOINs the grid select depends on (dimensions / duration / tris /
+/// page count).
 pub(crate) const ATTR_JOINS: &str = "LEFT JOIN image_attr ON image_attr.asset_id = asset.id
          LEFT JOIN audio_attr ON audio_attr.asset_id = asset.id
-         LEFT JOIN model_attr ON model_attr.asset_id = asset.id";
+         LEFT JOIN model_attr ON model_attr.asset_id = asset.id
+         LEFT JOIN video_attr ON video_attr.asset_id = asset.id
+         LEFT JOIN document_attr ON document_attr.asset_id = asset.id";
 
 /// Row → `AssetSummary` mapper for the [`GRID_SELECT`] column shape. Shared by the paged query,
 /// collection listing, and similarity/dedup summary fetch so the column contract lives in one place.
@@ -32,6 +42,8 @@ pub(crate) fn row_to_summary(r: &rusqlite::Row) -> rusqlite::Result<AssetSummary
     let audio_class: Option<String> = r.get(11)?;
     // Favourite is bit 1 of the asset `flags` bitset (bit 0 is the scan-derived "missing" mark).
     let flags: i64 = r.get(12)?;
+    let page_count: Option<i64> = r.get(13)?;
+    let word_count: Option<i64> = r.get(14)?;
     Ok(AssetSummary {
         id,
         name: r.get(1)?,
@@ -44,14 +56,16 @@ pub(crate) fn row_to_summary(r: &rusqlite::Row) -> rusqlite::Result<AssetSummary
         },
         top_tags: Vec::new(),
         origin: Origin::Local,
-        key_attrs: grid_key_attrs(
+        key_attrs: grid_key_attrs(GridKeyAttrs {
             media,
             width,
             height,
             duration_ms,
             tri_count,
-            audio_class.as_deref(),
-        ),
+            audio_class: audio_class.as_deref(),
+            page_count,
+            word_count,
+        }),
         favorite: flags & FAVORITE_FLAG != 0,
     })
 }
@@ -61,41 +75,71 @@ pub(crate) fn row_to_summary(r: &rusqlite::Row) -> rusqlite::Result<AssetSummary
 /// the re-scan upserts that clear/set bit 0.
 pub(crate) const FAVORITE_FLAG: i64 = 2;
 
+/// The row shape [`grid_key_attrs`] reads. A struct rather than positional arguments because the
+/// list crossed the point where `(media, width, height, duration_ms, tri_count, …)` at a call site
+/// says nothing about which `Option<i64>` is which.
+pub(crate) struct GridKeyAttrs<'a> {
+    pub media: MediaType,
+    pub width: Option<i64>,
+    pub height: Option<i64>,
+    pub duration_ms: Option<i64>,
+    pub tri_count: Option<i64>,
+    pub audio_class: Option<&'a str>,
+    pub page_count: Option<i64>,
+    pub word_count: Option<i64>,
+}
+
+/// Format a millisecond duration as `m:ss` for a grid tile / table row.
+fn fmt_duration(ms: i64) -> String {
+    let secs = ms as f64 / 1000.0;
+    format!("{:.0}:{:02}", (secs / 60.0).floor(), (secs % 60.0) as i64)
+}
+
 /// The couple of cheap per-media attributes shown on a grid tile / table row: dimensions for
 /// images, duration (+ a `loop` marker when the analysis classed it so) for audio, triangle count
-/// for models. Cheap and best-effort.
-pub(crate) fn grid_key_attrs(
-    media: MediaType,
-    width: Option<i64>,
-    height: Option<i64>,
-    duration_ms: Option<i64>,
-    tri_count: Option<i64>,
-    audio_class: Option<&str>,
-) -> SmallMap {
+/// for models, both dimensions and duration for video, page/word count for documents. Cheap and
+/// best-effort.
+pub(crate) fn grid_key_attrs(a: GridKeyAttrs<'_>) -> SmallMap {
     let mut m = SmallMap::new();
-    match media {
+    match a.media {
         MediaType::Image => {
-            if let (Some(w), Some(h)) = (width, height) {
+            if let (Some(w), Some(h)) = (a.width, a.height) {
                 m.insert("dimensions".into(), format!("{w}×{h}"));
             }
         }
         MediaType::Audio => {
-            if let Some(ms) = duration_ms {
-                let secs = ms as f64 / 1000.0;
-                m.insert(
-                    "duration".into(),
-                    format!("{:.0}:{:02}", (secs / 60.0).floor(), (secs % 60.0) as i64),
-                );
+            if let Some(ms) = a.duration_ms {
+                m.insert("duration".into(), fmt_duration(ms));
             }
             // The DSP classifier (analysis §4.2) labels audio one_shot | loop | music | sfx — surface
             // it so the table/grid can show the type alongside the duration.
-            if let Some(class) = audio_class.filter(|c| !c.is_empty()) {
+            if let Some(class) = a.audio_class.filter(|c| !c.is_empty()) {
                 m.insert("type".into(), class.replace('_', "-"));
             }
         }
         MediaType::Model => {
-            if let Some(t) = tri_count {
+            if let Some(t) = a.tri_count {
                 m.insert("tris".into(), t.to_string());
+            }
+        }
+        // Video is the one type that earns both slots: resolution and running time are each the
+        // first thing you want to know, and neither implies the other.
+        MediaType::Video => {
+            if let (Some(w), Some(h)) = (a.width, a.height) {
+                m.insert("dimensions".into(), format!("{w}×{h}"));
+            }
+            if let Some(ms) = a.duration_ms {
+                m.insert("duration".into(), fmt_duration(ms));
+            }
+        }
+        // Page count is meaningless for plaintext (there are no pages), so it only shows when the
+        // container actually paginates; word count is the honest fallback for everything else.
+        MediaType::Document => {
+            if let Some(p) = a.page_count.filter(|p| *p > 0) {
+                m.insert("pages".into(), p.to_string());
+            }
+            if let Some(w) = a.word_count.filter(|w| *w > 0) {
+                m.insert("words".into(), w.to_string());
             }
         }
     }
@@ -309,9 +353,11 @@ pub(crate) fn apply_filter(
             }
             _ => return Err(LibError::BadRequest("unsupported tag filter".into())),
         },
-        // Image attributes (image_attr).
-        Width => attr_num_filter(f, "image_attr", "width", where_sql, binds)?,
-        Height => attr_num_filter(f, "image_attr", "height", where_sql, binds)?,
+        // Image attributes (image_attr). Dimensions span video too — same column, same meaning.
+        Width => attr_num_filter_over(f, &["image_attr", "video_attr"], "width", where_sql, binds)?,
+        Height => {
+            attr_num_filter_over(f, &["image_attr", "video_attr"], "height", where_sql, binds)?
+        }
         ColorDepth => attr_num_filter(f, "image_attr", "color_depth", where_sql, binds)?,
         HasAlpha => attr_bool_filter(f, "image_attr", "has_alpha", where_sql, binds)?,
         ColorSpace => attr_str_filter(f, "image_attr", "color_space", where_sql, binds)?,
@@ -320,7 +366,13 @@ pub(crate) fn apply_filter(
         TileClass => attr_str_filter(f, "image_attr", "tile_class", where_sql, binds)?,
         // Audio attributes (audio_attr).
         Bpm => attr_num_filter(f, "audio_attr", "bpm", where_sql, binds)?,
-        Duration => attr_num_filter(f, "audio_attr", "duration_ms", where_sql, binds)?,
+        Duration => attr_num_filter_over(
+            f,
+            &["audio_attr", "video_attr"],
+            "duration_ms",
+            where_sql,
+            binds,
+        )?,
         SampleRate => attr_num_filter(f, "audio_attr", "sample_rate", where_sql, binds)?,
         BitDepth => attr_num_filter(f, "audio_attr", "bit_depth", where_sql, binds)?,
         Channels => attr_num_filter(f, "audio_attr", "channels", where_sql, binds)?,
@@ -342,6 +394,17 @@ pub(crate) fn apply_filter(
         HasAnimation => attr_bool_filter(f, "model_attr", "has_animation", where_sql, binds)?,
         HasUv => attr_bool_filter(f, "model_attr", "has_uv", where_sql, binds)?,
         ModelClass => attr_str_filter(f, "model_attr", "class", where_sql, binds)?,
+        // Video attributes (video_attr). Width/height/duration are handled above, shared with
+        // image/audio; these are the axes only video has.
+        Fps => attr_num_filter(f, "video_attr", "fps", where_sql, binds)?,
+        Bitrate => attr_num_filter(f, "video_attr", "bitrate", where_sql, binds)?,
+        HasAudio => attr_bool_filter(f, "video_attr", "has_audio", where_sql, binds)?,
+        VideoClass => attr_str_filter(f, "video_attr", "class", where_sql, binds)?,
+        // Document attributes (document_attr).
+        PageCount => attr_num_filter(f, "document_attr", "page_count", where_sql, binds)?,
+        WordCount => attr_num_filter(f, "document_attr", "word_count", where_sql, binds)?,
+        Author => attr_str_filter(f, "document_attr", "author", where_sql, binds)?,
+        DocumentClass => attr_str_filter(f, "document_attr", "class", where_sql, binds)?,
         // A boolean flag on the asset row itself — presence of the filter means "favourites only".
         // `Eq false` inverts it (everything not favourited), which keeps the op meaningful.
         Favorite => {
@@ -378,37 +441,65 @@ fn attr_num_filter(
     where_sql: &mut String,
     binds: &mut Vec<Value>,
 ) -> Result<(), LibError> {
+    attr_num_filter_over(f, &[table], col, where_sql, binds)
+}
+
+/// As [`attr_num_filter`], but matching the column across **several** attr tables.
+///
+/// Video shares its dimension and duration column names with `image_attr` and `audio_attr`
+/// (`width`, `height`, `duration_ms`), and they mean the same thing, so "width > 1920" should find
+/// a 4K texture *and* a 4K cutscene rather than forcing a second, near-identical facet field per
+/// media type. Only one attr table can hold a row for a given asset, so the `UNION ALL` cannot
+/// produce duplicates.
+fn attr_num_filter_over(
+    f: &Filter,
+    tables: &[&str],
+    col: &str,
+    where_sql: &mut String,
+    binds: &mut Vec<Value>,
+) -> Result<(), LibError> {
+    // Build the condition and its binds once, then replay the binds per table — each table
+    // contributes its own set of `?` placeholders to the UNION.
+    let mut cond_binds: Vec<Value> = Vec::new();
     let cond = match (&f.op, &f.value) {
         (FilterOp::Eq, FilterValue::Num(n)) => {
-            binds.push(Value::Real(*n));
+            cond_binds.push(Value::Real(*n));
             format!("{col} = ?")
         }
         (FilterOp::Gt, FilterValue::Num(n)) => {
-            binds.push(Value::Real(*n));
+            cond_binds.push(Value::Real(*n));
             format!("{col} > ?")
         }
         (FilterOp::Gte, FilterValue::Num(n)) => {
-            binds.push(Value::Real(*n));
+            cond_binds.push(Value::Real(*n));
             format!("{col} >= ?")
         }
         (FilterOp::Lt, FilterValue::Num(n)) => {
-            binds.push(Value::Real(*n));
+            cond_binds.push(Value::Real(*n));
             format!("{col} < ?")
         }
         (FilterOp::Lte, FilterValue::Num(n)) => {
-            binds.push(Value::Real(*n));
+            cond_binds.push(Value::Real(*n));
             format!("{col} <= ?")
         }
         (FilterOp::Range, FilterValue::Range(lo, hi)) => {
-            binds.push(Value::Real(*lo));
-            binds.push(Value::Real(*hi));
+            cond_binds.push(Value::Real(*lo));
+            cond_binds.push(Value::Real(*hi));
             format!("{col} BETWEEN ? AND ?")
         }
         _ => return Err(LibError::BadRequest(format!("unsupported filter on {col}"))),
     };
+    let selects: Vec<String> = tables
+        .iter()
+        .map(|t| format!("SELECT asset_id FROM {t} WHERE {cond}"))
+        .collect();
     where_sql.push_str(&format!(
-        " AND asset.id IN (SELECT asset_id FROM {table} WHERE {cond})"
+        " AND asset.id IN ({})",
+        selects.join(" UNION ALL ")
     ));
+    for _ in tables {
+        binds.extend(cond_binds.iter().cloned());
+    }
     Ok(())
 }
 
@@ -561,6 +652,16 @@ mod tests {
             HasAnimation => (FilterOp::Eq, FilterValue::Bool(false)),
             HasUv => (FilterOp::Eq, FilterValue::Bool(true)),
             ModelClass => (FilterOp::Eq, FilterValue::Str("prop_lowpoly".into())),
+            // Video attrs (width/height/duration are shared with image/audio, above).
+            Fps => (FilterOp::Gte, FilterValue::Num(24.0)),
+            Bitrate => (FilterOp::Lt, FilterValue::Num(8_000_000.0)),
+            HasAudio => (FilterOp::Eq, FilterValue::Bool(true)),
+            VideoClass => (FilterOp::Eq, FilterValue::Str("cutscene".into())),
+            // Document attrs.
+            PageCount => (FilterOp::Lte, FilterValue::Num(20.0)),
+            WordCount => (FilterOp::Gte, FilterValue::Num(100.0)),
+            Author => (FilterOp::Eq, FilterValue::Str("ada".into())),
+            DocumentClass => (FilterOp::Eq, FilterValue::Str("license".into())),
             Favorite => (FilterOp::Eq, FilterValue::Bool(true)),
             Path => (FilterOp::Eq, FilterValue::Str("Environment/".into())),
         };

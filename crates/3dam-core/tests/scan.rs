@@ -27,10 +27,17 @@ async fn scan_indexes_files_and_emits_events() {
     let tmp = unique_tmp();
     let assets = tmp.join("assets");
     std::fs::create_dir_all(assets.join("sub")).unwrap();
+    std::fs::create_dir_all(assets.join("node_modules/dep")).unwrap();
     std::fs::write(assets.join("a.wav"), b"RIFF....WAVE").unwrap();
     std::fs::write(assets.join("b.png"), b"\x89PNG\r\n").unwrap();
     std::fs::write(assets.join("sub/c.gltf"), b"{\"asset\":{}}").unwrap();
-    std::fs::write(assets.join("note.txt"), b"not an asset").unwrap(); // must be skipped
+    // A `.txt` is a document now (PRODUCT_SPEC §9 phase 2b) — it used to be skipped.
+    std::fs::write(assets.join("note.txt"), b"a project note").unwrap();
+    // …but the ingest ignore policy still keeps dependency boilerplate out of the catalog, which
+    // is what stops one `npm install` from outnumbering a project's actual assets.
+    std::fs::write(assets.join("node_modules/dep/README.md"), b"# dep").unwrap();
+    // Structured data is deliberately not a document, so it remains unindexable.
+    std::fs::write(assets.join("data.csv"), b"a,b\n1,2\n").unwrap();
 
     let lib =
         EmbeddedLibrary::open_with(&tmp.join("data"), dam_core::ResourceOptions::ungoverned())
@@ -81,8 +88,8 @@ async fn scan_indexes_files_and_emits_events() {
     }
     assert!(finished, "scan job should reach Done");
     assert_eq!(
-        added, 3,
-        "exactly the 3 recognised files emit AssetAdded (txt skipped)"
+        added, 4,
+        "the 4 recognised files emit AssetAdded (node_modules doc + csv skipped)"
     );
 
     let page = lib
@@ -98,14 +105,15 @@ async fn scan_indexes_files_and_emits_events() {
         )
         .await
         .unwrap();
-    assert_eq!(page.total, Some(3));
-    assert_eq!(page.items.len(), 3);
+    assert_eq!(page.total, Some(4));
+    assert_eq!(page.items.len(), 4);
 
     let stats = lib.library_stats(&ctx, None).await.unwrap();
-    assert_eq!(stats.total, 3);
+    assert_eq!(stats.total, 4);
     assert_eq!(stats.by_media.get("audio"), Some(&1));
     assert_eq!(stats.by_media.get("image"), Some(&1));
     assert_eq!(stats.by_media.get("model"), Some(&1));
+    assert_eq!(stats.by_media.get("document"), Some(&1));
 
     // A re-scan must not duplicate rows (reconcile on source_id+path).
     let job2 = lib
@@ -126,7 +134,7 @@ async fn scan_indexes_files_and_emits_events() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let stats2 = lib.library_stats(&ctx, None).await.unwrap();
-    assert_eq!(stats2.total, 3, "re-scan is idempotent");
+    assert_eq!(stats2.total, 4, "re-scan is idempotent");
 
     std::fs::remove_dir_all(&tmp).ok();
 }

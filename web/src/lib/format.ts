@@ -39,6 +39,8 @@ export const mediaLabel: Record<MediaType, string> = {
   audio: "Audio",
   image: "Image",
   model: "3D Model",
+  video: "Video",
+  document: "Document",
 };
 
 export function originLabel(o: Origin): string {

@@ -95,7 +95,7 @@ pub(crate) enum Cmd {
         /// Free-text query selector.
         #[arg(long)]
         text: Option<String>,
-        /// Media-type query selector: `audio`|`image`|`model`.
+        /// Media-type query selector: `audio`|`image`|`model`|`video`|`document`.
         #[arg(long)]
         media: Option<String>,
         /// Only the assets that need crediting, with attribution columns (the credits list).
@@ -179,7 +179,7 @@ pub(crate) enum Cmd {
         /// Near-duplicates (perceptual/embedding) instead of exact (byte-identical).
         #[arg(long)]
         near: bool,
-        /// Limit to one media type: `audio`|`image`|`model`.
+        /// Limit to one media type: `audio`|`image`|`model`|`video`|`document`.
         #[arg(long)]
         media: Option<String>,
         /// Max groups to return.
@@ -472,7 +472,7 @@ pub(crate) enum CollectionCmd {
         /// Smart-folder query: free text over filename.
         #[arg(long)]
         text: Option<String>,
-        /// Smart-folder media filter: `audio`|`image`|`model`.
+        /// Smart-folder media filter: `audio`|`image`|`model`|`video`|`document`.
         #[arg(long)]
         media: Option<String>,
     },

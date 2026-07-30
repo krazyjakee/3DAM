@@ -121,10 +121,10 @@ export function ContextMenu({
   const ids = assets.map((a) => a.id);
   const single = assets.length === 1;
   const heading = single ? assets[0].name : `${assets.length} items`;
-  // Only image + 3D assets have a server thumbnail to rebuild (audio uses the honest typed tile);
-  // hide "Regenerate thumbnail" when nothing in the target set can produce one.
+  // Only image, 3D and video assets have a server thumbnail to rebuild (audio and documents use the
+  // honest typed tile); hide "Regenerate thumbnail" when nothing in the target set can produce one.
   const thumbableIds = assets
-    .filter((a) => a.media === "image" || a.media === "model")
+    .filter((a) => a.media === "image" || a.media === "model" || a.media === "video")
     .map((a) => a.id);
 
   const run = (fn: () => void) => {

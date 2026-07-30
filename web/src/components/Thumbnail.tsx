@@ -6,24 +6,34 @@ import { useThumbnailVersion } from "@/lib/thumbnail-cache";
 import { MediaIcon } from "./MediaIcon";
 
 // Images get a real server-rendered PNG thumbnail (tech-spec 04 §6.4); 3D models get a server-side
-// wgpu turntable render (ADR 0002), both lazily loaded via <img>. Audio previews are interactive
+// wgpu turntable render (ADR 0002); video gets a poster frame grabbed at ~10% duration by a
+// discovered ffmpeg (ADR 0014) — all lazily loaded via <img>. Audio previews are interactive
 // WASM islands with no server thumbnail, so audio keeps the honest typed tile here
 // (DESIGN_GUIDELINES §4 — "no decorative placeholders masquerading as content").
+//
+// Documents keep the typed tile as well. Their excerpt is real content and it *is* shown — in the
+// Inspector, where there is room to read it. Shrinking 280 characters into a ~120px tile would
+// render unreadable grey texture: decoration wearing the costume of content, which is precisely
+// what that guideline rules out. The tile shows the glyph, the format, and the page/word counts
+// that already ride along in `key_attrs`.
 //
 // While a thumbnail is still fetching/generating we show a neutral placeholder (the typed tile
 // glyph) with a loading spinner overlay rather than raw alt text (issue #53); on load we swap to the
 // image, and on a decode/unsupported/no-GPU error we fall back to the same typed tile — so a model
-// on a GPU-less host, or a format the renderer can't decode yet, degrades gracefully.
+// on a GPU-less host, a format the renderer can't decode yet, or a video on a server with no ffmpeg
+// installed all degrade the same graceful way.
 
 /** Media whose preview the server can render to a PNG the grid shows via <img>. */
 function hasServerThumbnail(media: AssetSummary["media"]): boolean {
-  return media === "image" || media === "model";
+  return media === "image" || media === "model" || media === "video";
 }
 
 const TINT: Record<AssetSummary["media"], string> = {
   audio: "var(--color-lic-attribution)",
   image: "var(--color-lic-permissive)",
   model: "var(--color-warn)",
+  video: "var(--color-media-video)",
+  document: "var(--color-media-document)",
 };
 
 /** The honest typed tile: a media glyph + format label — never a fake preview. */

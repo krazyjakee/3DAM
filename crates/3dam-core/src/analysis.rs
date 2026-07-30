@@ -34,6 +34,14 @@ pub const PIPELINE_VERSION: i64 = 3;
 const IMAGE_SPACE: &str = "image-stats-v1";
 const AUDIO_SPACE: &str = "audio-stats-v1";
 const MODEL_SPACE: &str = "model-stats-v1";
+/// Video: container shape only (see [`analyze_video`]) — a weak descriptor, honestly named.
+const VIDEO_SPACE: &str = "video-stats-v1";
+/// Documents: hashed bag-of-words over the extracted text (`dam_media::text_descriptor`). Text is
+/// the one media type where the model-free descriptor is genuinely useful rather than a
+/// placeholder, because lexical overlap *is* a real similarity signal for prose. The model-backed
+/// text encoder is a later feature-gated bump into its own space (issue #47), never a redefinition
+/// of this one.
+const TEXT_SPACE: &str = "text-hash-v1";
 
 const PROGRESS_EVERY: u64 = 8;
 
@@ -130,6 +138,8 @@ fn analyze_one(
         MediaType::Image => analyze_image(store, t, &abs)?,
         MediaType::Audio => analyze_audio(store, t, &abs, &det)?,
         MediaType::Model => analyze_model(store, t, &abs, &det)?,
+        MediaType::Video => analyze_video(store, t, &abs, &det)?,
+        MediaType::Document => analyze_document(store, t, &abs, &det)?,
     }
     // Model-backed semantic embedding (semantic-search M4): when a model ships, also index the
     // shared text/media space so text queries can rank against it (M5 semantic mode). Additive to
@@ -349,6 +359,150 @@ fn analyze_model(
     }
     if m.has_uvs.unwrap_or(false) {
         suggestions.push(("uv_mapped", 0.9));
+    }
+    suggest_all(store, &t.id, &suggestions);
+    Ok(())
+}
+
+/// Analyse a video: container-shape embedding, a duration-based class, and structural tags.
+///
+/// Be clear about what this descriptor is. It is built from duration, resolution, frame rate and
+/// bitrate — the *shape* of the file, not its pictures — so "similar" here means "another clip of
+/// roughly this length and format", not "another clip that looks like this". That is the same
+/// bargain `model-stats-v1` strikes with triangle budgets, and it is the honest ceiling for a
+/// media type whose decode backend may not even be installed (ADR 0014).
+///
+/// A visual descriptor is a real follow-up: the poster frame already goes through
+/// `extract_image_features`, so a `video-frame-v1` space is mostly plumbing. It is deliberately not
+/// folded into *this* space, because a space must be homogeneous — half the library having visual
+/// vectors and half having shape vectors, depending on whether ffmpeg happened to be installed at
+/// scan time, is exactly what the `space_id` seam exists to prevent.
+fn analyze_video(
+    store: &Store,
+    t: &AnalysisTarget,
+    abs: &Path,
+    det: &dam_media::Detected,
+) -> Result<(), String> {
+    let MediaAttributes::Video(v) = dam_media::extract_metadata(abs, det) else {
+        return Err("video metadata unavailable".into());
+    };
+    // With no prober installed every field is None, which would make one identical vector for
+    // every video in the library — worse than useless, since it would rank them all as perfect
+    // matches for each other. Skip the embedding entirely rather than index a lie.
+    if v.duration_ms.is_none() && v.width.is_none() {
+        tracing::debug!(asset = %t.id, "no video metadata (no prober?); skipping embedding");
+        return Ok(());
+    }
+
+    let secs = v.duration_ms.unwrap_or(0) as f32 / 1000.0;
+    let vec = normalise(vec![
+        (1.0 + secs).log10(),
+        (1.0 + v.width.unwrap_or(0) as f32).log10(),
+        (1.0 + v.height.unwrap_or(0) as f32).log10(),
+        v.fps.unwrap_or(0.0) / 60.0,
+        (1.0 + v.bitrate.unwrap_or(0) as f32).log10() / 8.0,
+        v.has_audio.unwrap_or(false) as u8 as f32,
+    ]);
+    store
+        .set_embedding(&t.id, VIDEO_SPACE, MediaType::Video, &vec, "video-stats@1")
+        .map_err(|e| e.to_string())?;
+
+    // Duration is the one axis that reliably separates the kinds of video a game project holds.
+    let class = match v.duration_ms {
+        Some(ms) if ms < 5_000 => "sting",
+        Some(ms) if ms < 60_000 => "clip",
+        Some(_) => "cutscene",
+        None => "clip",
+    };
+    store
+        .set_media_class(&t.id, MediaType::Video, class)
+        .map_err(|e| e.to_string())?;
+
+    let mut suggestions: Vec<(&str, f32)> = vec![(class, 0.6)];
+    // A video with no audio track is very often a UI/VFX element or a video texture rather than a
+    // watchable clip — a genuinely useful thing to be able to filter on.
+    if v.has_audio == Some(false) {
+        suggestions.push(("silent", 0.9));
+    }
+    if let (Some(w), Some(h)) = (v.width, v.height) {
+        if w >= 3840 || h >= 2160 {
+            suggestions.push(("4k", 0.95));
+        } else if w >= 1920 || h >= 1080 {
+            suggestions.push(("1080p", 0.95));
+        }
+    }
+    suggest_all(store, &t.id, &suggestions);
+    Ok(())
+}
+
+/// Analyse a document: extract its full text, index it for search, and embed it.
+///
+/// This is the only analyse path that writes to the FTS index rather than (or as well as) the
+/// catalog, because for a document the *text is the content*. The order matters: text first, so a
+/// document is findable even if the embedding step later fails.
+fn analyze_document(
+    store: &Store,
+    t: &AnalysisTarget,
+    abs: &Path,
+    det: &dam_media::Detected,
+) -> Result<(), String> {
+    let MediaAttributes::Document(d) = dam_media::extract_metadata(abs, det) else {
+        return Err("document metadata unavailable".into());
+    };
+    // Re-persist the cheap tier: word/page counts and the excerpt for a document scanned before
+    // this pipeline version existed would otherwise stay empty until a rescan.
+    store
+        .set_media_attrs(&t.id, &MediaAttributes::Document(d.clone()))
+        .map_err(|e| e.to_string())?;
+
+    // A scanned-image PDF with no text layer legitimately yields nothing. That is not an error —
+    // it is a document we can describe but not read, and it stays findable by filename and tags.
+    let Some(text) = dam_media::extract_text(abs, &det.format) else {
+        tracing::debug!(asset = %t.id, "no extractable text; indexing by name only");
+        return Ok(());
+    };
+
+    store
+        .set_document_text(&t.id, &text)
+        .map_err(|e| e.to_string())?;
+
+    if let Some(vec) = dam_media::text_descriptor(&text) {
+        store
+            .set_embedding(&t.id, TEXT_SPACE, MediaType::Document, &vec, "text-hash@1")
+            .map_err(|e| e.to_string())?;
+    }
+
+    // Classify by what the document *is* to a project. Filename is the strongest signal here —
+    // a `LICENSE` is a licence whatever its prose says — with a text fallback for the rest.
+    let name = Path::new(&t.path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let head: String = text.chars().take(600).collect::<String>().to_lowercase();
+    let class = if name.contains("licen") || name.contains("copying") || name.contains("eula") {
+        "license"
+    } else if name.contains("readme") {
+        "readme"
+    } else if name.contains("changelog") || name.contains("changes") {
+        "changelog"
+    } else if name.contains("invoice") || name.contains("receipt") || name.contains("order") {
+        "receipt"
+    } else if head.contains("permission is hereby granted")
+        || head.contains("all rights reserved")
+        || head.contains("licensed under")
+    {
+        "license"
+    } else {
+        "document"
+    };
+    store
+        .set_media_class(&t.id, MediaType::Document, class)
+        .map_err(|e| e.to_string())?;
+
+    let mut suggestions: Vec<(&str, f32)> = vec![(class, 0.6)];
+    if d.page_count.is_some_and(|p| p > 20) {
+        suggestions.push(("long_form", 0.8));
     }
     suggest_all(store, &t.id, &suggestions);
     Ok(())

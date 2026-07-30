@@ -23,6 +23,7 @@ import {
   useSetFavorite,
   useSimilar,
   useSources,
+  useVersion,
 } from "@/api/queries";
 import { api, ApiError } from "@/api/client";
 import { AUTH_COPY } from "@/lib/auth";
@@ -243,9 +244,86 @@ function Preview({ asset }: { asset: Asset }) {
       </div>
     );
   }
+  if (summary.media === "video") {
+    // No WASM island and no transcode: the browser plays the original bytes natively. `preload`
+    // stays on metadata so opening the inspector doesn't pull a 200 MB cutscene down before the
+    // user has asked to watch it — the server's range support (see `ranged_content_response`) is
+    // what makes both that and seeking work. Playback works regardless of what the *server* can
+    // decode; only the metadata and poster frame depend on its ffmpeg (ADR 0014).
+    return <VideoPreview key={summary.id} src={src} />;
+  }
+  if (summary.media === "document") {
+    const excerpt =
+      asset.attributes?.media === "document" ? (asset.attributes.excerpt ?? null) : null;
+    return <DocumentPreview excerpt={excerpt} format={summary.format} src={src} />;
+  }
   return (
     <div className="aspect-square border-b border-border">
       <Thumbnail asset={summary} size={64} />
+    </div>
+  );
+}
+
+/** Native `<video>` playback, plus an honest note when the server has no decode backend.
+ *
+ *  The two are independent and it matters not to conflate them: the browser plays the original
+ *  bytes whatever the server can decode, so the video is watchable either way — but with no
+ *  discovered `ffmpeg`/`ffprobe` (ADR 0014) the server can't report duration/codec/resolution or
+ *  render a poster frame, and every video tile in the grid stays a typed glyph. Left unexplained
+ *  that reads as a broken thumbnailer rather than a missing optional dependency, so we say it once,
+ *  here, where the user is already looking at a video. */
+function VideoPreview({ src }: { src: string }) {
+  const version = useVersion();
+  // Only claim a decoder is missing once we've actually heard from the server — mid-fetch,
+  // `capabilities` is undefined, and asserting "not installed" then would be a guess.
+  const probeMissing =
+    version.data != null && !version.data.capabilities.includes("video_probe");
+  return (
+    <div className="border-b border-border">
+      <video src={src} controls preload="metadata" playsInline className="max-h-[60vh] w-full bg-black">
+        <track kind="captions" />
+      </video>
+      {probeMissing && (
+        <p className="px-3 py-2 text-[11px] text-fg-dim">
+          No video decoder on the server — playback works, but duration, codec and poster-frame
+          thumbnails need <span className="font-mono">ffmpeg</span> installed where 3DAM runs.
+        </p>
+      )}
+    </div>
+  );
+}
+
+/** The document preview: the extracted opening text, set as readable prose rather than rasterised
+ *  server-side (PRODUCT_SPEC §9 phase 2b). A document with no text layer — a scanned-image PDF, or
+ *  one not yet analysed — says so plainly instead of showing an empty card. "Open original" is the
+ *  escape hatch to the real file for anything we can't typeset. */
+function DocumentPreview({
+  excerpt,
+  format,
+  src,
+}: {
+  excerpt: string | null;
+  format: string;
+  src: string;
+}) {
+  return (
+    <div className="flex max-h-[50vh] flex-col gap-2 overflow-y-auto border-b border-border bg-surface-2 p-4">
+      {excerpt ? (
+        <p className="text-[12px] leading-relaxed whitespace-pre-wrap text-fg-muted">{excerpt}</p>
+      ) : (
+        <p className="text-[11px] text-fg-dim">
+          No text extracted — this <span className="font-mono uppercase">.{format}</span> may have no
+          text layer, or it hasn’t been analysed yet.
+        </p>
+      )}
+      <a
+        href={src}
+        target="_blank"
+        rel="noreferrer"
+        className="self-start text-[11px] text-accent hover:underline coarse:min-h-11"
+      >
+        Open original
+      </a>
     </div>
   );
 }
@@ -382,7 +460,9 @@ function Actions({ asset }: { asset: Asset }) {
   const canWrite = useCan("write");
   const { summary } = asset;
   const analyzed = asset.timestamps.analyzed != null;
-  const thumbable = summary.media === "image" || summary.media === "model";
+  // Video joins image + 3D as a type the server can re-render a thumbnail for (its poster frame).
+  const thumbable =
+    summary.media === "image" || summary.media === "model" || summary.media === "video";
 
   return (
     <div className="mt-3 flex flex-wrap gap-2">
@@ -810,6 +890,24 @@ function MediaFacts({ attrs }: { attrs: MediaAttributes }) {
     if (attrs.has_rig != null) rows.push(["Rigged", attrs.has_rig ? "yes" : "no"]);
     if (attrs.has_animation != null) rows.push(["Animation", attrs.has_animation ? "yes" : "no"]);
     if (attrs.has_uvs != null) rows.push(["UVs", attrs.has_uvs ? "yes" : "no"]);
+  }
+  if (attrs.media === "video") {
+    if (attrs.duration_ms != null) rows.push(["Duration", duration(attrs.duration_ms)]);
+    if (attrs.width != null && attrs.height != null)
+      rows.push(["Dimensions", `${attrs.width} × ${attrs.height}`]);
+    if (attrs.fps != null) rows.push(["Frame rate", `${attrs.fps.toFixed(2)} fps`]);
+    if (attrs.codec) rows.push(["Codec", attrs.codec]);
+    if (attrs.container) rows.push(["Container", attrs.container]);
+    if (attrs.bitrate != null)
+      rows.push(["Bitrate", `${Math.round(attrs.bitrate / 1000).toLocaleString()} kbps`]);
+    if (attrs.has_audio != null) rows.push(["Audio track", attrs.has_audio ? "yes" : "no"]);
+  }
+  if (attrs.media === "document") {
+    if (attrs.title) rows.push(["Title", attrs.title]);
+    if (attrs.author) rows.push(["Author", attrs.author]);
+    if (attrs.page_count != null) rows.push(["Pages", attrs.page_count.toLocaleString()]);
+    if (attrs.word_count != null) rows.push(["Words", attrs.word_count.toLocaleString()]);
+    if (attrs.encoding) rows.push(["Encoding", attrs.encoding]);
   }
   // "Extracted features" for audio (issue #61): the analysis pass's continuous acoustic signals —
   // loudness (text) + brightness / harmonicity (0–1 bars). Its own group, separate from the container

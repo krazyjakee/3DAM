@@ -3,9 +3,10 @@
 ![3DAM](assets/screenshot.png)
 
 `3dam` is a cross-platform, Rust-first **game-asset manager** for **audio, image, and 3D**
-assets. It unifies them into one local SQLite catalog and layers **content-based
-automation** on top: metadata extraction, thumbnails, embeddings, similarity search,
-auto-tagging, and deduplication.
+assets — plus the **video and documents** that sit alongside them in a real project folder.
+It unifies them into one local SQLite catalog and layers **content-based automation** on
+top: metadata extraction, thumbnails, embeddings, similarity search, auto-tagging, and
+deduplication.
 
 Local-first, non-destructive, and federation-ready. No cloud account, no lock-in — the
 catalog is a plain `library.db` on your disk, and your source files are never written to.

@@ -9,17 +9,22 @@
 
 mod audio;
 mod audio_features;
+mod document;
 mod features;
 mod image;
 mod mel;
 mod model;
+mod proc;
+mod video;
 
 pub use audio_features::{
     compute_waveform_peaks, decode_mono, extract_audio_features, AudioFeatures, LoopSource,
     WAVEFORM_BUCKETS,
 };
+pub use document::{extract_text, text_descriptor, MAX_TEXT_BYTES, TEXT_DIM};
 pub use features::{extract_image_features, l2_normalise, ImageFeatures};
 pub use mel::{log_mel, mel_from_samples, MelConfig, MelSpectrogram};
+pub use video::probe_available as video_probe_available;
 
 use dam_api::dto::{MediaAttributes, MediaType};
 use std::path::Path;
@@ -73,12 +78,24 @@ fn ext(path: &Path) -> Option<String> {
         .map(|e| e.to_ascii_lowercase())
 }
 
+/// Extensions that name a *container*, not a media type: an ISO-BMFF file may hold a video track,
+/// or only audio. [`detect`] calls these video provisionally; [`refine_with_content`] settles them
+/// against the real track table once bytes are available (ADR 0014).
+const AMBIGUOUS_CONTAINERS: &[&str] = &["mp4", "mov", "m4v"];
+
 /// The extension → (media, format) table for detection. Kept in one place so the format-coverage
 /// matrix (tech-spec 04 §7) has a single source of truth.
+///
+/// Detection is **pure, cheap, and infallible**: extension in, classification out, with no
+/// filesystem access. That is a requirement, not an optimisation — a scan calls this with the
+/// source-relative *logical* path (a fetched remote file has a random local name), and it runs on
+/// every walked entry including the progress pre-count, so it must not spawn a process or open a
+/// file. Where the extension genuinely doesn't determine the answer, see [`refine_with_content`].
 pub fn detect(path: &Path) -> Option<Detected> {
     let e = ext(path)?;
     let media = match e.as_str() {
-        // audio
+        // audio. `.m4a` is the audio-only ISO-BMFF extension by convention and is not probed —
+        // an `.m4a` carrying a video track is a file that has already lied about itself.
         "wav" | "flac" | "mp3" | "ogg" | "oga" | "opus" | "aiff" | "aif" | "m4a" | "aac"
         | "wma" | "it" | "xm" | "mod" | "s3m" => MediaType::Audio,
         // image
@@ -87,6 +104,14 @@ pub fn detect(path: &Path) -> Option<Detected> {
         // 3d models
         "gltf" | "glb" | "fbx" | "obj" | "stl" | "ply" | "dae" | "3ds" | "blend" | "usd"
         | "usdz" | "usda" | "usdc" => MediaType::Model,
+        // video. The shared containers provisionally classify as video here and are settled by
+        // [`refine_with_content`] once real bytes exist — see that function for why.
+        "mkv" | "webm" | "avi" | "ogv" => MediaType::Video,
+        c if AMBIGUOUS_CONTAINERS.contains(&c) => MediaType::Video,
+        // documents. `csv`/`json` are deliberately absent: they are structured data rather than
+        // prose, and indexing them as documents would put machine output into a text index built
+        // for language (PRODUCT_SPEC §9 phase 2b).
+        "pdf" | "md" | "markdown" | "txt" | "rtf" | "docx" | "odt" => MediaType::Document,
         _ => return None,
     };
     // Normalise a few aliases to a canonical format tag.
@@ -95,10 +120,96 @@ pub fn detect(path: &Path) -> Option<Detected> {
         "tif" => "tiff",
         "aif" => "aiff",
         "oga" => "ogg",
+        "markdown" => "md",
         other => other,
     }
     .to_string();
     Some(Detected { media, format })
+}
+
+/// Path segments whose contents are dependencies, build output, or VCS internals rather than
+/// project assets. Matched case-insensitively against whole path components.
+const NOISE_DIRS: &[&str] = &[
+    "node_modules",
+    ".git",
+    ".svn",
+    ".hg",
+    "vendor",
+    "target",
+    "build",
+    "dist",
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".tox",
+    ".gradle",
+    "cmakefiles",
+    "obj",
+    "bin",
+    "library", // Unity's regenerated import cache
+    "temp",
+    "intermediate", // Unreal's build intermediates
+    "saved",
+    "deriveddatacache",
+];
+
+/// Detection **with the ingest ignore policy applied** — what a scan should use.
+///
+/// [`detect`] answers "what is this file?", which is a question about the file. This answers
+/// "should the catalog hold it?", which is a question about the library, and the two are not the
+/// same once documents are indexable. A single `npm install` puts thousands of `README.md` and
+/// `LICENSE` files on disk; indexed naively they would outnumber a project's actual assets and
+/// make the document media type worse than useless (PRODUCT_SPEC §9 phase 2b, risk 4).
+///
+/// The policy is deliberately narrow:
+/// - It only ever filters **documents**. Real assets are never dropped, whatever directory they
+///   are in — a texture under `build/` is still a texture, and silently omitting it would be a far
+///   worse failure than over-indexing a readme.
+/// - Documents are dropped when they sit under a dependency/build/VCS directory. That is where
+///   generated and third-party noise lives, and nothing there is authored by the project. A
+///   `LICENSE.txt` at the root of a purchased asset pack — precisely the evidence the licence
+///   surface needs to point at — is untouched, because it is not in one of those directories.
+pub fn detect_for_ingest(rel_path: &Path) -> Option<Detected> {
+    let det = detect(rel_path)?;
+    if det.media != MediaType::Document {
+        return Some(det);
+    }
+    let in_noise_dir = rel_path
+        .parent()
+        .into_iter()
+        .flat_map(|p| p.components())
+        .filter_map(|c| c.as_os_str().to_str())
+        .any(|seg| NOISE_DIRS.contains(&seg.to_ascii_lowercase().as_str()));
+    (!in_noise_dir).then_some(det)
+}
+
+/// Settle a provisional [`detect`] result against the file's actual bytes.
+///
+/// `detect` classifies by extension because that is all a scan has at walk time — the logical path.
+/// (A remote source's fetched temp file has a random name, which is exactly why detection can't use
+/// the local path.) But `.mp4`, `.mov` and `.m4v` name a *container*, not a media type: the same
+/// extension covers a cutscene and an audio-only file, and `mp4` is already in the audio decode
+/// matrix. Calling one wrong means the wrong badge, the wrong preview, and a poster-frame render
+/// that can never succeed.
+///
+/// So the ambiguity is resolved here instead, once, at the one point in the scan where real bytes
+/// are on local disk. Returns `Some(corrected)` only when the classification actually changes, so
+/// the caller can cheaply skip the common case.
+///
+/// With no prober installed this returns `None` and the provisional answer stands, which is the
+/// documented ADR 0014 fallback: `.mp4`/`.mov`/`.m4v` are overwhelmingly video, and mis-typing the
+/// rare audio-only one costs a badge, not a broken asset — the bytes still play.
+pub fn refine_with_content(det: &Detected, abs: &Path) -> Option<Detected> {
+    if !AMBIGUOUS_CONTAINERS.contains(&det.format.as_str()) {
+        return None;
+    }
+    match video::has_video_stream(abs) {
+        Some(false) => Some(Detected {
+            media: MediaType::Audio,
+            format: det.format.clone(),
+        }),
+        _ => None,
+    }
 }
 
 /// CHEAP tier (tech-spec 04 §4): read the media-specific attribute struct from container headers /
@@ -110,12 +221,15 @@ pub fn extract_metadata(path: &Path, det: &Detected) -> MediaAttributes {
         MediaType::Audio => MediaAttributes::Audio(audio::metadata(path, &det.format)),
         MediaType::Image => MediaAttributes::Image(image::metadata(path, &det.format)),
         MediaType::Model => MediaAttributes::Model(model::metadata(path, &det.format)),
+        MediaType::Video => MediaAttributes::Video(video::metadata(path, &det.format)),
+        MediaType::Document => MediaAttributes::Document(document::metadata(path, &det.format)),
     }
 }
 
-/// EXPENSIVE tier: render a downscaled PNG thumbnail (tech-spec 04 §6.4). Only images produce one
-/// in v1 — audio waveforms and 3D turntables are interactive WASM islands, so this returns
-/// `Unsupported` for them and the UI falls back to the honest typed tile.
+/// EXPENSIVE tier: render a downscaled PNG thumbnail (tech-spec 04 §6.4). Images decode directly;
+/// video produces a poster frame via a discovered ffmpeg (ADR 0014). Audio waveforms and 3D
+/// turntables are interactive WASM islands and documents render an excerpt card in the DOM, so
+/// this returns `Unsupported` for them and the UI falls back to the honest typed tile.
 pub fn render_thumbnail(
     path: &Path,
     det: &Detected,
@@ -130,10 +244,25 @@ pub fn render_thumbnail(
                 height,
             })
         }
-        MediaType::Audio | MediaType::Model => Err(HandlerError::Unsupported(format!(
-            "{} previews render client-side (WASM island), not as a server thumbnail",
-            det.media.as_str()
-        ))),
+        MediaType::Video => {
+            let (bytes, width, height) = video::thumbnail(path, max_edge)?;
+            Ok(ThumbPng {
+                bytes,
+                width,
+                height,
+            })
+        }
+        // A document's "thumbnail" is its opening text, which the client already has as
+        // `DocumentAttributes::excerpt` and can render with real fonts, real theming, and
+        // selectable text. Rasterising type server-side would need a font stack and a PDF
+        // renderer — the native-dependency class ADR 0014 declined for video — to produce a
+        // strictly worse tile.
+        MediaType::Audio | MediaType::Model | MediaType::Document => {
+            Err(HandlerError::Unsupported(format!(
+                "{} previews render client-side, not as a server thumbnail",
+                det.media.as_str()
+            )))
+        }
     }
 }
 
@@ -191,6 +320,110 @@ mod tests {
         let img = ::image::RgbaImage::from_pixel(w, h, ::image::Rgba([10, 20, 30, 255]));
         img.save_with_format(path, ::image::ImageFormat::Png)
             .unwrap();
+    }
+
+    #[test]
+    fn detects_video_and_document_extensions() {
+        let media_of = |p: &str| detect(Path::new(p)).map(|d| d.media);
+        // Unambiguous video containers need no probe.
+        for p in ["a.mkv", "a.webm", "a.avi", "a.ogv"] {
+            assert_eq!(media_of(p), Some(MediaType::Video), "{p}");
+        }
+        for p in ["a.pdf", "a.md", "a.txt", "a.rtf", "a.docx", "a.odt"] {
+            assert_eq!(media_of(p), Some(MediaType::Document), "{p}");
+        }
+        // `.m4a` is audio by convention and must not be probed into video.
+        assert_eq!(media_of("a.m4a"), Some(MediaType::Audio));
+        // Structured data is deliberately *not* a document (PRODUCT_SPEC §9 phase 2b).
+        assert_eq!(media_of("a.csv"), None);
+        assert_eq!(media_of("a.json"), None);
+        // Alias normalisation.
+        assert_eq!(
+            detect(Path::new("a.markdown")).map(|d| d.format),
+            Some("md".to_string())
+        );
+    }
+
+    #[test]
+    fn ambiguous_containers_default_to_video_and_refine_is_a_no_op_without_bytes() {
+        // `detect` is extension-only and infallible — it must never touch the filesystem, because
+        // during a scan it is handed a *relative* logical path (a fetched remote file has a random
+        // local name). So the shared containers classify provisionally as video here...
+        for p in ["a.mp4", "a.mov", "a.m4v"] {
+            assert_eq!(
+                detect(Path::new(p)).map(|d| d.media),
+                Some(MediaType::Video),
+                "{p}"
+            );
+        }
+        // ...and refinement, given no readable bytes (or no prober), leaves that answer alone —
+        // ADR 0014's documented fallback rather than a drop or a guess of audio.
+        let det = detect(Path::new("a.mp4")).unwrap();
+        assert!(refine_with_content(&det, Path::new("/nonexistent/a.mp4")).is_none());
+
+        // Refinement only ever considers the ambiguous containers; everything else short-circuits
+        // without so much as a stat, whatever path it is handed.
+        for fmt in ["png", "wav", "glb", "mkv", "webm", "pdf"] {
+            let det = Detected {
+                media: MediaType::Image,
+                format: fmt.to_string(),
+            };
+            assert!(
+                refine_with_content(&det, Path::new("/nonexistent/x")).is_none(),
+                "{fmt} must not be probed"
+            );
+        }
+    }
+
+    #[test]
+    fn ingest_policy_drops_dependency_documents_only() {
+        let ingest = |p: &str| detect_for_ingest(Path::new(p)).map(|d| d.media);
+
+        // Project documents survive — including the root LICENSE the licence surface points at.
+        assert_eq!(ingest("LICENSE.txt"), Some(MediaType::Document));
+        assert_eq!(ingest("packs/kenney/README.md"), Some(MediaType::Document));
+        assert_eq!(ingest("docs/design/combat.pdf"), Some(MediaType::Document));
+
+        // Dependency/build/VCS noise does not.
+        assert_eq!(ingest("node_modules/left-pad/README.md"), None);
+        assert_eq!(ingest("web/node_modules/x/LICENSE"), None);
+        assert_eq!(ingest("target/debug/notes.txt"), None);
+        assert_eq!(ingest(".git/COMMIT_EDITMSG.txt"), None);
+        // Case-insensitive on the directory segment.
+        assert_eq!(ingest("Build/readme.md"), None);
+
+        // Real assets are never dropped, wherever they live — a texture under build/ is a texture.
+        assert_eq!(
+            ingest("node_modules/pack/tex.png"),
+            Some(MediaType::Image),
+            "the policy must only ever filter documents"
+        );
+        assert_eq!(ingest("target/release/kick.wav"), Some(MediaType::Audio));
+        assert_eq!(ingest("build/prop.glb"), Some(MediaType::Model));
+    }
+
+    #[test]
+    fn document_metadata_flows_through_extract_metadata() {
+        let p = tmp("notes.md");
+        std::fs::write(&p, "# Title\n\nsome body words here\n").unwrap();
+        let MediaAttributes::Document(d) = extract_metadata(&p, &det(MediaType::Document, "md"))
+        else {
+            panic!("expected document attrs")
+        };
+        assert_eq!(d.title.as_deref(), Some("Title"));
+        assert!(d.word_count.unwrap() > 0);
+        assert!(d.excerpt.is_some());
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn documents_have_no_server_thumbnail() {
+        // The excerpt card is DOM-rendered; the server must say so rather than produce a raster.
+        let p = tmp("doc.txt");
+        std::fs::write(&p, "hello").unwrap();
+        let err = render_thumbnail(&p, &det(MediaType::Document, "txt"), 64).unwrap_err();
+        assert!(matches!(err, HandlerError::Unsupported(_)));
+        std::fs::remove_file(&p).ok();
     }
 
     #[test]
