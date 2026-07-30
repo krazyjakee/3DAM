@@ -11,7 +11,7 @@ import { useQuery } from "@tanstack/react-query";
 import { api, ApiError } from "@/api/client";
 import { authApi } from "@/api/auth";
 import { useVersion } from "@/api/queries";
-import { getServer, resolveUrl, serverLabel, setServer } from "@/lib/server";
+import { getServer, isRemote, resolveUrl, serverLabel, setServer } from "@/lib/server";
 import { AUTH_COPY, isUnauthorized, useAuthExpired } from "@/lib/auth";
 import { bootDecision } from "@/lib/auth-policy";
 import { useFocusTrap } from "@/lib/use-focus-trap";
@@ -32,6 +32,10 @@ export function AuthGate({ children }: { children: ReactNode }) {
   // an unclaimed server gets the first-run claim screen. Accounts force auth to at least "token".
   const accounts = version.data?.accounts === true;
   const unclaimed = version.data?.unclaimed === true;
+  // Zero accounts = a genuinely un-claimed instance. A *re-opened* window (the lost-sole-admin
+  // recovery hatch, ADR 0014) also reports `unclaimed`, but every existing user's password still
+  // works — so the claim screen must not be exclusive there.
+  const noAccounts = (version.data?.account_count ?? 0) === 0;
   const token = getServer().token;
 
   // Validate a stored credential before mounting the app: in token mode it decides gate-vs-app; in
@@ -53,15 +57,20 @@ export function AuthGate({ children }: { children: ReactNode }) {
   // Unreachable server: the app's offline UX owns messaging; this is an auth gate, not an offline mode.
   if (version.isError) return <>{children}</>;
 
-  // First run of an accounts-on server: nobody *can* sign in until the initial admin is claimed.
-  if (accounts && unclaimed) return <ClaimScreen />;
+  // First run of an accounts-on server: nobody *can* sign in until the initial admin is claimed, so
+  // the claim screen is the whole UI. Only when the instance truly has no accounts — a re-opened
+  // claim window (recovery) leaves every editor and viewer able to sign in normally, and pinning
+  // them all to a claim form would be the recovery hatch locking the building.
+  if (accounts && unclaimed && noAccounts) return <ClaimScreen />;
 
+  const claimable = accounts && unclaimed;
   if (expired)
     return (
       <LoginScreen
         reason={token || hasSessionHint() ? AUTH_COPY.sessionExpired : null}
         allowReadOnly={auth === "anonymous"}
         accounts={accounts}
+        claimable={claimable}
       />
     );
   if (auth !== "token" && auth !== "anonymous") return <>{children}</>;
@@ -80,12 +89,20 @@ export function AuthGate({ children }: { children: ReactNode }) {
           }
           allowReadOnly={auth === "anonymous"}
           accounts={accounts}
+          claimable={claimable}
         />
       );
     return <>{children}</>; // credential valid (any other error is the offline UX's business)
   }
   if (bootDecision(auth, false) === "gate")
-    return <LoginScreen reason={null} allowReadOnly={false} accounts={accounts} />;
+    return (
+      <LoginScreen
+        reason={null}
+        allowReadOnly={false}
+        accounts={accounts}
+        claimable={claimable}
+      />
+    );
   return <>{children}</>; // anonymous, signed out — read-only by the operator's choice
 }
 
@@ -100,17 +117,32 @@ function BootSplash() {
 /** The full-screen login gate: the sign-in form over a bare background — no interface, no assets.
  *  It's the app's only surface here, so there's nothing to Escape to — just a focus-trapped dialog.
  *  Accounts-on servers get the username/password form (token as the fallback); otherwise the token
- *  form. */
+ *  form.
+ *
+ *  `claimable` (an accounts-on server whose claim window is open, but which already has accounts —
+ *  the re-opened recovery window) adds a secondary path to the claim form, so recovery is reachable
+ *  without evicting everyone who can still sign in. */
 function LoginScreen({
   reason,
   allowReadOnly,
   accounts,
+  claimable = false,
 }: {
   reason: string | null;
   allowReadOnly: boolean;
   accounts: boolean;
+  claimable?: boolean;
 }) {
   const ref = useFocusTrap<HTMLDivElement>(true);
+  const [claiming, setClaiming] = useState(false);
+
+  if (claiming) return <ClaimScreen onSignIn={() => setClaiming(false)} />;
+
+  // Account sign-in only works same-origin. The session is an HttpOnly, host-only,
+  // `SameSite=Strict` cookie and the server sends `Access-Control-Allow-Origin: *`, which can never
+  // carry credentials — so a cross-origin POST would 200, the browser would discard the Set-Cookie,
+  // and the reloaded app would land right back on this form with no error. Better to say so.
+  const remote = isRemote();
   return (
     <div className="fixed inset-0 flex items-center justify-center bg-bg p-4">
       <div
@@ -120,13 +152,40 @@ function LoginScreen({
         aria-labelledby="login-title"
         className="w-full max-w-md rounded-lg border border-border bg-surface p-4 shadow-xl"
       >
-        {accounts ? (
+        {accounts && remote && <RemoteAccountsNotice />}
+        {accounts && !remote ? (
           <AccountLoginForm reason={reason} allowReadOnly={allowReadOnly} />
         ) : (
           <TokenLoginForm reason={reason} allowReadOnly={allowReadOnly} />
         )}
+        {claimable && (
+          <button
+            type="button"
+            className="mt-3 text-[12px] text-fg-muted hover:underline"
+            onClick={() => setClaiming(true)}
+          >
+            Claim this server (create a new admin account)…
+          </button>
+        )}
       </div>
     </div>
+  );
+}
+
+/** Shown above the token form when the client is pointed at a *remote* server that uses accounts.
+ *  Username/password sign-in is same-origin only (see `LoginScreen`), so the honest instruction is
+ *  "open the server directly"; an API token still works cross-origin and is offered below. */
+function RemoteAccountsNotice() {
+  const base = getServer().base;
+  return (
+    <p className="mb-3 rounded border border-border bg-surface-2 px-2 py-1.5 text-[12px] text-fg-dim">
+      This server uses user accounts, and account sign-in only works when the app is served by the
+      server itself (the session cookie can't cross origins). Open{" "}
+      <a className="text-accent hover:underline" href={base} rel="noreferrer">
+        {base}
+      </a>{" "}
+      directly to sign in — or paste an API token below to keep browsing from here.
+    </p>
   );
 }
 
@@ -269,9 +328,12 @@ export function AccountLoginForm({
 
 /** First-run claim (user accounts, issue #42): an accounts-on server with no admin account yet.
  *  Full-screen like the login gate — nothing else is usable until the library is claimed. The
- *  server only accepts the claim from localhost while unclaimed. */
-function ClaimScreen() {
+ *  server only accepts the claim from a process on its own machine (or with the bootstrap owner
+ *  token), so `onSignIn` is always offered: a remote browser that gets a 403 here must not be
+ *  dead-ended, and neither must a user who can simply sign in (a re-opened claim window). */
+function ClaimScreen({ onSignIn }: { onSignIn?: () => void } = {}) {
   const ref = useFocusTrap<HTMLDivElement>(true);
+  const [tokenMode, setTokenMode] = useState(false);
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
@@ -281,6 +343,38 @@ function ClaimScreen() {
 
   const mismatch = confirm.length > 0 && password !== confirm;
   const canSubmit = !!username.trim() && !!password && password === confirm && !busy;
+
+  // The escape hatch. With accounts already present the caller just wants the login screen
+  // (`onSignIn`). With zero accounts there is nobody to sign in *as* — but the claim gate accepts
+  // an Admin-scoped bearer, so pasting the bootstrap owner token here and reloading brings the
+  // caller back to this form with a credential that claims from anywhere (ADR 0014 gate 2). That is
+  // the documented way out of a 403 on a proxied or remote instance.
+  if (tokenMode)
+    return (
+      <div className="fixed inset-0 flex items-center justify-center bg-bg p-4">
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="login-title"
+          className="w-full max-w-md rounded-lg border border-border bg-surface p-4 shadow-xl"
+        >
+          <p className="mb-3 rounded border border-border bg-surface-2 px-2 py-1.5 text-[12px] text-fg-dim">
+            This server can only be claimed from the machine it runs on. To claim it from here,
+            paste the <strong>bootstrap owner token</strong> — the server wrote it to{" "}
+            <code className="font-mono">bootstrap-owner-token.txt</code> in its data directory and
+            logged the path.
+          </p>
+          <TokenLoginForm reason={null} allowReadOnly={false} />
+          <button
+            type="button"
+            className="mt-3 text-[12px] text-fg-muted hover:underline"
+            onClick={() => setTokenMode(false)}
+          >
+            ← Back to the claim form
+          </button>
+        </div>
+      </div>
+    );
 
   const claim = async () => {
     if (!canSubmit) return;
@@ -376,7 +470,14 @@ function ClaimScreen() {
             />
           </label>
 
-          <div className="flex items-center justify-end">
+          <div className="flex items-center justify-end gap-2">
+            <button
+              type="button"
+              className="mr-auto text-[12px] text-fg-muted hover:underline"
+              onClick={onSignIn ?? (() => setTokenMode(true))}
+            >
+              {onSignIn ? "← Sign in instead" : "Claiming from another machine?"}
+            </button>
             <button
               type="submit"
               className="btn btn-accent disabled:opacity-40"

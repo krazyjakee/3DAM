@@ -110,8 +110,13 @@ export interface VersionInfo {
   auth?: import("./admin").AuthMode;
   /** User accounts are enabled (issue #42): the gate offers username/password sign-in. */
   accounts?: boolean;
-  /** Accounts on but no admin account exists yet — the first-run claim screen applies. */
+  /** The first-run claim window is open: either no account exists yet, or the operator re-opened
+   *  it from the config file to recover a lost sole admin. */
   unclaimed?: boolean;
+  /** How many accounts exist. Distinguishes a genuinely un-claimed instance (0 — the claim screen
+   *  is the only thing to show) from a re-opened window (>0 — existing users can still sign in, so
+   *  the login screen stays primary and the claim form is a secondary path). */
+  account_count?: number;
 }
 
 /** Who the current credential (bearer token or session cookie) resolves to, and what it can do
