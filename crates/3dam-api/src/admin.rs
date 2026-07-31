@@ -57,16 +57,23 @@ pub enum FlagKey {
     /// source. Off by default; off means the surface disappears (ADR 0004). The read queries a
     /// peer then issues are the ordinary read API under the ordinary auth gate.
     Federation,
+    /// `bool` — full user accounts (phase 6, issue #42): login/session auth, groups, and
+    /// source/collection sharing. Off by default; off means the whole `/api/v1/auth` +
+    /// accounts/groups/shares admin surface 404s. Turning it on raises the effective auth gate to
+    /// at least `Token` (accounts mean real identities) and, with zero accounts, enters the
+    /// *unclaimed* state — the first loopback signup becomes admin.
+    UserAccounts,
 }
 
 impl FlagKey {
-    pub const ALL: [FlagKey; 6] = [
+    pub const ALL: [FlagKey; 7] = [
         FlagKey::Authentication,
         FlagKey::McpServer,
         FlagKey::NetworkWrites,
         FlagKey::AutoThumbnail,
         FlagKey::AutoAnalyze,
         FlagKey::Federation,
+        FlagKey::UserAccounts,
     ];
     /// The stable string used in the URL, the store, and the config file.
     pub fn as_str(self) -> &'static str {
@@ -77,6 +84,7 @@ impl FlagKey {
             FlagKey::AutoThumbnail => "auto_thumbnail",
             FlagKey::AutoAnalyze => "auto_analyze",
             FlagKey::Federation => "federation",
+            FlagKey::UserAccounts => "user_accounts",
         }
     }
     pub fn parse(s: &str) -> Option<FlagKey> {
@@ -110,6 +118,7 @@ impl FlagValue {
                 | (FlagKey::AutoThumbnail, FlagValue::Bool(_))
                 | (FlagKey::AutoAnalyze, FlagValue::Bool(_))
                 | (FlagKey::Federation, FlagValue::Bool(_))
+                | (FlagKey::UserAccounts, FlagValue::Bool(_))
         )
     }
 }
@@ -165,6 +174,16 @@ pub struct AdminStatus {
     /// Bound beyond localhost with neither auth nor TLS — the headline exposure warning.
     pub exposed_without_auth: bool,
     pub token_count: usize,
+    /// The `UserAccounts` flag (phase 6, issue #42). Additive: defaults keep older clients working.
+    #[serde(default)]
+    pub accounts_enabled: bool,
+    /// Accounts are on but no account exists (or the claim window was re-opened by the config
+    /// escape hatch): the next loopback signup becomes admin. Loud on purpose — an exposed
+    /// unclaimed instance must never be silent.
+    #[serde(default)]
+    pub unclaimed: bool,
+    #[serde(default)]
+    pub account_count: usize,
 }
 
 /// A token/API-key record as listed by the admin API — **never** the secret (tech-spec 10 §1.4).

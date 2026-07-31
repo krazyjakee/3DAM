@@ -5,6 +5,16 @@
 
 import { useEffect, useRef } from "react";
 
+/** Call `onEscape` when Escape is pressed while mounted — the standard dismiss for modal overlays.
+ *  Kept alongside the focus trap so any overlay can pair the two (login/connect dialogs, etc.). */
+export function useEscape(onEscape: () => void) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onEscape();
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onEscape]);
+}
+
 const FOCUSABLE = [
   "a[href]",
   "button:not([disabled])",

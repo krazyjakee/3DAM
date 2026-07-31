@@ -74,16 +74,23 @@ impl LibError {
         }
     }
 
-    /// The wire form. `Internal`'s inner string is never serialised to the client.
+    /// The wire form. `Internal`'s inner string is never serialised to the client. `RateLimited`
+    /// carries its `retry_after` in `detail` so the reconstructed error keeps the backoff hint.
     pub fn to_body(&self) -> ErrorBody {
         let message = match self {
             LibError::Internal(_) => "internal error".to_string(),
             other => other.to_string(),
         };
+        let detail = match self {
+            LibError::RateLimited { retry_after } => {
+                Some(serde_json::json!({ "retry_after": retry_after }))
+            }
+            _ => None,
+        };
         ErrorBody {
             code: self.code().to_string(),
             message,
-            detail: None,
+            detail,
         }
     }
 
@@ -100,7 +107,15 @@ impl LibError {
             "source_unavailable" => LibError::SourceUnavailable(body.message),
             "upstream" => LibError::Upstream(body.message),
             "timeout" => LibError::Timeout,
-            "rate_limited" => LibError::RateLimited { retry_after: 0 },
+            "rate_limited" => LibError::RateLimited {
+                retry_after: body
+                    .detail
+                    .as_ref()
+                    .and_then(|d| d.get("retry_after"))
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u32)
+                    .unwrap_or(0),
+            },
             "cancelled" => LibError::Cancelled,
             _ => LibError::Internal(body.message),
         }

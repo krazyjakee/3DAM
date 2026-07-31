@@ -5,6 +5,7 @@
 //! and cannot tell which it is. This trait carries the **phase-1 slice** of the full surface;
 //! later methods (facets, similar, tags, collections, convert…) are added as their areas land.
 
+use crate::accounts::AccountIdentity;
 use crate::dto::*;
 use crate::error::LibError;
 use crate::event::{LibraryEvent, SubscribeRequest};
@@ -13,6 +14,7 @@ use crate::id::{AssetId, CollectionId, ContentHash, JobId, SourceId};
 use crate::page::{Page, PageParams};
 use async_trait::async_trait;
 use futures::Stream;
+use std::collections::BTreeSet;
 use std::pin::Pin;
 
 /// A stream of library events (the WS firehose when connected, a channel when embedded).
@@ -71,12 +73,15 @@ impl Scopes {
     }
     /// The scopes an unauthenticated request gets when `Authentication = Off` — full local trust
     /// (owner posture), so an operator can never lock themselves out of their own localhost server.
+    /// Includes `Federate`: the owner is the machine's full authority and must not silently lack a
+    /// capability the embedded engine holds (kept in step with [`Scopes::all`]).
     pub fn owner() -> Self {
         Scopes::none()
             .with(Scope::Read)
             .with(Scope::Write)
             .with(Scope::Admin)
             .with(Scope::McpUse)
+            .with(Scope::Federate)
     }
     pub fn with(self, s: Scope) -> Self {
         Scopes(self.0 | s.bit())
@@ -111,6 +116,95 @@ impl<'de> serde::Deserialize<'de> for Scopes {
     }
 }
 
+/// The visibility ceiling on a context (tech-spec 10 §4.3, issue #42): which sources and
+/// collections this identity may *reach*. Resolved **once, at auth time, in the server** (union of
+/// the identity's shares, intersected with any account ceiling) and enforced as a query predicate
+/// inside the engine — so the engine never learns what an account or a group is, and no handler
+/// can forget to filter.
+///
+/// Deliberately **not** `Default`: `Full` is the fail-open value, and a derived default would let a
+/// future credential kind (or a `..Default::default()` struct update) inherit unrestricted reach in
+/// silence. Every construction names its ceiling.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Visibility {
+    /// Unrestricted — the local owner, admins, tokens, and the embedded engine.
+    Full,
+    /// A positive reachable set. Anything outside it is *absent* (404/empty), never a 403 — an
+    /// unshared resource must not reveal its existence by erroring differently.
+    Restricted(VisibilityScope),
+}
+
+/// The reachable set of a restricted identity. `sources`/`collections` gate reads; the `write_*`
+/// subsets additionally gate writes to that resource. A `write` grant never implies `Scope::Write`
+/// — both gates must pass independently (issue #42 resolution rule 4).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VisibilityScope {
+    pub sources: BTreeSet<SourceId>,
+    pub collections: BTreeSet<CollectionId>,
+    pub write_sources: BTreeSet<SourceId>,
+    pub write_collections: BTreeSet<CollectionId>,
+}
+
+impl Visibility {
+    pub fn is_full(&self) -> bool {
+        matches!(self, Visibility::Full)
+    }
+    /// The restriction, if any — the engine's query builders branch on this.
+    pub fn restricted(&self) -> Option<&VisibilityScope> {
+        match self {
+            Visibility::Full => None,
+            Visibility::Restricted(s) => Some(s),
+        }
+    }
+    pub fn allows_source(&self, id: &SourceId) -> bool {
+        self.restricted().is_none_or(|s| s.sources.contains(id))
+    }
+    pub fn allows_collection(&self, id: &CollectionId) -> bool {
+        self.restricted().is_none_or(|s| s.collections.contains(id))
+    }
+    pub fn allows_source_write(&self, id: &SourceId) -> bool {
+        self.restricted()
+            .is_none_or(|s| s.write_sources.contains(id))
+    }
+    pub fn allows_collection_write(&self, id: &CollectionId) -> bool {
+        self.restricted()
+            .is_none_or(|s| s.write_collections.contains(id))
+    }
+    /// The write-half of this ceiling viewed as a read-shaped set — lets a writability check reuse
+    /// the same reachability predicate the read path enforces (engine-side, issue #42 rule 4).
+    pub fn write_view(&self) -> Visibility {
+        match self {
+            Visibility::Full => Visibility::Full,
+            Visibility::Restricted(s) => Visibility::Restricted(VisibilityScope {
+                sources: s.write_sources.clone(),
+                collections: s.write_collections.clone(),
+                write_sources: s.write_sources.clone(),
+                write_collections: s.write_collections.clone(),
+            }),
+        }
+    }
+}
+
+/// The caller's own resolved identity + effective scopes — the answer to `whoami` (tech-spec 10
+/// §1.2). Lets a front-end shape its UI to what this credential may actually do (disable a write
+/// button rather than let the request 403), so permissions are visible *before* an action, not
+/// discovered by its failure. `anonymous` is the honest "no verified credential" signal: true under
+/// `Off`/`Anonymous` with no token, false for a store-verified token or the local embedded owner.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct WhoAmI {
+    pub identity: Option<String>,
+    pub scopes: Scopes,
+    pub anonymous: bool,
+    /// The signed-in account, when the credential is a session (phase 6, issue #42). Additive:
+    /// absent for tokens, the local owner, and older servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<AccountIdentity>,
+    /// True when this context is visibility-restricted (some sources/collections are absent for
+    /// it). Lets a client explain "you may not be seeing everything" without learning what's hidden.
+    #[serde(default)]
+    pub restricted: bool,
+}
+
 /// Carries identity, granted scopes, and (later) a visibility ceiling. Resolved once per request by
 /// the server's auth middleware (tech-spec 10 §1.2); the embedded engine uses a full-scope context.
 #[derive(Clone, Debug)]
@@ -120,6 +214,13 @@ pub struct AuthContext {
     pub embedded: bool,
     /// The granted, effective scopes (tech-spec 10 §4.2).
     pub scopes: Scopes,
+    /// The visibility ceiling (tech-spec 10 §4.3): which sources/collections this context may
+    /// reach. `Full` for tokens, the owner, and the embedded engine; a share-derived set for
+    /// non-admin accounts. Enforced inside the engine's query path.
+    pub visibility: Visibility,
+    /// The signed-in account behind a session credential, if any (issue #42) — used for audit
+    /// attribution and `whoami`; guards still check scopes, never roles.
+    pub account: Option<AccountIdentity>,
 }
 
 impl AuthContext {
@@ -129,15 +230,27 @@ impl AuthContext {
             identity: None,
             embedded: true,
             scopes: Scopes::all(),
+            visibility: Visibility::Full,
+            account: None,
         }
     }
-    /// A connected caller with a resolved identity and its granted scopes (tech-spec 10 §1.2).
-    pub fn connected(identity: Option<String>, scopes: Scopes) -> Self {
+    /// A connected caller with a resolved identity, granted scopes, and — **required, never
+    /// defaulted** — its visibility ceiling (tech-spec 10 §1.2, §4.3). The ceiling is a positional
+    /// argument precisely so a new credential kind cannot inherit `Full` by omission; a caller that
+    /// genuinely has unrestricted reach (a token, the local owner) says `Visibility::Full` out loud.
+    pub fn connected(identity: Option<String>, scopes: Scopes, visibility: Visibility) -> Self {
         Self {
             identity,
             embedded: false,
             scopes,
+            visibility,
+            account: None,
         }
+    }
+    /// Attach the signed-in account identity (builder-style; server auth layer).
+    pub fn with_account(mut self, a: AccountIdentity) -> Self {
+        self.account = Some(a);
+        self
     }
     /// Guard: succeed iff this context holds `scope` (the embedded engine always does), else `403`
     /// (tech-spec 10 §1.2 `ctx.require`).
@@ -148,10 +261,35 @@ impl AuthContext {
             Err(LibError::Forbidden(format!("missing scope: {scope:?}")))
         }
     }
+    /// This context described back to the caller (the `whoami` answer). The embedded engine always
+    /// carries the full scope set, so it reports itself as a non-anonymous owner.
+    ///
+    /// `anonymous` marks a genuinely unauthenticated, non-owner caller — the `Anonymous`-mode
+    /// fallback. The two credential-less contexts are the auth-off local *owner* (full trust, holds
+    /// `Admin`) and the anonymous caller (read-only, no `Admin`); the `Admin` scope is what tells them
+    /// apart, so the owner is not reported as anonymous even though it presented no token.
+    pub fn whoami(&self) -> WhoAmI {
+        WhoAmI {
+            identity: self.identity.clone(),
+            scopes: self.scopes,
+            anonymous: !self.embedded && self.identity.is_none() && !self.scopes.has(Scope::Admin),
+            account: self.account.clone(),
+            restricted: !self.visibility.is_full(),
+        }
+    }
 }
 
 #[async_trait]
 pub trait LibraryService: Send + Sync {
+    // ── identity ─────────────────────────────────────────────────────────────
+    /// Who this credential is and what it may do — the front-door model's "permissions decide after
+    /// the gate" made legible to a client, which shapes its UI to the granted scopes instead of
+    /// discovering them through 403s. The embedded engine answers from its own full-trust context;
+    /// the connected client asks the server, whose answer reflects the presented token.
+    async fn whoami(&self, ctx: &AuthContext) -> Result<WhoAmI, LibError> {
+        Ok(ctx.whoami())
+    }
+
     // ── browse / search ────────────────────────────────────────────────────
     async fn query(
         &self,

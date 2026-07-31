@@ -1,6 +1,15 @@
 # 12 — Desktop GUI
 
-Status: **Draft v0.1** · Scope: the native `3dam-gui` shell — toolkit-choice framing, the app-shell/state architecture over a `LibraryService` handle, the three-region workspace, the virtualised grid/table, the license-prioritised inspector, embedding the wgpu 3D viewer and audio/image previews, keyboard navigation, and dark-mode handling.
+> **Superseded in implementation by [ADR 0013](../adr/0013-desktop-shell-tauri.md)** (2026-07-16).
+> The shipped desktop app is `crates/3dam-desktop`: a **Tauri webview shell** over the embedded
+> React client, served by an in-process `dam-server` (loopback, ephemeral port) in embedded mode or
+> a remote `3dam serve` in hosted mode. The egui client this spec describes was built to
+> substantive parity (see `docs/GUI_PARITY.md` history) and then retired; this file is kept as the
+> design record of that client and of the native-toolkit road not taken. The workspace/interaction
+> design it encodes (three-region layout, virtualised browser, license-prioritised inspector) lives
+> on in the web client ([09](09-server-and-web-client.md)).
+
+Status: **Draft v0.1 (superseded — historical)** · Scope: the native `3dam-gui` shell — toolkit-choice framing, the app-shell/state architecture over a `LibraryService` handle, the three-region workspace, the virtualised grid/table, the license-prioritised inspector, embedding the wgpu 3D viewer and audio/image previews, keyboard navigation, and dark-mode handling.
 
 This file is the low-level design for the **native desktop client** — the `3dam-gui` crate named in [01-architecture-and-crates.md](01-architecture-and-crates.md). It is a thin, GPU-accelerated front-end over the shared engine: it holds a `LibraryService` handle (embedded engine or API client) and does no data work of its own. It turns [PRODUCT_SPEC.md](../PRODUCT_SPEC.md) §6.3/§6.4 (browse/search/preview), §7 (candidate GUI stack), and §8 (60 fps at 100k+, virtualisation) into an implementable shell, and it realises [DESIGN_GUIDELINES.md](../DESIGN_GUIDELINES.md) §3 (three-region workspace, grid+table equal, license-prioritised inspector) and §4 (dark-first, low-chrome) natively.
 

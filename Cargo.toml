@@ -11,7 +11,7 @@ members = [
     "crates/3dam-client",
     "crates/3dam-server",
     "crates/3dam-frontend",
-    "crates/3dam-gui",
+    "crates/3dam-desktop",
     "crates/3dam-cli",
     "crates/3dam",
     "xtask",
@@ -46,7 +46,7 @@ dam-core = { path = "crates/3dam-core" }
 dam-client = { path = "crates/3dam-client" }
 dam-server = { path = "crates/3dam-server" }
 dam-frontend = { path = "crates/3dam-frontend" }
-dam-gui = { path = "crates/3dam-gui" }
+dam-desktop = { path = "crates/3dam-desktop" }
 dam-cli = { path = "crates/3dam-cli" }
 
 # async / runtime
@@ -64,6 +64,9 @@ bytes = "1"
 
 # storage
 rusqlite = { version = "0.40", features = ["bundled"] }
+# argon2id password hashing for user accounts (phase 6, issue #42; ADR 0009 §4). API-token secrets
+# stay on blake3 (high-entropy keys need no KDF); argon2 is for low-entropy user passwords only.
+argon2 = "0.5"
 
 # http / server / client
 axum = { version = "0.8", features = ["ws"] }
@@ -73,7 +76,7 @@ axum-server = { version = "0.7", features = ["tls-rustls"] }
 # Direct handle on rustls only to install the ring crypto provider for axum-server's TLS (issue #75).
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "set-header"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 url = "2"
 # web-client embedding (tech-spec 09 §A.4): bake web/dist into the binary, MIME by extension.

@@ -280,9 +280,17 @@ impl Store {
             .filter(|t| t.state == "confirmed")
             .map(|t| t.name.clone())
             .collect();
-        // Attach the manual collections this asset belongs to (inspector membership, §6.4).
-        drop(conn);
-        asset.collections = self.collections_for_asset(id)?;
+        Ok(asset)
+    }
+
+    /// The inspector form of [`Self::get_asset`]: the record plus the manual collections this asset
+    /// belongs to (§6.4), **filtered by the caller's ceiling**. Split from `get_asset` so the
+    /// engine's internal reads (convert, thumbnails, background grind) — which want the record, not
+    /// the membership — never have to invent a visibility argument, and so the one client-facing
+    /// path that does surface membership is forced to name a ceiling.
+    pub fn get_asset_detail(&self, id: &AssetId, vis: &Visibility) -> Result<Asset, LibError> {
+        let mut asset = self.get_asset(id)?;
+        asset.collections = self.collections_for_asset(id, vis)?;
         Ok(asset)
     }
     fn row_to_asset(r: &rusqlite::Row) -> rusqlite::Result<Asset> {

@@ -3,6 +3,7 @@ import { FolderPlus } from "lucide-react";
 import { useAddSource, useScan } from "@/api/queries";
 import { ApiError } from "@/api/client";
 import { Modal } from "@/lib/dialogs";
+import { pickDirectory, tauriDialog } from "@/lib/tauri";
 import type { SourceKind, SourceOptions } from "@/api/types";
 
 // local_fs, sftp and smb are backed by the phase-4 engine; federated peers by the phase-6
@@ -45,6 +46,19 @@ export function AddSourceDialog({ onClose }: { onClose: () => void }) {
 
   const remote = kind === "sftp" || kind === "smb";
   const federated = kind === "federated";
+  // Inside the Tauri desktop shell (ADR 0013) a local folder can be picked natively; in a plain
+  // browser there is no picker for a server-side path, so the button simply doesn't exist.
+  const canBrowse = kind === "local_fs" && tauriDialog() !== null;
+
+  const browse = async () => {
+    setErr(null);
+    try {
+      const dir = await pickDirectory("Choose a folder to add");
+      if (dir) setUri(dir);
+    } catch (e) {
+      setErr(String(e));
+    }
+  };
 
   const submit = async () => {
     setErr(null);
@@ -116,14 +130,21 @@ export function AddSourceDialog({ onClose }: { onClose: () => void }) {
         </select>
 
         <label className="mb-1 block text-[11px] text-fg-muted">{URI_FIELD[kind].label}</label>
-        <input
-          className="field mb-3"
-          placeholder={URI_FIELD[kind].placeholder}
-          value={uri}
-          onChange={(e) => setUri(e.target.value)}
-          autoFocus
-          onKeyDown={(e) => e.key === "Enter" && submit()}
-        />
+        <div className="mb-3 flex gap-2">
+          <input
+            className="field min-w-0"
+            placeholder={URI_FIELD[kind].placeholder}
+            value={uri}
+            onChange={(e) => setUri(e.target.value)}
+            autoFocus
+            onKeyDown={(e) => e.key === "Enter" && submit()}
+          />
+          {canBrowse && (
+            <button className="btn shrink-0" onClick={browse}>
+              Browse…
+            </button>
+          )}
+        </div>
 
         {federated && (
           <>

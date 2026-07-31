@@ -21,6 +21,12 @@ port = 7878
 tls_cert = "/etc/3dam/tls/fullchain.pem"
 tls_key  = "/etc/3dam/tls/privkey.pem"
 
+# Force `Secure` on the user-account session + CSRF cookies even though this process speaks
+# plaintext. Set this when a reverse proxy terminates TLS in front (the browser is on HTTPS but
+# `serve` only sees loopback HTTP, so it cannot tell). Deliberately not inferred from
+# X-Forwarded-Proto — a forwarded header is attacker-controlled unless the proxy strips it.
+#secure_cookies = true
+
 [flags]
 # Require a bearer token for the API/MCP/admin surface (issue tokens with `3dam admin token create`).
 # Off = the local owner has full trust (only safe on localhost).
@@ -43,6 +49,23 @@ auto_analyze   = true
 # off means the surface disappears (ADR 0004). Peer reads ride the normal auth gate above, so in
 # token mode a peer needs a read-scoped bearer token (`--password` on `sources add`).
 federation = false
+
+[accounts]
+# Full user accounts (see `[flags] user_accounts`). Both keys below are per-boot operator switches,
+# not runtime flags.
+
+# Require the bootstrap owner token for EVERY first-run claim, including one from a loopback peer
+# (ADR 0014). Set this whenever a reverse proxy fronts this server: from the server's point of view
+# a proxied request *is* a loopback peer, so the friendly "claim from localhost" path would be
+# reachable from the internet. The claim gate already refuses any request carrying
+# X-Forwarded-For / X-Real-IP / Forwarded, but a proxy that strips them leaves no signal — this is
+# the explicit switch. Redeem the token printed to <data>/bootstrap-owner-token.txt as an
+# `Authorization: Bearer …` on POST /api/v1/auth/claim.
+#require_claim_token = true
+
+# Recovery hatch: re-open the first-run claim window for ONE boot so a lost sole admin can be
+# replaced. Audited and warned about loudly. Remove it again immediately after recovery.
+#reopen_claim = true
 
 [resources]
 # Good-neighbour limits (tech-spec 14 §5) for the bulk work (scan hashing, thumbnail pre-render,

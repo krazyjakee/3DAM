@@ -12,5 +12,5 @@ path = "src/main.rs"
 [dependencies]
 dam-frontend.workspace = true
 dam-cli.workspace = true
-dam-gui.workspace = true
+dam-desktop.workspace = true
 tokio.workspace = true

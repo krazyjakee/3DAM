@@ -95,17 +95,20 @@ async fn defaults_are_safe_and_admin_reachable_under_off() {
     assert_eq!(body["network_writes"], false);
     assert_eq!(body["exposed_without_auth"], false);
 
-    // Six live flags, all at version 0 (unset → defaults): the three exposure flags, the two
-    // hosted-mode pipeline toggles (issue #71) which default *on*, and the federation peer flag
-    // (phase 6, issue #39) which defaults *off* — off means the advertise surface is absent.
+    // Seven live flags, all at version 0 (unset → defaults): the three exposure flags, the two
+    // hosted-mode pipeline toggles (issue #71) which default *on*, the federation peer flag
+    // (phase 6, issue #39) which defaults *off* — off means the advertise surface is absent — and
+    // user accounts (phase 6, issue #42), also off, which keeps the whole accounts/groups/shares
+    // surface absent.
     let (st, flags) = call(&app, "GET", "/admin/api/flags", None, None).await;
     assert_eq!(st, StatusCode::OK);
     let flags = flags.as_array().unwrap();
-    assert_eq!(flags.len(), 6);
+    assert_eq!(flags.len(), 7);
     let flag = |key: &str| flags.iter().find(|f| f["key"] == key).unwrap();
     assert_eq!(flag("auto_thumbnail")["value"], true);
     assert_eq!(flag("auto_analyze")["value"], true);
     assert_eq!(flag("federation")["value"], false);
+    assert_eq!(flag("user_accounts")["value"], false);
     // Workload toggles never raise exposure, so they need no confirm.
     assert_eq!(flag("auto_thumbnail")["exposure_increasing"], false);
 
@@ -809,4 +812,126 @@ async fn enabling_auth_mints_a_bootstrap_owner_token() {
         .bootstrap_owner_token_if_needed("startup")
         .unwrap()
         .is_none());
+}
+
+// ── whoami: the caller's own scopes, for a scope-aware UI ─────────────────────
+
+#[tokio::test]
+async fn whoami_reports_the_callers_scopes() {
+    let (app, store, _lib) = harness(true).await;
+
+    // Under Off, the unauthenticated local owner is a full-trust, non-anonymous identity.
+    let (st, body) = call(&app, "GET", "/api/v1/whoami", None, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(body["anonymous"], false);
+    let scopes = body["scopes"].as_array().unwrap();
+    assert!(scopes.iter().any(|s| s == "write"));
+    assert!(scopes.iter().any(|s| s == "admin"));
+
+    // Mint a read-only token, require tokens, then whoami reflects exactly that token's scopes.
+    let secret = store
+        .create_token(
+            dam_api::admin::NewToken {
+                label: "reader".into(),
+                scopes: dam_api::service::Scopes::none().with(dam_api::service::Scope::Read),
+                expires: None,
+            },
+            "test",
+        )
+        .unwrap()
+        .secret;
+    store
+        .set_flag(
+            dam_api::admin::FlagKey::Authentication,
+            dam_api::admin::SetFlag {
+                value: dam_api::admin::FlagValue::Auth(dam_api::admin::AuthMode::Token),
+                expected_version: None,
+                confirm: false,
+            },
+            "test",
+        )
+        .unwrap();
+
+    // No credential under Token mode → 401 (the client's cue to show a login gate).
+    let (st, _) = call(&app, "GET", "/api/v1/whoami", None, None).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+
+    // The read token sees itself: read but not write, non-anonymous, its label as identity.
+    let (st, body) = call(&app, "GET", "/api/v1/whoami", Some(&secret), None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(body["anonymous"], false);
+    assert_eq!(body["identity"], "reader");
+    let scopes = body["scopes"].as_array().unwrap();
+    assert!(scopes.iter().any(|s| s == "read"));
+    assert!(!scopes.iter().any(|s| s == "write"));
+}
+
+#[tokio::test]
+async fn unauthorized_carries_www_authenticate() {
+    // A 401 advertises the bearer scheme (RFC 7235 §3.1) so generic HTTP clients know how to auth.
+    let (app, store, _lib) = harness(true).await;
+    store
+        .set_flag(
+            dam_api::admin::FlagKey::Authentication,
+            dam_api::admin::SetFlag {
+                value: dam_api::admin::FlagValue::Auth(dam_api::admin::AuthMode::Token),
+                expected_version: None,
+                confirm: false,
+            },
+            "test",
+        )
+        .unwrap();
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/stats")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        resp.headers()
+            .get(axum::http::header::WWW_AUTHENTICATE)
+            .and_then(|v| v.to_str().ok()),
+        Some("Bearer")
+    );
+}
+
+#[tokio::test]
+async fn scopeless_token_is_rejected_at_mint() {
+    // A token with no scopes authenticates yet can do nothing — reject it rather than hand back a dud.
+    let (_app, store, _lib) = harness(true).await;
+    let err = store
+        .create_token(
+            dam_api::admin::NewToken {
+                label: "empty".into(),
+                scopes: dam_api::service::Scopes::none(),
+                expires: None,
+            },
+            "test",
+        )
+        .unwrap_err();
+    assert!(matches!(err, dam_api::LibError::BadRequest(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn anonymous_off_localhost_is_flagged_exposed() {
+    // Anonymous on a non-localhost bind with no TLS is still world-readable — it must trip the same
+    // exposure warning as Off, not report itself safe.
+    let (_app, store, _lib) = harness(false).await;
+    store
+        .set_flag(
+            dam_api::admin::FlagKey::Authentication,
+            dam_api::admin::SetFlag {
+                value: dam_api::admin::FlagValue::Auth(dam_api::admin::AuthMode::Anonymous),
+                expected_version: None,
+                confirm: false,
+            },
+            "test",
+        )
+        .unwrap();
+    let status = store.status("0.0.0.0:7878", false, false);
+    assert!(
+        status.exposed_without_auth,
+        "anonymous on 0.0.0.0 without TLS is exposed"
+    );
 }

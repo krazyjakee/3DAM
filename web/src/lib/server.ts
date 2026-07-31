@@ -86,6 +86,14 @@ export function clearServer(): void {
   localStorage.removeItem(KEY);
 }
 
+/** Drop the bearer token but stay pointed at the same server (sign out). Distinct from
+ *  `clearServer`, which also resets the base URL back to same-origin. On a token-gated server this
+ *  returns to the login gate; on an anonymous server it drops to read-only browsing. */
+export function clearToken(): void {
+  config = { ...config, token: "" };
+  localStorage.setItem(KEY, JSON.stringify(config));
+}
+
 /** Resolve an API path against the configured base (relative/same-origin when unset). */
 export function resolveUrl(path: string): string {
   return config.base ? `${config.base}${path}` : path;
@@ -94,6 +102,16 @@ export function resolveUrl(path: string): string {
 /** `Authorization` header for `fetch` when a token is configured. */
 export function authHeaders(): Record<string, string> {
   return config.token ? { authorization: `Bearer ${config.token}` } : {};
+}
+
+/** The `x-dam-csrf` header for cookie-session-authenticated requests (user accounts, issue #42).
+ *  The server mirrors the CSRF value in the readable `dam_csrf` cookie exactly so a reloaded page
+ *  can recover it here; every non-GET request authenticated by the session cookie must carry it.
+ *  Attached unconditionally by the shared fetch helpers — it's harmless alongside a bearer token or
+ *  on an auth-off server (empty when the cookie is absent). */
+export function csrfHeaders(): Record<string, string> {
+  const m = document.cookie.match(/(?:^|;\s*)dam_csrf=([^;]+)/);
+  return m ? { "x-dam-csrf": decodeURIComponent(m[1]) } : {};
 }
 
 /** A media URL (`<img>`/`<audio>`/mesh `src`): base-resolved, with the token as a `?token=` query

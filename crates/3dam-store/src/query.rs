@@ -3,12 +3,12 @@ use super::*;
 use crate::helpers::*;
 
 impl Store {
-    /// Faceted query → a page of summaries. Cursor is an offset (slice-simple; keyset later).
-    pub fn query_assets(&self, req: &QueryRequest) -> Result<Page<AssetSummary>, LibError> {
-        self.query_assets_semantic(req, None)
-    }
-
-    /// As [`query_assets`], but the engine may inject a pre-computed text-query embedding
+    /// Faceted query → a page of summaries. Cursor is an offset (slice-simple; keyset later). The
+    /// caller always names a ceiling — there is deliberately no `Full`-forwarding convenience
+    /// wrapper, because such a wrapper is exactly how a read path forgets to filter (issue #42).
+    /// The engine's entry point is this, with `ctx.visibility`.
+    ///
+    /// The engine may also inject a pre-computed text-query embedding
     /// (`(space_id, vector)`) for the query string (semantic-search M4/M5). When present and the mode
     /// is Hybrid/Semantic, it seeds a true text→asset ranked list in the fusion — the model-backed
     /// path that finds assets with zero lexical overlap. `None` (the default, and any build without a
@@ -17,6 +17,7 @@ impl Store {
         &self,
         req: &QueryRequest,
         text_vec: Option<(String, Vec<f32>)>,
+        vis: &Visibility,
     ) -> Result<Page<AssetSummary>, LibError> {
         let limit = req.page.clamped(QUERY_MAX_LIMIT);
         let offset = decode_offset(req.page.after.as_ref())?;
@@ -24,10 +25,10 @@ impl Store {
         // Semantic-search M5: a Hybrid/Semantic query with text widens the lexical hits with their
         // embedding neighbours. Falls back to the lexical path below when there's no text.
         if req.mode != SearchMode::Lexical && req.text.as_ref().is_some_and(|t| !t.is_empty()) {
-            return self.query_hybrid(req, limit, offset, text_vec);
+            return self.query_hybrid(req, limit, offset, text_vec, vis);
         }
 
-        let (where_sql, binds) = build_where(req, &self.synonyms)?;
+        let (where_sql, binds) = build_where(req, &self.synonyms, vis)?;
 
         let dir = match req.sort.dir {
             SortDir::Asc => "ASC",
@@ -125,6 +126,7 @@ impl Store {
         limit: u32,
         offset: usize,
         text_vec: Option<(String, Vec<f32>)>,
+        vis: &Visibility,
     ) -> Result<Page<AssetSummary>, LibError> {
         use std::collections::HashMap;
         // Fusion knobs. RRF k=60 is the usual default; the caps bound the fusion work per query.
@@ -136,7 +138,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
 
         // 1. Lexical candidates, best-first by bm25 (the M1 ranking), bounded.
-        let (where_sql, mut binds) = build_where(req, &self.synonyms)?;
+        let (where_sql, mut binds) = build_where(req, &self.synonyms, vis)?;
         let rank_match = req
             .text
             .as_ref()
@@ -192,10 +194,11 @@ impl Store {
             *fused.entry(*id).or_default() += w_text / (RRF_K + rank as f64 + 1.0);
         }
 
-        // 4. Apply facet filters + fetch summaries for the whole candidate set, then order by fused
-        //    score (name breaks ties) and paginate the survivors.
+        // 4. Apply facet filters + the visibility ceiling + fetch summaries for the whole candidate
+        //    set (the embedding expansion is space-wide, so an unshared neighbour must drop here),
+        //    then order by fused score (name breaks ties) and paginate the survivors.
         let candidate_ids: Vec<AssetId> = fused.keys().copied().collect();
-        let summaries = Self::summaries_for_ids(&conn, &candidate_ids, &req.filters)?;
+        let summaries = Self::summaries_for_ids(&conn, &candidate_ids, &req.filters, vis)?;
         let mut ranked: Vec<(AssetId, f64)> = fused
             .into_iter()
             .filter(|(id, _)| summaries.contains_key(id))
@@ -307,8 +310,12 @@ impl Store {
 
     /// Every asset id matching a query's text + filters, ordered by name — the unbounded id set an
     /// export or smart-folder resolution walks (no pagination). Ignores `page`/`sort`/`facets`.
-    pub fn query_asset_ids(&self, req: &QueryRequest) -> Result<Vec<AssetId>, LibError> {
-        let (where_sql, binds) = build_where(req, &self.synonyms)?;
+    pub fn query_asset_ids(
+        &self,
+        req: &QueryRequest,
+        vis: &Visibility,
+    ) -> Result<Vec<AssetId>, LibError> {
+        let (where_sql, binds) = build_where(req, &self.synonyms, vis)?;
         let conn = self.conn.lock().unwrap();
         let sql =
             format!("SELECT asset.id FROM asset {ATTR_JOINS} {where_sql} ORDER BY filename ASC, asset.id ASC");
@@ -340,54 +347,58 @@ impl Store {
     /// Library aggregates, optionally scoped to one source (`source = None` ⇒ whole library).
     /// The scoped form powers per-source sidebar counts; a federated source never reaches here —
     /// the engine proxies its stats to the peer instead.
-    pub fn stats(&self, source: Option<&SourceId>) -> Result<LibraryStats, LibError> {
+    ///
+    /// Every aggregate composes the visibility ceiling: totals, media/source breakdowns, and the tag
+    /// vocabulary are all oracles for hidden content (issue #42 leak audit), so each counts only the
+    /// caller-reachable assets, and `by_source` never names an unreachable source.
+    pub fn stats(
+        &self,
+        source: Option<&SourceId>,
+        vis: &Visibility,
+    ) -> Result<LibraryStats, LibError> {
         let conn = self.conn.lock().unwrap();
-        let sid_blob = source.map(|s| s.as_bytes().to_vec());
-        // One WHERE fragment reused across the asset aggregates; params line up by position.
-        let (asset_where, and_source): (&str, &str) = if sid_blob.is_some() {
-            ("WHERE source_id = ?1", "AND a.source_id = ?1")
-        } else {
-            ("", "")
-        };
-        let p =
-            |sql: &str| -> String { sql.replace("{W}", asset_where).replace("{A}", and_source) };
-        let prms: Vec<&dyn rusqlite::ToSql> = match &sid_blob {
-            Some(b) => vec![b as &dyn rusqlite::ToSql],
-            None => vec![],
+
+        // The shared per-asset predicate: optional source scope + the visibility ceiling. Built once
+        // per alias (the aggregates below reference the asset table as `asset` or `a`).
+        let asset_pred = |alias: &str| -> (String, Vec<Value>) {
+            let mut sql = String::new();
+            let mut binds: Vec<Value> = Vec::new();
+            if let Some(sid) = source {
+                sql.push_str(&format!(" AND {alias}.source_id = ?"));
+                binds.push(Value::Blob(sid.as_bytes().to_vec()));
+            }
+            push_visibility(vis, alias, &mut sql, &mut binds);
+            (sql, binds)
         };
 
-        let total: i64 = conn
-            .query_row(&p("SELECT COUNT(*) FROM asset {W}"), &prms[..], |r| {
-                r.get(0)
-            })
-            .map_err(internal)?;
-        let unanalyzed: i64 = conn
-            .query_row(
-                &p(if sid_blob.is_some() {
-                    "SELECT COUNT(*) FROM asset WHERE analysed_at IS NULL AND source_id = ?1"
-                } else {
-                    "SELECT COUNT(*) FROM asset WHERE analysed_at IS NULL"
-                }),
-                &prms[..],
-                |r| r.get(0),
-            )
-            .map_err(internal)?;
-        let sources: i64 = if sid_blob.is_some() {
-            1
-        } else {
-            conn.query_row("SELECT COUNT(*) FROM source", [], |r| r.get(0))
-                .map_err(internal)?
+        let count_where = |extra: &str| -> Result<i64, LibError> {
+            let (pred, binds) = asset_pred("asset");
+            let sql = format!("SELECT COUNT(*) FROM asset WHERE 1=1{extra}{pred}");
+            conn.query_row(&sql, rusqlite::params_from_iter(binds.iter()), |r| r.get(0))
+                .map_err(internal)
+        };
+        let total = count_where("")?;
+        let unanalyzed = count_where(" AND analysed_at IS NULL")?;
+
+        // Source count: only sources the caller can reach at all. A collection-only grant does not
+        // surface its members' sources here — the collection, not the source, is what was shared.
+        let sources: i64 = match (source, vis.restricted()) {
+            (Some(_), _) => 1,
+            (None, None) => conn
+                .query_row("SELECT COUNT(*) FROM source", [], |r| r.get(0))
+                .map_err(internal)?,
+            (None, Some(scope)) => scope.sources.len() as i64,
         };
 
         let mut by_media = CountMap::new();
         {
-            let mut stmt = conn
-                .prepare(&p(
-                    "SELECT media_type, COUNT(*) FROM asset {W} GROUP BY media_type",
-                ))
-                .map_err(internal)?;
+            let (pred, binds) = asset_pred("asset");
+            let sql = format!(
+                "SELECT media_type, COUNT(*) FROM asset WHERE 1=1{pred} GROUP BY media_type"
+            );
+            let mut stmt = conn.prepare(&sql).map_err(internal)?;
             let rows = stmt
-                .query_map(&prms[..], |r| {
+                .query_map(rusqlite::params_from_iter(binds.iter()), |r| {
                     Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
                 })
                 .map_err(internal)?;
@@ -398,17 +409,38 @@ impl Store {
         }
         let mut by_source = CountMap::new();
         {
-            let mut stmt = conn
-                .prepare(&p(if sid_blob.is_some() {
-                    "SELECT s.name, COUNT(a.id) FROM source s
-                     LEFT JOIN asset a ON a.source_id = s.id WHERE s.id = ?1 GROUP BY s.id"
+            // Restrict the *source rows themselves* — an unreachable source's name must not appear
+            // (even with a zero count). The joined-asset predicate then counts reachable assets.
+            let mut src_pred = String::new();
+            let mut binds: Vec<Value> = Vec::new();
+            if let Some(sid) = source {
+                src_pred.push_str(" AND s.id = ?");
+                binds.push(Value::Blob(sid.as_bytes().to_vec()));
+            }
+            if let Some(scope) = vis.restricted() {
+                if scope.sources.is_empty() {
+                    src_pred.push_str(" AND 0=1");
                 } else {
-                    "SELECT s.name, COUNT(a.id) FROM source s
-                     LEFT JOIN asset a ON a.source_id = s.id GROUP BY s.id"
-                }))
-                .map_err(internal)?;
+                    let ph = scope
+                        .sources
+                        .iter()
+                        .map(|_| "?")
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    src_pred.push_str(&format!(" AND s.id IN ({ph})"));
+                    for sid in &scope.sources {
+                        binds.push(Value::Blob(sid.as_bytes().to_vec()));
+                    }
+                }
+            }
+            let sql = format!(
+                "SELECT s.name, COUNT(a.id) FROM source s
+                 LEFT JOIN asset a ON a.source_id = s.id
+                 WHERE 1=1{src_pred} GROUP BY s.id"
+            );
+            let mut stmt = conn.prepare(&sql).map_err(internal)?;
             let rows = stmt
-                .query_map(&prms[..], |r| {
+                .query_map(rusqlite::params_from_iter(binds.iter()), |r| {
                     Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
                 })
                 .map_err(internal)?;
@@ -420,18 +452,21 @@ impl Store {
         // The most-used confirmed tags — the vocabulary behind the Tags filter facet. Picked by
         // frequency (top N) so the sidebar shows the useful few, not the whole long tail; the
         // BTreeMap then presents them alphabetically. Suggested/rejected tags are excluded — this is
-        // the curated set, mirroring what the inspector confirms.
+        // the curated set, mirroring what the inspector confirms. Visibility applies: a tag that
+        // exists only on hidden assets must not appear (issue #42 leak audit).
         let mut tags = CountMap::new();
         {
-            let mut stmt = conn
-                .prepare(&p("SELECT t.name, COUNT(*) AS n FROM asset_tag at
-                     JOIN tag t ON t.id = at.tag_id
-                     JOIN asset a ON a.id = at.asset_id
-                     WHERE at.state = 'confirmed' {A}
-                     GROUP BY at.tag_id ORDER BY n DESC, t.name ASC LIMIT 30"))
-                .map_err(internal)?;
+            let (pred, binds) = asset_pred("a");
+            let sql = format!(
+                "SELECT t.name, COUNT(*) AS n FROM asset_tag at
+                 JOIN tag t ON t.id = at.tag_id
+                 JOIN asset a ON a.id = at.asset_id
+                 WHERE at.state = 'confirmed'{pred}
+                 GROUP BY at.tag_id ORDER BY n DESC, t.name ASC LIMIT 30"
+            );
+            let mut stmt = conn.prepare(&sql).map_err(internal)?;
             let rows = stmt
-                .query_map(&prms[..], |r| {
+                .query_map(rusqlite::params_from_iter(binds.iter()), |r| {
                     Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
                 })
                 .map_err(internal)?;
@@ -455,6 +490,12 @@ impl Store {
 mod tests {
     use super::*;
     use dam_sources::SourceConnection;
+
+    /// Unrestricted query — the test-local stand-in for the `Full`-forwarding wrapper that
+    /// production code deliberately no longer has (every real caller names its ceiling).
+    fn query_all(store: &Store, req: &QueryRequest) -> Result<Page<AssetSummary>, LibError> {
+        store.query_assets_semantic(req, None, &Visibility::Full)
+    }
 
     /// Insert one image asset with the given filename and return the live store.
     fn store_with(filename: &str) -> Store {
@@ -519,7 +560,7 @@ mod tests {
         let _b = mk("other.png");
 
         // Fresh assets are not favourites.
-        let all = store.query_assets(&QueryRequest::default()).unwrap().items;
+        let all = query_all(&store, &QueryRequest::default()).unwrap().items;
         assert_eq!(all.len(), 2);
         assert!(all.iter().all(|s| !s.favorite));
 
@@ -533,14 +574,14 @@ mod tests {
             }],
             ..Default::default()
         };
-        let favs = store.query_assets(&fav_req).unwrap().items;
+        let favs = query_all(&store, &fav_req).unwrap().items;
         assert_eq!(favs.len(), 1);
         assert_eq!(favs[0].name, "keep.png");
         assert!(favs[0].favorite);
 
         // Un-star; the filter is empty again.
         store.set_favorite(&a, false).unwrap();
-        assert!(store.query_assets(&fav_req).unwrap().items.is_empty());
+        assert!(query_all(&store, &fav_req).unwrap().items.is_empty());
     }
 
     /// Folder navigation (issue #66): the on-the-fly tree derived from stored paths, and the
@@ -610,7 +651,7 @@ mod tests {
                 }],
                 ..Default::default()
             };
-            store.query_assets(&req).unwrap().total.unwrap()
+            query_all(&store, &req).unwrap().total.unwrap()
         };
         assert_eq!(scoped("Environment/"), 3);
         assert_eq!(scoped("Environment/Rock/"), 2);
@@ -627,8 +668,7 @@ mod tests {
             mode,
             ..Default::default()
         };
-        store
-            .query_assets(&req)
+        query_all(store, &req)
             .unwrap()
             .items
             .into_iter()
@@ -659,7 +699,7 @@ mod tests {
     #[test]
     fn tag_name_is_searchable_and_reject_removes_it() {
         let store = store_with("clip_0001.wav");
-        let id = store.query_assets(&QueryRequest::default()).unwrap().items[0].id;
+        let id = query_all(&store, &QueryRequest::default()).unwrap().items[0].id;
         // A term that appears only as a tag, never in the filename.
         assert!(search(&store, "snare").is_empty());
         store.suggest_tag(&id, "snare", 0.9, "test@1").unwrap();
@@ -745,8 +785,7 @@ mod tests {
                 filters: vec![Filter { field, op, value }],
                 ..Default::default()
             };
-            let mut names = store
-                .query_assets(&req)
+            let mut names = query_all(&store, &req)
                 .unwrap()
                 .items
                 .into_iter()
@@ -894,7 +933,11 @@ mod tests {
             ..Default::default()
         };
         let page = store
-            .query_assets_semantic(&req, Some((space.to_string(), vec![0.05, 0.98, 0.0])))
+            .query_assets_semantic(
+                &req,
+                Some((space.to_string(), vec![0.05, 0.98, 0.0])),
+                &Visibility::Full,
+            )
             .unwrap();
         let names: Vec<String> = page.items.iter().map(|s| s.name.clone()).collect();
         assert!(

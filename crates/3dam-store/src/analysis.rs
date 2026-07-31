@@ -304,6 +304,7 @@ impl Store {
         id: &AssetId,
         k: u32,
         filters: &[Filter],
+        vis: &Visibility,
     ) -> Result<Vec<(AssetSummary, f32)>, LibError> {
         let conn = self.conn.lock().unwrap();
         // Query vector + its space.
@@ -352,9 +353,11 @@ impl Store {
             scored
         };
 
-        // Post-filter against the facet predicate and fetch summaries (§3.3).
+        // Post-filter against the facet predicate + the visibility ceiling and fetch summaries
+        // (§3.3). The ceiling applies to the *candidates* — a neighbour from an unshared source
+        // leaks both its existence and its content-likeness (issue #42 leak audit).
         let candidate_ids: Vec<AssetId> = scored.iter().take(overfetch).map(|(a, _)| *a).collect();
-        let summaries = Self::summaries_for_ids(&conn, &candidate_ids, filters)?;
+        let summaries = Self::summaries_for_ids(&conn, &candidate_ids, filters, vis)?;
         let mut out = Vec::new();
         for (aid, score) in scored {
             if out.len() >= k as usize {
@@ -393,6 +396,7 @@ impl Store {
         qvec: &[f32],
         k: u32,
         filters: &[Filter],
+        vis: &Visibility,
     ) -> Result<Vec<(AssetSummary, f32)>, LibError> {
         let conn = self.conn.lock().unwrap();
         let dim: Option<i64> = conn
@@ -420,7 +424,7 @@ impl Store {
         let overfetch = (k as usize * 4).max(k as usize + 16);
         let scored = self.nearest_in_space(&conn, space_id, qvec, overfetch)?;
         let candidate_ids: Vec<AssetId> = scored.iter().map(|(a, _)| *a).collect();
-        let summaries = Self::summaries_for_ids(&conn, &candidate_ids, filters)?;
+        let summaries = Self::summaries_for_ids(&conn, &candidate_ids, filters, vis)?;
         let mut out = Vec::new();
         for (aid, score) in scored {
             if out.len() >= k as usize {
@@ -534,7 +538,11 @@ impl Store {
 
     /// Duplicate groups for the review view (§4). `Exact` groups by content hash; `Near` groups by
     /// embedding cosine ≥ threshold within a media space (union-find over the pairwise relation, §4.3).
-    pub fn duplicates(&self, req: &DupRequest) -> Result<Vec<DupGroup>, LibError> {
+    pub fn duplicates(
+        &self,
+        req: &DupRequest,
+        vis: &Visibility,
+    ) -> Result<Vec<DupGroup>, LibError> {
         const NEAR_COS: f32 = 0.92; // conservative "strong near-dup" band (§4.2; tuned later, §8)
         let conn = self.conn.lock().unwrap();
         let mut groups: Vec<DupGroup> = Vec::new();
@@ -563,6 +571,7 @@ impl Store {
                         DupKind::Exact,
                         &ids,
                         "identical bytes (same content hash)",
+                        vis,
                     )? {
                         groups.push(g);
                     }
@@ -610,6 +619,7 @@ impl Store {
                         DupKind::Near,
                         &member_ids,
                         &format!("embedding cosine ≥ {NEAR_COS:.2}"),
+                        vis,
                     )? {
                         groups.push(g);
                     }
@@ -620,14 +630,18 @@ impl Store {
     }
 
     /// Build a `DupGroup` from member ids: load summaries, pick the suggested keep (largest bytes,
-    /// then highest pixel count for images). Skips groups that collapse to <2 resolvable members.
+    /// then highest pixel count for images). Skips groups that collapse to <2 resolvable members —
+    /// which also re-forms visibility-filtered groups (issue #42 leak audit): a duplicate pair
+    /// spanning a shared and an unshared source collapses to one visible member, and a group of one
+    /// is not a duplicate, so the hidden file's existence never shows.
     fn build_dup_group(
         conn: &Connection,
         kind: DupKind,
         ids: &[AssetId],
         signal: &str,
+        vis: &Visibility,
     ) -> Result<Option<DupGroup>, LibError> {
-        let map = Self::summaries_for_ids(conn, ids, &[])?;
+        let map = Self::summaries_for_ids(conn, ids, &[], vis)?;
         let mut members: Vec<AssetSummary> =
             ids.iter().filter_map(|i| map.get(i).cloned()).collect();
         if members.len() < 2 {
@@ -646,12 +660,15 @@ impl Store {
         }))
     }
 
-    /// Fetch summaries for a set of ids, applying the same faceted filters as text search (§3.3).
+    /// Fetch summaries for a set of ids, applying the same faceted filters as text search (§3.3)
+    /// plus the visibility ceiling — the shared choke point of the similarity, hybrid-search, and
+    /// dedup candidate paths, so an unreachable asset drops out of all of them in one place.
     /// Returns a map so callers can preserve their own ordering (similarity score / dup grouping).
     pub(crate) fn summaries_for_ids(
         conn: &Connection,
         ids: &[AssetId],
         filters: &[Filter],
+        vis: &Visibility,
     ) -> Result<std::collections::HashMap<AssetId, AssetSummary>, LibError> {
         let mut map = std::collections::HashMap::new();
         if ids.is_empty() {
@@ -659,6 +676,7 @@ impl Store {
         }
         let mut where_sql = String::from(" WHERE 1=1");
         let mut binds: Vec<Value> = Vec::new();
+        push_visibility(vis, "asset", &mut where_sql, &mut binds);
         for f in filters {
             apply_filter(f, &mut where_sql, &mut binds)?;
         }

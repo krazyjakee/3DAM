@@ -11,6 +11,7 @@
 
 mod admin;
 mod auth;
+mod authn;
 mod config;
 mod mcp;
 mod store;
@@ -36,6 +37,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 use tower_http::cors::CorsLayer;
+use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 
 use auth::{Reader, Writer};
@@ -76,6 +78,12 @@ pub(crate) struct AppState {
     pub bind: String,
     pub localhost_only: bool,
     pub tls: bool,
+    /// Force `Secure` on session/CSRF cookies regardless of the local TLS posture — the operator's
+    /// declaration that a TLS-terminating proxy sits in front (`[server] secure_cookies`).
+    pub secure_cookies: bool,
+    /// Refuse the *open* (loopback-peer) first-run claim path outright, so only bootstrap-token
+    /// redemption can claim (`[accounts] require_claim_token`; ADR 0014).
+    pub require_claim_token: bool,
     /// Flips `false → true` once when shutdown begins, so long-lived handlers (the `/api/v1/ws`
     /// loop) can stop awaiting and close cleanly instead of pinning the graceful drain open.
     pub shutdown: watch::Receiver<bool>,
@@ -117,13 +125,65 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status =
             StatusCode::from_u16(self.0.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        (status, Json(self.0.to_body())).into_response()
+        let mut resp = (status, Json(self.0.to_body())).into_response();
+        // A 401 SHOULD advertise the scheme it wants (RFC 7235 §3.1). We use bearer tokens, so say
+        // so — tools and generic HTTP clients key off this header, and it costs nothing.
+        if status == StatusCode::UNAUTHORIZED {
+            resp.headers_mut().insert(
+                header::WWW_AUTHENTICATE,
+                header::HeaderValue::from_static("Bearer"),
+            );
+        }
+        resp
     }
 }
 
 fn parse_id<T: std::str::FromStr>(s: &str, what: &str) -> Result<T, ApiError> {
     s.parse::<T>()
         .map_err(|_| ApiError(LibError::BadRequest(format!("invalid {what} id"))))
+}
+
+/// Write a secret (the bootstrap owner token) to a file readable only by the owner. On Unix the file
+/// is created with `0600` before any bytes are written, so the secret is never briefly world-readable;
+/// elsewhere it falls back to a plain write (best effort). Kept out of the logs on purpose.
+fn write_secret_file(path: &std::path::Path, secret: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        writeln!(f, "{secret}")
+    }
+    #[cfg(not(unix))]
+    {
+        let mut f = std::fs::File::create(path)?;
+        writeln!(f, "{secret}")
+    }
+}
+
+/// Wrap a sub-router in the **one** `UserAccounts` flag gate (ADR 0004: off *unmounts* the route —
+/// a 404, not a 403, decided before auth so a disabled surface cannot be probed). Both gated blocks
+/// — all of `/api/v1/auth` and the accounts/groups/shares block of `/admin/api` — pass through here,
+/// so the check exists once instead of being pasted into eighteen handler bodies where the
+/// nineteenth would forget it.
+pub(crate) fn gate_accounts(router: Router<AppState>, state: AppState) -> Router<AppState> {
+    router.route_layer(axum::middleware::from_fn_with_state(state, accounts_gate))
+}
+
+async fn accounts_gate(
+    State(st): State<AppState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    match st.store.require_user_accounts() {
+        Ok(()) => next.run(req).await,
+        Err(e) => ApiError(e).into_response(),
+    }
 }
 
 /// Assemble the router over a fully-built [`AppState`].
@@ -134,6 +194,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
         // balancer / systemd watchdog can poll them without a token: liveness vs readiness.
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
+        .route("/api/v1/whoami", get(whoami))
         .route("/api/v1/query", post(query))
         .route("/api/v1/assets/{id}", get(get_asset).delete(remove_asset))
         .route("/api/v1/assets/{id}/content", get(asset_content))
@@ -185,12 +246,21 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/api/v1/ws", get(ws_handler))
         // The MCP endpoint (tech-spec 11): present, but the handler 404s when the flag is Off.
         .route("/mcp", post(mcp_http))
+        // User accounts: claim/login/sessions (phase 6, issue #42) — 404 while the flag is off.
+        .merge(authn::routes(state.clone()))
         // The admin API (tech-spec 10 §5), guarded by the AdminAuth extractor.
-        .merge(admin::routes())
+        .merge(admin::routes(state.clone()))
         // SPA fallback: any non-API GET serves the embedded web client (tech-spec 09 §A.4).
         .fallback(static_handler)
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
+        // Reads carry the bearer as a `?token=` query param on `<img>`/`<audio>`/WS loads (browsers
+        // can't header-auth those). `no-referrer` stops that token leaking onward via the `Referer`
+        // header when a preview or the page links out. Applied to every response, cheaply.
+        .layer(SetResponseHeaderLayer::overriding(
+            header::REFERRER_POLICY,
+            header::HeaderValue::from_static("no-referrer"),
+        ))
         .with_state(state)
 }
 
@@ -212,6 +282,8 @@ pub fn router(
         bind,
         localhost_only,
         tls: false,
+        secure_cookies: false,
+        require_claim_token: false,
         shutdown,
         // The test seam is ready the moment it's built (no async pipeline warm-up to await).
         ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
@@ -265,6 +337,13 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
     for (key, value) in file.flag_seeds() {
         store.seed_flag(key, value)?;
     }
+    // Config-plane recovery hatch (ADR 0009 §3, issue #42): `[accounts] reopen_claim = true`
+    // re-opens the first-run claim window for this boot, so a lost sole admin can be recovered
+    // from the machine that owns the config file. Audited, and loud below via the unclaimed beat.
+    if file.accounts.reopen_claim == Some(true) {
+        store.reopen_claim("config-file")?;
+        eprintln!("  ⚠ [accounts] reopen_claim: the claim window is OPEN — the next signup from this machine becomes admin");
+    }
 
     // Hosted-mode background pipeline (issue #71): proactively drain thumbnails + analysis on ingest
     // so a freshly-connected client hits ready data instead of paying first-look render latency.
@@ -285,6 +364,8 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
         bind: addr.to_string(),
         localhost_only,
         tls,
+        secure_cookies: file.server.secure_cookies == Some(true),
+        require_claim_token: file.accounts.require_claim_token == Some(true),
         shutdown: shutdown_rx,
         ready: ready.clone(),
     };
@@ -316,17 +397,46 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
     }
     // Never locked out: a config file can seed a credentialed mode on first boot (the hardened
     // template does), which would gate the instance with zero key holders. Mint the bootstrap owner
-    // token and print it once — recoverable from the container/service logs until first use.
+    // token — but the secret must NOT land in stderr/journald/docker logs, which persist and are
+    // widely readable. Write it to a 0600 file the operator collects once and then deletes; log only
+    // the path.
     if !matches!(s.auth, dam_api::admin::AuthMode::Off) {
         if let Some(t) = store.bootstrap_owner_token_if_needed("startup")? {
+            let path = cfg.data_dir.join("bootstrap-owner-token.txt");
+            write_secret_file(&path, &t.secret)?;
             eprintln!(
                 "  authentication is on and no admin credential existed — minted the owner token\n  \
-                 secret (shown once): {}",
-                t.secret
+                 secret written to {} (owner-only; save it, then delete the file)",
+                path.display()
+            );
+            tracing::warn!(
+                path = %path.display(),
+                "minted bootstrap owner token; secret is in the file, kept out of the logs"
             );
         }
     }
     ready.store(true, std::sync::atomic::Ordering::Relaxed);
+
+    // Unclaimed state is loud (issue #42 §2): while accounts are on with no admin claimed, warn on
+    // a beat so an exposed unclaimed instance is never silent. The task ends itself once claimed.
+    {
+        let store = store.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                tick.tick().await;
+                if !store.unclaimed() {
+                    break;
+                }
+                tracing::warn!(
+                    "user accounts are on but UNCLAIMED — the first signup from a process on this \
+                     machine becomes admin; claim it now (web UI) or via POST /api/v1/auth/claim. \
+                     Behind a reverse proxy set [accounts] require_claim_token and redeem the \
+                     bootstrap owner token instead"
+                );
+            }
+        });
+    }
 
     // TLS deployment: serve HTTPS via axum-server (its own graceful-shutdown handle), still flipping
     // the WS watch so idle sockets close. Plaintext keeps the axum::serve path below.
@@ -342,7 +452,13 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
     //   3. axum stops accepting and drains in-flight requests. A grace timer is the backstop so a
     //      wedged connection can't hang the process — past the window we stop waiting and exit.
     let shutdown_rx_backstop = shutdown_tx.subscribe();
-    let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
+    // ConnectInfo gives handlers the peer address — the first-run claim gate binds acceptance to a
+    // loopback peer (issue #42 §2), which needs more than the bind posture when listening wide.
+    let serve = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
         wait_for_signal().await;
         tracing::info!("shutdown signal received; draining connections");
         eprintln!(
@@ -405,7 +521,7 @@ async fn serve_tls(
 
     axum_server::from_tcp_rustls(std_listener, config)
         .handle(handle)
-        .serve(app.into_make_service())
+        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
         .await?;
     tracing::info!(%actual, "TLS shutdown complete; all connections drained");
     Ok(())
@@ -449,6 +565,111 @@ async fn wait_for_signal() {
     {
         let _ = tokio::signal::ctrl_c().await;
     }
+}
+
+/// What [`serve_desktop`] reports back to the desktop shell (ADR 0013): where the in-process server
+/// listens and the credential the webview should present.
+pub struct DesktopServer {
+    /// `http://127.0.0.1:<port>` — loopback only, ephemeral port.
+    pub url: String,
+    /// A fresh owner-scoped shell token when the `Authentication` flag is on; `None` when it is Off
+    /// (an Off-mode server already resolves the unauthenticated local caller to owner trust).
+    pub token: Option<String>,
+}
+
+/// Run the server for the native desktop shell (ADR 0013): the same engine + store + router as
+/// [`serve`], but bound to `127.0.0.1:0` (loopback, ephemeral port), defaults-only config (no config
+/// file, no TLS), and no signal handling — the shell owns the process lifetime and this future is
+/// simply dropped (or the process exits) when the window closes. The bound URL (and shell credential)
+/// is sent through `ready` once the listener is accepting.
+pub async fn serve_desktop(
+    data_dir: PathBuf,
+    ready: tokio::sync::oneshot::Sender<anyhow::Result<DesktopServer>>,
+) {
+    let (app, listener, info) = match desktop_setup(&data_dir).await {
+        Ok(parts) => parts,
+        Err(e) => {
+            let _ = ready.send(Err(e));
+            return;
+        }
+    };
+    let _ = ready.send(Ok(info));
+    if let Err(e) = axum::serve(listener, app).await {
+        tracing::error!(error = %e, "desktop server exited with an error");
+    }
+}
+
+/// Wire the desktop server: open the stores, start watchers + the background pipeline, mint the
+/// shell credential, and bind. Split from [`serve_desktop`] so setup failures funnel to one `?` path.
+async fn desktop_setup(
+    data_dir: &std::path::Path,
+) -> anyhow::Result<(Router, tokio::net::TcpListener, DesktopServer)> {
+    let lib = Arc::new(EmbeddedLibrary::open(data_dir).await?);
+    lib.start_watchers();
+    let store = Arc::new(ServerStore::open(&data_dir.join("server.db"))?);
+    lib.start_background_pipeline(Arc::new(ServerPipelinePolicy {
+        store: store.clone(),
+    }));
+    let token = desktop_shell_token(&store)?;
+
+    // No graceful drain for the desktop role — leak the sender (as the test seam does) so the WS
+    // loops never observe a spurious shutdown flip from a dropped channel.
+    let (tx, shutdown) = watch::channel(false);
+    Box::leak(Box::new(tx));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let actual = listener.local_addr()?;
+    let state = AppState {
+        lib,
+        store,
+        bind: actual.to_string(),
+        localhost_only: true,
+        tls: false,
+        // The desktop shell is a webview on a genuinely local loopback socket: no proxy in front
+        // (so no forced `Secure` over plaintext http://127.0.0.1, which browsers would then drop)
+        // and the open claim path is exactly right for the solo-dev first run (ADR 0013/0014).
+        secure_cookies: false,
+        require_claim_token: false,
+        shutdown,
+        ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+    };
+    tracing::info!(%actual, "3dam desktop server listening");
+    Ok((
+        build_router(state),
+        listener,
+        DesktopServer {
+            url: format!("http://{actual}"),
+            token,
+        },
+    ))
+}
+
+/// The desktop shell's credential when the `Authentication` flag is on: a fresh owner-scoped token
+/// per launch, with the previous launch's revoked by label so they don't accumulate in `server.db`.
+/// (Two concurrent shells on one data dir will fight over this label — the second launch signs the
+/// first out; an accepted edge, same as today's concurrent-session behaviour.)
+fn desktop_shell_token(store: &ServerStore) -> Result<Option<String>, LibError> {
+    use dam_api::admin::{AuthMode, NewToken};
+    // The *effective* mode: `UserAccounts` on gates the surface even with the auth flag Off, and
+    // the shell webview still needs a credential to reach its own in-process server (ADR 0013).
+    if matches!(store.effective_auth_mode(), AuthMode::Off) {
+        return Ok(None);
+    }
+    const LABEL: &str = "desktop shell";
+    for t in store.list_tokens()? {
+        if t.label == LABEL {
+            store.revoke_token(&t.token_id, "desktop")?;
+        }
+    }
+    let minted = store.create_token(
+        NewToken {
+            label: LABEL.into(),
+            scopes: dam_api::service::Scopes::owner(),
+            expires: None,
+        },
+        "desktop",
+    )?;
+    Ok(Some(minted.secret))
 }
 
 /// The MCP stdio transport (`3dam mcp`, tech-spec 11 §2.2). Opens an embedded engine — no network,
@@ -514,12 +735,38 @@ async fn version(State(st): State<AppState>) -> Json<serde_json::Value> {
         "api": "v1",
         "server": concat!("3dam ", env!("CARGO_PKG_VERSION")),
         // The auth posture, on the one public route: lets a client render its login gate up front
-        // instead of provoking 401s (the same fact a 401 would reveal anyway).
-        "auth": st.store.auth_mode(),
+        // instead of provoking 401s (the same fact a 401 would reveal anyway). The *effective*
+        // mode — `UserAccounts` on raises `Off` to `Token` (issue #42).
+        "auth": st.store.effective_auth_mode(),
+        // Accounts posture (issue #42): lets the client offer username/password login (and the
+        // first-run claim screen while unclaimed) instead of the bare token prompt.
+        "accounts": st.store.user_accounts(),
+        "unclaimed": st.store.unclaimed(),
+        // How many accounts exist. `unclaimed` alone can't distinguish "brand new instance" from
+        // "the operator re-opened the claim window to recover a lost admin" — and in the second
+        // case every existing user can still sign in, so the client must not replace the login
+        // screen with a claim form. Reveals only a cardinality the claim screen itself implies.
+        "account_count": st.store.count_accounts().unwrap_or(0),
         "capabilities": ["query", "sources", "scan", "stats", "ws", "web", "thumbnail", "convert",
                          "analyze", "similar", "duplicates", "suggestions", "collections", "export",
-                         "auth", "flags", "mcp"],
+                         "auth", "flags", "mcp", "accounts"],
     }))
+}
+
+/// `GET /api/v1/whoami` — the caller's resolved identity + effective scopes (tech-spec 10 §1.2).
+/// Deliberately requires no scope of its own: it reports whatever the presented credential resolves
+/// to, so a client can shape its UI to the granted scopes. Under `Token` mode with no credential it
+/// still `401`s (via `resolve`), which is the signal to show a login gate.
+async fn whoami(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<dam_api::WhoAmI>, ApiError> {
+    let resolved = auth::resolve(
+        &st.store,
+        auth::bearer_header(&headers),
+        auth::cookie_value(&headers, auth::SESSION_COOKIE),
+    )?;
+    Ok(Json(resolved.ctx.whoami()))
 }
 
 /// Liveness probe (issue #75): the process is up and the axum stack is answering. Always `200 ok`
@@ -786,6 +1033,13 @@ async fn remove_source(
 ) -> Result<StatusCode, ApiError> {
     let id: SourceId = parse_id(&id, "source")?;
     st.lib.remove_source(&ctx, &id, req).await?;
+    // Orphan-GC the cross-database soft references (issue #42): shares of a deleted source are
+    // dead grants. Ids are uuids (never recycled), so a failure here is clutter, not exposure.
+    let _ = st.store.remove_shares_for_resource(
+        dam_api::accounts::ShareResource::Source,
+        &id.to_string(),
+        "system",
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -861,6 +1115,12 @@ async fn delete_collection(
 ) -> Result<StatusCode, ApiError> {
     let id: CollectionId = parse_id(&id, "collection")?;
     st.lib.delete_collection(&ctx, &id).await?;
+    // Orphan-GC shares pointing at the deleted collection (issue #42; see remove_source).
+    let _ = st.store.remove_shares_for_resource(
+        dam_api::accounts::ShareResource::Collection,
+        &id.to_string(),
+        "system",
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -943,14 +1203,28 @@ async fn ws_handler(
     headers: HeaderMap,
     State(st): State<AppState>,
 ) -> Response {
-    if let Err(e) = auth::resolve_ws(&st.store, &headers, q.token) {
-        return ApiError(e).into_response();
-    }
-    ws.on_upgrade(move |socket| ws_loop(socket, st))
+    let resolved = match auth::resolve_ws(&st.store, &headers, q.token.clone()) {
+        Ok(r) => r,
+        Err(e) => return ApiError(e).into_response(),
+    };
+    // Keep the raw credentials so the long-lived loop can *re-resolve* when shares/groups change
+    // (issue #42): a revoked share must not keep feeding a stale ceiling to an open socket.
+    let token = auth::bearer_header(&headers).or(q.token);
+    let cookie = auth::cookie_value(&headers, auth::SESSION_COOKIE);
+    ws.on_upgrade(move |socket| ws_loop(socket, st, resolved.ctx, token, cookie))
 }
 
-async fn ws_loop(mut socket: WebSocket, st: AppState) {
-    let mut stream = match st.lib.subscribe(&ectx(), SubscribeRequest::default()).await {
+async fn ws_loop(
+    mut socket: WebSocket,
+    st: AppState,
+    ctx: dam_api::service::AuthContext,
+    token: Option<String>,
+    cookie: Option<String>,
+) {
+    // Subscribe under the *caller's* context, not the embedded owner — the engine filters the
+    // stream to the ceiling (restricted subscribers get no job/asset payloads; issue #42).
+    let mut vis_gen = st.store.visibility_generation();
+    let mut stream = match st.lib.subscribe(&ctx, SubscribeRequest::default()).await {
         Ok(s) => s,
         Err(_) => return,
     };
@@ -964,6 +1238,25 @@ async fn ws_loop(mut socket: WebSocket, st: AppState) {
             }
             ev = stream.next() => {
                 let Some(ev) = ev else { break }; // event bus closed (engine shutting down)
+                // A share/group/account mutation since we subscribed: re-resolve the credential
+                // and re-subscribe under the fresh ceiling; a now-invalid credential closes.
+                let gen_now = st.store.visibility_generation();
+                if gen_now != vis_gen {
+                    vis_gen = gen_now;
+                    match auth::resolve(&st.store, token.clone(), cookie.clone()) {
+                        Ok(r) if r.ctx.scopes.has(dam_api::service::Scope::Read) => {
+                            match st.lib.subscribe(&r.ctx, SubscribeRequest::default()).await {
+                                Ok(s) => stream = s,
+                                Err(_) => break,
+                            }
+                        }
+                        _ => {
+                            let _ = socket.send(Message::Close(None)).await;
+                            break;
+                        }
+                    }
+                    continue; // the in-flight event predates the fresh ceiling — drop it
+                }
                 match serde_json::to_string(&ev) {
                     Ok(txt) => {
                         if socket.send(Message::Text(txt.into())).await.is_err() {
@@ -980,16 +1273,35 @@ async fn ws_loop(mut socket: WebSocket, st: AppState) {
 /// `POST /mcp` — the Streamable-HTTP MCP transport (tech-spec 11 §2.1). The `McpServer` flag is read
 /// live: `Off` ⇒ `404` (route absent, checked *before* auth so a disabled endpoint cannot even be
 /// probed). Otherwise auth is resolved on the shared surface and one JSON-RPC message is dispatched.
+///
+/// A cookie-authenticated call passes the same CSRF gate as any other write: this is a POST that can
+/// reach write tools, and while `SameSite=Strict` already stops a cross-site cookie from riding
+/// along, the double-submit token is the second fence (ADR 0009 §4). Bearer-credentialled agents —
+/// the normal MCP client — are unaffected.
 async fn mcp_http(State(st): State<AppState>, headers: HeaderMap, body: Body) -> Response {
     use dam_api::admin::McpMode;
     let mcp = st.store.mcp_mode();
     if matches!(mcp, McpMode::Off) {
         return ApiError(LibError::NotFound("mcp is disabled".into())).into_response();
     }
-    let ctx = match auth::resolve(&st.store, auth::bearer_header(&headers)) {
-        Ok(c) => c,
+    let resolved = match auth::resolve(
+        &st.store,
+        auth::bearer_header(&headers),
+        auth::cookie_value(&headers, auth::SESSION_COOKIE),
+    ) {
+        Ok(r) => r,
         Err(e) => return ApiError(e).into_response(),
     };
+    if let Some(sess) = &resolved.session {
+        let presented = headers.get(auth::CSRF_HEADER).and_then(|v| v.to_str().ok());
+        if presented != Some(sess.csrf.as_str()) {
+            return ApiError(LibError::Forbidden(
+                "missing or invalid CSRF token (send the login csrf in x-dam-csrf)".into(),
+            ))
+            .into_response();
+        }
+    }
+    let ctx = resolved.ctx;
     let bytes = match axum::body::to_bytes(body, 4 * 1024 * 1024).await {
         Ok(b) => b,
         Err(_) => return ApiError(LibError::BadRequest("body too large".into())).into_response(),

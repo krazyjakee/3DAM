@@ -566,6 +566,55 @@ export type LibraryEvent =
   | ({ type: "job_progress" } & JobStatus)
   | { type: "catalog_reset" }; // whole catalog wiped (maintenance) — drop caches and refetch
 
+// ── user accounts (issue #42) ───────────────────────────────────────────────
+
+/** An account's capability tier: `admin` (everything), `editor` (read+write), `viewer` (read). */
+export type AccountRole = "admin" | "editor" | "viewer";
+
+/** The signed-in account, as `/whoami` and the login/claim replies report it. */
+export interface AccountRef {
+  account_id: string;
+  username: string;
+  role: AccountRole;
+}
+
+/** Public accounts posture — `GET /api/v1/auth/status` (404 while the flag is off). */
+export interface AuthStatus {
+  enabled: boolean;
+  /** No admin account exists yet: the first-run claim screen applies (localhost only). */
+  unclaimed: boolean;
+}
+
+/** First-run claim of the initial admin account — `POST /api/v1/auth/claim`. */
+export interface ClaimRequest {
+  username: string;
+  password: string;
+  display_name?: string | null;
+}
+
+/** Username/password sign-in — `POST /api/v1/auth/login`. */
+export interface LoginRequest {
+  username: string;
+  password: string;
+}
+
+/** Login/claim reply. The session rides an HttpOnly cookie; `csrf` (also mirrored in the readable
+ *  `dam_csrf` cookie) must accompany every non-GET request as the `x-dam-csrf` header. */
+export interface LoginReply {
+  account: AccountRef;
+  csrf: string;
+}
+
+/** One of the caller's live sessions — `GET /api/v1/auth/sessions`. */
+export interface SessionInfo {
+  session_id: string;
+  created: number;
+  last_seen: number;
+  user_agent: string | null;
+  /** The session this request rode in on — revoking it signs this browser out. */
+  current: boolean;
+}
+
 // ── error envelope ──────────────────────────────────────────────────────────
 
 export interface ErrorBody {

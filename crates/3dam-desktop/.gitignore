@@ -1,0 +1,2 @@
+# tauri-build regenerates these schema artifacts on every build
+/gen/

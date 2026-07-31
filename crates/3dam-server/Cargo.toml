@@ -28,6 +28,8 @@ anyhow.workspace = true
 rusqlite.workspace = true
 blake3.workspace = true
 uuid.workspace = true
+# argon2id password hashing for user accounts (phase 6, issue #42).
+argon2.workspace = true
 # serve config file (tech-spec 09 §A.1).
 toml.workspace = true
 

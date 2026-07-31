@@ -20,6 +20,8 @@ pub struct ServeFile {
     pub flags: FlagsBlock,
     #[serde(default)]
     pub resources: ResourcesBlock,
+    #[serde(default)]
+    pub accounts: AccountsBlock,
 }
 
 /// `[resources]` — the good-neighbour knobs (tech-spec 14 §5). Unset values fall back to the
@@ -46,6 +48,15 @@ pub struct ServerBlock {
     /// PEM cert chain + key for in-process TLS (issue #75). Both together enable HTTPS.
     pub tls_cert: Option<std::path::PathBuf>,
     pub tls_key: Option<std::path::PathBuf>,
+    /// Force `Secure` on the session + CSRF cookies even though *this process* speaks plaintext.
+    /// The deployment `docs/DEPLOYMENT.md` recommends terminates TLS in a reverse proxy and talks
+    /// to us over loopback HTTP, so the TLS posture we can observe is `false` while the browser is
+    /// genuinely on HTTPS — without this the 90-day session cookie ships without `Secure`.
+    ///
+    /// Deliberately an **operator opt-in**, not an `X-Forwarded-Proto` sniff: a forwarded header is
+    /// attacker-controlled on any deployment that doesn't strip it, so trusting it would make the
+    /// flag settable by the client. Pairs with `[accounts] require_claim_token`.
+    pub secure_cookies: Option<bool>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -62,6 +73,25 @@ pub struct FlagsBlock {
     /// Serve as a federation peer (phase 6, issue #39): mounts `GET /api/v1/advertise` so other
     /// 3DAM instances can register this one as a federated source. Off by default.
     pub federation: Option<bool>,
+    /// Full user accounts (phase 6, issue #42): login/session auth, groups, sharing. Off by
+    /// default; on raises the effective auth gate to at least `token`.
+    pub user_accounts: Option<bool>,
+}
+
+/// `[accounts]` — the config-plane recovery hatch (ADR 0009 §3, issue #42). Not a flag: it acts
+/// once per boot, not as live-toggleable state.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct AccountsBlock {
+    /// Re-open the first-run claim window this boot, so a lost sole admin can be recovered: the
+    /// next claim from localhost becomes a (new) admin account. Remove it again after recovery.
+    pub reopen_claim: Option<bool>,
+    /// Require the bootstrap owner token for **every** claim, including one from a loopback peer
+    /// (ADR 0014). Behind a same-host reverse proxy every request *is* a loopback peer, so the
+    /// open-claim window would otherwise be reachable from the internet. The claim gate already
+    /// refuses any request carrying a forwarding header, but a proxy that strips them (or one
+    /// speaking a scheme we don't model) leaves no signal — this is the operator's explicit
+    /// "I know I am proxied" switch. Bootstrap-token redemption keeps working either way.
+    pub require_claim_token: Option<bool>,
 }
 
 impl ServeFile {
@@ -101,6 +131,9 @@ impl ServeFile {
         }
         if let Some(f) = self.flags.federation {
             out.push((FlagKey::Federation, FlagValue::Bool(f)));
+        }
+        if let Some(u) = self.flags.user_accounts {
+            out.push((FlagKey::UserAccounts, FlagValue::Bool(u)));
         }
         out
     }

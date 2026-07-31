@@ -29,7 +29,7 @@ with current status. The spec is authoritative; this table just adds where we ar
 <tr><td>3</td><td><strong>Automation</strong> — feature extraction + embeddings, similarity search, auto-tag/categorise, dedup, review UX <span class="sub">The differentiator. Analyze pass (embeddings + tileability/pHash + auto-tag/-category suggestions), embedding-cosine <code>find_similar</code>, exact + near dedup grouping, and the accept/reject suggestion lifecycle all landed CLI-first over the same seam (embedded + <code>--connect</code>). Model-free v1 behind the <code>EmbeddingSpace</code> seam (ADR 0006): SigLIP/CLAP weights are a later feature-gated bump; the web review surface and HNSW-at-scale follow.</span></td><td><span class="pill done">Shipped</span></td></tr>
 <tr><td>4</td><td><strong>Reach</strong> — SFTP + SMB sources, watch/auto-rescan, smart folders, export/manifests, CLI/GUI parity <span class="sub">The <code>FileSource</code> seam now spans local FS, <strong>SFTP</strong> (<code>russh</code>) and <strong>SMB2/3</strong> (pure-Rust <code>smb</code>) behind one <code>open_source</code>/<code>fetch</code> path; delta re-scan skips unchanged files and marks vanished ones absent; <strong>watch/auto-rescan</strong> (local FS events + remote polling) drives delta scans; <strong>smart folders</strong> (live saved queries) and manual collections; and <strong>export/manifests</strong> (JSON/CSV/sidecar, incl. attribution-only). All CLI-first over the same seam, embedded + <code>--connect</code>. Desktop GUI stays phase 5.</span></td><td><span class="pill done">Shipped</span></td></tr>
 <tr><td>5</td><td><strong>Server &amp; web</strong> — <code>LibraryService</code> boundary, <code>3dam serve</code>, <code>3dam mcp</code>, <code>--connect</code>, web client, feature flags + Settings, basic auth <span class="sub">Complete for v1: the runtime feature-flag store + audited <code>/admin/api</code> + web Settings surface, basic access control (anonymous + token auth), and the MCP server (<code>3dam mcp</code> stdio + flag-gated <code>POST /mcp</code>) all landed on the one auth surface. Opt-in <strong>user accounts + OIDC</strong> layer on the same seam in phase 6.</span></td><td><span class="pill done">Shipped</span></td></tr>
-<tr><td>6</td><td><strong>Federation &amp; auth</strong> — 3DAM-server source, federated fan-out + re-rank, cross-peer vector similarity, OIDC/OAuth2, opt-in accounts &amp; roles <span class="sub"><strong>Federation shipped</strong> (#39, #40): the <code>federated</code> source kind — a <code>3dam://</code> peer added behind a flag-gated <code>advertise()</code> handshake (semver protocol negotiation) — with query fan-out at the frozen 2.5&nbsp;s deadline, merge/re-rank + origin tagging + partial flagging (<code>total = None</code>), peer preview/detail proxying with a 7-day local cache, and cross-peer similarity <em>by vector</em> gated on an exact embedding-space match (mismatched spaces are omitted + flagged, never co-ranked). <strong>OIDC/OAuth2 (#41) and opt-in accounts/roles (#42)</strong> remain.</span></td><td><span class="pill active">In progress</span></td></tr>
+<tr><td>6</td><td><strong>Federation &amp; auth</strong> — 3DAM-server source, federated fan-out + re-rank, cross-peer vector similarity, OIDC/OAuth2, opt-in accounts &amp; roles <span class="sub"><strong>Federation shipped</strong> (#39, #40): the <code>federated</code> source kind — a <code>3dam://</code> peer added behind a flag-gated <code>advertise()</code> handshake (semver protocol negotiation) — with query fan-out at the frozen 2.5&nbsp;s deadline, merge/re-rank + origin tagging + partial flagging (<code>total = None</code>), peer preview/detail proxying with a 7-day local cache, and cross-peer similarity <em>by vector</em> gated on an exact embedding-space match (mismatched spaces are omitted + flagged, never co-ranked). <strong>User accounts (#42) shipped</strong>: the <code>user_accounts</code> flag (off by default) brings full login accounts (argon2id, cookie sessions + CSRF + lockout, 14d/90d expiry), the first-run claim — first loopback signup becomes admin (ADR 0014) — fixed <code>admin/editor/viewer</code> roles mapped to scopes, flat groups, and source/collection <strong>sharing</strong> to users or groups, enforced as a visibility predicate inside the engine query path (search, similar, dedup, stats, folders, collections, previews, export, jobs, events all filter through one seam) with a leak-audit test per read path. <strong>OIDC/OAuth2 (#41)</strong> remains.</span></td><td><span class="pill active">In progress</span></td></tr>
 <tr><td>7</td><td><strong>Polish &amp; scale</strong> — performance at 1M assets, accessibility, packaging/distribution for all three OSes</td><td><span class="pill later">Later</span></td></tr>
 <tr><td>8</td><td><strong>Future — asset networks</strong> — peer relay/mesh, instance discovery, trust/reputation (beyond v1)</td><td><span class="pill later">Beyond v1</span></td></tr>
 </tbody>
@@ -77,8 +77,9 @@ fallback, each frontend owns its presentation, native desktop GUI — no webview
   full-page canvas. *(Serves phase 2.)*
 - **Responsive + touch pass** — the web client degrades gracefully to tablet/phone widths (see
   *Mobile & tablet posture*) before it is considered done.
-- **Desktop GUI (egui)** — the native app, reusing the settled interaction patterns and the same
-  engine/API. *(Phase 5 / spec §9 GUI parity.)*
+- **Desktop GUI** — the native app. Built first as an egui client to substantive parity, then
+  replaced by a Tauri webview shell over the embedded web client (ADR 0013) — one UI codebase,
+  parity by construction. *(Phase 5 / spec §9 GUI parity.)*
 
 ### Progress
 
@@ -199,9 +200,8 @@ and read/write/admin scopes gate handlers (writes further gated by the network c
 flags|flag|token|status|audit|maintenance</code>, embedded or <code>--connect</code>) and the web <strong>Settings / Administration</strong>
 surface (grouped flag cards, warn-and-confirm, token management, audit trail, and a <strong>Storage &amp; maintenance</strong>
 section — usage overview, clear thumbnail/3D-preview caches, clear analysis, VACUUM, reset-catalog, and factory-reset,
-all audited and non-destructive to source files). <em>(These maintenance controls are web + CLI today; the native egui
-Settings surface inherits them when the desktop GUI is built — it is still a stub, so the whole Settings area is
-web-only for now.)</em> The <strong>MCP server</strong> (ADR 0003,
+all audited and non-destructive to source files). <em>(The desktop shell renders the same web client
+(ADR 0013), so the Settings surface is native too.)</em> The <strong>MCP server</strong> (ADR 0003,
 hand-rolled JSON-RPC over <code>dyn LibraryService</code> — no subprocess) serves tools/resources/prompts over both
 <code>3dam mcp</code> stdio (locally trusted) and <code>POST /mcp</code> on the shared port; the <code>mcp_server</code>
 flag mounts/unmounts it (<code>Off ⇒ 404</code>) and a <code>WriteGate</code> (bind + flag + caller scope) filters the write
@@ -249,7 +249,7 @@ Most were resolved on 2026-07-06 in [ADR 0008](adr/0008-web-client-stack.md) (we
 - ~~Code signing &amp; notarization.~~ **Unsigned for v1;** revisit post-v1.
 - ~~Distribution channels.~~ **GitHub Releases only for v1** ([ADR 0009 §10](adr/0009-v1-scope-decisions.md)).
 - ~~View-logic sharing web ↔ desktop.~~ **Each frontend owns its presentation over the shared API in v1;** no shared view crate ([ADR 0009 §9](adr/0009-v1-scope-decisions.md)).
-- ~~Desktop GUI embeds a webview.~~ **No** — fully native egui in v1 ([ADR 0009 §9](adr/0009-v1-scope-decisions.md)).
+- ~~Desktop GUI embeds a webview.~~ Originally **no** (fully native egui, [ADR 0009 §9](adr/0009-v1-scope-decisions.md)); **reversed 2026-07-16** — the desktop app is now a Tauri webview over the embedded web client ([ADR 0013](adr/0013-desktop-shell-tauri.md)).
 
 ---
 

@@ -9,7 +9,9 @@ import {
   useQueryClient,
 } from "@tanstack/react-query";
 import { api } from "./client";
+import type { Scope } from "./admin";
 import { bustThumbnails } from "@/lib/thumbnail-cache";
+import { getServer } from "@/lib/server";
 import type {
   AddSource,
   AnalyzeRequest,
@@ -33,6 +35,7 @@ import type {
 /** Stable query-key roots — ws.ts invalidates against these. */
 export const qk = {
   version: ["version"] as const,
+  whoami: ["whoami"] as const,
   assets: ["assets"] as const,
   asset: (id: AssetId) => ["asset", id] as const,
   stats: ["stats"] as const,
@@ -49,6 +52,40 @@ const PAGE_LIMIT = 60;
 
 export function useVersion() {
   return useQuery({ queryKey: qk.version, queryFn: api.version, staleTime: Infinity });
+}
+
+/** Who the current credential is + what it can do (front-door auth). Keyed on the stored token so a
+ *  sign-in / sign-out / token swap refetches automatically (the AuthGate reloads the app on those,
+ *  but keying it makes the hook correct even without a reload). A 401 flips the AuthGate via the
+ *  shared QueryCache handler; we don't retry it. Every server posture reports scopes, so the whole
+ *  UI can gate consistently — an auth-off server grants full trust (all scopes). */
+export function useWhoami() {
+  return useQuery({
+    queryKey: [...qk.whoami, getServer().token],
+    queryFn: api.whoami,
+    staleTime: Infinity,
+    retry: false,
+  });
+}
+
+/** The full-trust scope set — what an auth-off server (or a not-yet-loaded whoami on such a server)
+ *  grants. Every capability. */
+const ALL_SCOPES: Scope[] = ["read", "write", "admin", "mcp_use", "federate"];
+
+/** The caller's current scopes. On an auth-off server (`/whoami` absent/erroring with the local
+ *  owner's full trust) this resolves to every scope, so gating never hides capability the operator
+ *  actually has. While loading it is optimistic (all scopes) to avoid a flash of disabled controls;
+ *  a real read-only token settles it once the query lands. */
+export function useScopes(): Scope[] {
+  const whoami = useWhoami();
+  if (whoami.data) return whoami.data.scopes;
+  // No data yet (loading) or the endpoint 404'd on an older/auth-off server: assume full trust.
+  return ALL_SCOPES;
+}
+
+/** Does the caller hold `scope`? The shared gate for write-action controls (see useScopes). */
+export function useCan(scope: Scope): boolean {
+  return useScopes().includes(scope);
 }
 
 /** The browse grid/table — cursor-paginated infinite scroll (tech-spec 03 §4.1). With a `collection`

@@ -18,12 +18,14 @@ import {
 import { api } from "@/api/client";
 import {
   useAnalyze,
+  useCan,
   useCollections,
   useCollectionMembers,
   useRegenerateThumbnail,
   useRemoveAsset,
 } from "@/api/queries";
 import type { AssetSummary } from "@/api/types";
+import { AUTH_COPY } from "@/lib/auth";
 import { useViewState } from "@/lib/view-state";
 
 export interface MenuState {
@@ -77,6 +79,7 @@ export function ContextMenu({
   const collections = useCollections();
   const members = useCollectionMembers();
   const remove = useRemoveAsset();
+  const canWrite = useCan("write");
   const [submenu, setSubmenu] = useState(false);
   // Removal is a two-step, in-menu confirm (issue #21): the first click reveals Remove / Remove+block.
   const [confirming, setConfirming] = useState(false);
@@ -166,6 +169,8 @@ export function ContextMenu({
       <Item
         icon={<Sparkles size={13} />}
         label={single ? "Reanalyze" : `Reanalyze ${assets.length}`}
+        disabled={!canWrite}
+        title={!canWrite ? AUTH_COPY.needsWrite : undefined}
         onClick={() => run(() => analyze.mutate({ assets: ids, force: true }))}
       />
       {thumbableIds.length > 0 && (
@@ -174,12 +179,16 @@ export function ContextMenu({
           label={
             thumbableIds.length === 1 ? "Regenerate thumbnail" : `Regenerate ${thumbableIds.length} thumbnails`
           }
+          disabled={!canWrite}
+          title={!canWrite ? AUTH_COPY.needsWrite : undefined}
           onClick={() => run(() => regenerateThumbnail.mutate(thumbableIds))}
         />
       )}
       <Item
         icon={<FileCog size={13} />}
         label={single ? "Convert…" : `Convert ${assets.length}…`}
+        disabled={!canWrite}
+        title={!canWrite ? AUTH_COPY.needsWrite : undefined}
         onClick={() => run(() => onConvert(assets))}
       />
 
@@ -193,6 +202,8 @@ export function ContextMenu({
           icon={<FolderPlus size={13} />}
           label="Add to collection"
           chevron
+          disabled={!canWrite}
+          title={!canWrite ? AUTH_COPY.needsWrite : undefined}
           onClick={() => setSubmenu((s) => !s)}
         />
         {submenu && (
@@ -258,8 +269,10 @@ export function ContextMenu({
         <button
           type="button"
           role="menuitem"
+          disabled={!canWrite}
+          title={!canWrite ? AUTH_COPY.needsWrite : undefined}
           onClick={() => setConfirming(true)}
-          className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-danger hover:bg-danger/10 coarse:min-h-11"
+          className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-danger hover:bg-danger/10 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent coarse:min-h-11"
         >
           <span className="flex w-4 shrink-0 justify-center">
             <Trash2 size={13} />
@@ -276,18 +289,24 @@ function Item({
   label,
   onClick,
   chevron,
+  disabled,
+  title,
 }: {
   icon?: React.ReactNode;
   label: string;
   onClick: () => void;
   chevron?: boolean;
+  disabled?: boolean;
+  title?: string;
 }) {
   return (
     <button
       type="button"
       role="menuitem"
       onClick={onClick}
-      className="flex w-full items-center gap-2 px-3 py-1.5 text-left hover:bg-surface-2 hover:text-fg coarse:min-h-11"
+      disabled={disabled}
+      title={title}
+      className="flex w-full items-center gap-2 px-3 py-1.5 text-left hover:bg-surface-2 hover:text-fg disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-fg-muted coarse:min-h-11"
     >
       <span className="flex w-4 shrink-0 justify-center text-fg-dim">{icon}</span>
       <span className="flex-1 truncate">{label}</span>

@@ -7,7 +7,7 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 import type React from "react";
 import { X } from "lucide-react";
-import { useFocusTrap } from "./use-focus-trap";
+import { useEscape, useFocusTrap } from "./use-focus-trap";
 
 export interface ConfirmOpts {
   title: string;
@@ -89,14 +89,6 @@ function Overlay({ children, onClose }: { children: React.ReactNode; onClose: ()
       {children}
     </div>
   );
-}
-
-function useEscape(onEscape: () => void) {
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onEscape();
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onEscape]);
 }
 
 /**

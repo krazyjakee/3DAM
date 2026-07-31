@@ -132,6 +132,54 @@ pub(crate) fn escape_like(s: &str) -> String {
         .replace('_', "\\_")
 }
 
+/// Append the visibility ceiling (tech-spec 10 §4.3, issue #42) as a WHERE predicate: the asset
+/// must live in a readable source **or** be a member of a readable (shared, manual) collection.
+/// `alias` names the asset table in the enclosing statement (`"asset"` or `"a"`). `Full` appends
+/// nothing; an empty reachable set appends `0=1` so the result is honestly empty, not unfiltered.
+/// This is *the* enforcement point — every read query composes it, so no handler can forget it.
+pub(crate) fn push_visibility(
+    vis: &Visibility,
+    alias: &str,
+    where_sql: &mut String,
+    binds: &mut Vec<Value>,
+) {
+    let Some(scope) = vis.restricted() else {
+        return;
+    };
+    if scope.sources.is_empty() && scope.collections.is_empty() {
+        where_sql.push_str(" AND 0=1");
+        return;
+    }
+    let mut arms: Vec<String> = Vec::new();
+    if !scope.sources.is_empty() {
+        let ph = scope
+            .sources
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        arms.push(format!("{alias}.source_id IN ({ph})"));
+        for s in &scope.sources {
+            binds.push(Value::Blob(s.as_bytes().to_vec()));
+        }
+    }
+    if !scope.collections.is_empty() {
+        let ph = scope
+            .collections
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        arms.push(format!(
+            "{alias}.id IN (SELECT asset_id FROM collection_member WHERE collection_id IN ({ph}))"
+        ));
+        for c in &scope.collections {
+            binds.push(Value::Blob(c.as_bytes().to_vec()));
+        }
+    }
+    where_sql.push_str(&format!(" AND ({})", arms.join(" OR ")));
+}
+
 /// Build the shared `WHERE` clause (FTS text match + facet filters) and its bind values from a query
 /// request — the common prefix of both `query_assets` (paged) and `query_asset_ids` (unbounded).
 ///
@@ -142,9 +190,11 @@ pub(crate) fn escape_like(s: &str) -> String {
 pub(crate) fn build_where(
     req: &QueryRequest,
     syn: &crate::search::SynonymMap,
+    vis: &Visibility,
 ) -> Result<(String, Vec<Value>), LibError> {
     let mut where_sql = String::from(" WHERE 1=1");
     let mut binds: Vec<Value> = Vec::new();
+    push_visibility(vis, "asset", &mut where_sql, &mut binds);
     if let Some(text) = req.text.as_ref().filter(|t| !t.is_empty()) {
         if let Some(m) = crate::search::fts_match_expr(text, syn) {
             where_sql.push_str(
@@ -579,12 +629,15 @@ mod tests {
                 ..Default::default()
             };
             let syn = crate::search::SynonymMap::default();
-            let (where_sql, binds) = match build_where(&req, &syn) {
+            let (where_sql, binds) = match build_where(&req, &syn, &Visibility::Full) {
                 Ok(v) => v,
                 Err(e) => panic!("filter on {field:?} failed to build: {e:?}"),
             };
             assert!(
-                !matches!(build_where(&req, &syn), Err(LibError::Unsupported(_))),
+                !matches!(
+                    build_where(&req, &syn, &Visibility::Full),
+                    Err(LibError::Unsupported(_))
+                ),
                 "filter on {field:?} is Unsupported"
             );
             // Prove the SQL is executable against the real schema (both the JOINed page query and

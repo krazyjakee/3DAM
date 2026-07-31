@@ -28,7 +28,7 @@ The `3dam` binary dispatches on its first argument — no separate installs, no 
 
 | Invocation        | Role                                                              |
 | ----------------- | ---------------------------------------------------------------- |
-| `3dam` (no arg)   | **GUI** — native desktop shell (egui) *(stub today — see Status)* |
+| `3dam` (no arg)   | **GUI** — native desktop shell (Tauri webview over the web client)   |
 | `3dam serve`      | **HTTP/WS server** + embedded web client + MCP endpoint          |
 | `3dam mcp`        | **MCP server** over stdio                                        |
 | anything else     | **CLI** — run-and-exit (`scan`, `search`, `convert`, …)          |
@@ -40,8 +40,8 @@ no code change.
 
 ## Status
 
-The engine, CLI, and web client are working; the native GUI and headless renderer are
-stubs. Shipped so far (capability phases 1–5 of the [product spec](docs/PRODUCT_SPEC.md)
+The engine, CLI, web client, native desktop shell, and headless renderer are all
+working. Shipped so far (capability phases 1–5 of the [product spec](docs/PRODUCT_SPEC.md)
 §9):
 
 - **Catalog** — SQLite catalog with forward-only migrations, sources, jobs, collections, tags.
@@ -50,11 +50,13 @@ stubs. Shipped so far (capability phases 1–5 of the [product spec](docs/PRODUC
 - **Reach** — SFTP and SMB file sources behind a `FileSource` seam, delta scan + watch/auto-rescan, smart-folder saved queries, export manifests.
 - **Server & web** — axum REST + WebSocket API, embedded React web client, runtime feature flags, token auth + scopes, MCP.
 
-Not yet real: the **native egui GUI** (`crates/3dam-gui` is a ~14-line stub — the web
-client is the only live UI today, by design) and the **headless wgpu renderer**
-(`crates/3dam-render`). Embeddings are **model-free v1** vectors behind the
-`EmbeddingSpace` seam; SigLIP/CLAP model-backed extractors are a later feature-gated bump.
-See [`docs/ROADMAP.md`](docs/ROADMAP.md) for status against the spec.
+The **desktop app** (`crates/3dam-desktop`) is a Tauri webview shell over the same
+embedded web client the server ships ([ADR 0013](docs/adr/0013-desktop-shell-tauri.md)) —
+one UI codebase, so web ↔ native parity is structural. The **headless wgpu renderer**
+(`crates/3dam-render`) produces textured-PBR turntable thumbnails for 3D assets.
+Embeddings are **model-free v1** vectors behind the `EmbeddingSpace` seam; SigLIP/CLAP
+model-backed extractors are a later feature-gated bump. See
+[`docs/ROADMAP.md`](docs/ROADMAP.md) for status against the spec.
 
 ## Install
 
@@ -70,8 +72,19 @@ cargo build -p dam --release
 
 The binary lands at `target/release/3dam`. A native-only build skips the wasm-only viewer
 deps; `wasm-pack` (WASM viewer) and `pnpm` (web client) are optional and only needed for a
-complete `serve` with the live web UI. Linux GUI/audio builds need the usual system libs
-(GTK, xkbcommon, wayland, xcb, ALSA, ssl/pkg-config).
+complete `serve` (and desktop shell) with the live web UI. Linux builds need the usual system
+libs (GTK3 + webkit2gtk-4.1 for the Tauri desktop shell, ssl/pkg-config).
+
+### Package the desktop app (deb / AppImage)
+
+```sh
+cargo install tauri-cli --version '^2'   # one-time; xtask skips gracefully without it
+cargo xtask bundle
+```
+
+This builds the web client, then the release `3dam` binary, then runs the Tauri bundler
+against it (config in `crates/3dam-desktop/tauri.conf.json`). Bundles land under
+`target/release/bundle/`. The AppImage target additionally needs `librsvg2-dev` installed.
 
 ## Quick start
 
@@ -182,6 +195,7 @@ cargo clippy --all-targets -- -D warnings     # lint
 cargo xtask ci                                # the canonical pre-push gate (fmt + clippy + tests + web build)
 cargo xtask web                               # build the React client → web/dist/
 cargo xtask wasm                              # wasm-pack build the dam-viewer islands
+cargo xtask bundle                            # package the desktop app (deb/AppImage via tauri-cli)
 ```
 
 The crate layout, seams, and data model are documented in
@@ -192,10 +206,9 @@ The crate layout, seams, and data model are documented in
 
 Issues and PRs welcome. Good first targets:
 
-- flesh out the native egui GUI (`crates/3dam-gui`) toward web-client parity
+- native desktop affordances in the Tauri shell (`crates/3dam-desktop`): folder pickers, tray, OS integration
 - new `FileSource` backends (S3, peers) behind the existing `open_source()` seam
 - additional media handlers or convert targets in `dam-media`
-- the headless wgpu renderer (`crates/3dam-render`)
 
 The spec is the single source of truth: [`docs/PRODUCT_SPEC.md`](docs/PRODUCT_SPEC.md) §9
 is the authoritative roadmap, and [`docs/ROADMAP.md`](docs/ROADMAP.md) tracks status

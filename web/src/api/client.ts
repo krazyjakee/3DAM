@@ -46,7 +46,7 @@ import type {
   ErrorBody,
 } from "./types";
 
-import { authHeaders, mediaUrl, resolveUrl } from "@/lib/server";
+import { authHeaders, csrfHeaders, mediaUrl, resolveUrl } from "@/lib/server";
 
 const API = "/api/v1";
 
@@ -93,6 +93,8 @@ async function send<T>(method: string, path: string, body?: unknown): Promise<T>
         "content-type": "application/json",
         accept: "application/json",
         ...authHeaders(),
+        // Cookie-session callers (user accounts) must CSRF-stamp every mutation; harmless otherwise.
+        ...csrfHeaders(),
       },
       body: body === undefined ? undefined : JSON.stringify(body),
     }),
@@ -103,13 +105,40 @@ export interface VersionInfo {
   api: string;
   server: string;
   capabilities: string[];
-  /** The server's auth posture — lets the AuthGate render a login before provoking 401s.
-   *  Absent on older servers (treated as "off"). */
+  /** The server's *effective* auth posture — lets the AuthGate render a login before provoking
+   *  401s. Accounts-on forces at least "token". Absent on older servers (treated as "off"). */
   auth?: import("./admin").AuthMode;
+  /** User accounts are enabled (issue #42): the gate offers username/password sign-in. */
+  accounts?: boolean;
+  /** The first-run claim window is open: either no account exists yet, or the operator re-opened
+   *  it from the config file to recover a lost sole admin. */
+  unclaimed?: boolean;
+  /** How many accounts exist. Distinguishes a genuinely un-claimed instance (0 — the claim screen
+   *  is the only thing to show) from a re-opened window (>0 — existing users can still sign in, so
+   *  the login screen stays primary and the claim form is a secondary path). */
+  account_count?: number;
+}
+
+/** Who the current credential (bearer token or session cookie) resolves to, and what it can do
+ *  (front-door auth). Drives the scope-aware UI: write controls disable without `write`, the
+ *  Settings link hides without `admin`. In token mode a missing/invalid credential 401s (the
+ *  AuthGate owns that); anonymous mode reports the anonymous caller's scopes. */
+export interface WhoAmI {
+  identity: string | null;
+  scopes: import("./admin").Scope[];
+  anonymous: boolean;
+  /** The signed-in user account, when the credential is an account session (issue #42). */
+  account?: import("./types").AccountRef | null;
+  /** Sharing rules scope this caller's view — some catalog content may be hidden. */
+  restricted?: boolean;
 }
 
 export const api = {
   version: () => get<VersionInfo>("/api/version"),
+
+  /** The current token's identity + scopes (front-door auth). Under token mode a missing/invalid
+   *  token 401s here (the AuthGate handles it); anonymous mode returns the anonymous scopes. */
+  whoami: () => get<WhoAmI>(`${API}/whoami`),
 
   // browse / search
   query: (req: QueryRequest) => send<Page<AssetSummary>>("POST", `${API}/query`, req),

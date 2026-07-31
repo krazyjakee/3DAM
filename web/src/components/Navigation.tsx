@@ -18,6 +18,7 @@ import {
   Pencil,
   RefreshCw,
   Settings as SettingsIcon,
+  Share2,
   Sparkles,
   Star,
   Sun,
@@ -34,8 +35,12 @@ import {
   useScan,
   useSources,
   useStats,
+  useVersion,
 } from "@/api/queries";
+import { useCan } from "@/api/queries";
+import type { ShareResource } from "@/api/admin";
 import { useConnection } from "@/api/connection";
+import { useWriteGate, type WriteGate } from "@/lib/write-gate";
 import type {
   Collection,
   FacetField,
@@ -50,6 +55,7 @@ import { useDialogs } from "@/lib/dialogs";
 import { useTheme, type ThemePref } from "@/lib/theme";
 import { AddSourceDialog } from "./AddSourceDialog";
 import { FolderTree } from "./FolderTree";
+import { ShareDialog } from "./ShareDialog";
 
 const MEDIA: { key: MediaType; label: string; Icon: typeof AudioLines }[] = [
   { key: "audio", label: "Audio", Icon: AudioLines },
@@ -190,7 +196,18 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
   const removeSource = useRemoveSource();
   const conn = useConnection();
   const { confirm } = useDialogs();
+  const { gate } = useWriteGate();
+  const canAdmin = useCan("admin");
   const [showAdd, setShowAdd] = useState(false);
+  // Sharing (user accounts, issue #42): the Share… affordance is admin-only and needs the
+  // `user_accounts` flag on — /api/version already reports it, so no extra query.
+  const accountsOn = useVersion().data?.accounts === true;
+  const canShare = canAdmin && accountsOn;
+  const [share, setShare] = useState<{
+    resource: ShareResource;
+    id: string;
+    name: string;
+  } | null>(null);
 
   const total = stats.data?.total ?? 0;
   const byMedia = stats.data?.by_media ?? {};
@@ -210,20 +227,24 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
           </div>
         </div>
         <button
-          className="btn ml-auto px-1.5 py-1 coarse:min-h-11 coarse:min-w-11 coarse:justify-center"
-          title="Analyze library (embeddings, similarity, auto-tags)"
+          className="btn ml-auto px-1.5 py-1 disabled:opacity-40 coarse:min-h-11 coarse:min-w-11 coarse:justify-center"
           aria-label="Analyze library"
           onClick={() => analyze.mutate({})}
-          disabled={analyze.isPending}
+          {...gate({
+            disabled: analyze.isPending,
+            title: "Analyze library (embeddings, similarity, auto-tags)",
+          })}
         >
           <Sparkles size={13} className={analyze.isPending ? "animate-pulse" : ""} />
         </button>
         <button
-          className="btn px-1.5 py-1 coarse:min-h-11 coarse:min-w-11 coarse:justify-center"
-          title="Quick rescan — changed files only (all sources)"
+          className="btn px-1.5 py-1 disabled:opacity-40 coarse:min-h-11 coarse:min-w-11 coarse:justify-center"
           aria-label="Quick rescan all sources (changed files only)"
           onClick={() => scan.mutate({ mode: "delta" })}
-          disabled={scan.isPending}
+          {...gate({
+            disabled: scan.isPending,
+            title: "Quick rescan — changed files only (all sources)",
+          })}
         >
           <RefreshCw size={13} className={scan.isPending ? "animate-spin" : ""} />
         </button>
@@ -315,9 +336,10 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
           Sources
         </span>
         <button
-          className="flex items-center justify-center text-fg-dim hover:text-accent coarse:min-h-11 coarse:min-w-11"
-          title="Add source"
+          className="flex items-center justify-center text-fg-dim hover:text-accent disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:text-fg-dim coarse:min-h-11 coarse:min-w-11"
+          aria-label="Add source"
           onClick={() => setShowAdd(true)}
+          {...gate({ title: "Add source" })}
         >
           <FolderPlus size={14} />
         </button>
@@ -336,12 +358,22 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
         <SourceRow
           key={s.id}
           source={s}
+          gate={gate}
           active={state.source === s.id && !state.path && !state.collection}
           removing={removeSource.isPending && removeSource.variables === s.id}
           onNavigate={onNavigate}
           onSelect={() =>
             // Selecting the source row means the whole source — drop any folder scope (issue #66).
             go({ source: state.source === s.id ? null : s.id, path: null, collection: null })
+          }
+          onShare={
+            // A federated peer source can be shared in the data model but grants nothing: the
+            // engine skips the peer path for any restricted context, so the grantee would get a
+            // sidebar entry with a real count over a permanently empty grid. The server rejects
+            // such a share; don't offer it here either (issue #42).
+            canShare && s.kind !== "federated"
+              ? () => setShare({ resource: "source", id: s.id, name: s.name })
+              : undefined
           }
           onRescan={() => scan.mutate({ sources: [s.id], mode: "delta" })}
           onRemove={async () => {
@@ -368,6 +400,14 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
 
       {/* collections & smart folders (phase 4) */}
       <Collections
+        gate={gate}
+        onShare={
+          // Smart folders are excluded inside `Collections` (their membership is a live query with
+          // no rows to grant) — see the `onShare` guard on each row.
+          canShare
+            ? (c) => setShare({ resource: "collection", id: c.id, name: c.name })
+            : undefined
+        }
         activeId={state.collection}
         onSelect={(id) =>
           go({
@@ -402,15 +442,35 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
       >
         <Ban size={14} /> Rescan blocklist
       </Link>
-      {/* Admin / Settings surface (tech-spec 09 §B.4). */}
-      <Link
-        to="/settings"
-        onClick={onNavigate}
-        className="flex items-center gap-2 border-t border-border px-3 py-2 text-xs text-fg-dim hover:text-accent coarse:min-h-11"
-      >
-        <SettingsIcon size={14} /> Settings &amp; Administration
-      </Link>
+      {/* Admin / Settings surface (tech-spec 09 §B.4). Gated on the admin scope: a non-admin has
+          nothing to do there (every action 403s), so show it disabled-with-reason rather than a
+          dead-end link. */}
+      {canAdmin ? (
+        <Link
+          to="/settings"
+          onClick={onNavigate}
+          className="flex items-center gap-2 border-t border-border px-3 py-2 text-xs text-fg-dim hover:text-accent coarse:min-h-11"
+        >
+          <SettingsIcon size={14} /> Settings &amp; Administration
+        </Link>
+      ) : (
+        <span
+          className="flex cursor-not-allowed items-center gap-2 border-t border-border px-3 py-2 text-xs text-fg-dim opacity-40 coarse:min-h-11"
+          title="Requires an admin token"
+          aria-disabled="true"
+        >
+          <SettingsIcon size={14} /> Settings &amp; Administration
+        </span>
+      )}
       {showAdd && <AddSourceDialog onClose={() => setShowAdd(false)} />}
+      {share && (
+        <ShareDialog
+          resource={share.resource}
+          resourceId={share.id}
+          resourceName={share.name}
+          onClose={() => setShare(null)}
+        />
+      )}
     </nav>
   );
 }
@@ -454,11 +514,16 @@ function Count({ n, loading = false }: { n: number; loading?: boolean }) {
  *  saved query (set via the CLI in v1) and is shown read-only with a Sparkles marker. Adding assets
  *  to a manual collection happens per-asset in the Inspector (batch add lands with multi-select). */
 function Collections({
+  gate,
   activeId,
   onSelect,
+  onShare,
 }: {
+  gate: WriteGate["gate"];
   activeId: string | null;
   onSelect: (id: string | null) => void;
+  /** Open the sharing dialog for a collection (admin + accounts flag on); undefined hides it. */
+  onShare?: (c: Collection) => void;
 }) {
   const collections = useCollections();
   const create = useCreateCollection();
@@ -479,11 +544,10 @@ function Collections({
           Collections
         </span>
         <button
-          className="flex items-center justify-center text-fg-dim hover:text-accent coarse:min-h-11 coarse:min-w-11"
-          title="New collection"
+          className="flex items-center justify-center text-fg-dim hover:text-accent disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:text-fg-dim coarse:min-h-11 coarse:min-w-11"
           aria-label="New collection"
           onClick={onCreate}
-          disabled={create.isPending}
+          {...gate({ disabled: create.isPending, title: "New collection" })}
         >
           <FolderPlus size={14} />
         </button>
@@ -500,7 +564,12 @@ function Collections({
         <CollectionRow
           key={c.id}
           collection={c}
+          gate={gate}
           active={activeId === c.id}
+          // A smart folder's membership is a live query, and a collection grant expands only
+          // through stored `collection_member` rows — so sharing one would grant nothing at all.
+          // The server rejects it; the affordance is absent rather than a button that errors.
+          onShare={onShare && c.kind !== "smart" ? () => onShare(c) : undefined}
           onSelect={() => onSelect(activeId === c.id ? null : c.id)}
           onRename={async () => {
             const name = (
@@ -529,16 +598,21 @@ function Collections({
 
 function CollectionRow({
   collection,
+  gate,
   active,
   onSelect,
   onRename,
   onDelete,
+  onShare,
 }: {
   collection: Collection;
+  gate: WriteGate["gate"];
   active: boolean;
   onSelect: () => void;
   onRename: () => void;
   onDelete: () => void;
+  /** Sharing (issue #42) — present only for admins with the accounts flag on. */
+  onShare?: () => void;
 }) {
   const smart = collection.kind === "smart";
   return (
@@ -568,20 +642,31 @@ function CollectionRow({
         )}
       </button>
       <div className="hidden items-center gap-1 group-hover:flex coarse:flex">
+        {/* Sharing (issue #42): admin-only, so it bypasses the write gate — an admin always may. */}
+        {onShare && (
+          <button
+            className="flex items-center justify-center text-fg-dim hover:text-accent coarse:min-h-11 coarse:min-w-11"
+            aria-label={`Share collection ${collection.name}`}
+            title="Share…"
+            onClick={onShare}
+          >
+            <Share2 size={12} />
+          </button>
+        )}
         {/* Renaming a smart folder is fine; its query is edited via the CLI in v1. */}
         <button
-          className="flex items-center justify-center text-fg-dim hover:text-accent coarse:min-h-11 coarse:min-w-11"
-          title="Rename"
+          className="flex items-center justify-center text-fg-dim hover:text-accent disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:text-fg-dim coarse:min-h-11 coarse:min-w-11"
           aria-label={`Rename collection ${collection.name}`}
           onClick={onRename}
+          {...gate({ title: "Rename" })}
         >
           <Pencil size={12} />
         </button>
         <button
-          className="flex items-center justify-center text-fg-dim hover:text-danger coarse:min-h-11 coarse:min-w-11"
-          title="Delete"
+          className="flex items-center justify-center text-fg-dim hover:text-danger disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:text-fg-dim coarse:min-h-11 coarse:min-w-11"
           aria-label={`Delete collection ${collection.name}`}
           onClick={onDelete}
+          {...gate({ title: "Delete" })}
         >
           <Trash2 size={12} />
         </button>
@@ -592,19 +677,24 @@ function CollectionRow({
 
 function SourceRow({
   source,
+  gate,
   active,
   removing,
   onSelect,
   onRescan,
   onRemove,
+  onShare,
   onNavigate,
 }: {
   source: SourceInfo;
+  gate: WriteGate["gate"];
   active: boolean;
   removing: boolean;
   onSelect: () => void;
   onRescan: () => void;
   onRemove: () => void;
+  /** Sharing (issue #42) — present only for admins with the accounts flag on. */
+  onShare?: () => void;
   onNavigate?: () => void;
 }) {
   const scanning = source.state === "scanning";
@@ -682,21 +772,32 @@ function SourceRow({
       </button>
       {/* Hover-reveal under a mouse; always visible on touch, where there is no hover. */}
       <div className="hidden items-center gap-1 group-hover:flex coarse:flex">
-        {!peer && (
+        {/* Sharing (issue #42): admin-only, so it bypasses the write gate — an admin always may. */}
+        {onShare && (
           <button
             className="flex items-center justify-center text-fg-dim hover:text-accent coarse:min-h-11 coarse:min-w-11"
-            title="Quick rescan — changed files only (full re-scan lives in Settings)"
+            aria-label={`Share source ${source.name}`}
+            title="Share…"
+            onClick={onShare}
+          >
+            <Share2 size={12} />
+          </button>
+        )}
+        {!peer && (
+          <button
+            className="flex items-center justify-center text-fg-dim hover:text-accent disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:text-fg-dim coarse:min-h-11 coarse:min-w-11"
             aria-label="Quick rescan this source (changed files only)"
             onClick={onRescan}
+            {...gate({ title: "Quick rescan — changed files only (full re-scan lives in Settings)" })}
           >
             <RefreshCw size={12} className={scanning ? "animate-spin" : ""} />
           </button>
         )}
         <button
-          className="flex items-center justify-center text-fg-dim hover:text-danger disabled:opacity-40 coarse:min-h-11 coarse:min-w-11"
-          title="Remove"
+          className="flex items-center justify-center text-fg-dim hover:text-danger disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:text-fg-dim coarse:min-h-11 coarse:min-w-11"
+          aria-label="Remove source"
           onClick={onRemove}
-          disabled={removing}
+          {...gate({ disabled: removing, title: "Remove" })}
         >
           <Trash2 size={12} className={removing ? "animate-pulse" : ""} />
         </button>

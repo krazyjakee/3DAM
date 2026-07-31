@@ -5,7 +5,8 @@
 
 import { Link } from "react-router-dom";
 import { Ban, RotateCcw } from "lucide-react";
-import { useBlocklist, useUnblock } from "@/api/queries";
+import { useBlocklist, useCan, useUnblock } from "@/api/queries";
+import { AUTH_COPY } from "@/lib/auth";
 import { relTime } from "@/lib/format";
 import { CenteredCard } from "@/lib/ui";
 import type { BlockEntry } from "@/api/types";
@@ -13,6 +14,7 @@ import type { BlockEntry } from "@/api/types";
 export function Blocklist() {
   const list = useBlocklist();
   const unblock = useUnblock();
+  const canWrite = useCan("write");
   const data = list.data ?? [];
 
   return (
@@ -49,7 +51,13 @@ export function Blocklist() {
       ) : (
         <ul className="flex flex-col divide-y divide-border rounded border border-border">
           {data.map((e) => (
-            <Row key={e.hash} entry={e} onUnblock={() => unblock.mutate(e.hash)} busy={unblock.isPending} />
+            <Row
+              key={e.hash}
+              entry={e}
+              onUnblock={() => unblock.mutate(e.hash)}
+              busy={unblock.isPending}
+              canWrite={canWrite}
+            />
           ))}
         </ul>
       )}
@@ -61,10 +69,12 @@ function Row({
   entry,
   onUnblock,
   busy,
+  canWrite,
 }: {
   entry: BlockEntry;
   onUnblock: () => void;
   busy: boolean;
+  canWrite: boolean;
 }) {
   return (
     <li className="flex items-center gap-3 px-3 py-2">
@@ -82,9 +92,13 @@ function Row({
       <button
         type="button"
         onClick={onUnblock}
-        disabled={busy}
-        className="btn flex shrink-0 items-center gap-1.5"
-        title="Lift the block so a later scan can re-import this content"
+        disabled={busy || !canWrite}
+        className="btn flex shrink-0 items-center gap-1.5 disabled:cursor-not-allowed disabled:opacity-40"
+        title={
+          !canWrite
+            ? AUTH_COPY.needsWrite
+            : "Lift the block so a later scan can re-import this content"
+        }
       >
         <RotateCcw size={13} /> Unblock
       </button>
