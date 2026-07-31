@@ -45,6 +45,9 @@ pub struct NewAsset {
 /// content hash that keys the extractor cache (tech-spec 05 §7.1). Produced by [`Store::list_analysis_targets`].
 pub struct AnalysisTarget {
     pub id: AssetId,
+    /// The source this asset belongs to — attribution for the `AssetChanged` event the pass emits per
+    /// analysed asset, and for the analyse job's own `sources` set (issue #42).
+    pub source_id: SourceId,
     /// Absolute source root the relative `path` joins onto.
     pub source_uri: String,
     pub path: String,

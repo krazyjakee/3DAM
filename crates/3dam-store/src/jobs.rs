@@ -5,24 +5,31 @@ use crate::helpers::*;
 impl Store {
     // ── jobs ───────────────────────────────────────────────────────────────
 
+    /// Create a queued job. `sources` records every source the job will touch — the attribution a
+    /// visibility ceiling is evaluated against (issue #42). Pass the *full* set: a job is observable
+    /// by a restricted identity only when all of it is reachable, so an under-recorded job hides
+    /// itself rather than leaking the paths of a source that was left out.
     pub fn create_job(
         &self,
         kind: JobKind,
         params_json: &str,
         total: Option<u64>,
+        sources: &[SourceId],
     ) -> Result<JobId, LibError> {
         let id = JobId::new();
         let now = now_ms();
+        let sources_json = encode_job_sources(sources);
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO job (id, kind, state, params, progress, done, total, created_at, updated_at)
-             VALUES (?1, ?2, 'queued', ?3, 0, 0, ?4, ?5, ?5)",
+            "INSERT INTO job (id, kind, state, params, progress, done, total, created_at, updated_at, sources)
+             VALUES (?1, ?2, 'queued', ?3, 0, 0, ?4, ?5, ?5, ?6)",
             params![
                 id.as_bytes().to_vec(),
                 job_kind_str(kind),
                 params_json,
                 total.map(|t| t as i64),
                 now,
+                sources_json,
             ],
         )
         .map_err(internal)?;
@@ -82,7 +89,7 @@ impl Store {
     pub fn get_job(&self, id: &JobId) -> Result<JobStatus, LibError> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT id, kind, state, done, total, current, error FROM job WHERE id = ?1",
+            "SELECT id, kind, state, done, total, current, error, sources FROM job WHERE id = ?1",
             params![id.as_bytes().to_vec()],
             Self::row_to_job,
         )
@@ -91,13 +98,19 @@ impl Store {
         .ok_or_else(|| LibError::NotFound(format!("job {id}")))
     }
 
-    pub fn list_jobs(&self, req: &JobListRequest) -> Result<Page<JobStatus>, LibError> {
+    /// List jobs newest-first, filtered to what `vis` may observe. A job outside the ceiling is
+    /// simply absent — the same "unreachable reads as nonexistent" rule the asset queries follow.
+    pub fn list_jobs(
+        &self,
+        req: &JobListRequest,
+        vis: &Visibility,
+    ) -> Result<Page<JobStatus>, LibError> {
         let limit = req.page.clamped(QUERY_MAX_LIMIT);
         let offset = decode_offset(req.page.after.as_ref())?;
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT id, kind, state, done, total, current, error FROM job
+                "SELECT id, kind, state, done, total, current, error, sources FROM job
                  ORDER BY created_at DESC LIMIT ? OFFSET ?",
             )
             .map_err(internal)?;
@@ -109,7 +122,7 @@ impl Store {
             let job = r.map_err(internal)?;
             let keep_kind = req.kinds.is_empty() || req.kinds.contains(&job.kind);
             let keep_state = req.state.map(|s| s == job.state).unwrap_or(true);
-            if keep_kind && keep_state {
+            if keep_kind && keep_state && vis.allows_job(&job) {
                 items.push(job);
             }
         }
@@ -129,6 +142,7 @@ impl Store {
         let total: Option<i64> = r.get(4)?;
         let current: Option<String> = r.get(5)?;
         let error: Option<String> = r.get(6)?;
+        let sources: Option<String> = r.get(7)?;
         Ok(JobStatus {
             id,
             kind: parse_job_kind(&kind_s),
@@ -139,8 +153,30 @@ impl Store {
                 current,
             },
             error,
+            sources: decode_job_sources(sources.as_deref()),
         })
     }
+}
+
+/// Job source attribution ↔ the `job.sources` TEXT column: a JSON array of canonical uuid strings.
+/// JSON rather than a join table because the set is tiny, write-once at job creation, and only ever
+/// read whole.
+fn encode_job_sources(sources: &[SourceId]) -> String {
+    let ids: Vec<String> = sources.iter().map(|s| s.to_string()).collect();
+    serde_json::to_string(&ids).unwrap_or_else(|_| "[]".into())
+}
+
+/// Decode `job.sources`. NULL (a pre-V9 row) and anything unparseable read back as empty — the
+/// unattributed case, which `Visibility::allows_job` treats as observable only at `Full`.
+fn decode_job_sources(raw: Option<&str>) -> Vec<SourceId> {
+    let Some(raw) = raw else {
+        return Vec::new();
+    };
+    serde_json::from_str::<Vec<String>>(raw)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|s| s.parse().ok())
+        .collect()
 }
 
 fn job_kind_str(k: JobKind) -> &'static str {

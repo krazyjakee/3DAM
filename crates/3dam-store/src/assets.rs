@@ -249,6 +249,22 @@ impl Store {
         }
     }
 
+    /// Just the source an asset belongs to — a one-column point read, no attribute joins.
+    ///
+    /// Exists so an event emitter can attribute an `AssetChanged`/`AssetRemoved` without paying for
+    /// a whole [`Self::get_asset`], and so a *removal* can capture the source **before** the row
+    /// disappears (issue #42). `None` for an unknown id.
+    pub fn asset_source(&self, id: &AssetId) -> Result<Option<SourceId>, LibError> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT source_id FROM asset WHERE id = ?1",
+            params![id.as_bytes().to_vec()],
+            |r| Ok(blob_to_source_id(&r.get::<_, Vec<u8>>(0)?)),
+        )
+        .optional()
+        .map_err(internal)
+    }
+
     pub fn get_asset(&self, id: &AssetId) -> Result<Asset, LibError> {
         let conn = self.conn.lock().unwrap();
         let asset = conn
@@ -334,6 +350,7 @@ impl Store {
             origin: Origin::Local,
             key_attrs: SmallMap::new(),
             favorite: flags & crate::helpers::FAVORITE_FLAG != 0,
+            source_id: Some(source_id),
         };
         Ok(Asset {
             summary,

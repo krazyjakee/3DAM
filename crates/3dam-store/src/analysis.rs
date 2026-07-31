@@ -16,7 +16,7 @@ impl Store {
     ) -> Result<Vec<AnalysisTarget>, LibError> {
         let conn = self.conn.lock().unwrap();
         let mut sql = String::from(
-            "SELECT a.id, s.connection, a.path, a.media_type, a.format, a.content_hash
+            "SELECT a.id, s.connection, a.path, a.media_type, a.format, a.content_hash, a.source_id
              FROM asset a JOIN source s ON s.id = a.source_id
              WHERE s.kind = 'local_fs'",
         );
@@ -40,12 +40,14 @@ impl Store {
                 let media_s: String = r.get(3)?;
                 let format: String = r.get(4)?;
                 let hash: Option<Vec<u8>> = r.get(5)?;
+                let source_id = blob_to_source_id(&r.get::<_, Vec<u8>>(6)?);
                 // local_fs display URI is the (canonical) source root the analyzer joins onto.
                 let source_uri = parse_connection(&connection)
                     .map(|c| c.display_uri())
                     .unwrap_or_default();
                 Ok(AnalysisTarget {
                     id,
+                    source_id,
                     source_uri,
                     path,
                     media: MediaType::parse(&media_s).unwrap_or(MediaType::Image),

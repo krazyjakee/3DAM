@@ -3,10 +3,11 @@
 //! server stands in for `3dam serve`'s `/api/v1/ws` — it does exactly what `ws_loop` does (send each
 //! event JSON-serialized as a text frame), so this exercises the real client transport end to end.
 //!
-//! NB: the events used here are the *struct*-shaped variants. `LibraryEvent::AssetRemoved(AssetId)`
-//! and other newtype-with-scalar variants can't be serialized under the enum's internally-tagged
-//! `#[serde(tag = "type")]` representation — a separate latent bug (they're silently dropped by the
-//! server's `ws_loop`), tracked outside this issue.
+//! NB: every variant used here is *struct*-shaped. A newtype-with-scalar variant cannot be
+//! serialized under the enum's internally-tagged `#[serde(tag = "type")]` representation — it is
+//! silently dropped by the server's `ws_loop`. `AssetRemoved` used to be one (`AssetRemoved(AssetId)`)
+//! and stopped being one when it grew its `source_id` attribution (issue #42), which incidentally
+//! made removals deliverable at all; `assets_removed_round_trips` pins that down.
 
 use dam_api::dto::SourceState;
 use dam_api::event::{ChangeKind, EventTopic, LibraryEvent, SubscribeRequest};
@@ -52,6 +53,7 @@ async fn subscribe_streams_server_events() {
     let id = AssetId::new();
     let port = spawn_ws_server(vec![LibraryEvent::AssetChanged {
         id,
+        source_id: None,
         kind: ChangeKind::Retagged,
     }])
     .await;
@@ -63,11 +65,43 @@ async fn subscribe_streams_server_events() {
         .expect("subscribe should connect");
 
     match next_event(&mut stream).await {
-        LibraryEvent::AssetChanged { id: gid, kind } => {
+        LibraryEvent::AssetChanged { id: gid, kind, .. } => {
             assert_eq!(gid, id, "the id must round-trip");
             assert_eq!(kind, ChangeKind::Retagged);
         }
         other => panic!("expected AssetChanged, got {other:?}"),
+    }
+}
+
+/// A removal must survive the wire. It only can because `AssetRemoved` is a struct variant: serde's
+/// internally-tagged representation cannot serialize a newtype-with-scalar, so the previous
+/// `AssetRemoved(AssetId)` was silently dropped by `ws_loop` and never reached any client. The
+/// `source_id` the ceiling check reads must round-trip alongside the id (issue #42).
+#[tokio::test]
+async fn asset_removed_round_trips() {
+    let id = AssetId::new();
+    let source_id = SourceId::new();
+    let port = spawn_ws_server(vec![LibraryEvent::AssetRemoved {
+        id,
+        source_id: Some(source_id),
+    }])
+    .await;
+    let client = client_for(port).await;
+
+    let mut stream = client
+        .subscribe(&AuthContext::embedded(), SubscribeRequest::default())
+        .await
+        .expect("subscribe should connect");
+
+    match next_event(&mut stream).await {
+        LibraryEvent::AssetRemoved {
+            id: gid,
+            source_id: gsid,
+        } => {
+            assert_eq!(gid, id, "the id must round-trip");
+            assert_eq!(gsid, Some(source_id), "the attribution must round-trip");
+        }
+        other => panic!("expected AssetRemoved, got {other:?}"),
     }
 }
 
@@ -83,6 +117,7 @@ async fn subscribe_honours_topic_filter() {
         },
         LibraryEvent::AssetChanged {
             id,
+            source_id: None,
             kind: ChangeKind::Metadata,
         },
     ])

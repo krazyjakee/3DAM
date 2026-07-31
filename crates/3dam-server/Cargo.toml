@@ -38,3 +38,5 @@ toml.workspace = true
 tower = { workspace = true, features = ["util"] }
 # analyzable PNG fixtures for the federation similarity tests (phase 6, issue #40).
 image.workspace = true
+# `StreamExt::next` for draining a `subscribe` stream (the restricted-subscriber test, issue #42).
+futures.workspace = true

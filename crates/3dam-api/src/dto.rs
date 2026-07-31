@@ -173,6 +173,17 @@ pub struct AssetSummary {
     /// so pre-favourite payloads deserialize to `false`.
     #[serde(default)]
     pub favorite: bool,
+    /// Which source this row came from — the attribution a [`Visibility`](crate::service::Visibility)
+    /// ceiling is evaluated against. Carried on the *summary* (not just the full [`Asset`]) because
+    /// `LibraryEvent::AssetAdded` ships a summary, and a restricted subscriber can only be told
+    /// about an asset whose source it may reach (issue #42).
+    ///
+    /// `None` means "unattributed": a payload from a server older than this field, or a peer row
+    /// federation has not re-attributed yet. Unattributed is treated as *out* of every restricted
+    /// ceiling — the fail-safe direction, since withholding an event costs a stale grid while
+    /// leaking one costs a disclosure.
+    #[serde(default)]
+    pub source_id: Option<SourceId>,
 }
 
 /// Full inspector record.
@@ -662,6 +673,15 @@ pub struct JobStatus {
     pub progress: Progress,
     #[serde(default)]
     pub error: Option<String>,
+    /// Every source this job touches, recorded when the job is created (issue #42). `Progress.current`
+    /// names a live file path, so a restricted identity may only observe a job whose sources are
+    /// *all* within its ceiling — see
+    /// [`Visibility::allows_job`](crate::service::Visibility::allows_job).
+    ///
+    /// Empty means "unattributed" (a pre-attribution job row, or a server older than this field) and
+    /// is therefore reachable only at `Visibility::Full`.
+    #[serde(default)]
+    pub sources: Vec<SourceId>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

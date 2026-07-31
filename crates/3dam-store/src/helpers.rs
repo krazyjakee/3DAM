@@ -8,12 +8,12 @@ pub(crate) fn parse_connection(blob: &str) -> Result<SourceConnection, LibError>
         .map_err(|e| LibError::Internal(format!("corrupt source connection: {e}")))
 }
 
-/// The SELECT column list every grid/summary query shares — thirteen columns in the exact order
+/// The SELECT column list every grid/summary query shares — fourteen columns in the exact order
 /// `row_to_summary` reads them. Callers append their own `FROM …`, `{ATTR_JOINS}`, WHERE and ORDER.
 pub(crate) const GRID_SELECT: &str = "SELECT asset.id, filename, media_type, format,
         size_bytes + COALESCE(model_attr.dependency_bytes, 0), license_id, license_status,
         image_attr.width, image_attr.height, audio_attr.duration_ms, model_attr.triangle_count,
-        audio_attr.class, asset.flags";
+        audio_attr.class, asset.flags, asset.source_id";
 
 /// The per-media attribute LEFT JOINs the grid select depends on (dimensions / duration / tris).
 pub(crate) const ATTR_JOINS: &str = "LEFT JOIN image_attr ON image_attr.asset_id = asset.id
@@ -53,6 +53,7 @@ pub(crate) fn row_to_summary(r: &rusqlite::Row) -> rusqlite::Result<AssetSummary
             audio_class.as_deref(),
         ),
         favorite: flags & FAVORITE_FLAG != 0,
+        source_id: Some(blob_to_source_id(&r.get::<_, Vec<u8>>(13)?)),
     })
 }
 

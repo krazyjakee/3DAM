@@ -448,6 +448,10 @@ pub(crate) async fn federated_query(
             Ok(mut sp) => {
                 for item in &mut sp.items {
                     item.origin = Origin::Peer(peer.name.clone());
+                    // Re-attribute to the *local* federated source row. The id the peer sent names a
+                    // source in the peer's catalog and is meaningless here; the local row is what a
+                    // share, a `Source` filter, and a visibility ceiling are expressed against.
+                    item.source_id = Some(peer.source_id);
                 }
                 pages.push((false, Some(peer.source_id), sp));
             }
@@ -565,6 +569,7 @@ pub(crate) async fn federated_similar(
             Ok(Some(hits)) => {
                 for mut hit in hits {
                     hit.asset.origin = Origin::Peer(peer.name.clone());
+                    hit.asset.source_id = Some(peer.source_id);
                     all.push(hit);
                 }
             }
@@ -629,6 +634,9 @@ pub(crate) async fn proxy_get_asset(lib: &EmbeddedLibrary, id: &AssetId) -> Opti
     try_peers(lib, |peer| async move {
         let mut asset = peer.client.get_asset(&ectx(), &id).await?;
         asset.summary.origin = Origin::Peer(peer.name.clone());
+        // Both attribution fields name the local federated source row, not the peer's own source.
+        asset.source_id = peer.source_id;
+        asset.summary.source_id = Some(peer.source_id);
         Ok(asset)
     })
     .await

@@ -187,6 +187,9 @@ pub(crate) fn run_scan(
                                     key_attrs: key_attrs_of(&attrs),
                                     // A freshly-scanned asset is never a favourite yet.
                                     favorite: false,
+                                    // Attribution for the ceiling check on the way out to
+                                    // subscribers (issue #42).
+                                    source_id: Some(sid),
                                 };
                                 let _ = events.send(LibraryEvent::AssetAdded(summary));
                             }

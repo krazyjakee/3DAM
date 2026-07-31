@@ -106,8 +106,9 @@ impl EmbeddedLibrary {
             return Ok(()); // everything already analysed — idempotent no-op
         }
         let total = targets.len() as u64;
+        let touched = crate::distinct_sources(&targets);
         let job = self
-            .db(move |s| s.create_job(JobKind::Analyze, "{\"auto\":true}", Some(total)))
+            .db(move |s| s.create_job(JobKind::Analyze, "{\"auto\":true}", Some(total), &touched))
             .await?;
         let cancel = Arc::new(AtomicBool::new(false));
         self.cancels.lock().unwrap().insert(job, cancel.clone());

@@ -275,6 +275,13 @@ fn cache_write_atomic(cache_path: &Path, bytes: &[u8]) {
     }
 }
 
+/// The distinct sources an analyse run will touch — the job's visibility attribution (issue #42).
+/// Sorted+deduped so the recorded set is stable regardless of target order.
+pub(crate) fn distinct_sources(targets: &[dam_store::AnalysisTarget]) -> Vec<SourceId> {
+    let set: std::collections::BTreeSet<SourceId> = targets.iter().map(|t| t.source_id).collect();
+    set.into_iter().collect()
+}
+
 /// Emit a job's current progress as a `JobProgress` event (best-effort; a dropped read is skipped).
 /// Shared by the scan and analyse job loops.
 pub(crate) fn emit_progress(store: &Store, events: &broadcast::Sender<LibraryEvent>, job: &JobId) {
@@ -1232,9 +1239,14 @@ impl LibraryService for EmbeddedLibrary {
             Self::require_full_visibility(ctx, "blocklisting content")?;
         }
         let id = *id;
+        // Capture the attribution *before* the delete — afterwards the row is gone and the event
+        // could never be matched against a subscriber's ceiling (issue #42).
+        let source_id = self.db(move |s| s.asset_source(&id)).await?;
         self.db(move |s| s.remove_asset(&id, req.block)).await?;
         // Live update: drop the row from every open grid/inspector (mirrors AssetAdded on scan).
-        let _ = self.events.send(LibraryEvent::AssetRemoved(id));
+        let _ = self
+            .events
+            .send(LibraryEvent::AssetRemoved { id, source_id });
         Ok(())
     }
 
@@ -1409,8 +1421,10 @@ impl LibraryService for EmbeddedLibrary {
 
         let mode = req.mode;
         let params = serde_json::to_string(&req).unwrap_or_else(|_| "{}".into());
+        // The resolved source set *is* the job's attribution (issue #42).
+        let touched: Vec<SourceId> = sources.iter().map(|s| s.id).collect();
         let job = self
-            .db(move |s| s.create_job(JobKind::Scan, &params, None))
+            .db(move |s| s.create_job(JobKind::Scan, &params, None, &touched))
             .await?;
 
         let cancel = Arc::new(AtomicBool::new(false));
@@ -1446,8 +1460,9 @@ impl LibraryService for EmbeddedLibrary {
 
         let params = serde_json::to_string(&req).unwrap_or_else(|_| "{}".into());
         let total = targets.len() as u64;
+        let touched = distinct_sources(&targets);
         let job = self
-            .db(move |s| s.create_job(JobKind::Analyze, &params, Some(total)))
+            .db(move |s| s.create_job(JobKind::Analyze, &params, Some(total), &touched))
             .await?;
 
         let cancel = Arc::new(AtomicBool::new(false));
@@ -1615,8 +1630,10 @@ impl LibraryService for EmbeddedLibrary {
         let id = req.asset;
         let tag = req.tag.clone();
         self.db(move |s| s.set_tag_state(&id, &tag, state)).await?;
+        let source_id = self.db(move |s| s.asset_source(&id)).await?;
         let _ = self.events.send(LibraryEvent::AssetChanged {
             id: req.asset,
+            source_id,
             kind: ChangeKind::Retagged,
         });
         Ok(())
@@ -1627,21 +1644,28 @@ impl LibraryService for EmbeddedLibrary {
         let id = req.asset;
         let on = req.favorite;
         self.db(move |s| s.set_favorite(&id, on)).await?;
+        let source_id = self.db(move |s| s.asset_source(&id)).await?;
         let _ = self.events.send(LibraryEvent::AssetChanged {
             id: req.asset,
+            source_id,
             kind: ChangeKind::Metadata,
         });
         Ok(())
     }
 
+    /// A job is readable when every source it touches is within the caller's ceiling — see
+    /// [`Visibility::allows_job`]. Outside it the job is *absent*, not forbidden.
+    ///
+    /// This is what lets a share-based identity watch its own scan finish: the WebSocket delivers
+    /// `JobProgress`, the client invalidates its jobs query, and the refetch has to agree with the
+    /// event or the status bar would blink empty (issue #42).
     async fn get_job(&self, ctx: &AuthContext, id: &JobId) -> Result<JobStatus, LibError> {
-        // Jobs are library-wide operations (scans/analysis name paths in their progress): absent
-        // for restricted contexts, who also cannot submit them.
-        if !ctx.visibility.is_full() {
+        let jid = *id;
+        let job = self.db(move |s| s.get_job(&jid)).await?;
+        if !ctx.visibility.allows_job(&job) {
             return Err(LibError::NotFound(format!("job {id}")));
         }
-        let id = *id;
-        self.db(move |s| s.get_job(&id)).await
+        Ok(job)
     }
 
     async fn list_jobs(
@@ -1649,16 +1673,16 @@ impl LibraryService for EmbeddedLibrary {
         ctx: &AuthContext,
         req: JobListRequest,
     ) -> Result<Page<JobStatus>, LibError> {
-        if !ctx.visibility.is_full() {
-            return Ok(Page::new(Vec::new(), None));
-        }
-        self.db(move |s| s.list_jobs(&req)).await
+        let vis = ctx.visibility.clone();
+        self.db(move |s| s.list_jobs(&req, &vis)).await
     }
 
     async fn cancel_job(&self, ctx: &AuthContext, id: &JobId) -> Result<(), LibError> {
-        if !ctx.visibility.is_full() {
-            return Err(LibError::NotFound(format!("job {id}")));
-        }
+        // Read-then-write split, matching `require_asset_writable`: a job outside the ceiling is
+        // absent (404), one inside it but cancellable only by an unrestricted identity is forbidden.
+        // Cancelling is a library-wide act — a share grants the right to *watch* a job, not stop it.
+        self.get_job(ctx, id).await?;
+        Self::require_full_visibility(ctx, "cancelling a job")?;
         if let Some(flag) = self.cancels.lock().unwrap().get(id) {
             flag.store(true, Ordering::Relaxed);
         }
@@ -1682,33 +1706,15 @@ impl LibraryService for EmbeddedLibrary {
         let rx = self.events.subscribe();
         let vis = ctx.visibility.clone();
         // Drop lag errors (a slow subscriber missed events) rather than failing the stream.
-        // Restricted subscribers get a conservatively-filtered stream (issue #42 leak audit):
-        // job progress names paths, and per-asset events can't be cheaply vouched for, so only
-        // reachable-source state changes and catalog resets pass. Their UIs refetch on demand.
+        //
+        // Restricted subscribers get a per-event ceiling check rather than a blanket withhold
+        // (issue #42). Every event now carries the attribution the check needs — `source_id` on the
+        // per-asset variants, the touched `sources` on `JobStatus` — so the decision is a set lookup
+        // on data already in hand, with no database round-trip per event per subscriber. The rule
+        // itself lives in `Visibility::allows_event` so the engine and any future transport enforce
+        // one definition, and so adding a `LibraryEvent` variant fails to compile until it is judged.
         let stream = tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(move |r| {
-            // Every variant is matched explicitly — no positional catch-all — so a newly added
-            // `LibraryEvent` fails to compile here instead of being silently withheld (a dead
-            // client) or silently leaked (a hole in the ceiling).
-            //
-            // The four `false` arms are a **known gap**, not a judgement that restricted identities
-            // want no live updates: `AssetSummary` and `JobStatus` carry no source/asset
-            // attribution (`dam_api::dto`), so the ceiling cannot be evaluated per event and the
-            // only safe answer is to withhold. Closing it means adding attribution — a
-            // `source_id` on `AssetSummary`, and the touched source(s) on `JobStatus` — across
-            // `dam-api`, `dam-server`, `dam-client` and `web/src/api/types.ts` together. That is a
-            // DTO contract change, deliberately not folded into the accounts PR.
-            let keep = match r.as_ref() {
-                Err(_) => false,
-                Ok(ev) => match (&vis, ev) {
-                    (Visibility::Full, _) => true,
-                    (v, LibraryEvent::SourceState { id, .. }) => v.allows_source(id),
-                    (_, LibraryEvent::CatalogReset) => true,
-                    (Visibility::Restricted(_), LibraryEvent::AssetAdded(_)) => false,
-                    (Visibility::Restricted(_), LibraryEvent::AssetChanged { .. }) => false,
-                    (Visibility::Restricted(_), LibraryEvent::AssetRemoved(_)) => false,
-                    (Visibility::Restricted(_), LibraryEvent::JobProgress(_)) => false,
-                },
-            };
+            let keep = r.as_ref().is_ok_and(|ev| vis.allows_event(ev));
             async move {
                 if keep {
                     r.ok()

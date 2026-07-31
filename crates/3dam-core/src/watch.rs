@@ -220,7 +220,8 @@ fn trigger_delta(
         }
     };
     let params = r#"{"mode":"delta","watch":true}"#;
-    let job = match store.create_job(JobKind::Scan, params, None) {
+    // An auto-rescan touches exactly the one watched source (issue #42).
+    let job = match store.create_job(JobKind::Scan, params, None, &[id]) {
         Ok(j) => j,
         Err(_) => {
             clear();

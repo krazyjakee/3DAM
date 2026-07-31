@@ -105,7 +105,7 @@ fn topic_matches(topics: &[EventTopic], ev: &LibraryEvent) -> bool {
     let topic = match ev {
         LibraryEvent::AssetAdded(_)
         | LibraryEvent::AssetChanged { .. }
-        | LibraryEvent::AssetRemoved(_)
+        | LibraryEvent::AssetRemoved { .. }
         // A catalog-wide reset is an asset-topic event: subscribers watching assets must drop
         // their caches and refetch (the whole catalog just changed underneath them).
         | LibraryEvent::CatalogReset => EventTopic::Assets,

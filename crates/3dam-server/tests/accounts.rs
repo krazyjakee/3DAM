@@ -13,6 +13,7 @@ use axum::body::Body;
 use axum::extract::ConnectInfo;
 use axum::http::{HeaderMap, Request, StatusCode};
 use dam_api::dto::*;
+use dam_api::event::LibraryEvent;
 use dam_api::service::{AuthContext, LibraryService};
 use dam_core::EmbeddedLibrary;
 use dam_server::{router, ServerStore};
@@ -907,8 +908,11 @@ async fn leak_audit_collections_and_shared_collection_grant() {
 
 #[tokio::test]
 async fn leak_audit_jobs_are_absent_for_restricted_identities() {
-    let (app, _s, lib, admin, vera, _shared, _secret, _vid) = leak_world().await;
-    // The seeding scan/analyze jobs exist and name paths — the admin can list them…
+    let (app, _s, lib, admin, vera, shared, _secret, _vid) = leak_world().await;
+    // The seeding scan/analyze jobs span *both* sources, so every one of them names paths vera
+    // cannot reach. A job is observable only when its whole source set is inside the ceiling
+    // (`Visibility::allows_job`) — "all", not "any", precisely so `progress.current` can never carry
+    // a path out of an unshared source.
     let (st, body) = call(
         &app,
         "POST",
@@ -947,6 +951,187 @@ async fn leak_audit_jobs_are_absent_for_restricted_identities() {
     )
     .await;
     assert_eq!(st, StatusCode::NOT_FOUND);
+
+    // …but a job confined to the source she *does* hold is hers to watch. This is the other half of
+    // the rule: absence is driven by attribution, not by a blanket "restricted identities get no
+    // jobs" — otherwise her status bar could never show her own scan running (issue #42).
+    let mine = lib
+        .submit_scan(
+            &ctx,
+            ScanRequest {
+                sources: vec![shared.parse().unwrap()],
+                mode: ScanMode::Full,
+            },
+        )
+        .await
+        .unwrap();
+    wait_job(&lib, &ctx, &mine).await;
+    let (st, body) = call(
+        &app,
+        "GET",
+        &format!("/api/v1/jobs/{mine}"),
+        Some(&vera),
+        None,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "a scan of her own source is visible: {body}"
+    );
+    assert_eq!(body["sources"], json!([shared]));
+
+    // Visible is not cancellable: watching a job is a read, stopping one is a library-wide act.
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/api/v1/jobs/{mine}/cancel"),
+        Some(&vera),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+}
+
+/// The restricted-subscriber contract (issue #42): a share-based identity must get a *live* stream
+/// for the sources it holds, not a socket that never speaks. Every `LibraryEvent` now carries the
+/// attribution the ceiling is evaluated against, so this asserts both directions at once — the
+/// shared source's events arrive, the unshared source's events never do.
+///
+/// Each pair below emits the **secret** event first. If the filter were merely slow rather than
+/// exclusive, the secret event would arrive first and fail the assertion; ordering is what turns
+/// "we saw the shared one" into "we saw *only* the shared one".
+#[tokio::test]
+async fn restricted_subscriber_receives_events_only_for_shared_sources() {
+    let (app, store, lib, admin, _vera, shared, secret, vera_id) = leak_world().await;
+    let shared_sid: dam_api::SourceId = shared.parse().unwrap();
+    let secret_sid: dam_api::SourceId = secret.parse().unwrap();
+
+    // Vera's ceiling, resolved from her real share rows the same way the auth layer resolves it for
+    // a session — not a hand-built scope, so the share→visibility mapping is under test too.
+    let acct = store.get_account(&vera_id).unwrap();
+    let vis = store
+        .resolve_visibility(&dam_api::AccountIdentity {
+            account_id: acct.account_id.clone(),
+            username: acct.username.clone(),
+            role: acct.role,
+        })
+        .unwrap();
+    assert!(
+        !vis.is_full(),
+        "vera must be restricted or this test proves nothing"
+    );
+    let vera_ctx = AuthContext::connected(Some(acct.username.clone()), acct.role.scopes(), vis);
+    let ctx = AuthContext::embedded();
+
+    let mut stream = lib
+        .subscribe(&vera_ctx, dam_api::SubscribeRequest::default())
+        .await
+        .unwrap();
+
+    // ── AssetChanged: a favourite toggle on each source ──────────────────────
+    let secret_asset: dam_api::AssetId = asset_id_by_name(&app, &admin, "secret_wall.png")
+        .await
+        .parse()
+        .unwrap();
+    let shared_asset: dam_api::AssetId = asset_id_by_name(&app, &admin, "brick_red.png")
+        .await
+        .parse()
+        .unwrap();
+    for asset in [secret_asset, shared_asset] {
+        lib.set_favorite(
+            &ctx,
+            FavoriteRequest {
+                asset,
+                favorite: true,
+            },
+        )
+        .await
+        .unwrap();
+    }
+    match next_event(&mut stream).await {
+        LibraryEvent::AssetChanged { id, source_id, .. } => {
+            assert_eq!(
+                id, shared_asset,
+                "the secret source's change must be dropped"
+            );
+            assert_eq!(source_id, Some(shared_sid));
+        }
+        other => panic!("expected AssetChanged for the shared asset, got {other:?}"),
+    }
+
+    // ── AssetRemoved: attribution captured before the row disappears ─────────
+    let secret_dup: dam_api::AssetId = asset_id_by_name(&app, &admin, "brick_red_copy.png")
+        .await
+        .parse()
+        .unwrap();
+    let shared_other: dam_api::AssetId = asset_id_by_name(&app, &admin, "brick_blue.png")
+        .await
+        .parse()
+        .unwrap();
+    for asset in [secret_dup, shared_other] {
+        lib.remove_asset(&ctx, &asset, RemoveAsset { block: false })
+            .await
+            .unwrap();
+    }
+    match next_event(&mut stream).await {
+        LibraryEvent::AssetRemoved { id, source_id } => {
+            assert_eq!(
+                id, shared_other,
+                "the secret source's removal must be dropped"
+            );
+            assert_eq!(
+                source_id,
+                Some(shared_sid),
+                "a removal must still name its source after the row is gone"
+            );
+        }
+        other => panic!("expected AssetRemoved for the shared asset, got {other:?}"),
+    }
+
+    // ── JobProgress: a scan of each source in turn ───────────────────────────
+    for sid in [secret_sid, shared_sid] {
+        let job = lib
+            .submit_scan(
+                &ctx,
+                ScanRequest {
+                    sources: vec![sid],
+                    mode: ScanMode::Full,
+                },
+            )
+            .await
+            .unwrap();
+        wait_job(&lib, &ctx, &job).await;
+    }
+    // Scans also re-add the two assets removed above, so drain to the first job event.
+    let progress = loop {
+        match next_event(&mut stream).await {
+            LibraryEvent::JobProgress(js) => break js,
+            LibraryEvent::AssetAdded(a) => {
+                assert_eq!(
+                    a.source_id,
+                    Some(shared_sid),
+                    "a re-scan must not announce the secret source's assets"
+                );
+            }
+            other => panic!("unexpected event while waiting for job progress: {other:?}"),
+        }
+    };
+    assert_eq!(
+        progress.sources,
+        vec![shared_sid],
+        "only the scan confined to her own source may surface"
+    );
+}
+
+/// Deadline-bounded read of the next event — a filter bug that withholds everything would otherwise
+/// hang the test rather than fail it.
+async fn next_event(stream: &mut dam_api::service::EventStream<LibraryEvent>) -> LibraryEvent {
+    use futures::StreamExt;
+    tokio::time::timeout(Duration::from_secs(10), stream.next())
+        .await
+        .expect("an allowed event should arrive before the timeout")
+        .expect("the stream should still be open")
 }
 
 #[tokio::test]

@@ -43,6 +43,10 @@ export interface AssetSummary {
   key_attrs: Record<string, string>;
   /** User-flagged favourite (issue #63); persisted in the asset `flags` bitset server-side. */
   favorite: boolean;
+  /** Which source this row came from. Present so the server can match an `asset_added` event
+   *  against a share-based visibility ceiling before sending it (issue #42). `null` for a payload
+   *  from a server predating the field. */
+  source_id: SourceId | null;
 }
 
 export interface AssetTimes {
@@ -536,6 +540,10 @@ export interface JobStatus {
   state: JobState;
   progress: Progress;
   error: string | null;
+  /** Every source this job touches. `progress.current` names a live file path, so a
+   *  visibility-restricted session is shown a job only when all of these are within its ceiling —
+   *  jobs outside it are simply absent from `/jobs` and from the event stream (issue #42). */
+  sources: SourceId[];
 }
 export interface JobListRequest {
   kinds?: JobKind[];
@@ -558,10 +566,14 @@ export interface LibraryStats {
 // ── live events (WebSocket) ─────────────────────────────────────────────────
 
 export type ChangeKind = "reanalyzed" | "retagged" | "license_set" | "metadata";
+/** Each per-asset variant carries the asset's `source_id`. That attribution is what lets the server
+ *  evaluate a share-based visibility ceiling per event, so a restricted session gets a live stream
+ *  for the sources it may reach instead of a silent socket (issue #42). `null` means unattributed;
+ *  the server treats that as outside every restricted ceiling. */
 export type LibraryEvent =
   | ({ type: "asset_added" } & AssetSummary)
-  | { type: "asset_changed"; id: AssetId; kind: ChangeKind }
-  | { type: "asset_removed"; 0: AssetId } // AssetRemoved(AssetId) — newtype variant
+  | { type: "asset_changed"; id: AssetId; source_id: SourceId | null; kind: ChangeKind }
+  | { type: "asset_removed"; id: AssetId; source_id: SourceId | null }
   | { type: "source_state"; id: SourceId; state: SourceState }
   | ({ type: "job_progress" } & JobStatus)
   | { type: "catalog_reset" }; // whole catalog wiped (maintenance) — drop caches and refetch

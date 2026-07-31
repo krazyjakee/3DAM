@@ -170,6 +170,52 @@ impl Visibility {
         self.restricted()
             .is_none_or(|s| s.write_collections.contains(id))
     }
+    /// Whether a job may be *observed* by this ceiling — the predicate behind `get_job`, `list_jobs`,
+    /// and the `JobProgress` arm of [`allows_event`](Self::allows_event).
+    ///
+    /// Deliberately `all`, not `any`: `Progress.current` names the file being worked on right now, so
+    /// a job spanning a shared *and* an unshared source would dribble unshared paths into a restricted
+    /// client's status bar. Requiring every touched source to be reachable makes the paths a job can
+    /// emit reachable by construction, which is why nothing here has to scrub `current`.
+    ///
+    /// An unattributed job (`sources` empty — a row written before attribution existed) is observable
+    /// only at `Full`.
+    pub fn allows_job(&self, job: &crate::dto::JobStatus) -> bool {
+        if self.is_full() {
+            return true;
+        }
+        !job.sources.is_empty() && job.sources.iter().all(|s| self.allows_source(s))
+    }
+
+    /// Whether a live event may be delivered to a subscriber holding this ceiling (issue #42).
+    ///
+    /// Every variant is matched explicitly — no positional catch-all — so a newly added
+    /// `LibraryEvent` fails to compile here rather than being silently withheld (a dead client) or
+    /// silently leaked (a hole in the ceiling).
+    ///
+    /// Per-asset events are judged on their `source_id` alone. That covers source shares completely;
+    /// it does **not** cover an identity whose reach comes *only* from a collection share, because
+    /// collection membership lives in `collection_member` and answering it would cost a query per
+    /// event per subscriber on the firehose. Such a subscriber keeps today's behaviour — no per-asset
+    /// events, a grid that refreshes on its own refetches — rather than gaining a leak. Closing that
+    /// remainder means carrying an event's collection ids the way `source_id` is carried here.
+    pub fn allows_event(&self, ev: &crate::event::LibraryEvent) -> bool {
+        use crate::event::LibraryEvent as E;
+        if self.is_full() {
+            return true;
+        }
+        match ev {
+            // A reset carries no ids — it says "your view is stale", which is true for everyone.
+            E::CatalogReset => true,
+            E::SourceState { id, .. } => self.allows_source(id),
+            E::AssetAdded(a) => a.source_id.is_some_and(|s| self.allows_source(&s)),
+            E::AssetChanged { source_id, .. } | E::AssetRemoved { source_id, .. } => {
+                source_id.is_some_and(|s| self.allows_source(&s))
+            }
+            E::JobProgress(j) => self.allows_job(j),
+        }
+    }
+
     /// The write-half of this ceiling viewed as a read-shaped set — lets a writability check reuse
     /// the same reachability predicate the read path enforces (engine-side, issue #42 rule 4).
     pub fn write_view(&self) -> Visibility {

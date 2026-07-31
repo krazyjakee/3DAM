@@ -82,6 +82,7 @@ pub(crate) fn run_analyze(
             Ok(()) => {
                 let _ = events.send(LibraryEvent::AssetChanged {
                     id: t.id,
+                    source_id: Some(t.source_id),
                     kind: ChangeKind::Reanalyzed,
                 });
             }

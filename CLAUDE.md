@@ -73,7 +73,7 @@ Packages are named `dam-*` (Cargo forbids leading digits); directories are brand
 - Data dir: platform default (see `dam-core/src/paths.rs`), overridable with `--data`.
 - `library.db` — the catalog (assets, sources, jobs, collections, tags, embeddings). Owned by `dam-store`, private to the engine.
 - `server.db` — server config, tokens, feature flags, audit log. Owned by `dam-server`.
-- **Schema is forward-only** (`PRAGMA user_version`), currently **V3** (V1 catalog → V2 audio codec/container → V3 `embedding` table). A DB from a *newer* schema is rejected rather than downgraded. When you change the schema, add a numbered migration in `dam-store/src/schema.rs` and bump the version — never edit an existing migration.
+- **Schema is forward-only** (`PRAGMA user_version`), currently **V9** (V1 catalog → V2 audio codec/container → V3 `embedding` table → V4 blocklist → V5 model dependency bytes → V6/V7 FTS index → V8 waveform peaks → V9 `job.sources`). A DB from a *newer* schema is rejected rather than downgraded. When you change the schema, add a numbered migration in `dam-store/src/schema.rs` and bump the version — never edit an existing migration.
 
 ---
 

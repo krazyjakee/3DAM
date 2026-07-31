@@ -284,4 +284,12 @@ pub const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE audio_attr ADD COLUMN waveform_peaks TEXT;
     "#,
+    // ── V9: which sources a job touches (issue #42) ───────────────────────────────────────────────
+    // `JobStatus` now carries attribution so a visibility-restricted identity can be shown its own
+    // jobs — and be sent `JobProgress` events — without seeing paths from sources it cannot reach.
+    // Stored as a JSON array of canonical uuid strings; NULL/absent on pre-V9 rows, which read back
+    // as an empty set and are therefore visible only at `Visibility::Full` (fail-safe).
+    r#"
+    ALTER TABLE job ADD COLUMN sources TEXT;
+    "#,
 ];
