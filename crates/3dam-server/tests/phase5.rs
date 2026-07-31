@@ -107,25 +107,40 @@ async fn defaults_are_safe_and_admin_reachable_under_off() {
     assert_eq!(body["network_writes"], false);
     assert_eq!(body["exposed_without_auth"], false);
 
-    // Seven live flags, all at version 0 (unset → defaults): the three exposure flags, the two
+    // Eight live flags, all at version 0 (unset → defaults): the three exposure flags, the two
     // hosted-mode pipeline toggles (issue #71) which default *on*, the federation peer flag
-    // (phase 6, issue #39) which defaults *off* — off means the advertise surface is absent — and
+    // (phase 6, issue #39) which defaults *off* — off means the advertise surface is absent —
     // user accounts (phase 6, issue #42), also off, which keeps the whole accounts/groups/shares
-    // surface absent.
+    // surface absent, and uploads (issue #80), off, which keeps the one write-into-source route
+    // absent.
     let (st, flags) = call(&app, "GET", "/admin/api/flags", None, None).await;
     assert_eq!(st, StatusCode::OK);
     let flags = flags.as_array().unwrap();
-    assert_eq!(flags.len(), 7);
+    assert_eq!(flags.len(), 8);
     let flag = |key: &str| flags.iter().find(|f| f["key"] == key).unwrap();
     assert_eq!(flag("auto_thumbnail")["value"], true);
     assert_eq!(flag("auto_analyze")["value"], true);
     assert_eq!(flag("federation")["value"], false);
     assert_eq!(flag("user_accounts")["value"], false);
+    assert_eq!(flag("upload")["value"], false);
     // Workload toggles never raise exposure, so they need no confirm.
     assert_eq!(flag("auto_thumbnail")["exposure_increasing"], false);
+    // Uploads do: on is the only way bytes enter a source over the network.
+    assert_eq!(flag("upload")["exposure_increasing"], true);
 
     // Federation off ⇒ the advertise surface is absent (404, same mechanism as /mcp).
     let (st, _) = call(&app, "GET", "/api/v1/advertise", None, None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    // Upload off ⇒ so is the one write-into-source route (issue #80, same mechanism again).
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/api/v1/upload?source=x&name=y.png",
+        None,
+        None,
+    )
+    .await;
     assert_eq!(st, StatusCode::NOT_FOUND);
 
     // Reads work under Off (owner holds Read).

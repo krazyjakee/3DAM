@@ -67,8 +67,8 @@ watch      = true
 # Per-file ceiling for writes into a source (issue #80; the create-only path of file 08 §5.1).
 # Config rather than a runtime flag, for the same reason as [resources]: "a reasonable maximum
 # asset size" is a deployment property — an audio library and a 3D one disagree by two orders of
-# magnitude — not a live exposure toggle. *Whether* uploads are allowed at all remains a real
-# runtime decision, made by the Write scope and the network_writes flag below.
+# magnitude — not a live exposure toggle. *Whether* uploads are allowed at all is a runtime
+# decision and lives in [flags] upload below; this block only sizes them.
 max_file_mb = 2048
 
 # --- Feature flags: seed values only. Authoritative semantics + reconciliation: file 10. ---
@@ -80,7 +80,21 @@ mcp               = "off"        # off | read-only | writes   (mounts/unmounts P
 inbound_federation= false        # answer federated queries from peers?
 remote_connect    = false        # accept GUI/CLI --connect sessions as a backend?
 accounts          = false        # opt-in user accounts (file 10)
+upload            = false        # accept writes of NEW files into a registered source (file 08 §5.1)
 ```
+
+`upload` is worth a note, because it is the one capability here whose blast radius is the user's
+own files rather than the catalog. Every other write in 3DAM edits catalog rows — tags, notes,
+collections — and `Scope::Write` grants them all together; upload is the only surface that puts
+bytes in a project folder. Folding it into that scope would have meant every write token already
+minted silently gaining the ability the day the feature shipped, and would have left an operator
+who wants tagging-without-uploading no way to say so. So it is its own flag, off by default, and
+off ⇒ `POST /api/v1/upload` is **absent** (404, by §A.2's rule), not forbidden: whether a
+deployment accepts uploads at all is the operator's posture, and a 403 there advertises a
+capability they chose not to run. The per-*caller* question is still answered plainly — past the
+flag gate, `Scope::Write` and the `network_writes` ceiling produce the usual 401/403. The web
+client reads the flag off `GET /api/version` (`"upload": true|false`) and hides its Upload view
+rather than offering a drop target whose every request would 404.
 
 The `[flags]` block is deliberately thin here: it is a *seed*, and every key's meaning, its reconciliation with runtime admin-UI edits, and whether flipping it applies live or needs a restart are **file 10's** to define ([ADR 0004](../adr/0004-feature-flags-admin.md) decision 2, and its §10 open question on "two writers, one state").
 

@@ -32,8 +32,8 @@ pub struct ServeFile {
 /// size" is a deployment property (disk, link speed, what the library holds), not a live exposure
 /// toggle. An audio library and a 3D one disagree by two orders of magnitude, and neither wants to
 /// discover the limit by having a drop fail halfway. Note that *whether* uploads are allowed at all
-/// remains a real runtime decision, made by `Scope::Write` and the `network_writes` flag — this
-/// only sizes them.
+/// is a runtime decision and lives in `[flags] upload` (off by default), narrowed further by
+/// `Scope::Write` and the `network_writes` ceiling — this block only sizes them.
 #[derive(Debug, Default, serde::Deserialize)]
 pub struct UploadBlock {
     /// Largest single uploaded file, in MiB. Default 2048 (2 GiB).
@@ -114,6 +114,10 @@ pub struct FlagsBlock {
     /// Full user accounts (phase 6, issue #42): login/session auth, groups, sharing. Off by
     /// default; on raises the effective auth gate to at least `token`.
     pub user_accounts: Option<bool>,
+    /// Accept uploads — writes of *new* files into a registered source (issue #80). Off by default;
+    /// off means `POST /api/v1/upload` is absent. Sized by `[upload] max_file_mb`, which is a
+    /// deployment property rather than a posture, hence the separate block.
+    pub upload: Option<bool>,
 }
 
 /// `[accounts]` — the config-plane recovery hatch (ADR 0009 §3, issue #42). Not a flag: it acts
@@ -172,6 +176,9 @@ impl ServeFile {
         }
         if let Some(u) = self.flags.user_accounts {
             out.push((FlagKey::UserAccounts, FlagValue::Bool(u)));
+        }
+        if let Some(u) = self.flags.upload {
+            out.push((FlagKey::Upload, FlagValue::Bool(u)));
         }
         out
     }

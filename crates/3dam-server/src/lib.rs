@@ -273,10 +273,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
         // User accounts: claim/login/sessions (phase 6, issue #42) — 404 while the flag is off.
         .merge(authn::routes(state.clone()))
         .merge(comments::routes(state.clone()))
-        // The one write-into-source path (issue #80). Not gated at the router: it is guarded by the
-        // `Writer` extractor per-request, so an unauthorised caller gets a 403 that says why rather
-        // than a 404 implying the feature does not exist.
-        .merge(upload::routes())
+        // The one write-into-source path (issue #80) — behind the `Upload` flag, so the route is
+        // absent (404) until an operator turns uploads on. Past that gate the `Writer` extractor
+        // still answers the per-*caller* question with a 401/403 that says why.
+        .merge(upload::routes(state.clone()))
         // The admin API (tech-spec 10 §5), guarded by the AdminAuth extractor.
         .merge(admin::routes(state.clone()))
         // SPA fallback: any non-API GET serves the embedded web client (tech-spec 09 §A.4).
@@ -802,6 +802,10 @@ async fn version(State(st): State<AppState>) -> Json<serde_json::Value> {
         // Accounts posture (issue #42): lets the client offer username/password login (and the
         // first-run claim screen while unclaimed) instead of the bare token prompt.
         "accounts": st.store.user_accounts(),
+        // Upload posture (issue #80): the route is absent while the flag is off, so the client hides
+        // its Upload view rather than offering one whose every request 404s. Reported here for the
+        // same reason `accounts` is — a capability the build has but this deployment may not run.
+        "upload": st.store.upload(),
         "unclaimed": st.store.unclaimed(),
         // How many accounts exist. `unclaimed` alone can't distinguish "brand new instance" from
         // "the operator re-opened the claim window to recover a lost admin" — and in the second

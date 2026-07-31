@@ -27,7 +27,8 @@ export type FlagKey =
   | "federation"
   | "user_accounts"
   | "auto_thumbnail"
-  | "auto_analyze";
+  | "auto_analyze"
+  | "upload";
 
 export interface FlagInfo {
   key: FlagKey;
@@ -62,6 +63,8 @@ export interface AdminStatus {
   accounts_enabled?: boolean;
   unclaimed?: boolean;
   account_count?: number;
+  /** Uploads — writes of new files into a source (issue #80; absent on older servers). */
+  upload_enabled?: boolean;
 }
 
 export interface TokenInfo {

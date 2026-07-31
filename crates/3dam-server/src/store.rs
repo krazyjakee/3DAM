@@ -36,6 +36,10 @@ pub struct FlagState {
     /// whole `/api/v1/auth` + accounts admin surface 404s; on ⇒ the effective auth gate is raised
     /// to at least `Token` (see [`ServerStore::effective_auth_mode`]).
     pub user_accounts: bool,
+    /// Accept uploads — writes of *new* files into a registered source (issue #80). Off ⇒
+    /// `POST /api/v1/upload` 404s. Squarely an exposure flag, not a workload one: it is the only
+    /// surface in 3DAM that puts bytes in the user's project folders (tech-spec 08 §5.1).
+    pub upload: bool,
     versions: HashMap<FlagKey, u64>,
 }
 
@@ -52,6 +56,7 @@ impl FlagState {
             auto_analyze: true,
             federation: false,
             user_accounts: false,
+            upload: false,
             versions: HashMap::new(),
         }
     }
@@ -64,10 +69,11 @@ impl FlagState {
             FlagKey::AutoAnalyze => FlagValue::Bool(self.auto_analyze),
             FlagKey::Federation => FlagValue::Bool(self.federation),
             FlagKey::UserAccounts => FlagValue::Bool(self.user_accounts),
+            FlagKey::Upload => FlagValue::Bool(self.upload),
         }
     }
-    /// Apply a typed value under its key. The key disambiguates the three `bool` flags, which the
-    /// value alone can't (network_writes vs the two pipeline toggles).
+    /// Apply a typed value under its key. The key disambiguates the `bool` flags, which the value
+    /// alone can't (network_writes vs upload vs the two pipeline toggles).
     fn apply(&mut self, key: FlagKey, value: FlagValue) {
         match (key, value) {
             (FlagKey::Authentication, FlagValue::Auth(m)) => self.auth = m,
@@ -77,6 +83,7 @@ impl FlagState {
             (FlagKey::AutoAnalyze, FlagValue::Bool(b)) => self.auto_analyze = b,
             (FlagKey::Federation, FlagValue::Bool(b)) => self.federation = b,
             (FlagKey::UserAccounts, FlagValue::Bool(b)) => self.user_accounts = b,
+            (FlagKey::Upload, FlagValue::Bool(b)) => self.upload = b,
             // Type-mismatched pairs are rejected before this point (`FlagValue::matches`).
             _ => {}
         }
@@ -112,6 +119,10 @@ pub fn is_exposure_increasing(
             o != McpMode::ReadWrite
         }
         (FlagKey::NetworkWrites, FlagValue::Bool(true), FlagValue::Bool(false)) => true,
+        // Upload *on* opens the only path by which a remote caller can put bytes in the user's
+        // project folders (issue #80). Confirmed like network writes, and for a stronger reason:
+        // the blast radius is files on disk rather than rows in the catalog.
+        (FlagKey::Upload, FlagValue::Bool(true), FlagValue::Bool(false)) => true,
         // Accounts *off* is the exposure-increasing direction, and only while the raise is
         // load-bearing (raw auth `Off`). With auth already at `Anonymous`/`Token` the gate survives
         // the flip, so it stays an ordinary toggle.
@@ -132,6 +143,7 @@ fn flag_can_increase_exposure(key: FlagKey) -> bool {
             | FlagKey::McpServer
             | FlagKey::NetworkWrites
             | FlagKey::UserAccounts
+            | FlagKey::Upload
     )
 }
 
@@ -236,6 +248,21 @@ impl ServerStore {
     /// Full user accounts (phase 6, issue #42): the `/api/v1/auth` + accounts admin surface.
     pub fn user_accounts(&self) -> bool {
         self.flags.read().unwrap().user_accounts
+    }
+    /// Accept uploads (issue #80): mount `POST /api/v1/upload`.
+    pub fn upload(&self) -> bool {
+        self.flags.read().unwrap().upload
+    }
+
+    /// The single `Upload` guard, behind the router's `route_layer` on `/api/v1/upload`.
+    /// `NotFound`, not `Forbidden` — off ⇒ the surface is *absent* (ADR 0004), the same answer
+    /// `/mcp` and the accounts surface give, so a disabled capability cannot be probed for.
+    pub fn require_upload(&self) -> Result<(), LibError> {
+        if self.upload() {
+            Ok(())
+        } else {
+            Err(LibError::NotFound("uploads are disabled".into()))
+        }
     }
 
     /// The single `UserAccounts` guard, shared by every gated surface: the HTTP router's one
@@ -640,9 +667,9 @@ impl ServerStore {
     // ── status (tech-spec 10 §5) ─────────────────────────────────────────────
 
     pub fn status(&self, bind: &str, localhost_only: bool, tls: bool) -> AdminStatus {
-        let (auth, mcp, network_writes, accounts_enabled) = {
+        let (auth, mcp, network_writes, accounts_enabled, upload_enabled) = {
             let f = self.flags.read().unwrap();
-            (f.auth, f.mcp, f.network_writes, f.user_accounts)
+            (f.auth, f.mcp, f.network_writes, f.user_accounts, f.upload)
         };
         // "Exposed" = reachable off-box, no transport encryption, and no credential demanded of an
         // unauthenticated caller. Both `Off` (everyone is owner) and `Anonymous` (everyone gets read
@@ -662,6 +689,7 @@ impl ServerStore {
             exposed_without_auth,
             token_count: self.list_tokens().map(|t| t.len()).unwrap_or(0),
             accounts_enabled,
+            upload_enabled,
             unclaimed: self.unclaimed(),
             account_count: self.count_accounts().unwrap_or(0),
         }

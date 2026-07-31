@@ -121,6 +121,10 @@ export interface VersionInfo {
    *  is the only thing to show) from a re-opened window (>0 — existing users can still sign in, so
    *  the login screen stays primary and the claim form is a secondary path). */
   account_count?: number;
+  /** Uploads are enabled (issue #80). Off ⇒ POST /api/v1/upload is absent (404), so the Upload
+   *  view and its nav entry hide rather than offering a drop target whose every request fails.
+   *  Absent on older servers — treated as off, which is also this flag's default. */
+  upload?: boolean;
 }
 
 /** Who the current credential (bearer token or session cookie) resolves to, and what it can do

@@ -229,6 +229,10 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
   // `user_accounts` flag on — /api/version already reports it, so no extra query.
   const accountsOn = useVersion().data?.accounts === true;
   const canShare = canAdmin && accountsOn;
+  // Uploads (issue #80) need the `upload` flag *and* write scope: the flag says this deployment
+  // accepts writes into a source at all, the scope says this caller may make them. Same source of
+  // truth as `accounts` — /api/version already reports it, so no extra query.
+  const uploadOn = useVersion().data?.upload === true;
   const [share, setShare] = useState<{
     resource: ShareResource;
     id: string;
@@ -452,10 +456,12 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
       <div className="mt-auto" />
       {/* Light/dark theme (issue #62) — cycles system → light → dark, persisted. */}
       <ThemeToggle />
-      {/* Upload (issue #80). Absent, not disabled, for a caller without `write`: the whole surface
-          is a write action, so a greyed-out entry would only advertise something they can never do
-          — unlike a per-asset control, where the row still has a read purpose. */}
-      {canWrite && (
+      {/* Upload (issue #80). Absent, not disabled, without the `upload` flag or `write` scope: the
+          whole surface is a write action, so a greyed-out entry would only advertise something
+          they can never do — unlike a per-asset control, where the row still has a read purpose.
+          With the flag off the route is genuinely absent server-side, so there is nothing to
+          advertise at all. */}
+      {uploadOn && canWrite && (
         <Link
           to="/upload"
           onClick={onNavigate}

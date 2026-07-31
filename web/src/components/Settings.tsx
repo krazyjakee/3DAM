@@ -221,6 +221,22 @@ export function Settings() {
         </FlagCard>
 
         <FlagCard
+          title="Uploads"
+          hint="Off by default. Allows writing new files into a registered source — the only surface that puts bytes in your project folders. Never replaces an existing file."
+          flag={flag("upload")}
+        >
+          <Toggle
+            label="Uploads"
+            checked={flag("upload")?.value === true}
+            disabled={busyFlag !== null}
+            onChange={(v) => {
+              const f = flag("upload");
+              if (f) void setFlag(f.key, v, f.version);
+            }}
+          />
+        </FlagCard>
+
+        <FlagCard
           title="Federation peer"
           hint="Serve this instance's catalog to other 3DAM instances (advertise endpoint)."
           flag={flag("federation")}

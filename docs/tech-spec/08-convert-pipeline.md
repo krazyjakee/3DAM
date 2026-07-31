@@ -466,6 +466,34 @@ that keep the invariant intact rather than merely policy-gated:
 Replacing or overwriting an existing asset stays out of scope, and is not reachable by relaxing
 anything here.
 
+**Upload has its own off-by-default flag** (`[flags] upload`, file 09 §A.1 — ADR 0004). Being the
+only path that writes into a source makes it its own *exposure class*, not a corner of an existing
+one. `Scope::Write` is a catalog-write scope: it is what tagging, notes, and collections need, and
+a token minted for those must not silently also be able to put files in the user's project folders
+— which is precisely what shipping upload under that scope alone would have done to every write
+token already issued. Nor did `network_writes` cover it: that is a *network ceiling* on
+implicit-trust callers, so a verified write token passes it, and it says nothing at all about a
+loopback deployment.
+
+The gate is therefore three, narrowing:
+
+| Gate | Question | Refusal |
+|---|---|---|
+| `[flags] upload` | Does this **deployment** accept writes into a source? | `404` — the route is absent (off ⇒ the surface disappears) |
+| `Scope::Write` | May this **caller** write? | `401` / `403` |
+| `network_writes` | May an **implicit-trust** caller write from beyond localhost? | `403` |
+
+The first is a 404 rather than a 403 deliberately, and the distinction is which question is being
+asked. "Does this server do uploads?" is the operator's posture: a 403 would advertise a capability
+they chose not to run, and hand a client an Upload view whose every request fails. "May *you*
+upload?" is a per-caller answer that still comes back as a plain 401/403 once past the flag, so the
+under-scoped caller keeps their explanation. The flag gate sits outside the auth gate, so the
+answer while uploads are off does not vary with the credential presented.
+
+Successful and *refused* uploads are both audited (`source.upload` / `source.upload.refused`) —
+being the only way bytes enter a source, the refused attempts are exactly the ones an audit log is
+read for after the fact.
+
 **Collision resolution is retry, not probe-then-write.** `FileSource::put` is create-only and
 answers `Conflict` when the name is taken, so `Suffix` asks for the next name and `Skip` stops.
 There is deliberately no `exists()` check whose answer could go stale before the write: the

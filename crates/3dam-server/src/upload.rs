@@ -1,5 +1,10 @@
 //! The upload transport (issue #80, slice 3) — the one route that writes into a source.
 //!
+//! **Off by default**, behind its own `Upload` runtime flag. Being the only path that puts bytes in
+//! the user's project folders, it is its own exposure class: `Scope::Write` also buys tagging,
+//! notes, and collections, so a token minted for those must not silently carry this too. See
+//! [`routes`] for why "off" answers 404 rather than 403.
+//!
 //! **One file per request, body is the bytes.** Not multipart, and that is a deliberate choice
 //! rather than an omission:
 //!
@@ -35,14 +40,40 @@ use dam_api::LibError;
 use futures::StreamExt;
 use tokio::io::AsyncWriteExt;
 
-/// The upload surface. `DefaultBodyLimit::disable()` removes axum's 2 MB extractor cap — which
-/// would reject essentially every real asset — and the per-request ceiling below replaces it.
-/// Disabling it is safe *because* it is replaced: the streaming loop stops reading at the limit.
-pub fn routes() -> Router<AppState> {
-    Router::new().route(
-        "/api/v1/upload",
-        post(upload).layer(DefaultBodyLimit::disable()),
-    )
+/// The upload surface, behind the `Upload` feature flag (off by default — ADR 0004).
+///
+/// The flag guard is a `route_layer`, so with uploads off the route answers **404, not 403**: off
+/// means the surface is *absent*, the same answer `/mcp` and the accounts block give. That is a
+/// deliberate reversal of this route's original reasoning, which preferred a 403 "so an
+/// unauthorised caller learns why". The two questions turn out to be different ones. *Whether this
+/// deployment does uploads at all* is the operator's posture, and a 403 there advertises a
+/// capability the operator chose not to run — worth probing for, and a false lead for the client,
+/// which would show an Upload view that can only fail. *Whether this caller may upload* is still
+/// answered plainly: past the gate, the `Writer` extractor 401s/403s exactly as before, so the
+/// caller who is merely under-scoped keeps their explanation.
+///
+/// `DefaultBodyLimit::disable()` removes axum's 2 MB extractor cap — which would reject essentially
+/// every real asset — and the per-request ceiling below replaces it. Disabling it is safe *because*
+/// it is replaced: the streaming loop stops reading at the limit.
+pub fn routes(state: AppState) -> Router<AppState> {
+    Router::new()
+        .route(
+            "/api/v1/upload",
+            post(upload).layer(DefaultBodyLimit::disable()),
+        )
+        .route_layer(axum::middleware::from_fn_with_state(state, upload_gate))
+}
+
+async fn upload_gate(
+    State(st): State<AppState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match st.store.require_upload() {
+        Ok(()) => next.run(req).await,
+        Err(e) => ApiError(e).into_response(),
+    }
 }
 
 #[derive(serde::Deserialize)]

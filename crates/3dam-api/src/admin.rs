@@ -63,10 +63,19 @@ pub enum FlagKey {
     /// at least `Token` (accounts mean real identities) and, with zero accounts, enters the
     /// *unclaimed* state — the first loopback signup becomes admin.
     UserAccounts,
+    /// `bool` — accept uploads: writes of *new* files into a registered source (issue #80). Off by
+    /// default; off means `POST /api/v1/upload` 404s and the client's Upload view disappears.
+    ///
+    /// Its own flag rather than a corner of `NetworkWrites` or `Scope::Write`, because it is its
+    /// own exposure class: every other write in 3DAM edits the catalog (tags, notes, collections),
+    /// and this is the only one that puts bytes in the user's project folders (tech-spec 08 §5.1).
+    /// A token minted for tagging should not silently also be able to do that, and an operator who
+    /// wants tagging-without-uploading had no way to say so while the two shared one scope.
+    Upload,
 }
 
 impl FlagKey {
-    pub const ALL: [FlagKey; 7] = [
+    pub const ALL: [FlagKey; 8] = [
         FlagKey::Authentication,
         FlagKey::McpServer,
         FlagKey::NetworkWrites,
@@ -74,6 +83,7 @@ impl FlagKey {
         FlagKey::AutoAnalyze,
         FlagKey::Federation,
         FlagKey::UserAccounts,
+        FlagKey::Upload,
     ];
     /// The stable string used in the URL, the store, and the config file.
     pub fn as_str(self) -> &'static str {
@@ -85,6 +95,7 @@ impl FlagKey {
             FlagKey::AutoAnalyze => "auto_analyze",
             FlagKey::Federation => "federation",
             FlagKey::UserAccounts => "user_accounts",
+            FlagKey::Upload => "upload",
         }
     }
     pub fn parse(s: &str) -> Option<FlagKey> {
@@ -119,6 +130,7 @@ impl FlagValue {
                 | (FlagKey::AutoAnalyze, FlagValue::Bool(_))
                 | (FlagKey::Federation, FlagValue::Bool(_))
                 | (FlagKey::UserAccounts, FlagValue::Bool(_))
+                | (FlagKey::Upload, FlagValue::Bool(_))
         )
     }
 }
@@ -177,6 +189,12 @@ pub struct AdminStatus {
     /// The `UserAccounts` flag (phase 6, issue #42). Additive: defaults keep older clients working.
     #[serde(default)]
     pub accounts_enabled: bool,
+    /// The `Upload` flag (issue #80) — whether this instance accepts writes of new files into a
+    /// registered source. Reported beside `network_writes` because it is the same question one
+    /// level further in: that one asks whether the network may write to the *catalog*, this one
+    /// whether it may write to the user's *files*.
+    #[serde(default)]
+    pub upload_enabled: bool,
     /// Accounts are on but no account exists (or the claim window was re-opened by the config
     /// escape hatch): the next loopback signup becomes admin. Loud on purpose — an exposed
     /// unclaimed instance must never be silent.

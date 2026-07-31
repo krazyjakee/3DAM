@@ -14,7 +14,7 @@ import {
 } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { api, ApiError } from "@/api/client";
-import { qk, useSources } from "@/api/queries";
+import { qk, useSources, useVersion } from "@/api/queries";
 import type { SourceId, SourceInfo, UploadCollision, UploadOutcome } from "@/api/types";
 import { bytes } from "@/lib/format";
 import { FolderTree } from "./FolderTree";
@@ -55,6 +55,7 @@ function unwritableReason(s: SourceInfo): string | null {
 
 export function Upload() {
   const sources = useSources();
+  const version = useVersion();
   const qc = useQueryClient();
   const [source, setSource] = useState<SourceId | null>(null);
   const [folder, setFolder] = useState("");
@@ -202,6 +203,30 @@ export function Upload() {
   const blocked = all.filter((s) => unwritableReason(s));
   const queued = items.filter((i) => i.state === "queued");
   const dropping = dragDepth > 0;
+
+  // The `upload` flag is off (issue #80): the route itself is absent server-side, so every request
+  // this view could make would 404. The nav entry is already hidden — this covers the deep link,
+  // and says *why* rather than letting the user discover it one failed drop at a time. Waits for
+  // the version query so a slow first load doesn't flash "disabled" at an enabled server.
+  if (version.isSuccess && version.data.upload !== true) {
+    return (
+      <div className="mx-auto flex min-h-dvh max-w-4xl flex-col gap-4 p-6 text-sm">
+        <header className="flex items-center justify-between">
+          <h1 className="flex items-center gap-2 text-lg font-semibold text-fg">
+            <UploadIcon size={18} className="text-fg-dim" /> Upload assets
+          </h1>
+          <Link to="/" className="text-xs text-accent hover:underline">
+            ← Back to library
+          </Link>
+        </header>
+        <p className="rounded border border-border bg-panel p-3 text-xs text-fg-dim">
+          Uploads are disabled on this server. Writing files into a source is off by default — an
+          admin can turn it on in Settings, or with{" "}
+          <code className="font-mono text-fg">3dam admin flag upload on</code>.
+        </p>
+      </div>
+    );
+  }
 
   return (
     <div className="mx-auto flex min-h-dvh max-w-4xl flex-col gap-5 p-6 text-sm">

@@ -466,6 +466,7 @@ fn parse_flag_value(key: FlagKey, s: &str) -> anyhow::Result<FlagValue> {
         FlagKey::AutoAnalyze => FlagValue::Bool(parse_bool("auto_analyze")?),
         FlagKey::Federation => FlagValue::Bool(parse_bool("federation")?),
         FlagKey::UserAccounts => FlagValue::Bool(parse_bool("user_accounts")?),
+        FlagKey::Upload => FlagValue::Bool(parse_bool("upload")?),
     })
 }
 
@@ -506,6 +507,12 @@ fn print_status(s: &AdminStatus, json: bool) -> anyhow::Result<()> {
     println!("auth:           {:?}", s.auth);
     println!("mcp:            {:?}", s.mcp);
     println!("network writes: {}", s.network_writes);
+    // The only surface that writes into a registered source (issue #80) — worth a line of its own
+    // in the "am I safe to expose?" view rather than being inferred from `network writes`.
+    println!(
+        "uploads:        {}",
+        if s.upload_enabled { "on" } else { "off" }
+    );
     println!("tokens:         {}", s.token_count);
     println!(
         "accounts:       {}",
