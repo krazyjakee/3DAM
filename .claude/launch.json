@@ -26,6 +26,12 @@
       "port": 5274
     },
     {
+      "name": "web-fed-smoke",
+      "runtimeExecutable": "env",
+      "runtimeArgs": ["VITE_API_TARGET=http://127.0.0.1:7334", "pnpm", "--dir", "web", "dev", "--port", "5275", "--strictPort"],
+      "port": 5275
+    },
+    {
       "name": "web-verify",
       "runtimeExecutable": "pnpm",
       "runtimeArgs": ["--dir", "web", "dev"],

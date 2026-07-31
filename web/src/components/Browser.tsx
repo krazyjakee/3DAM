@@ -29,6 +29,7 @@ import {
 import { api } from "@/api/client";
 import type { AssetSummary, DupGroup, SearchMode, SortField } from "@/api/types";
 import { AUTH_COPY } from "@/lib/auth";
+import { isLocal, localOnly, PEER_READONLY_SET } from "@/lib/origin";
 import { useWriteGate } from "@/lib/write-gate";
 import { useViewState } from "@/lib/view-state";
 import { useDebounced } from "@/lib/use-debounced";
@@ -371,53 +372,68 @@ function SelectionBar({
   const manual = (collections.data ?? []).filter((c) => c.kind === "manual");
   const [showExport, setShowExport] = useState(false);
   const [showConvert, setShowConvert] = useState(false);
-  const ids = assets.map((a) => a.id);
+  // Federated selections are read-only references (tech-spec 07 §7.4): batch actions run against
+  // the local subset, and disable when nothing selected is ours.
+  const locals = localOnly(assets);
+  const localIds = locals.map((a) => a.id);
+  const peerCount = assets.length - locals.length;
+  const peerOnly = locals.length === 0;
 
   return (
     <div className="flex items-center gap-2 border-b border-border bg-surface px-3 py-1.5 text-xs">
       <span className="font-medium text-fg tabular-nums">{assets.length} selected</span>
+      {peerCount > 0 && (
+        <span className="text-fg-dim" title={PEER_READONLY_SET}>
+          {peerCount} federated (read-only)
+        </span>
+      )}
       <button
         className="btn disabled:cursor-not-allowed disabled:opacity-40"
-        onClick={() => analyze.mutate({ assets: ids })}
-        {...gate({ disabled: analyze.isPending })}
+        onClick={() => analyze.mutate({ assets: localIds })}
+        {...gate({
+          disabled: analyze.isPending || peerOnly,
+          title: peerOnly ? PEER_READONLY_SET : undefined,
+        })}
       >
         <Sparkles size={12} /> Analyze
       </button>
       <button
         className="btn disabled:cursor-not-allowed disabled:opacity-40"
         onClick={() => setShowConvert(true)}
-        {...gate()}
+        {...gate({ disabled: peerOnly, title: peerOnly ? PEER_READONLY_SET : undefined })}
       >
         <FileCog size={12} /> Convert
       </button>
       <button
         className="btn disabled:cursor-not-allowed disabled:opacity-40"
         onClick={() => setShowExport(true)}
-        {...gate()}
+        {...gate({ disabled: peerOnly, title: peerOnly ? PEER_READONLY_SET : undefined })}
       >
         <FileDown size={12} /> Export
       </button>
       {showConvert && (
-        <ConvertDialog assets={assets} onClose={() => setShowConvert(false)} />
+        <ConvertDialog assets={locals} onClose={() => setShowConvert(false)} />
       )}
       {showExport && (
-        <ExportDialog scope={{ assets: ids }} onClose={() => setShowExport(false)} />
+        <ExportDialog scope={{ assets: localIds }} onClose={() => setShowExport(false)} />
       )}
       <select
         className="field w-auto disabled:cursor-not-allowed disabled:opacity-40"
         aria-label="Add selection to collection"
         value=""
-        disabled={manual.length === 0 || members.isPending || !canWrite}
+        disabled={manual.length === 0 || members.isPending || !canWrite || peerOnly}
         onChange={(e) => {
-          if (e.target.value) members.mutate({ id: e.target.value, members: { add: ids } });
+          if (e.target.value) members.mutate({ id: e.target.value, members: { add: localIds } });
           e.currentTarget.value = "";
         }}
         title={
-          !canWrite
-            ? AUTH_COPY.needsWrite
-            : manual.length === 0
-              ? "No manual collections yet"
-              : "Add selection to a collection"
+          peerOnly
+            ? PEER_READONLY_SET
+            : !canWrite
+              ? AUTH_COPY.needsWrite
+              : manual.length === 0
+                ? "No manual collections yet"
+                : "Add selection to a collection"
         }
       >
         <option value="" disabled>
@@ -1119,14 +1135,19 @@ function FavoriteStar({ asset }: { asset: AssetSummary }) {
   const setFavorite = useSetFavorite();
   const canWrite = useCan("write");
   const on = asset.favorite;
-  // Read-only: a starred asset still shows its (non-clickable) marker so the state is visible, but
+  // Read-only — the caller lacks write scope, or the asset is a peer-owned reference (tech-spec 07
+  // §7.4): a starred asset still shows its (non-clickable) marker so the state is visible, but
   // there's no toggle affordance — an unstarred tile shows nothing to click.
-  if (!canWrite) {
+  if (!canWrite || !isLocal(asset.origin)) {
     if (!on) return null;
     return (
       <span
         aria-hidden="true"
-        title="Favourite (read-only — needs write access to change)"
+        title={
+          !isLocal(asset.origin)
+            ? "Favourite (read-only — lives on a federated peer)"
+            : "Favourite (read-only — needs write access to change)"
+        }
         className="flex shrink-0 items-center justify-center rounded coarse:min-h-11 coarse:min-w-11"
         style={{ color: "var(--color-accent)" }}
       >

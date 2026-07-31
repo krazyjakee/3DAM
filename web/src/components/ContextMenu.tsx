@@ -26,6 +26,7 @@ import {
 } from "@/api/queries";
 import type { AssetSummary } from "@/api/types";
 import { AUTH_COPY } from "@/lib/auth";
+import { localOnly, PEER_READONLY_SET, peerReadOnlyTitle } from "@/lib/origin";
 import { useViewState } from "@/lib/view-state";
 
 export interface MenuState {
@@ -121,9 +122,17 @@ export function ContextMenu({
   const ids = assets.map((a) => a.id);
   const single = assets.length === 1;
   const heading = single ? assets[0].name : `${assets.length} items`;
+  // Federated targets are read-only references (tech-spec 07 §7.4) — no local write path mutates
+  // them, so mutations act on the local subset only, and disable entirely (with the standard
+  // origin-gate tooltip) when everything clicked lives on a peer.
+  const localTargets = localOnly(assets);
+  const localIds = localTargets.map((a) => a.id);
+  const peerOnly = localIds.length === 0;
+  const peerExcluded = assets.length - localTargets.length;
+  const peerTitle = single ? peerReadOnlyTitle(assets[0].origin) : PEER_READONLY_SET;
   // Only image, 3D and video assets have a server thumbnail to rebuild (audio and documents use the
   // honest typed tile); hide "Regenerate thumbnail" when nothing in the target set can produce one.
-  const thumbableIds = assets
+  const thumbableIds = localTargets
     .filter((a) => a.media === "image" || a.media === "model" || a.media === "video")
     .map((a) => a.id);
 
@@ -146,7 +155,7 @@ export function ContextMenu({
   // Remove the target set from the catalog; `block` also blocks each content hash from re-import.
   // The source files are never touched — only catalog rows (issue #21).
   const removeAll = (block: boolean) =>
-    run(() => ids.forEach((id) => remove.mutate({ id, block })));
+    run(() => localIds.forEach((id) => remove.mutate({ id, block })));
 
   return (
     <div
@@ -168,10 +177,10 @@ export function ContextMenu({
           no-op on an already-up-to-date asset; it still analyses never-analysed targets too. */}
       <Item
         icon={<Sparkles size={13} />}
-        label={single ? "Reanalyze" : `Reanalyze ${assets.length}`}
-        disabled={!canWrite}
-        title={!canWrite ? AUTH_COPY.needsWrite : undefined}
-        onClick={() => run(() => analyze.mutate({ assets: ids, force: true }))}
+        label={single ? "Reanalyze" : `Reanalyze ${localIds.length}`}
+        disabled={!canWrite || peerOnly}
+        title={peerOnly ? peerTitle : !canWrite ? AUTH_COPY.needsWrite : undefined}
+        onClick={() => run(() => analyze.mutate({ assets: localIds, force: true }))}
       />
       {thumbableIds.length > 0 && (
         <Item
@@ -186,10 +195,10 @@ export function ContextMenu({
       )}
       <Item
         icon={<FileCog size={13} />}
-        label={single ? "Convert…" : `Convert ${assets.length}…`}
-        disabled={!canWrite}
-        title={!canWrite ? AUTH_COPY.needsWrite : undefined}
-        onClick={() => run(() => onConvert(assets))}
+        label={single ? "Convert…" : `Convert ${localTargets.length}…`}
+        disabled={!canWrite || peerOnly}
+        title={peerOnly ? peerTitle : !canWrite ? AUTH_COPY.needsWrite : undefined}
+        onClick={() => run(() => onConvert(localTargets))}
       />
 
       {/* Add to collection — submenu of manual collections (smart folders are query-driven). */}
@@ -202,11 +211,13 @@ export function ContextMenu({
           icon={<FolderPlus size={13} />}
           label="Add to collection"
           chevron
-          disabled={!canWrite}
-          title={!canWrite ? AUTH_COPY.needsWrite : undefined}
+          disabled={!canWrite || peerOnly}
+          title={peerOnly ? peerTitle : !canWrite ? AUTH_COPY.needsWrite : undefined}
           onClick={() => setSubmenu((s) => !s)}
         />
-        {submenu && (
+        {/* Hover opens the submenu even when the trigger is disabled — keep it shut for a
+            peer-only target set (there is nothing local to add). */}
+        {submenu && !peerOnly && (
           <div className="absolute top-0 left-full -mt-1 ml-0.5 min-w-40 rounded-md border border-border bg-surface py-1 shadow-xl">
             {manualCollections.length === 0 ? (
               <div className="px-3 py-1.5 text-[11px] text-fg-dim italic">No collections yet</div>
@@ -215,7 +226,7 @@ export function ContextMenu({
                 <Item
                   key={c.id}
                   label={c.name}
-                  onClick={() => run(() => members.mutate({ id: c.id, members: { add: ids } }))}
+                  onClick={() => run(() => members.mutate({ id: c.id, members: { add: localIds } }))}
                 />
               ))
             )}
@@ -237,9 +248,19 @@ export function ContextMenu({
       {confirming ? (
         <div className="px-3 py-1.5">
           <p className="mb-2 text-[10px] text-fg-dim">
-            Remove {single ? "this asset" : `${assets.length} assets`} from the catalog? The source
-            file{single ? "" : "s"} won’t be deleted. <span className="text-fg-muted">Block</span>{" "}
-            also removes every byte-identical copy and skips those bytes on future scans.
+            Remove {localTargets.length === 1 ? "this asset" : `${localTargets.length} assets`} from
+            the catalog? The source file{localTargets.length === 1 ? "" : "s"} won’t be deleted.{" "}
+            <span className="text-fg-muted">Block</span> also removes every byte-identical copy and
+            skips those bytes on future scans.
+            {peerExcluded > 0 && (
+              <>
+                {" "}
+                {peerExcluded === 1
+                  ? "1 selected item lives"
+                  : `${peerExcluded} selected items live`}{" "}
+                on a federated peer and won’t be touched.
+              </>
+            )}
           </p>
           <div className="flex flex-col gap-1">
             <button
@@ -269,15 +290,17 @@ export function ContextMenu({
         <button
           type="button"
           role="menuitem"
-          disabled={!canWrite}
-          title={!canWrite ? AUTH_COPY.needsWrite : undefined}
+          disabled={!canWrite || peerOnly}
+          title={peerOnly ? peerTitle : !canWrite ? AUTH_COPY.needsWrite : undefined}
           onClick={() => setConfirming(true)}
           className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-danger hover:bg-danger/10 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent coarse:min-h-11"
         >
           <span className="flex w-4 shrink-0 justify-center">
             <Trash2 size={13} />
           </span>
-          <span className="flex-1 truncate">{single ? "Remove…" : `Remove ${assets.length}…`}</span>
+          <span className="flex-1 truncate">
+            {single ? "Remove…" : `Remove ${localTargets.length}…`}
+          </span>
         </button>
       )}
     </div>

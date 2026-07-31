@@ -33,11 +33,13 @@ import type {
   AssetSummary,
   CollectionId,
   MediaAttributes,
+  Origin,
   ReviewAction,
   SimilarHit,
   TagRef,
 } from "@/api/types";
 import { bytes, duration, mediaLabel, originLabel, relTime } from "@/lib/format";
+import { peerReadOnlyTitle } from "@/lib/origin";
 import { hasInteractive3D } from "@/lib/model-formats";
 import { useViewState } from "@/lib/view-state";
 import { ModelViewerIsland } from "@/islands/ModelViewerIsland";
@@ -410,7 +412,7 @@ function Body({ asset }: { asset: Asset }) {
 
         {/* tags — auto-suggestions are actionable (accept/reject); the analysis pass shipped in phase 3 */}
         <Group title={`Tags (${asset.tags.length})`}>
-          <TagList assetId={summary.id} tags={asset.tags} />
+          <TagList assetId={summary.id} tags={asset.tags} origin={summary.origin} />
         </Group>
 
         {/* collections — this asset's manual memberships, with per-asset add/remove (issue #3) */}
@@ -433,6 +435,7 @@ function Body({ asset }: { asset: Asset }) {
 function FavoriteButton({ asset }: { asset: Asset }) {
   const setFavorite = useSetFavorite();
   const canWrite = useCan("write");
+  const peerTitle = peerReadOnlyTitle(asset.summary.origin);
   const on = asset.summary.favorite;
   const label = on ? "Remove from favourites" : "Add to favourites";
   return (
@@ -440,10 +443,10 @@ function FavoriteButton({ asset }: { asset: Asset }) {
       type="button"
       className="flex shrink-0 items-center justify-center transition-colors disabled:cursor-not-allowed disabled:opacity-40 coarse:min-h-11 coarse:min-w-11"
       style={{ color: on ? "var(--color-accent)" : "var(--color-fg-dim)" }}
-      title={!canWrite ? AUTH_COPY.needsWrite : label}
+      title={peerTitle ?? (!canWrite ? AUTH_COPY.needsWrite : label)}
       aria-label={label}
       aria-pressed={on}
-      disabled={setFavorite.isPending || !canWrite}
+      disabled={setFavorite.isPending || !canWrite || !!peerTitle}
       onClick={() => setFavorite.mutate({ asset: asset.summary.id, favorite: !on })}
     >
       <Star size={16} className={on ? "fill-current" : ""} />
@@ -460,6 +463,8 @@ function Actions({ asset }: { asset: Asset }) {
   const regenerateThumbnail = useRegenerateThumbnail();
   const canWrite = useCan("write");
   const { summary } = asset;
+  // Peer-owned assets are read-only references (tech-spec 07 §7.4) — maintenance runs on their peer.
+  const peerTitle = peerReadOnlyTitle(summary.origin);
   const analyzed = asset.timestamps.analyzed != null;
   // Video joins image + 3D as a type the server can re-render a thumbnail for (its poster frame).
   const thumbable =
@@ -470,12 +475,13 @@ function Actions({ asset }: { asset: Asset }) {
       <button
         type="button"
         className="btn disabled:cursor-not-allowed disabled:opacity-40"
-        disabled={analyze.isPending || !canWrite}
+        disabled={analyze.isPending || !canWrite || !!peerTitle}
         onClick={() => analyze.mutate({ assets: [summary.id], force: true })}
         title={
-          !canWrite
+          peerTitle ??
+          (!canWrite
             ? AUTH_COPY.needsWrite
-            : "Re-run analysis (embeddings, tileability, auto-tags) for this asset"
+            : "Re-run analysis (embeddings, tileability, auto-tags) for this asset")
         }
       >
         <Sparkles size={13} />
@@ -485,12 +491,13 @@ function Actions({ asset }: { asset: Asset }) {
         <button
           type="button"
           className="btn disabled:cursor-not-allowed disabled:opacity-40"
-          disabled={regenerateThumbnail.isPending || !canWrite}
+          disabled={regenerateThumbnail.isPending || !canWrite || !!peerTitle}
           onClick={() => regenerateThumbnail.mutate([summary.id])}
           title={
-            !canWrite
+            peerTitle ??
+            (!canWrite
               ? AUTH_COPY.needsWrite
-              : "Rebuild the preview thumbnail from the current source file"
+              : "Rebuild the preview thumbnail from the current source file")
           }
         >
           <RefreshCw size={13} />
@@ -509,6 +516,8 @@ function CollectionsGroup({ asset }: { asset: Asset }) {
   const collections = useCollections();
   const members = useCollectionMembers();
   const canWrite = useCan("write");
+  // Membership rows live in this instance's catalog — a peer-owned reference can't join them.
+  const peerTitle = peerReadOnlyTitle(asset.summary.origin);
   const all = collections.data ?? [];
   const inIds = new Set(asset.collections);
   const inCollections = all.filter((c) => inIds.has(c.id));
@@ -533,9 +542,9 @@ function CollectionsGroup({ asset }: { asset: Asset }) {
               {c.kind === "manual" && (
                 <button
                   className="flex items-center justify-center hover:text-danger disabled:cursor-not-allowed disabled:opacity-40 coarse:min-h-11 coarse:min-w-11"
-                  title={!canWrite ? AUTH_COPY.needsWrite : `Remove from ${c.name}`}
+                  title={peerTitle ?? (!canWrite ? AUTH_COPY.needsWrite : `Remove from ${c.name}`)}
                   aria-label={`Remove from ${c.name}`}
-                  disabled={members.isPending || !canWrite}
+                  disabled={members.isPending || !canWrite || !!peerTitle}
                   onClick={() => edit(c.id, "remove")}
                 >
                   <X size={11} />
@@ -549,9 +558,9 @@ function CollectionsGroup({ asset }: { asset: Asset }) {
         <select
           className="field mt-2 disabled:cursor-not-allowed disabled:opacity-40"
           aria-label="Add to collection"
-          title={!canWrite ? AUTH_COPY.needsWrite : undefined}
+          title={peerTitle ?? (!canWrite ? AUTH_COPY.needsWrite : undefined)}
           value=""
-          disabled={members.isPending || !canWrite}
+          disabled={members.isPending || !canWrite || !!peerTitle}
           onChange={(e) => {
             if (e.target.value) edit(e.target.value, "add");
           }}
@@ -652,6 +661,7 @@ function SimilarSection({ asset }: { asset: Asset }) {
   const [open, setOpen] = useState(false);
   const analyzed = asset.timestamps.analyzed != null;
   const analyze = useAnalyze();
+  const peerTitle = peerReadOnlyTitle(asset.summary.origin);
   const similar = useSimilar(asset.summary.id, open && analyzed);
 
   if (!analyzed) {
@@ -661,8 +671,9 @@ function SimilarSection({ asset }: { asset: Asset }) {
           Analyze this asset to find visually similar ones.
         </p>
         <button
-          className="btn mt-2"
-          disabled={analyze.isPending}
+          className="btn mt-2 disabled:cursor-not-allowed disabled:opacity-40"
+          disabled={analyze.isPending || !!peerTitle}
+          title={peerTitle}
           onClick={() => analyze.mutate({ assets: [asset.summary.id] })}
         >
           <Sparkles size={12} />
@@ -730,8 +741,18 @@ function SimilarTile({ hit, onOpen }: { hit: SimilarHit; onOpen: () => void }) {
  *  filtering as soon as the analysis pass proposes it, no accept step. The only review action is
  *  *reject*, which hides a wrong tag from search and stops the same extractor re-suggesting it;
  *  a rejected tag can be *restored*. User-authored tags are static — there is nothing to review. */
-function TagList({ assetId, tags }: { assetId: AssetId; tags: TagRef[] }) {
+function TagList({
+  assetId,
+  tags,
+  origin,
+}: {
+  assetId: AssetId;
+  tags: TagRef[];
+  origin: Origin;
+}) {
   const review = useReviewSuggestion();
+  // Tag review mutates this instance's catalog — a peer-owned asset's tags are reviewed on the peer.
+  const peerTitle = peerReadOnlyTitle(origin);
   if (tags.length === 0) {
     return (
       <p className="text-[11px] text-fg-dim italic">
@@ -746,6 +767,7 @@ function TagList({ assetId, tags }: { assetId: AssetId; tags: TagRef[] }) {
           key={t.name}
           tag={t}
           busy={review.isPending && review.variables?.tag === t.name}
+          peerTitle={peerTitle}
           onReview={(action) => review.mutate({ asset: assetId, tag: t.name, action })}
         />
       ))}
@@ -756,10 +778,12 @@ function TagList({ assetId, tags }: { assetId: AssetId; tags: TagRef[] }) {
 function TagChip({
   tag,
   busy,
+  peerTitle,
   onReview,
 }: {
   tag: TagRef;
   busy: boolean;
+  peerTitle?: string;
   onReview: (action: ReviewAction) => void;
 }) {
   const auto = tag.source === "auto";
@@ -796,9 +820,12 @@ function TagChip({
       {rejected ? (
         <button
           className="flex items-center justify-center hover:text-accent disabled:cursor-not-allowed disabled:opacity-40 coarse:min-h-11 coarse:min-w-11"
-          title={!canWrite ? AUTH_COPY.needsWrite : "Restore tag — include it in search again"}
+          title={
+            peerTitle ??
+            (!canWrite ? AUTH_COPY.needsWrite : "Restore tag — include it in search again")
+          }
           aria-label={`Restore tag ${tag.name}`}
-          disabled={busy || !canWrite}
+          disabled={busy || !canWrite || !!peerTitle}
           onClick={() => onReview("accept")}
         >
           <RotateCcw size={12} />
@@ -806,9 +833,9 @@ function TagChip({
       ) : (
         <button
           className="flex items-center justify-center hover:text-danger disabled:cursor-not-allowed disabled:opacity-40 coarse:min-h-11 coarse:min-w-11"
-          title={!canWrite ? AUTH_COPY.needsWrite : "Reject tag — hide it from search"}
+          title={peerTitle ?? (!canWrite ? AUTH_COPY.needsWrite : "Reject tag — hide it from search")}
           aria-label={`Reject tag ${tag.name}`}
-          disabled={busy || !canWrite}
+          disabled={busy || !canWrite || !!peerTitle}
           onClick={() => onReview("reject")}
         >
           <X size={12} />
