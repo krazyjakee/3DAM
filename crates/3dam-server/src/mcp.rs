@@ -76,6 +76,14 @@ struct ToolDef {
     schema: fn() -> Value,
 }
 
+/// The `media` enum advertised in the MCP tool schemas, derived from [`MediaType::ALL`] rather
+/// than written out. An agent's whole view of what this library can hold comes from these schemas,
+/// so a hardcoded list that missed a variant would make that media type effectively invisible to
+/// every agent — a silent, hard-to-notice failure.
+fn media_enum() -> Vec<&'static str> {
+    MediaType::ALL.iter().map(|m| m.as_str()).collect()
+}
+
 fn tool_defs() -> Vec<ToolDef> {
     vec![
         ToolDef {
@@ -87,7 +95,7 @@ fn tool_defs() -> Vec<ToolDef> {
                     "type": "object",
                     "properties": {
                         "query": {"type": "string", "description": "Free text over filename."},
-                        "media": {"type": "string", "enum": ["audio","image","model"]},
+                        "media": {"type": "string", "enum": media_enum()},
                         "tags": {"type": "array", "items": {"type": "string"}},
                         "source": {"type": "string", "description": "Source id (UUID)."},
                         "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50}
@@ -143,7 +151,7 @@ fn tool_defs() -> Vec<ToolDef> {
                     "type": "object",
                     "properties": {
                         "near": {"type": "boolean", "default": false},
-                        "media": {"type": "string", "enum": ["audio","image","model"]},
+                        "media": {"type": "string", "enum": media_enum()},
                         "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50}
                     }
                 })
@@ -660,7 +668,8 @@ fn get_prompt(params: Value) -> Result<Value, RpcError> {
     }))
 }
 
-const INSTRUCTIONS: &str = "3dam is a local-first game-asset manager (audio, images, 3D models). \
+const INSTRUCTIONS: &str = "3dam is a local-first game-asset manager (audio, images, 3D models, \
+plus the video and documents that sit alongside them). \
 Use `search` and `find_similar` to explore the catalog, `get_asset` for full metadata including \
 license, and `find_duplicates` for dedup review. Write tools (tag/add_source/scan/convert/export) \
 are non-destructive and only available when the server enables them.";

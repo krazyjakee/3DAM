@@ -15,11 +15,23 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tower::ServiceExt;
 
 fn unique_tmp() -> std::path::PathBuf {
+    // Per-process atomic counter as well as a timestamp, for the reason `dam-core/tests/scan.rs`
+    // documents: these tests run in parallel within one process and `as_nanos()` can coincide for
+    // two that start in the same clock tick, silently sharing a data dir — which surfaces as a
+    // migration failure ("table already exists") from whichever harness loses the race. The
+    // window is only as narrow as `open` is fast, so it widens whenever a migration is added.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    std::env::temp_dir().join(format!("3dam-phase5-{}-{}", std::process::id(), nanos))
+    std::env::temp_dir().join(format!(
+        "3dam-phase5-{}-{}-{}",
+        std::process::id(),
+        nanos,
+        n
+    ))
 }
 
 async fn harness(localhost_only: bool) -> (axum::Router, Arc<ServerStore>, Arc<EmbeddedLibrary>) {

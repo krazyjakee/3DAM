@@ -125,7 +125,49 @@ const MODEL: Control[] = [
   { field: "has_uv", label: "UV mapped", kind: "bool" },
 ];
 
-const CATALOG: Record<MediaType, Control[]> = { audio: AUDIO, image: IMAGE, model: MODEL };
+const VIDEO: Control[] = [
+  {
+    field: "video_class",
+    label: "Length",
+    kind: "enum",
+    options: [
+      ["sting", "Sting"],
+      ["clip", "Clip"],
+      ["cutscene", "Cutscene"],
+    ],
+  },
+  { field: "duration", label: "Duration", kind: "range", unit: "ms" },
+  { field: "width", label: "Width", kind: "range", unit: "px" },
+  { field: "height", label: "Height", kind: "range", unit: "px" },
+  { field: "fps", label: "Frame rate", kind: "range", unit: "fps" },
+  { field: "bitrate", label: "Bitrate", kind: "range", unit: "bps" },
+  { field: "has_audio", label: "Has audio", kind: "bool" },
+];
+
+const DOCUMENT: Control[] = [
+  {
+    field: "document_class",
+    label: "Kind",
+    kind: "enum",
+    options: [
+      ["license", "Licence"],
+      ["readme", "Readme"],
+      ["changelog", "Changelog"],
+      ["receipt", "Receipt"],
+      ["document", "Other"],
+    ],
+  },
+  { field: "page_count", label: "Pages", kind: "range" },
+  { field: "word_count", label: "Words", kind: "range" },
+];
+
+const CATALOG: Record<MediaType, Control[]> = {
+  audio: AUDIO,
+  image: IMAGE,
+  model: MODEL,
+  video: VIDEO,
+  document: DOCUMENT,
+};
 
 /** Replace (or clear, when `filter` is null) the single filter targeting `field`. */
 function withFilter(adv: Filter[], field: FacetField, filter: Filter | null): Filter[] {

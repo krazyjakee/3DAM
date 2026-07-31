@@ -13,12 +13,18 @@ pub type CountMap = BTreeMap<String, u64>;
 
 // ── media / license shared value types ─────────────────────────────────────
 
+/// The media classes the catalog spans. `Audio`/`Image`/`Model` are the **deep** types — full
+/// decode, analysis, embeddings, conversion. `Video`/`Document` (PRODUCT_SPEC §9 phase 2b) are
+/// deliberately shallower: they exist so a source can be catalogued *completely*, and each is
+/// honest about what it can't do rather than faking parity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MediaType {
     Audio,
     Image,
     Model,
+    Video,
+    Document,
 }
 
 /// Raw asset bytes for a preview, plus just enough descriptor to serve/label them. This is the
@@ -38,7 +44,20 @@ pub struct AssetContent {
 /// Best-effort MIME for a `(media, format)` pair — covers the v1 decode matrix (ADR 0009 §8) and
 /// falls back to `application/octet-stream`. Lives here so both the engine and any client agree.
 pub fn content_type_for(media: MediaType, format: &str) -> &'static str {
-    match format.to_ascii_lowercase().as_str() {
+    let fmt = format.to_ascii_lowercase();
+    // Container extensions shared by more than one media class must consult `media` first —
+    // `.mp4`/`.mov` are audio-only or full video depending on their track table, and serving a
+    // video as `audio/mp4` makes the browser refuse to render a picture (PRODUCT_SPEC §9 2b).
+    match (media, fmt.as_str()) {
+        (MediaType::Video, "mp4" | "m4v") => return "video/mp4",
+        (MediaType::Video, "mov") => return "video/quicktime",
+        (MediaType::Video, "webm") => return "video/webm",
+        (MediaType::Video, "mkv") => return "video/x-matroska",
+        (MediaType::Video, "avi") => return "video/x-msvideo",
+        (MediaType::Video, "ogv") => return "video/ogg",
+        _ => {}
+    }
+    match fmt.as_str() {
         // 3D
         "glb" => "model/gltf-binary",
         "gltf" => "model/gltf+json",
@@ -51,7 +70,11 @@ pub fn content_type_for(media: MediaType, format: &str) -> &'static str {
         "mp3" => "audio/mpeg",
         "flac" => "audio/flac",
         "ogg" => "audio/ogg",
-        "aac" | "m4a" | "mp4" => "audio/mp4",
+        // `mov`/`m4v` land here only when the content probe has already reclassified the file as
+        // audio-only (it keeps the original format token) — the video arm above caught every other
+        // case. Serving those as `application/octet-stream` would make the one file the probe
+        // exists to detect the one file that won't play.
+        "aac" | "m4a" | "mp4" | "mov" | "m4v" => "audio/mp4",
         // image
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
@@ -59,10 +82,19 @@ pub fn content_type_for(media: MediaType, format: &str) -> &'static str {
         "gif" => "image/gif",
         "bmp" => "image/bmp",
         "tif" | "tiff" => "image/tiff",
+        // documents — text/* types carry an explicit charset so the browser doesn't guess
+        "pdf" => "application/pdf",
+        "md" => "text/markdown; charset=utf-8",
+        "txt" => "text/plain; charset=utf-8",
+        "rtf" => "application/rtf",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "odt" => "application/vnd.oasis.opendocument.text",
         _ => match media {
-            MediaType::Image => "application/octet-stream",
-            MediaType::Audio => "application/octet-stream",
-            MediaType::Model => "application/octet-stream",
+            MediaType::Image
+            | MediaType::Audio
+            | MediaType::Model
+            | MediaType::Video
+            | MediaType::Document => "application/octet-stream",
         },
     }
 }
@@ -73,6 +105,8 @@ impl MediaType {
             MediaType::Audio => "audio",
             MediaType::Image => "image",
             MediaType::Model => "model",
+            MediaType::Video => "video",
+            MediaType::Document => "document",
         }
     }
     pub fn parse(s: &str) -> Option<Self> {
@@ -80,9 +114,20 @@ impl MediaType {
             "audio" => Some(MediaType::Audio),
             "image" => Some(MediaType::Image),
             "model" => Some(MediaType::Model),
+            "video" => Some(MediaType::Video),
+            "document" => Some(MediaType::Document),
             _ => None,
         }
     }
+    /// Every variant, in display order. Lets callers enumerate media types without re-listing
+    /// them (and silently missing one) each time a variant is added.
+    pub const ALL: &'static [MediaType] = &[
+        MediaType::Audio,
+        MediaType::Image,
+        MediaType::Model,
+        MediaType::Video,
+        MediaType::Document,
+    ];
 }
 
 /// Where a result row lives — local or a named peer (attributable, PRODUCT_SPEC §4.4).
@@ -218,6 +263,8 @@ pub enum MediaAttributes {
     Audio(AudioAttributes),
     Image(ImageAttributes),
     Model(ModelAttributes),
+    Video(VideoAttributes),
+    Document(DocumentAttributes),
     /// Cheap metadata not yet extracted.
     None,
 }
@@ -302,6 +349,59 @@ pub struct ModelAttributes {
     #[serde(default)]
     pub has_uvs: Option<bool>,
     /// Auto-category guess (`prop` | `character` | `environment` | …); tech-spec 05 §5.
+    #[serde(default)]
+    pub class: Option<String>,
+}
+
+/// Cheap-tier video facts, read from the container by a discovered `ffprobe`
+/// ([ADR 0015](../../../docs/adr/0015-video-decode-backend.md)). Every field is `Option` because
+/// the whole struct is empty-but-valid when no prober is installed — a video with no metadata is
+/// still a catalogued, browsable, playable asset.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct VideoAttributes {
+    pub duration_ms: Option<i64>,
+    pub width: Option<i64>,
+    pub height: Option<i64>,
+    /// Average frame rate, frames per second.
+    #[serde(default)]
+    pub fps: Option<f32>,
+    /// Video codec of the first video stream (`h264`, `vp9`, `av1`, …).
+    #[serde(default)]
+    pub codec: Option<String>,
+    /// Container/format name (`mov,mp4,m4a,3gp,3g2,mj2`, `matroska,webm`, …).
+    #[serde(default)]
+    pub container: Option<String>,
+    /// Overall container bitrate in bits per second.
+    #[serde(default)]
+    pub bitrate: Option<i64>,
+    /// Whether the container carries at least one audio stream.
+    #[serde(default)]
+    pub has_audio: Option<bool>,
+    /// Auto-category guess (`cutscene` | `clip` | `loop` | …); `None` until analysed.
+    #[serde(default)]
+    pub class: Option<String>,
+}
+
+/// Cheap-tier document facts. Documents are the first media type whose *content is language*
+/// (PRODUCT_SPEC §9 phase 2b), so this carries a short excerpt for display; the full extracted
+/// text goes to the FTS index rather than travelling on every summary row.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DocumentAttributes {
+    pub page_count: Option<i64>,
+    pub word_count: Option<i64>,
+    /// Document title from the container's metadata (PDF info dict, DOCX core properties, or a
+    /// leading Markdown `#` heading) — *not* the filename.
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub author: Option<String>,
+    /// Detected text encoding for plaintext formats (`utf-8`, `utf-16le`, `latin-1`).
+    #[serde(default)]
+    pub encoding: Option<String>,
+    /// A short leading excerpt for the inspector/grid card. Truncated on a character boundary.
+    #[serde(default)]
+    pub excerpt: Option<String>,
+    /// Auto-category guess (`license` | `readme` | `design_doc` | `receipt` | …).
     #[serde(default)]
     pub class: Option<String>,
 }
@@ -409,6 +509,17 @@ pub enum FacetField {
     HasAnimation,
     HasUv,
     ModelClass,
+    // Video (video_attr). `Width`/`Height`/`Duration` above also match video — the columns mean
+    // the same thing there, so those facets span both tables rather than being duplicated.
+    Fps,
+    Bitrate,
+    HasAudio,
+    VideoClass,
+    // Document (document_attr):
+    PageCount,
+    WordCount,
+    Author,
+    DocumentClass,
     /// User-flagged favourite (issue #63). Presence of the filter means "favourites only".
     Favorite,
     /// Source-relative path prefix (issue #66) — scopes the browse to a folder subtree. The value is

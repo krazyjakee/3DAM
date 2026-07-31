@@ -8,7 +8,8 @@ export type JobId = string;
 export type CollectionId = string;
 export type ContentHash = string;
 
-export type MediaType = "audio" | "image" | "model";
+/** Deep media types plus the shallower `video`/`document` (PRODUCT_SPEC §9 phase 2b). */
+export type MediaType = "audio" | "image" | "model" | "video" | "document";
 export type LicenseStatus = "permissive" | "attribution" | "restricted" | "unknown";
 
 export type Origin = "local" | { peer: string };
@@ -60,6 +61,8 @@ export type MediaAttributes =
   | ({ media: "audio" } & AudioAttributes)
   | ({ media: "image" } & ImageAttributes)
   | ({ media: "model" } & ModelAttributes)
+  | ({ media: "video" } & VideoAttributes)
+  | ({ media: "document" } & DocumentAttributes)
   | { media: "none" };
 
 export interface AudioAttributes {
@@ -117,6 +120,35 @@ export interface ModelAttributes {
   has_rig?: boolean | null;
   has_animation?: boolean | null;
   has_uvs?: boolean | null;
+}
+
+/**
+ * Cheap-tier video facts from a discovered `ffprobe` (ADR 0015). Every field is nullable because
+ * the whole struct is empty-but-valid when no prober is installed on the server — render that as
+ * "unknown", not as a broken asset.
+ */
+export interface VideoAttributes {
+  duration_ms: number | null;
+  width: number | null;
+  height: number | null;
+  fps?: number | null;
+  codec?: string | null;
+  container?: string | null;
+  bitrate?: number | null;
+  has_audio?: boolean | null;
+  class?: string | null;
+}
+
+/** Cheap-tier document facts. `excerpt` is a short leading extract, used for the tile card. */
+export interface DocumentAttributes {
+  page_count: number | null;
+  word_count: number | null;
+  /** Title from the container's metadata (PDF info dict, DOCX core props, leading `#`) — not the filename. */
+  title?: string | null;
+  author?: string | null;
+  encoding?: string | null;
+  excerpt?: string | null;
+  class?: string | null;
 }
 
 export interface TagRef {
@@ -197,7 +229,17 @@ export type FacetField =
   | "has_rig"
   | "has_animation"
   | "has_uv"
-  | "model_class";
+  | "model_class"
+  // video (video_attr) — width/height/duration above also match video
+  | "fps"
+  | "bitrate"
+  | "has_audio"
+  | "video_class"
+  // document (document_attr)
+  | "page_count"
+  | "word_count"
+  | "author"
+  | "document_class";
 
 export type FilterOp =
   | "eq"

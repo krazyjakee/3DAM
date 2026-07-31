@@ -90,11 +90,13 @@ impl Store {
     ) -> Result<(), LibError> {
         let conn = self.conn.lock().unwrap();
         let key = id.as_bytes().to_vec();
-        // Column set is identical across the three attr tables; pick the table for the media type.
+        // Every attr table carries the same `class` column; pick the table for the media type.
         let sql = match media {
             MediaType::Audio => "INSERT INTO audio_attr (asset_id, class) VALUES (?1, ?2) ON CONFLICT(asset_id) DO UPDATE SET class=excluded.class",
             MediaType::Model => "INSERT INTO model_attr (asset_id, class) VALUES (?1, ?2) ON CONFLICT(asset_id) DO UPDATE SET class=excluded.class",
             MediaType::Image => "INSERT INTO image_attr (asset_id, class) VALUES (?1, ?2) ON CONFLICT(asset_id) DO UPDATE SET class=excluded.class",
+            MediaType::Video => "INSERT INTO video_attr (asset_id, class) VALUES (?1, ?2) ON CONFLICT(asset_id) DO UPDATE SET class=excluded.class",
+            MediaType::Document => "INSERT INTO document_attr (asset_id, class) VALUES (?1, ?2) ON CONFLICT(asset_id) DO UPDATE SET class=excluded.class",
         };
         conn.execute(sql, params![key, class]).map_err(internal)?;
         Ok(())
@@ -178,6 +180,25 @@ impl Store {
         Ok(())
     }
 
+    /// Drop an asset's embedding in one space. The counterpart to [`Self::set_embedding`] for the
+    /// case where re-analysis produces *no* vector (a document whose new revision has no readable
+    /// text): leaving the previous one indexed would keep ranking the asset on content it no longer
+    /// has. A no-op when there was nothing there.
+    pub fn clear_embedding(&self, id: &AssetId, space_id: &str) -> Result<(), LibError> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn
+            .execute(
+                "DELETE FROM embedding WHERE asset_id = ?1 AND space_id = ?2",
+                params![id.as_bytes().to_vec(), space_id],
+            )
+            .map_err(internal)?;
+        if n > 0 {
+            self.embed_gen
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
     /// Record that an asset is now analysed at `version` (the Plan gate reads this, §7.2).
     pub fn mark_analysed(&self, id: &AssetId, version: i64) -> Result<(), LibError> {
         let conn = self.conn.lock().unwrap();
@@ -226,6 +247,24 @@ impl Store {
              WHERE rowid = (SELECT rowid FROM asset WHERE id = ?1)",
             params![id.as_bytes().to_vec()],
         );
+    }
+
+    /// Write a document's extracted body text into the `text` FTS column (schema V10).
+    ///
+    /// The text is stored **only** in the index, never in a base-table column: it can be a megabyte
+    /// per asset, nothing but search reads it, and keeping it out of `asset` keeps the row width
+    /// (and every `SELECT *`-shaped query) unchanged. The cost of that choice is that the value has
+    /// to be stashed and restored on any future FTS rebuild — exactly as `tokens` and `tags`
+    /// already are, and as V10's own migration does.
+    pub fn set_document_text(&self, id: &AssetId, text: &str) -> Result<(), LibError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE asset_fts SET text = ?2
+             WHERE rowid = (SELECT rowid FROM asset WHERE id = ?1)",
+            params![id.as_bytes().to_vec(), text],
+        )
+        .map_err(internal)?;
+        Ok(())
     }
 
     /// Intern a tag name, returning its id (case-insensitive unique).
@@ -307,7 +346,7 @@ impl Store {
         k: u32,
         filters: &[Filter],
         vis: &Visibility,
-    ) -> Result<Vec<(AssetSummary, f32)>, LibError> {
+    ) -> Result<(String, Vec<(AssetSummary, f32)>), LibError> {
         let conn = self.conn.lock().unwrap();
         // Query vector + its space.
         let query: Option<(String, Vec<u8>)> = conn
@@ -319,7 +358,7 @@ impl Store {
             .optional()
             .map_err(internal)?;
         let Some((space_id, qbytes)) = query else {
-            return Ok(Vec::new()); // not embedded yet (§1.3)
+            return Ok((String::new(), Vec::new())); // not embedded yet (§1.3)
         };
         let qvec = bytes_to_f32(&qbytes);
         // Over-fetch nearest neighbours (self excluded) so the facet post-filter still leaves ≥ k.
@@ -369,7 +408,7 @@ impl Store {
                 out.push((sum.clone(), score));
             }
         }
-        Ok(out)
+        Ok((space_id, out))
     }
 
     /// The stored embedding for one asset — `(space_id, vector)`, or `None` when not yet analysed.

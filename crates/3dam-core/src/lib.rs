@@ -17,6 +17,16 @@ pub use background::PipelinePolicy;
 pub use paths::default_data_dir;
 pub use resources::ResourceOptions;
 
+/// Whether this machine has a video decode backend installed (a discovered `ffprobe`, ADR 0015).
+///
+/// Re-exported from `dam-media` so the server can advertise it without taking a direct dependency
+/// on the handler crate — frontends talk to the engine, not around it. It is a property of the
+/// *host*, not the build, so a client has no way to infer it and an unexplained empty tile would
+/// read as a bug.
+pub fn video_probe_available() -> bool {
+    dam_media::video_probe_available()
+}
+
 use async_trait::async_trait;
 use dam_api::admin::{
     CacheTarget, CacheUsage, ClearAnalysisReport, ClearCacheReport, StorageUsage, VacuumReport,
@@ -648,10 +658,16 @@ impl EmbeddedLibrary {
     /// its media with the model-backed space id.
     pub fn embedding_spaces(&self) -> std::collections::BTreeMap<String, String> {
         let mut spaces = std::collections::BTreeMap::new();
-        for media in [MediaType::Audio, MediaType::Image, MediaType::Model] {
+        for &media in MediaType::ALL {
+            // A loaded model that doesn't cover this media reports an empty space id (the composite
+            // has no checkpoint for video or prose); fall back to the model-free space the analyse
+            // pass actually wrote into, so the advertised name is never one nothing was indexed under.
             let id = match &self.semantic {
-                Some(m) => m.space_id(media),
-                None => format!("{}-stats-v1", media.as_str()),
+                Some(m) => match m.space_id(media) {
+                    s if s.is_empty() => analysis::model_free_space(media).to_string(),
+                    s => s,
+                },
+                None => analysis::model_free_space(media).to_string(),
             };
             spaces.insert(media.as_str().to_string(), id);
         }
@@ -1520,13 +1536,18 @@ impl LibraryService for EmbeddedLibrary {
         let (asset, k) = (req.asset, req.k);
         let filters = req.filters.clone();
         let vis = ctx.visibility.clone();
-        let hits = self
+        let (space, hits) = self
             .db(move |s| s.similar(&asset, k, &filters, &vis))
-            .await?
+            .await?;
+        let hits = hits
             .into_iter()
-            // Tag each hit with the media space it was ranked in (the explanation, §3.2).
+            // Tag each hit with the space it was actually ranked in (the explanation, §3.2). This
+            // is the `space_id` the store ranked against, not a string rebuilt from the media type:
+            // spaces are not uniformly named (documents rank in `text-hash-v1`) and a model-backed
+            // embedding ranks in its own space entirely, so reconstructing the label would state a
+            // space the ranking never used.
             .map(|(asset, score)| SimilarHit {
-                space: format!("{}-stats-v1", asset.media.as_str()),
+                space: space.clone(),
                 asset,
                 score,
             })

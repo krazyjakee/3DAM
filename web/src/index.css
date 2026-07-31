@@ -47,6 +47,10 @@
   --color-media-audio: #35d0ba;
   --color-media-image: #f0883e;
   --color-media-model: #7c8cff;
+  /* Video (rose) and document (slate) sit apart from the three deep-media hues deliberately: they
+     are the shallower types (PRODUCT_SPEC §9 phase 2b) and shouldn't read as peers of them. */
+  --color-media-video: #f472b6;
+  --color-media-document: #94a3b8;
 }
 
 /* ── Light theme (DESIGN_GUIDELINES §3.5) ────────────────────────────────────
@@ -88,6 +92,9 @@
   --color-media-audio: #0f766e;
   --color-media-image: #c2410c;
   --color-media-model: #4f46e5;
+  /* Both darkened from their dark-theme values so the badge labels clear AA on a light surface. */
+  --color-media-video: #be185d;
+  --color-media-document: #475569;
 }
 
 @layer base {

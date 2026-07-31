@@ -40,14 +40,24 @@ impl Store {
         let rank_match = rank_text.and_then(|t| crate::search::fts_match_expr(t, &self.synonyms));
         let (order_clause, order_binds): (String, Vec<Value>) = match req.sort.field {
             SortField::Relevance if rank_match.is_some() => (
-                // FTS bm25 relevance (M1): a correlated lookup returns the row's bm25 score (more
-                // negative = better); rows matched only by the LIKE fallback have no bm25 row and
-                // COALESCE to a large sentinel so they sort last. Name length/name break ties.
-                "COALESCE((SELECT bm25(asset_fts) FROM asset_fts \
-                    WHERE asset_fts.rowid = asset.rowid AND asset_fts MATCH ?), 1e9) ASC, \
-                    LENGTH(filename) ASC, filename ASC"
-                    .into(),
-                vec![Value::Text(rank_match.unwrap())],
+                // FTS relevance (M1), two-level. First a categorical tier so a name/tag match
+                // always beats a document-body-only match (`NAME_SCOPED_TIER` explains why a bm25
+                // weight can't do this); then bm25 within the tier (more negative = better). Rows
+                // matched only by the LIKE fallback have no bm25 row and COALESCE to a large
+                // sentinel so they sort last. Name length/name break ties.
+                format!(
+                    "{tier}, \
+                     COALESCE((SELECT {rank} FROM asset_fts \
+                        WHERE asset_fts.rowid = asset.rowid AND asset_fts MATCH ?), 1e9) ASC, \
+                        LENGTH(filename) ASC, filename ASC",
+                    tier = crate::search::NAME_SCOPED_TIER,
+                    rank = crate::search::FTS_RANK
+                ),
+                {
+                    let m = rank_match.unwrap();
+                    // Bind order follows the clause: the tier's name-scoped MATCH, then bm25's.
+                    vec![Value::Text(crate::search::name_scoped(&m)), Value::Text(m)]
+                },
             ),
             SortField::Relevance if rank_text.is_some() => (
                 // Text present but unindexable (punctuation-only) — the old substring proxy.
@@ -144,12 +154,20 @@ impl Store {
             .as_ref()
             .and_then(|t| crate::search::fts_match_expr(t, &self.synonyms));
         let order = if let Some(m) = rank_match {
+            // Same two-level ranking as the lexical page (tier, then weighted bm25) so the
+            // candidate list the fusion starts from is ordered the same way the user would see it.
+            binds.push(Value::Text(crate::search::name_scoped(&m)));
             binds.push(Value::Text(m));
-            "COALESCE((SELECT bm25(asset_fts) FROM asset_fts \
-                WHERE asset_fts.rowid = asset.rowid AND asset_fts MATCH ?), 1e9) ASC, \
-                LENGTH(filename) ASC, filename ASC"
+            format!(
+                "{tier}, \
+                 COALESCE((SELECT {rank} FROM asset_fts \
+                    WHERE asset_fts.rowid = asset.rowid AND asset_fts MATCH ?), 1e9) ASC, \
+                    LENGTH(filename) ASC, filename ASC",
+                tier = crate::search::NAME_SCOPED_TIER,
+                rank = crate::search::FTS_RANK
+            )
         } else {
-            "filename ASC, asset.id ASC"
+            "filename ASC, asset.id ASC".to_string()
         };
         let sql = format!(
             "SELECT asset.id FROM asset {ATTR_JOINS} {where_sql} ORDER BY {order} LIMIT {LEX_CAP}"
@@ -523,6 +541,91 @@ mod tests {
             })
             .unwrap();
         store
+    }
+
+    /// The ranking risk the video/document epic (#79) called out: document body text joins the same
+    /// FTS index as filenames, so without per-column bm25 weights a long document that merely
+    /// *mentions* a word buries the file actually named after it. Asserts the weighting works.
+    #[test]
+    fn filename_outranks_document_body_text() {
+        let store = Store::open_in_memory().unwrap();
+        let src = store
+            .add_source(
+                &SourceConnection::LocalFs {
+                    root: "/tmp".into(),
+                },
+                "t",
+                false,
+            )
+            .unwrap();
+        let add = |filename: &str, media: MediaType, format: &str| {
+            store
+                .upsert_asset(&NewAsset {
+                    source_id: src,
+                    path: filename.to_string(),
+                    filename: filename.to_string(),
+                    content_hash: None,
+                    size_bytes: Some(1),
+                    source_modified_at: None,
+                    scanned_at: now_ms(),
+                    media_type: media,
+                    format: format.into(),
+                })
+                .unwrap()
+                .0
+        };
+        let sound = add("kick.wav", MediaType::Audio, "wav");
+        let doc = add("design-notes.md", MediaType::Document, "md");
+
+        // The document says "kick" repeatedly; the audio file merely *is* kick.wav.
+        let body = "kick ".repeat(200) + "and other percussion design notes";
+        store.set_document_text(&doc, &body).unwrap();
+
+        let page = query_all(
+            &store,
+            &QueryRequest {
+                text: Some("kick".into()),
+                sort: Sort {
+                    field: SortField::Relevance,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let ids: Vec<_> = page.items.iter().map(|a| a.id).collect();
+        assert!(
+            ids.contains(&doc),
+            "the document must still be findable by its text — the tier reorders, it never filters"
+        );
+        assert_eq!(
+            ids.first(),
+            Some(&sound),
+            "the file named `kick.wav` must outrank a document that merely mentions kick 200 times"
+        );
+
+        // The other half of the bargain: a word that appears *only* in a document's body is still
+        // a hit. Full-text search over documents is the whole point of putting the text in the
+        // index — demoting it below filenames must not become suppressing it.
+        let page = query_all(
+            &store,
+            &QueryRequest {
+                text: Some("percussion".into()),
+                sort: Sort {
+                    field: SortField::Relevance,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let ids: Vec<_> = page.items.iter().map(|a| a.id).collect();
+        assert_eq!(
+            ids,
+            vec![doc],
+            "a term only present in document body text must still match that document"
+        );
     }
 
     /// Favourites (issue #63): the flag round-trips through the `flags` bitset, the `favorite` facet

@@ -92,7 +92,7 @@ pub(crate) fn run_scan(
                 Ok(fe) => {
                     seen.insert(fe.rel_path.clone());
                     // Detect by the logical path's extension (a remote temp file has a random name).
-                    let Some(det) = dam_media::detect(Path::new(&fe.rel_path)) else {
+                    let Some(det) = dam_media::detect_for_ingest(Path::new(&fe.rel_path)) else {
                         return true; // unhandled type: skip (fail-soft, DG §6)
                     };
                     // Progress tracks every detectable file we examine — not just new/changed
@@ -132,6 +132,11 @@ pub(crate) fn run_scan(
                         }
                     };
                     let abs = fetched.path();
+                    // Now that real bytes exist locally, settle the container extensions whose
+                    // media type the path alone can't determine (`.mp4`/`.mov`/`.m4v` — audio-only
+                    // or video?). This is the only point in the scan where that question is
+                    // answerable, and it's asked once per asset, before the row is written.
+                    let det = dam_media::refine_with_content(&det, abs).unwrap_or(det);
                     let hash = match hash_file(abs) {
                         Some(h) => Some(h),
                         None => {
@@ -295,6 +300,26 @@ fn key_attrs_of(attrs: &MediaAttributes) -> SmallMap {
                 m.insert("tris".into(), t.to_string());
             }
         }
+        MediaAttributes::Video(v) => {
+            if let (Some(w), Some(h)) = (v.width, v.height) {
+                m.insert("dimensions".into(), format!("{w}×{h}"));
+            }
+            if let Some(ms) = v.duration_ms {
+                let secs = ms as f64 / 1000.0;
+                m.insert(
+                    "duration".into(),
+                    format!("{:.0}:{:02}", (secs / 60.0).floor(), (secs % 60.0) as i64),
+                );
+            }
+        }
+        MediaAttributes::Document(d) => {
+            if let Some(p) = d.page_count.filter(|p| *p > 0) {
+                m.insert("pages".into(), p.to_string());
+            }
+            if let Some(w) = d.word_count.filter(|w| *w > 0) {
+                m.insert("words".into(), w.to_string());
+            }
+        }
         MediaAttributes::None => {}
     }
     m
@@ -327,7 +352,7 @@ fn count_total(store: &Store, sources: &[SourceInfo], cancel: &AtomicBool) -> Op
                 return false;
             }
             if let Ok(fe) = entry {
-                if dam_media::detect(Path::new(&fe.rel_path)).is_some() {
+                if dam_media::detect_for_ingest(Path::new(&fe.rel_path)).is_some() {
                     n += 1;
                 }
             }

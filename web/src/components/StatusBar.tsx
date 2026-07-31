@@ -185,12 +185,15 @@ function ServerChip() {
 
 /** Per-media asset totals on the right of the bar — `3D 412 · IMG 590 · SFX 246` (issue #64,
  *  DESIGN_GUIDELINES footer). Same hue + short label per media type as the grid/table `MediaBadge`
- *  (model → 3D indigo, image → IMG orange, audio → SFX teal); reads the already-cached `by_media`
- *  stats. Media types with no assets are omitted so an audio-free library shows just `3D · IMG`. */
+ *  (model → 3D indigo, image → IMG orange, audio → SFX teal, video → VID rose, document → DOC
+ *  slate); reads the already-cached `by_media` stats. Media types with no assets are omitted, so a
+ *  library with no video or documents shows exactly what it showed before they existed. */
 const MEDIA_BREAKDOWN: { key: MediaType; label: string; full: string; color: string }[] = [
   { key: "model", label: "3D", full: "3D models", color: "var(--color-media-model)" },
   { key: "image", label: "IMG", full: "images", color: "var(--color-media-image)" },
   { key: "audio", label: "SFX", full: "audio", color: "var(--color-media-audio)" },
+  { key: "video", label: "VID", full: "video", color: "var(--color-media-video)" },
+  { key: "document", label: "DOC", full: "documents", color: "var(--color-media-document)" },
 ];
 
 function MediaBreakdown() {

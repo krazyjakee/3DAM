@@ -100,6 +100,16 @@ impl Store {
             .map_err(internal)?;
         tx.execute("UPDATE model_attr SET class = NULL", [])
             .map_err(internal)?;
+        tx.execute("UPDATE video_attr SET class = NULL", [])
+            .map_err(internal)?;
+        tx.execute("UPDATE document_attr SET class = NULL", [])
+            .map_err(internal)?;
+        // Document body text lives *inside* the FTS index (schema V10), not in a base-table column,
+        // so it has to be cleared here too — otherwise "clear analysis" leaves every document still
+        // findable by prose it can no longer explain. The name/token/tag columns are scan-time data
+        // and stay.
+        tx.execute("UPDATE asset_fts SET text = ''", [])
+            .map_err(internal)?;
         // Mark everything due for re-analysis (the Plan gate reads `analysis_version`, §7.2).
         tx.execute(
             "UPDATE asset SET analysis_version = 0, analysed_at = NULL",

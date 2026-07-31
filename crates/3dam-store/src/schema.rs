@@ -292,4 +292,91 @@ pub const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE job ADD COLUMN sources TEXT;
     "#,
+    // ── V10: video + document attribute tables (PRODUCT_SPEC §9 phase 2b, issue #79) ──────────────
+    // `MediaType` grows a fourth and fifth variant so a source is catalogued *completely*. Each new
+    // type gets its own `*_attr` table, mirroring audio/image/model exactly — one row per asset,
+    // cascade-deleted with it, every column nullable because both cheap tiers are best-effort.
+    //
+    // Note `asset.media_type` carries no CHECK constraint (it never has), so existing rows and the
+    // enum widening need no data migration: the column's comment in V1 is simply now out of date,
+    // and the authoritative list lives in `MediaType::parse`.
+    //
+    // Video columns come from a discovered `ffprobe` (ADR 0015) and are *all* NULL when no prober is
+    // installed — that is the designed floor, not a failure. `has_audio` is 0/1 (STRICT has no bool).
+    r#"
+    CREATE TABLE video_attr (
+        asset_id    BLOB PRIMARY KEY REFERENCES asset(id) ON DELETE CASCADE,
+        duration_ms INTEGER,
+        width       INTEGER,
+        height      INTEGER,
+        fps         REAL,
+        codec       TEXT,
+        container   TEXT,
+        bitrate     INTEGER,
+        has_audio   INTEGER,
+        class       TEXT
+    ) STRICT;
+
+    CREATE TABLE document_attr (
+        asset_id   BLOB PRIMARY KEY REFERENCES asset(id) ON DELETE CASCADE,
+        page_count INTEGER,
+        word_count INTEGER,
+        title      TEXT,
+        author     TEXT,
+        encoding   TEXT,
+        excerpt    TEXT,
+        class      TEXT
+    ) STRICT;
+    "#,
+    // ── V11: extracted document text as a fourth FTS column (PRODUCT_SPEC §9 phase 2b) ────────────
+    // Documents are the first media type whose *content is language*, so their text belongs in the
+    // index that already answers text search — not a second index that would need its own ranking,
+    // its own triggers, and a union at query time. FTS5 still has no ADD COLUMN, so this repeats the
+    // V7 rebuild dance exactly: stash the columns that live *only* in the index (`tokens` and now
+    // `tags`, which V7 seeds from the tag tables but the write path has since updated), rebuild with
+    // the new column, re-seed, restore triggers.
+    //
+    // The new column is seeded empty rather than back-filled: the text isn't in the database yet,
+    // it's in the files. The analyse pass fills it (a document scanned before this migration is
+    // picked up on its next analyse, like any other new derived field).
+    //
+    // Ranking is the real design question here, not plumbing. `bm25()` weights columns left-to-right
+    // and defaults to 1.0 for each; with a 40-page design doc in `text`, an unweighted index buries
+    // an exact filename match under every document that merely mentions the word. The query layer
+    // therefore passes explicit weights (see `query.rs`) — this migration only has to put the column
+    // last so the existing weight order stays stable.
+    r#"
+    CREATE TEMP TABLE _fts_stash AS
+        SELECT rowid AS rid, tokens, tags FROM asset_fts;
+
+    DROP TRIGGER asset_fts_ai;
+    DROP TRIGGER asset_fts_ad;
+    DROP TRIGGER asset_fts_au;
+    DROP TABLE asset_fts;
+
+    CREATE VIRTUAL TABLE asset_fts USING fts5(
+        filename,
+        tokens,
+        tags,
+        text,
+        tokenize = "unicode61 remove_diacritics 2"
+    );
+
+    INSERT INTO asset_fts(rowid, filename, tokens, tags, text)
+        SELECT a.rowid, a.filename, COALESCE(s.tokens, ''), COALESCE(s.tags, ''), ''
+        FROM asset a LEFT JOIN _fts_stash s ON s.rid = a.rowid;
+
+    DROP TABLE _fts_stash;
+
+    CREATE TRIGGER asset_fts_ai AFTER INSERT ON asset BEGIN
+        INSERT INTO asset_fts(rowid, filename, tokens, tags, text)
+            VALUES (new.rowid, new.filename, '', '', '');
+    END;
+    CREATE TRIGGER asset_fts_ad AFTER DELETE ON asset BEGIN
+        DELETE FROM asset_fts WHERE rowid = old.rowid;
+    END;
+    CREATE TRIGGER asset_fts_au AFTER UPDATE OF filename ON asset BEGIN
+        UPDATE asset_fts SET filename = new.filename WHERE rowid = new.rowid;
+    END;
+    "#,
 ];

@@ -61,10 +61,31 @@ fn media_from_content_type(ct: &str) -> (MediaType, String) {
         "audio/flac" => (MediaType::Audio, "flac".to_string()),
         "audio/ogg" => (MediaType::Audio, "ogg".to_string()),
         "audio/mp4" => (MediaType::Audio, "aac".to_string()),
+        // video — the `.mp4`/`.mov` container extensions are shared with audio, and the server
+        // already resolved which one this is (`content_type_for` consults the media type first),
+        // so the MIME is the authority here.
+        "video/mp4" => (MediaType::Video, "mp4".to_string()),
+        "video/quicktime" => (MediaType::Video, "mov".to_string()),
+        "video/webm" => (MediaType::Video, "webm".to_string()),
+        "video/x-matroska" => (MediaType::Video, "mkv".to_string()),
+        "video/x-msvideo" => (MediaType::Video, "avi".to_string()),
+        // documents
+        "application/pdf" => (MediaType::Document, "pdf".to_string()),
+        "text/markdown" => (MediaType::Document, "md".to_string()),
+        "text/plain" => (MediaType::Document, "txt".to_string()),
+        "application/rtf" => (MediaType::Document, "rtf".to_string()),
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => {
+            (MediaType::Document, "docx".to_string())
+        }
+        "application/vnd.oasis.opendocument.text" => (MediaType::Document, "odt".to_string()),
         m if m.starts_with("image/") => {
             (MediaType::Image, m.trim_start_matches("image/").to_string())
         }
         m if m.starts_with("audio/") => (MediaType::Audio, String::new()),
+        // `video/ogg` and anything else in the family: the class is unambiguous even when the
+        // format token isn't.
+        m if m.starts_with("video/") => (MediaType::Video, String::new()),
+        m if m.starts_with("text/") => (MediaType::Document, String::new()),
         _ => (MediaType::Model, String::new()),
     }
 }
@@ -857,5 +878,51 @@ impl LibraryService for ApiClient {
         });
 
         Ok(Box::pin(rx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// [`media_from_content_type`] is the documented inverse of `dto::content_type_for`, and the
+    /// two live in different crates — nothing but this test stops them drifting. Only the media
+    /// *class* has to survive the round trip: the format token is informational, and a MIME shared
+    /// by several extensions (`audio/mp4` covers `aac`/`m4a`/`mp4`) cannot name which one it was.
+    #[test]
+    fn content_type_round_trips_to_the_same_media_class() {
+        let matrix: &[(MediaType, &[&str])] = &[
+            (
+                MediaType::Model,
+                &["glb", "gltf", "obj", "ply", "stl", "fbx"],
+            ),
+            (
+                MediaType::Audio,
+                // `mov`/`m4v` appear here too: the content probe reclassifies an audio-only
+                // ISO-BMFF file while keeping its original extension.
+                &[
+                    "wav", "mp3", "flac", "ogg", "aac", "m4a", "mp4", "mov", "m4v",
+                ],
+            ),
+            (
+                MediaType::Image,
+                &["png", "jpg", "jpeg", "webp", "gif", "bmp", "tiff"],
+            ),
+            (
+                MediaType::Video,
+                &["mp4", "m4v", "mov", "webm", "mkv", "avi", "ogv"],
+            ),
+            (
+                MediaType::Document,
+                &["pdf", "md", "txt", "rtf", "docx", "odt"],
+            ),
+        ];
+        for (media, formats) in matrix {
+            for f in *formats {
+                let ct = content_type_for(*media, f);
+                let (got, _) = media_from_content_type(ct);
+                assert_eq!(got, *media, "{f} served as {ct} came back as {got:?}");
+            }
+        }
     }
 }

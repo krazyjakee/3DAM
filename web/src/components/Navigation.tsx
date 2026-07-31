@@ -8,6 +8,8 @@ import {
   ChevronRight,
   Clock,
   Copy,
+  FileText,
+  Film,
   Folder,
   FolderPlus,
   Image as ImageIcon,
@@ -61,6 +63,8 @@ const MEDIA: { key: MediaType; label: string; Icon: typeof AudioLines }[] = [
   { key: "audio", label: "Audio", Icon: AudioLines },
   { key: "image", label: "Images", Icon: ImageIcon },
   { key: "model", label: "3D Models", Icon: Box },
+  { key: "video", label: "Video", Icon: Film },
+  { key: "document", label: "Documents", Icon: FileText },
 ];
 
 const LICENSES: LicenseStatus[] = ["permissive", "attribution", "restricted", "unknown"];
@@ -104,6 +108,26 @@ const CLASS_FACET: Record<MediaType, { field: FacetField; label: string; options
       ["prop_lowpoly", "Low-poly"],
       ["prop", "Prop"],
       ["prop_highpoly", "High-poly"],
+    ],
+  },
+  video: {
+    field: "video_class",
+    label: "Length",
+    options: [
+      ["sting", "Sting"],
+      ["clip", "Clip"],
+      ["cutscene", "Cutscene"],
+    ],
+  },
+  document: {
+    field: "document_class",
+    label: "Kind",
+    options: [
+      ["license", "Licence"],
+      ["readme", "Readme"],
+      ["changelog", "Changelog"],
+      ["receipt", "Receipt"],
+      ["document", "Other"],
     ],
   },
 };

@@ -855,14 +855,21 @@ function TableSkeleton() {
 }
 
 /** The media-specific "detail" from the store's `key_attrs` — image dimensions, audio duration
- *  (with the analysis type: loop / music / one-shot / sfx), or model triangle count (issue #55). One
- *  value per media type so a mixed grid/table has a single meaningful column. */
+ *  (with the analysis type: loop / music / one-shot / sfx), model triangle count (issue #55), video
+ *  resolution + running time, or document page/word count. One value per media type so a mixed
+ *  grid/table has a single meaningful column. */
 function detailAttr(asset: AssetSummary): string | null {
   const k = asset.key_attrs;
   if (asset.media === "image") return k.dimensions ?? null;
   if (asset.media === "audio")
     return k.duration ? (k.type ? `${k.duration} · ${k.type}` : k.duration) : (k.type ?? null);
   if (asset.media === "model") return k.tris ? `${k.tris} tris` : null;
+  // Video is the one type that fills both slots — neither resolution nor length implies the other.
+  if (asset.media === "video")
+    return [k.dimensions, k.duration].filter(Boolean).join(" · ") || null;
+  // Pages are meaningless for plaintext, so the store only sets them when the container paginates.
+  if (asset.media === "document")
+    return k.pages ? `${k.pages} pp` : k.words ? `${k.words} words` : null;
   return null;
 }
 

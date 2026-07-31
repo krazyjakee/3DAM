@@ -57,8 +57,10 @@ Rust-ish pseudocode; indicative, not a frozen API (see [00-overview.md](00-overv
 ### 2.1 Shared types
 
 ```rust
-/// The three v1 media types. The concrete format is a separate string/enum on the asset.
-pub enum MediaType { Audio, Image, Model }
+/// The media types. Audio/Image/Model are the three *deep* ones this spec is written around;
+/// Video and Document (PRODUCT_SPEC §9 phase 2b) are deliberately shallower — see §7.4/§7.5.
+/// The concrete format is a separate string/enum on the asset.
+pub enum MediaType { Audio, Image, Model, Video, Document }
 
 /// Result of sniffing: which media type + concrete format a byte stream is.
 pub struct FormatId {
@@ -390,6 +392,41 @@ the header-level colour-space flag is cheap-tier, the linear-space analysis is 0
 | PLY | ✅ | Later | header element counts cheap; decode staged |
 | USD / USDZ | Later | Later | high value, heavier dependency; staged |
 | glTF Draco-compressed | ✅ (counts) | Later | JSON counts still cheap; Draco geometry decode staged |
+
+### 7.4 Video (discovered `ffprobe`/`ffmpeg` binary — [ADR 0015](../adr/0015-video-decode-backend.md))
+
+| Format | Cheap metadata | Poster frame | Notes |
+|---|---|---|---|
+| MP4 / M4V (`.mp4`, `.m4v`) | ✅\* | ✅\* | shares the ISO-BMFF container with audio-only `.m4a` — settled by `refine_with_content` against the real track table, not the extension |
+| QuickTime (`.mov`) | ✅\* | ✅\* | same container ambiguity as MP4 |
+| Matroska / WebM (`.mkv`, `.webm`) | ✅\* | ✅\* | unambiguous by extension |
+| AVI (`.avi`), Ogg video (`.ogv`) | ✅\* | ✅\* | coverage is whatever the host's ffmpeg has |
+
+\* **Conditional on the host.** There is no linked decoder and no cargo feature: `dam-media`
+discovers `ffprobe`/`ffmpeg` on `PATH` at runtime. With neither, a video is still detected,
+catalogued, searchable and playable — it simply has no metadata and shows the typed tile. With
+`ffprobe` only, the cheap tier is complete but there is no poster frame. Playback never depends on
+any of this: the browser plays the original bytes over the range-capable content route, so **video
+has no WASM island and is not a convert target**.
+
+### 7.5 Document (`lopdf` · `zip` + `quick-xml` · `encoding_rs`)
+
+| Format | Cheap metadata | Text extraction | Notes |
+|---|---|---|---|
+| PDF (`.pdf`) | ✅ | ✅ | page count + info-dict title/author; text via `lopdf`. A scanned-image PDF has no text layer — that is a normal empty result, not an error |
+| Markdown (`.md`), plaintext (`.txt`) | ✅ | ✅ | encoding sniffed (BOM → UTF-8 → Windows-1252); `md` title from a leading ATX heading |
+| RTF (`.rtf`) | ✅ | ✅ | lexical control-word strip, not a full RTF parse |
+| DOCX / ODT | ✅ | ✅ | ZIP + XML: `word/document.xml` / `content.xml` for text, core-properties/`meta.xml` for title+author |
+| CSV / JSON | — | — | **deliberately excluded**: structured data, not prose. A later "data" media type if ever wanted |
+
+Documents have **no server-rendered thumbnail** — the tile is the typed glyph and the excerpt is
+typeset in the DOM (a server-side PDF raster would need a native PDF renderer + font stack, the
+dependency class ADR 0015 declined). Extracted text is the one handler output that does not live on
+the asset row: it goes to the `asset_fts` `text` column (schema V10) and to a text embedding space.
+Ingest applies an **ignore policy** (`detect_for_ingest`) so documents under dependency/build/VCS
+directories never enter the catalog.
+
+---
 
 3D **rendering** (turntable thumbnail, multi-view for shape embeddings, the interactive orbit
 viewer, and the GPU-less software-raster fallback) is **not specified here** — the handler hands a
