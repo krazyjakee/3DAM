@@ -715,6 +715,26 @@ impl LibraryService for ApiClient {
         Self::expect_no_content(resp).await
     }
 
+    async fn get_note(&self, _ctx: &AuthContext, id: &AssetId) -> Result<Option<Note>, LibError> {
+        self.get(&format!("/api/v1/assets/{id}/note")).await
+    }
+
+    async fn set_note(
+        &self,
+        _ctx: &AuthContext,
+        id: &AssetId,
+        req: NoteRequest,
+    ) -> Result<Option<Note>, LibError> {
+        let resp = self
+            .http
+            .put(self.url(&format!("/api/v1/assets/{id}/note"))?)
+            .json(&req)
+            .send()
+            .await
+            .map_err(|e| LibError::SourceUnavailable(e.to_string()))?;
+        Self::decode(resp).await
+    }
+
     async fn list_collections(&self, _ctx: &AuthContext) -> Result<Vec<Collection>, LibError> {
         self.get("/api/v1/collections").await
     }

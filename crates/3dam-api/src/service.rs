@@ -516,6 +516,23 @@ pub trait LibraryService: Send + Sync {
     /// `flags` bitset so it survives re-scans.
     async fn set_favorite(&self, ctx: &AuthContext, req: FavoriteRequest) -> Result<(), LibError>;
 
+    // ── notes (issue #81) ────────────────────────────────────────────────────
+    /// The user's free-text note on an asset, or `None` if there isn't one. `Scope::Read`.
+    ///
+    /// [`get_asset`](Self::get_asset) already returns this on the record; this exists for the
+    /// callers that want the note alone (the CLI, a client polling after an edit) without paying
+    /// for the attribute/tag/collection joins.
+    async fn get_note(&self, ctx: &AuthContext, id: &AssetId) -> Result<Option<Note>, LibError>;
+
+    /// Set or clear an asset's note. An empty body clears it. `Scope::Write`, plus a write share on
+    /// the asset's source once accounts restrict reach. Emits `AssetChanged { kind: NoteSet }`.
+    async fn set_note(
+        &self,
+        ctx: &AuthContext,
+        id: &AssetId,
+        req: NoteRequest,
+    ) -> Result<Option<Note>, LibError>;
+
     // ── collections / smart folders (phase 4) ────────────────────────────────
     /// All collections and smart folders. Manual folders carry an exact member count; a smart
     /// folder's live count is left `None` here (computed on demand).

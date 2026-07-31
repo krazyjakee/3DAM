@@ -46,6 +46,8 @@ pub enum ChangeKind {
     Retagged,
     LicenseSet,
     Metadata,
+    /// The user's free-text note was set or cleared (issue #81).
+    NoteSet,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

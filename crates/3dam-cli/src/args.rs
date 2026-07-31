@@ -196,6 +196,20 @@ pub(crate) enum Cmd {
         #[arg(long)]
         reject: bool,
     },
+    /// Read, write, or clear an asset's free-text note (issue #81).
+    ///
+    /// With no flag it prints the current note (nothing at all if there isn't one, so it pipes
+    /// cleanly). `--set` replaces it; `--clear` removes it.
+    Note {
+        /// Asset id.
+        id: String,
+        /// Replace the note with this text.
+        #[arg(long, value_name = "TEXT", conflicts_with = "clear")]
+        set: Option<String>,
+        /// Clear the note.
+        #[arg(long)]
+        clear: bool,
+    },
     /// Administer the server: feature flags, API tokens, status, audit (tech-spec 10 §5).
     ///
     /// Drives the same admin surface as the web Settings area. Over `--connect` it calls the

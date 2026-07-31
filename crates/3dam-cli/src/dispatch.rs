@@ -516,6 +516,23 @@ pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             let verb = if reject { "rejected" } else { "confirmed" };
             println!("{verb} tag '{tag}' on {asset}");
         }
+
+        Cmd::Note { id, set, clear } => {
+            let asset: AssetId = id
+                .parse()
+                .map_err(|_| anyhow::anyhow!("invalid asset id"))?;
+            // `--clear` is `--set ""`; the service treats a blank body as a clear either way.
+            let write = clear.then(String::new).or(set);
+            let note = match write {
+                Some(body) => lib.set_note(&ctx, &asset, NoteRequest { body }).await?,
+                None => lib.get_note(&ctx, &asset).await?,
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&note)?);
+            } else if let Some(n) = note {
+                println!("{}", n.body);
+            }
+        }
     }
     Ok(())
 }

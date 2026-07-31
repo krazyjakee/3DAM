@@ -138,6 +138,99 @@ impl Store {
         Ok(())
     }
 
+    // ── notes (issue #81) ──────────────────────────────────────────────────
+
+    /// The asset's free-text note, or `None` if it has never had one (or it was cleared).
+    pub fn get_note(&self, id: &AssetId) -> Result<Option<Note>, LibError> {
+        let conn = self.conn.lock().unwrap();
+        Self::read_note(&conn, id.as_bytes())
+    }
+
+    /// Set or clear an asset's note, returning the stored value (`None` once cleared).
+    ///
+    /// A blank body is a **clear**, not an empty note: the row is deleted so `asset_note` never
+    /// accumulates rows that mean nothing, and the FTS `note` column is emptied in the same
+    /// transaction so a cleared note stops matching immediately. A stale index entry here would be
+    /// a real bug — the text has no other home to fall back on.
+    ///
+    /// Returns `NotFound` for an unknown asset rather than silently writing an orphan row: the FK
+    /// would reject it anyway, and a caller deserves the specific error.
+    pub fn set_note(
+        &self,
+        id: &AssetId,
+        body: &str,
+        by: Option<&str>,
+    ) -> Result<Option<Note>, LibError> {
+        let mut conn = self.conn.lock().unwrap();
+        let key = id.as_bytes().to_vec();
+        let exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM asset WHERE id = ?1",
+                params![key],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(internal)?
+            .is_some();
+        if !exists {
+            return Err(LibError::NotFound(format!("asset {id}")));
+        }
+        let body = body.trim();
+        let now = now_ms();
+        let tx = conn.transaction().map_err(internal)?;
+        if body.is_empty() {
+            tx.execute("DELETE FROM asset_note WHERE asset_id = ?1", params![key])
+                .map_err(internal)?;
+        } else {
+            tx.execute(
+                "INSERT INTO asset_note (asset_id, body, updated_at, updated_by)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(asset_id) DO UPDATE SET
+                    body = excluded.body, updated_at = excluded.updated_at,
+                    updated_by = excluded.updated_by",
+                params![key, body, now, by],
+            )
+            .map_err(internal)?;
+        }
+        // Keep the index in lockstep from the write path. `asset_note` is a different table from
+        // the one the FTS triggers watch, and the note text lives *only* in the index — the same
+        // arrangement `analysis.rs` already uses for tags.
+        tx.execute(
+            "UPDATE asset_fts SET note = ?2 WHERE rowid = (SELECT rowid FROM asset WHERE id = ?1)",
+            params![key, body],
+        )
+        .map_err(internal)?;
+        // A note is user-authored catalog state; touching `updated_at` keeps "last changed" honest
+        // for anything that sorts or syncs on it.
+        tx.execute(
+            "UPDATE asset SET updated_at = ?2 WHERE id = ?1",
+            params![key, now],
+        )
+        .map_err(internal)?;
+        tx.commit().map_err(internal)?;
+        Ok((!body.is_empty()).then(|| Note {
+            body: body.to_string(),
+            updated_at: now,
+            updated_by: by.map(str::to_string),
+        }))
+    }
+
+    fn read_note(conn: &Connection, key: &[u8]) -> Result<Option<Note>, LibError> {
+        conn.query_row(
+            "SELECT body, updated_at, updated_by FROM asset_note WHERE asset_id = ?1",
+            params![key.to_vec()],
+            |r| {
+                Ok(Note {
+                    body: r.get(0)?,
+                    updated_at: r.get(1)?,
+                    updated_by: r.get(2)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(internal)
+    }
+
     pub fn set_media_attrs(&self, id: &AssetId, attrs: &MediaAttributes) -> Result<(), LibError> {
         let conn = self.conn.lock().unwrap();
         let key = id.as_bytes().to_vec();
@@ -425,6 +518,9 @@ impl Store {
         if let MediaAttributes::Model(m) = &asset.attributes {
             asset.summary.size += m.dependency_bytes.unwrap_or(0).max(0) as u64;
         }
+        // Attach the user's note (issue #81) — authored state, so it rides along with every read
+        // rather than needing a second round-trip from the inspector.
+        asset.note = Self::read_note(&conn, id.as_bytes())?;
         // Attach tags (suggested + confirmed + rejected) and surface confirmed ones on the summary.
         asset.tags = Self::load_tags(&conn, id.as_bytes());
         asset.summary.top_tags = asset
@@ -517,6 +613,7 @@ impl Store {
             },
             tags: Vec::new(),
             collections: Vec::new(),
+            note: None,
         })
     }
 }

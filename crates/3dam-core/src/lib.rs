@@ -1674,6 +1674,40 @@ impl LibraryService for EmbeddedLibrary {
         Ok(())
     }
 
+    async fn get_note(&self, ctx: &AuthContext, id: &AssetId) -> Result<Option<Note>, LibError> {
+        self.require_asset_visible(ctx, id).await?;
+        let id = *id;
+        self.db(move |s| s.get_note(&id)).await
+    }
+
+    async fn set_note(
+        &self,
+        ctx: &AuthContext,
+        id: &AssetId,
+        req: NoteRequest,
+    ) -> Result<Option<Note>, LibError> {
+        self.require_asset_writable(ctx, id).await?;
+        // Attribution is best-effort and deliberately loose (see `Note::updated_by`): the signed-in
+        // account if there is one, else whatever identity the credential resolved to, else nobody —
+        // which is the honest answer for a single-user local library.
+        let by = ctx
+            .account
+            .as_ref()
+            .map(|a| a.username.clone())
+            .or_else(|| ctx.identity.clone());
+        let aid = *id;
+        let note = self
+            .db(move |s| s.set_note(&aid, &req.body, by.as_deref()))
+            .await?;
+        let source_id = self.db(move |s| s.asset_source(&aid)).await?;
+        let _ = self.events.send(LibraryEvent::AssetChanged {
+            id: aid,
+            source_id,
+            kind: ChangeKind::NoteSet,
+        });
+        Ok(note)
+    }
+
     /// A job is readable when every source it touches is within the caller's ceiling — see
     /// [`Visibility::allows_job`]. Outside it the job is *absent*, not forbidden.
     ///

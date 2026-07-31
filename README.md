@@ -122,6 +122,7 @@ the local catalog.
 3dam similar     <asset-id>                    # cosine similarity search
 3dam dedup                                    # find exact + near duplicates
 3dam tag         <asset-id> …                 # accept/reject/apply tags
+3dam note        <asset-id> [--set <text>]    # read/write an asset's free-text note
 3dam export      … --manifest <fmt>            # export assets + manifests (json/csv/sidecar)
 3dam jobs / job  [<id>]                        # list jobs / inspect one
 3dam admin       {status, flags, flag, token, audit}  # server config + auth (feature-flagged)

@@ -245,6 +245,10 @@ pub struct Asset {
     pub tags: Vec<TagRef>,
     #[serde(default)]
     pub collections: Vec<CollectionId>,
+    /// The user's free-text note, if one has been written (issue #81). `None` and an empty body are
+    /// the same state by construction — clearing a note deletes the row.
+    #[serde(default)]
+    pub note: Option<Note>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -1074,6 +1078,31 @@ pub enum ReviewAction {
 pub struct FavoriteRequest {
     pub asset: AssetId,
     pub favorite: bool,
+}
+
+/// A user's free-text annotation on an asset (issue #81) — the "why" that filenames, tags, and
+/// extracted metadata cannot carry ("client rejected this variant"; "needs a high-pass before use").
+///
+/// One editable note per asset, not a thread: it answers *"what should I know about this asset?"*,
+/// which is a single durable statement. Time-ordered, authored discussion is a different feature.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Note {
+    /// Exactly what the user typed. Stored verbatim — a client may *render* markdown, but nothing
+    /// on the way in or out is allowed to rewrite it.
+    pub body: String,
+    /// Unix ms of the last edit.
+    pub updated_at: i64,
+    /// Who last edited it, as a loose identity string (account username, else the token identity).
+    /// `None` for a single-user local library, which is the common case today.
+    #[serde(default)]
+    pub updated_by: Option<String>,
+}
+
+/// Set or clear an asset's note. An empty (or whitespace-only) `body` **clears** it: there is no
+/// separate delete verb, because "select all, delete, blur" is how a user expects to remove text.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NoteRequest {
+    pub body: String,
 }
 
 // ── collections / smart folders (phase 4 Reach; PRODUCT_SPEC §3, §6.4) ────────────────────────

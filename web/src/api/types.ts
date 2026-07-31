@@ -173,6 +173,14 @@ export interface FavoriteRequest {
   favorite: boolean;
 }
 
+/** A user's free-text annotation on an asset (issue #81) — the "why" no extractor can infer.
+ *  Backend routes: GET/PUT /api/v1/assets/{id}/note. `body` is verbatim what the user typed. */
+export interface Note {
+  body: string;
+  updated_at: number;
+  updated_by: string | null;
+}
+
 export interface Asset {
   summary: AssetSummary;
   hash: ContentHash | null;
@@ -183,6 +191,8 @@ export interface Asset {
   license: License;
   tags: TagRef[];
   collections: CollectionId[];
+  /** `null` when the asset has no note — an empty body and no note are the same state. */
+  note: Note | null;
 }
 
 // ── query ──────────────────────────────────────────────────────────────────
@@ -607,7 +617,12 @@ export interface LibraryStats {
 
 // ── live events (WebSocket) ─────────────────────────────────────────────────
 
-export type ChangeKind = "reanalyzed" | "retagged" | "license_set" | "metadata";
+export type ChangeKind =
+  | "reanalyzed"
+  | "retagged"
+  | "license_set"
+  | "metadata"
+  | "note_set";
 /** Each per-asset variant carries the asset's `source_id`. That attribution is what lets the server
  *  evaluate a share-based visibility ceiling per event, so a restricted session gets a live stream
  *  for the sources it may reach instead of a silent socket (issue #42). `null` means unattributed;

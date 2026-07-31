@@ -120,7 +120,7 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "get_asset",
-            description: "Full metadata for one asset, including its license block.",
+            description: "Full metadata for one asset, including its license block and user note.",
             write: false,
             schema: || {
                 json!({

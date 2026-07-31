@@ -201,6 +201,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/api/v1/assets/{id}/related", get(asset_related))
         .route("/api/v1/assets/{id}/preview-mesh", get(asset_preview_mesh))
         .route("/api/v1/assets/{id}/thumbnail", get(asset_thumbnail))
+        .route("/api/v1/assets/{id}/note", get(get_note).put(set_note))
         .route("/api/v1/stats", get(stats))
         .route("/api/v1/convert", post(convert))
         .route("/api/v1/similar", post(find_similar))
@@ -1145,6 +1146,29 @@ async fn set_favorite(
 ) -> Result<StatusCode, ApiError> {
     st.lib.set_favorite(&ctx, req).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// The asset's note (issue #81). `null` when there isn't one — an absent note is a normal state,
+/// not a 404, so a client can render the empty editor without special-casing an error.
+async fn get_note(
+    Reader(ctx): Reader,
+    State(st): State<AppState>,
+    AxPath(id): AxPath<String>,
+) -> Result<Json<Option<Note>>, ApiError> {
+    let id: AssetId = parse_id(&id, "asset")?;
+    Ok(Json(st.lib.get_note(&ctx, &id).await?))
+}
+
+/// Set or clear the asset's note. Returns the stored value so the client's "saved" state comes from
+/// what the server actually kept (including the trim), not from what it optimistically sent.
+async fn set_note(
+    Writer(ctx): Writer,
+    State(st): State<AppState>,
+    AxPath(id): AxPath<String>,
+    Json(req): Json<NoteRequest>,
+) -> Result<Json<Option<Note>>, ApiError> {
+    let id: AssetId = parse_id(&id, "asset")?;
+    Ok(Json(st.lib.set_note(&ctx, &id, req).await?))
 }
 
 /// Prefetch hint (issue #72): a read-scoped client names the assets it's about to render; the server

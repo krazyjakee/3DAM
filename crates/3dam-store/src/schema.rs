@@ -379,4 +379,139 @@ pub const MIGRATIONS: &[&str] = &[
         UPDATE asset_fts SET filename = new.filename WHERE rowid = new.rowid;
     END;
     "#,
+    // ── V12: per-asset user notes (issue #81) ────────────────────────────────────────────────────
+    // A free-text annotation — the "why" no extractor can infer ("client rejected this variant").
+    // It lives in the catalog, never as a sidecar next to the file: originals are never mutated and
+    // all derived data stays in the managed store (tech-spec 02 §3.5), and a `.txt` 3DAM wrote would
+    // come straight back in on the next scan as an asset of its own.
+    //
+    // Its own table rather than a column on `asset`, for three reasons: the body is unbounded and
+    // `asset` is the hot row every grid query reads; a note is authored state that must survive the
+    // scan upsert path untouched; and `updated_at`/`updated_by` are note facts, not asset facts.
+    // `updated_by` is a loose identity string on purpose — when accounts land (#42) it becomes a
+    // real account reference without rewriting the migration.
+    //
+    // The V1 `asset.notes` column is dropped in the same step. It shipped in the first schema and
+    // was never read or written by any code path; leaving a dead `notes` next to a live `asset_note`
+    // is the kind of ambiguity that gets written to by mistake exactly once.
+    //
+    // FTS still has no ADD COLUMN, so this is the V7/V11 stash-and-restore rebuild a third time, now
+    // with three index-only columns to carry across. `note` is seeded empty because `asset_note` is
+    // created empty here; the write path fills it from then on.
+    //
+    // Column placement is deliberate: `note` goes *before* `text` so the tier/weight story stays
+    // legible — see `search.rs`, where notes join the authored tier (a note is the user speaking,
+    // not incidental body prose) but rank below filename, tokens, and tags within it.
+    r#"
+    CREATE TABLE asset_note (
+        asset_id   BLOB PRIMARY KEY REFERENCES asset(id) ON DELETE CASCADE,
+        body       TEXT NOT NULL,
+        updated_at INTEGER NOT NULL,
+        updated_by TEXT
+    ) STRICT;
+
+    ALTER TABLE asset DROP COLUMN notes;
+
+    CREATE TEMP TABLE _fts_stash AS
+        SELECT rowid AS rid, tokens, tags, text FROM asset_fts;
+
+    DROP TRIGGER asset_fts_ai;
+    DROP TRIGGER asset_fts_ad;
+    DROP TRIGGER asset_fts_au;
+    DROP TABLE asset_fts;
+
+    CREATE VIRTUAL TABLE asset_fts USING fts5(
+        filename,
+        tokens,
+        tags,
+        note,
+        text,
+        tokenize = "unicode61 remove_diacritics 2"
+    );
+
+    INSERT INTO asset_fts(rowid, filename, tokens, tags, note, text)
+        SELECT a.rowid, a.filename, COALESCE(s.tokens, ''), COALESCE(s.tags, ''), '',
+               COALESCE(s.text, '')
+        FROM asset a LEFT JOIN _fts_stash s ON s.rid = a.rowid;
+
+    DROP TABLE _fts_stash;
+
+    CREATE TRIGGER asset_fts_ai AFTER INSERT ON asset BEGIN
+        INSERT INTO asset_fts(rowid, filename, tokens, tags, note, text)
+            VALUES (new.rowid, new.filename, '', '', '', '');
+    END;
+    CREATE TRIGGER asset_fts_ad AFTER DELETE ON asset BEGIN
+        DELETE FROM asset_fts WHERE rowid = old.rowid;
+    END;
+    CREATE TRIGGER asset_fts_au AFTER UPDATE OF filename ON asset BEGIN
+        UPDATE asset_fts SET filename = new.filename WHERE rowid = new.rowid;
+    END;
+    "#,
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::MIGRATIONS;
+    use rusqlite::Connection;
+
+    /// Apply the first `n` migrations to a fresh in-memory database.
+    fn db_at(n: usize) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        for step in &MIGRATIONS[..n] {
+            conn.execute_batch(step).unwrap();
+        }
+        conn
+    }
+
+    /// An FTS5 rebuild has to carry the index-only columns across, and the only way to know it does
+    /// is to upgrade a *populated* database — a fresh one is empty when the migration runs, so every
+    /// other test in the workspace exercises the SQL without exercising the data movement.
+    ///
+    /// `tokens`, `tags`, and `text` exist nowhere but inside `asset_fts`: losing them silently
+    /// un-indexes filename sub-tokens, every tag, and every document body, with no error and no way
+    /// to notice short of a user's search going quiet. V7 and V11 set the stash-and-restore
+    /// precedent; this pins it so a fourth rebuild cannot quietly skip a column.
+    #[test]
+    fn v12_rebuild_preserves_the_index_only_columns() {
+        let conn = db_at(11);
+        conn.execute_batch(
+            "INSERT INTO source (id, name, kind, connection, created_at, updated_at)
+                VALUES (x'01', 's', 'local_fs', '/tmp', 0, 0);
+             INSERT INTO asset (id, source_id, path, filename, scanned_at, media_type, format,
+                                created_at, updated_at)
+                VALUES (x'02', x'01', 'a/ak47_lowpoly.fbx', 'ak47_lowpoly.fbx', 0, 'model', 'fbx', 0, 0);
+             UPDATE asset_fts SET tokens = 'ak47 ak 47 low poly fbx', tags = 'rifle weapon',
+                                  text = 'the quick brown fox';",
+        )
+        .unwrap();
+
+        conn.execute_batch(MIGRATIONS[11]).unwrap();
+
+        let (tokens, tags, note, text): (String, String, String, String) = conn
+            .query_row("SELECT tokens, tags, note, text FROM asset_fts", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
+            .unwrap();
+        assert_eq!(
+            tokens, "ak47 ak 47 low poly fbx",
+            "tokens lost in the rebuild"
+        );
+        assert_eq!(tags, "rifle weapon", "tags lost in the rebuild");
+        assert_eq!(
+            text, "the quick brown fox",
+            "document text lost in the rebuild"
+        );
+        assert_eq!(
+            note, "",
+            "the new column starts empty; the write path fills it"
+        );
+
+        // The vestigial V1 `asset.notes` column is gone, so there is exactly one place a note lives.
+        let has_notes_column: bool = conn
+            .prepare("SELECT * FROM asset")
+            .unwrap()
+            .column_names()
+            .contains(&"notes");
+        assert!(!has_notes_column, "dead asset.notes column survived V12");
+    }
+}

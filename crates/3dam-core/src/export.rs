@@ -38,6 +38,10 @@ struct ManifestRow {
     license_url: Option<String>,
     /// Confirmed tags, `;`-joined (CSV-friendly).
     tags: String,
+    /// The user's own note (issue #81), empty when there isn't one. Included because an export that
+    /// dropped the one field the user wrote by hand would not be "your data is yours"
+    /// (MISSION §3) — it is the only column here no re-scan could reproduce.
+    note: String,
 }
 
 /// A credits row — the attribution-only subset.
@@ -170,6 +174,7 @@ fn manifest_row(a: &Asset) -> ManifestRow {
         attribution_credit: a.license.credit.clone(),
         license_url: a.license.url.clone(),
         tags,
+        note: a.note.as_ref().map(|n| n.body.clone()).unwrap_or_default(),
     }
 }
 

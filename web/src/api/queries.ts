@@ -15,6 +15,7 @@ import { getServer } from "@/lib/server";
 import type {
   AddSource,
   AnalyzeRequest,
+  Asset,
   AssetId,
   CollectionId,
   CollectionMembers,
@@ -234,6 +235,27 @@ export function useSetFavorite() {
     meta: { errorPrefix: "Couldn’t update favourite" },
     onSuccess: (_data, req) => {
       qc.invalidateQueries({ queryKey: qk.asset(req.asset) });
+      qc.invalidateQueries({ queryKey: qk.assets });
+    },
+  });
+}
+
+/** Set or clear an asset's free-text note (issue #81).
+ *
+ *  Deliberately **no `qk.asset` invalidation**: this mutation autosaves while the user is still
+ *  typing, and a refetch would race the textarea and could stomp in-flight keystrokes with the
+ *  server's older copy. The note is the only thing that changed and the response already carries
+ *  what was stored, so `setQueryData` patches the cached asset in place instead. The grid is
+ *  invalidated because a note feeds full-text search, so result sets can legitimately move. */
+export function useSetNote() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, body }: { id: AssetId; body: string }) => api.setNote(id, body),
+    meta: { errorPrefix: "Couldn’t save note" },
+    onSuccess: (note, { id }) => {
+      qc.setQueryData(qk.asset(id), (prev: Asset | undefined) =>
+        prev ? { ...prev, note } : prev,
+      );
       qc.invalidateQueries({ queryKey: qk.assets });
     },
   });

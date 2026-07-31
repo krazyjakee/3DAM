@@ -31,6 +31,7 @@ import type {
   FavoriteRequest,
   FolderEntry,
   FolderListing,
+  Note,
   QueryRequest,
   RemoveAsset,
   RemoveSource,
@@ -168,6 +169,11 @@ export const api = {
 
   /** Flag/unflag an asset as a favourite (issue #63). */
   setFavorite: (req: FavoriteRequest) => send<void>("POST", `${API}/assets/favorite`, req),
+
+  /** Set or clear an asset's free-text note (issue #81); an empty body clears it. Resolves to the
+   *  note the server actually stored (trimmed), or `null` once cleared. */
+  setNote: (id: AssetId, body: string) =>
+    send<Note | null>("PUT", `${API}/assets/${id}/note`, { body }),
 
   /** "More like this" — cosine over embeddings, ranked in the asset's media space (tech-spec 05 §3). */
   findSimilar: (req: SimilarRequest) => send<Page<SimilarHit>>("POST", `${API}/similar`, req),

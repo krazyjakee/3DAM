@@ -12,20 +12,23 @@ use std::path::Path;
 
 /// The ranking expression for the `asset_fts` index, with **explicit per-column weights**.
 ///
-/// Column order matches the V10 index: `filename, tokens, tags, text`. More negative = better, so
-/// a larger weight pulls a match toward the top:
+/// Column order matches the V12 index: `filename, tokens, tags, note, text`. More negative =
+/// better, so a larger weight pulls a match toward the top:
 /// - `filename` 10 — the user typed a name; the file called that is the answer.
 /// - `tokens`    5 — filename-derived sub-tokens (`ak47` inside `ak47_lowpoly.fbx`), the same
 ///   intent one step removed.
 /// - `tags`      4 — curated/accepted labels, deliberate but not what was typed.
-/// - `text`      1 — body prose: the widest recall and the weakest per-hit evidence.
+/// - `note`      3 — the user's own prose about this asset: authored, but about it rather than
+///   naming it.
+/// - `text`      1 — extracted body prose: the widest recall and the weakest per-hit evidence.
 ///
 /// These order results *within* a tier. They are deliberately **not** relied on to keep documents
-/// off the top — see [`NAME_SCOPED_TIER`] for why that needs more than a weight.
-pub(crate) const FTS_RANK: &str = "bm25(asset_fts, 10.0, 5.0, 4.0, 1.0)";
+/// off the top — see [`AUTHORED_TIER`] for why that needs more than a weight.
+pub(crate) const FTS_RANK: &str = "bm25(asset_fts, 10.0, 5.0, 4.0, 3.0, 1.0)";
 
-/// The **primary** sort key: 0 for a row matching in a name-ish column, 1 for a body-text-only
-/// match. Any filename/token/tag hit therefore outranks every text-only hit, always.
+/// The **primary** sort key: 0 for a row matching in an *authored* column, 1 for an
+/// extracted-body-text-only match. Any filename/token/tag/note hit therefore outranks every
+/// text-only hit, always.
 ///
 /// This exists because column weighting alone cannot do the job, which is worth recording so
 /// nobody "simplifies" it back. bm25 saturates term frequency (the `k1` term): once a document
@@ -41,14 +44,19 @@ pub(crate) const FTS_RANK: &str = "bm25(asset_fts, 10.0, 5.0, 4.0, 1.0)";
 /// corpus size, or term distribution. Recall is untouched — the document still matches and still
 /// appears, it just appears below the file that is actually named after the query.
 ///
+/// The tier is *authored*, not merely name-ish: a user's `note` (issue #81) joins filename, tokens,
+/// and tags on the near side of the line. Someone who typed "client rejected this variant" onto an
+/// asset said something deliberate about it, and that should not sort below a 40-page PDF that
+/// happens to contain the word "variant" — which is precisely the failure this tier exists to stop.
+///
 /// `{col1 col2} : (expr)` is FTS5's column-filter syntax; the expression is parenthesised because
 /// the filter binds to the term that follows it, not to a whole boolean chain.
-pub(crate) const NAME_SCOPED_TIER: &str =
+pub(crate) const AUTHORED_TIER: &str =
     "CASE WHEN asset.rowid IN (SELECT rowid FROM asset_fts WHERE asset_fts MATCH ?) THEN 0 ELSE 1 END ASC";
 
-/// Wrap a MATCH expression so it only searches the name-ish columns (see [`NAME_SCOPED_TIER`]).
-pub(crate) fn name_scoped(match_expr: &str) -> String {
-    format!("{{filename tokens tags}} : ({match_expr})")
+/// Wrap a MATCH expression so it only searches the authored columns (see [`AUTHORED_TIER`]).
+pub(crate) fn authored_scoped(match_expr: &str) -> String {
+    format!("{{filename tokens tags note}} : ({match_expr})")
 }
 
 /// Split a filename (or free text) into lowercase search tokens. Splits on non-alphanumeric runs

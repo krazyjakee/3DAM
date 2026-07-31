@@ -41,7 +41,7 @@ impl Store {
         let (order_clause, order_binds): (String, Vec<Value>) = match req.sort.field {
             SortField::Relevance if rank_match.is_some() => (
                 // FTS relevance (M1), two-level. First a categorical tier so a name/tag match
-                // always beats a document-body-only match (`NAME_SCOPED_TIER` explains why a bm25
+                // always beats a document-body-only match (`AUTHORED_TIER` explains why a bm25
                 // weight can't do this); then bm25 within the tier (more negative = better). Rows
                 // matched only by the LIKE fallback have no bm25 row and COALESCE to a large
                 // sentinel so they sort last. Name length/name break ties.
@@ -50,13 +50,16 @@ impl Store {
                      COALESCE((SELECT {rank} FROM asset_fts \
                         WHERE asset_fts.rowid = asset.rowid AND asset_fts MATCH ?), 1e9) ASC, \
                         LENGTH(filename) ASC, filename ASC",
-                    tier = crate::search::NAME_SCOPED_TIER,
+                    tier = crate::search::AUTHORED_TIER,
                     rank = crate::search::FTS_RANK
                 ),
                 {
                     let m = rank_match.unwrap();
-                    // Bind order follows the clause: the tier's name-scoped MATCH, then bm25's.
-                    vec![Value::Text(crate::search::name_scoped(&m)), Value::Text(m)]
+                    // Bind order follows the clause: the tier's authored-scoped MATCH, then bm25's.
+                    vec![
+                        Value::Text(crate::search::authored_scoped(&m)),
+                        Value::Text(m),
+                    ]
                 },
             ),
             SortField::Relevance if rank_text.is_some() => (
@@ -156,14 +159,14 @@ impl Store {
         let order = if let Some(m) = rank_match {
             // Same two-level ranking as the lexical page (tier, then weighted bm25) so the
             // candidate list the fusion starts from is ordered the same way the user would see it.
-            binds.push(Value::Text(crate::search::name_scoped(&m)));
+            binds.push(Value::Text(crate::search::authored_scoped(&m)));
             binds.push(Value::Text(m));
             format!(
                 "{tier}, \
                  COALESCE((SELECT {rank} FROM asset_fts \
                     WHERE asset_fts.rowid = asset.rowid AND asset_fts MATCH ?), 1e9) ASC, \
                     LENGTH(filename) ASC, filename ASC",
-                tier = crate::search::NAME_SCOPED_TIER,
+                tier = crate::search::AUTHORED_TIER,
                 rank = crate::search::FTS_RANK
             )
         } else {
