@@ -24,10 +24,17 @@ const RESERVED_STEMS: &[&str] = &[
     "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
 ];
 
-/// Characters no path component may contain. `/` is the separator (handled by splitting), the rest
-/// are the Windows-illegal set plus the quoting/wildcard characters that make a name hostile to
-/// every shell and glob it will ever pass through.
-const ILLEGAL_CHARS: &[char] = &['<', '>', ':', '"', '\\', '|', '?', '*'];
+/// Characters no path component may contain: both separators, the Windows-illegal set, and the
+/// quoting/wildcard characters that make a name hostile to every shell and glob it will ever pass
+/// through.
+///
+/// `/` is here even though [`check_rel_path`] splits on it first and so can never pass one down.
+/// [`check_component`] is public and is called directly with a single caller-supplied *filename*
+/// (upload, issue #80), where a `/` is not a separator to honour but an attempt to escape the
+/// destination the user chose — `sub/nested.png` would silently land a directory deeper than the
+/// folder they picked. Rejecting it here means every caller gets that guarantee rather than each
+/// having to remember it.
+const ILLEGAL_CHARS: &[char] = &['/', '<', '>', ':', '"', '\\', '|', '?', '*'];
 
 /// The longest single path component we will create. 255 bytes is the common filesystem ceiling
 /// (ext4, APFS, NTFS); measured in bytes, not chars, because that is what the filesystem counts.
@@ -169,6 +176,21 @@ pub fn suffixed(name: &str, n: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A *component* is one name, so a separator in it is an escape rather than structure.
+    ///
+    /// Upload validates its filename with `check_component` alone (the folder is chosen separately),
+    /// so without this a `name` of `sub/nested.png` would pass every check and land a directory
+    /// below the folder the user picked — inside the source root, and therefore invisible to the
+    /// containment guard, but not where they said to put it.
+    #[test]
+    fn a_component_may_not_contain_a_separator() {
+        for bad in ["sub/nested.png", "a\\b.png", "/leading.png", "trailing/"] {
+            assert!(check_component(bad).is_err(), "must reject {bad:?}");
+        }
+        // The whole-path checker still accepts `/` as structure, since it splits first.
+        assert!(check_rel_path("sub/nested.png").is_ok());
+    }
 
     /// The traversal family. Every one of these has been a real CVE somewhere.
     #[test]

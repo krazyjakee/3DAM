@@ -537,7 +537,49 @@ export interface SourceInfo {
   state: SourceState;
   stats: SourceStats;
   watch: boolean;
+  /**
+   * Can this source accept an upload right now (issue #80)? Probed server-side, not inferred from
+   * `kind` — a local source can sit on a read-only mount, and a federated peer is never writable.
+   * Optional so an older server reads as read-only rather than advertising a write that would fail.
+   */
+  writable?: boolean;
 }
+/**
+ * How an upload resolves a name that is already taken (issue #80).
+ *
+ * Deliberately *not* the convert pipeline's `CollisionRule`: there is no `overwrite` value, and
+ * that absence is the feature — upload is the one path that writes inside a source, and clobbering
+ * an existing file is not expressible in the API at all (tech-spec 08 §5.1).
+ */
+export type UploadCollision = 'fail' | 'suffix' | 'skip';
+
+/** Query parameters for `POST /api/v1/upload`; the request body is the raw file bytes. */
+export interface UploadRequest {
+  source: SourceId;
+  /** Source-relative destination directory. Empty means the source root. Created if missing. */
+  folder?: string;
+  /** The bare filename to create — rejected rather than sanitised if it is not a legal name. */
+  name: string;
+  collision?: UploadCollision;
+}
+
+/** What became of one uploaded file. */
+export interface UploadOutcome {
+  /** The path actually written — differs from `name` under `suffix`, so never assume the request. */
+  path: string;
+  /** `skip` left an existing file in place; nothing was written. */
+  skipped: boolean;
+  size: number;
+  /** The catalogued asset, when the file was one 3DAM understands. */
+  asset?: AssetId | null;
+  /**
+   * Set when the file was stored but deliberately not catalogued — an unsupported format, or
+   * content on the blocklist. Render this: the upload succeeded, but the asset will not appear in
+   * the library, and treating it as a plain success is how that becomes a confusing bug report.
+   */
+  uncatalogued_reason?: string | null;
+}
+
 export interface SourceOptions {
   watch?: boolean;
   include?: string[];

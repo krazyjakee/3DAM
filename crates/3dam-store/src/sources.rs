@@ -161,6 +161,10 @@ impl Store {
                 last_error,
             },
             watch: watch != 0,
+            // Left false here: answering it means touching the filesystem or a remote host, which
+            // this row-mapper runs under the connection lock and must not do. The engine fills it
+            // in after the query (`EmbeddedLibrary::mark_writable`), where the probe is off-lock.
+            writable: false,
         })
     }
 

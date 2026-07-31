@@ -280,7 +280,7 @@ fn unchanged(
 
 /// A couple of display attributes for the live-added grid row, mirroring the store's grid map so a
 /// freshly scanned asset shows its dimensions/duration/tris immediately (before any refetch).
-fn key_attrs_of(attrs: &MediaAttributes) -> SmallMap {
+pub(crate) fn key_attrs_of(attrs: &MediaAttributes) -> SmallMap {
     let mut m = SmallMap::new();
     match attrs {
         MediaAttributes::Image(i) => {
@@ -373,7 +373,7 @@ fn count_total(
     (counted_any && total > 0).then_some(total)
 }
 
-fn hash_file(path: &Path) -> Option<dam_api::id::ContentHash> {
+pub(crate) fn hash_file(path: &Path) -> Option<dam_api::id::ContentHash> {
     let mut hasher = blake3::Hasher::new();
     let file = std::fs::File::open(path).ok()?;
     let mut reader = std::io::BufReader::new(file);
@@ -382,7 +382,7 @@ fn hash_file(path: &Path) -> Option<dam_api::id::ContentHash> {
 }
 
 /// The final path component of a source-relative path (works for `/`-separated remote paths too).
-fn file_name(rel_path: &str) -> String {
+pub(crate) fn file_name(rel_path: &str) -> String {
     rel_path
         .rsplit(['/', '\\'])
         .next()

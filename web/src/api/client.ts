@@ -41,6 +41,8 @@ import type {
   SimilarRequest,
   SourceId,
   SourceInfo,
+  UploadOutcome,
+  UploadRequest,
   SuggestionReview,
   ThumbnailRegenRequest,
   ThumbnailRegenReport,
@@ -239,6 +241,52 @@ export const api = {
 
   /** Immediate subfolders under a source path — the lazy unit the folder tree expands (issue #66). */
   listFolders: (req: FolderListing) => send<FolderEntry[]>("POST", `${API}/folders`, req),
+
+  /**
+   * Write one file into a source (issue #80). The body is the raw bytes, so the file is streamed
+   * rather than base64'd into JSON — a multi-hundred-megabyte asset must not be held in memory
+   * twice. One request per file, which is what makes per-file progress and fail-soft natural:
+   * `onProgress` rides this request's own upload progress, and a rejected file is one failed
+   * promise among many rather than a batch that dies whole.
+   *
+   * Uses `XMLHttpRequest` rather than `fetch` for exactly one reason: `fetch` has no upload
+   * progress event (request streaming is still not broadly available), and progress is the point.
+   */
+  upload: (req: UploadRequest, file: Blob, onProgress?: (fraction: number) => void) =>
+    new Promise<UploadOutcome>((resolve, reject) => {
+      const q = new URLSearchParams({ source: req.source, name: req.name });
+      if (req.folder) q.set("folder", req.folder);
+      if (req.collision) q.set("collision", req.collision);
+
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", resolveUrl(`${API}/upload?${q}`));
+      xhr.setRequestHeader("content-type", "application/octet-stream");
+      xhr.setRequestHeader("accept", "application/json");
+      for (const [k, v] of Object.entries({ ...authHeaders(), ...csrfHeaders() })) {
+        xhr.setRequestHeader(k, v as string);
+      }
+      if (onProgress) {
+        xhr.upload.onprogress = (e) => {
+          if (e.lengthComputable) onProgress(e.loaded / e.total);
+        };
+      }
+      xhr.onload = () => {
+        const body = xhr.responseText ? JSON.parse(xhr.responseText) : undefined;
+        if (xhr.status >= 200 && xhr.status < 300) return resolve(body as UploadOutcome);
+        const err = body as ErrorBody | undefined;
+        reject(
+          new ApiError(
+            err?.code ?? "internal",
+            err?.message ?? `HTTP ${xhr.status}`,
+            xhr.status,
+            err?.detail,
+          ),
+        );
+      };
+      xhr.onerror = () => reject(new ApiError("upstream", "upload failed", 0));
+      xhr.onabort = () => reject(new ApiError("cancelled", "upload cancelled", 0));
+      xhr.send(file);
+    }),
 
   // jobs
   submitScan: (req: ScanRequest) => send<{ job_id: JobId }>("POST", `${API}/jobs/scan`, req),

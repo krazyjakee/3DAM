@@ -11,23 +11,10 @@ use axum::{Json, Router};
 use dam_api::accounts::*;
 use dam_api::admin::*;
 use dam_api::dto::{CollectionKind, SourceKind};
-use dam_api::service::{AuthContext, LibraryService};
+use dam_api::service::LibraryService;
 use dam_api::LibError;
 
-/// The audit actor string for a request (tech-spec 10 §4.5). A signed-in account records as
-/// `account:<username>`; a store-verified token as `token:<label>`; an unauthenticated localhost
-/// owner (under `Authentication = Off`) as `local-owner`. The prefixes keep attribution
-/// unambiguous — the bootstrap token is *labelled* "owner", so a bare name couldn't tell the
-/// no-credential local owner from the holder of that token.
-fn actor_of(ctx: &AuthContext) -> String {
-    if let Some(acct) = &ctx.account {
-        return format!("account:{}", acct.username);
-    }
-    match &ctx.identity {
-        Some(label) => format!("token:{label}"),
-        None => "local-owner".to_string(),
-    }
-}
+pub(crate) use crate::actor_of;
 
 pub fn routes(st: AppState) -> Router<AppState> {
     Router::new()

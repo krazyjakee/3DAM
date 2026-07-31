@@ -24,7 +24,7 @@ use axum::routing::{get, put};
 use axum::{Json, Router};
 use dam_api::dto::{Comment, EditComment, NewComment};
 use dam_api::id::{AssetId, CommentId};
-use dam_api::service::{AuthContext, LibraryService};
+use dam_api::service::LibraryService;
 use dam_api::LibError;
 
 /// The whole discussion surface, gated once at the router.
@@ -68,15 +68,7 @@ fn resolve_one(st: &AppState, mut comment: Comment) -> Comment {
     comment
 }
 
-/// The audit actor for a comment mutation. Always an account here — posting requires one — but the
-/// fallbacks keep the string honest if that ever changes.
-fn actor_of(ctx: &AuthContext) -> String {
-    match (&ctx.account, &ctx.identity) {
-        (Some(a), _) => format!("account:{}", a.username),
-        (None, Some(label)) => format!("token:{label}"),
-        (None, None) => "local-owner".to_string(),
-    }
-}
+use crate::actor_of;
 
 fn parse_comment_id(raw: &str) -> Result<CommentId, ApiError> {
     raw.parse()

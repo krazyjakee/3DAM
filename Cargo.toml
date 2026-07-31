@@ -77,7 +77,9 @@ axum-server = { version = "0.7", features = ["tls-rustls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace", "set-header"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# `stream` is what lets an upload body be a file handle rather than a `Vec<u8>` (issue #80): the
+# connected backend must not have to hold a multi-gigabyte asset in memory to forward it.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 url = "2"
 # web-client embedding (tech-spec 09 §A.4): bake web/dist into the binary, MIME by extension.
 rust-embed = { version = "8", features = ["mime-guess"] }

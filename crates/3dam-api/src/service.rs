@@ -413,6 +413,25 @@ pub trait LibraryService: Send + Sync {
         req: ConvertRequest,
     ) -> Result<ConvertReport, LibError>;
 
+    // ── upload (issue #80, tech-spec 08 §5.1) ────────────────────────────────
+    /// Write one file into a registered source and catalogue it.
+    ///
+    /// This is the **only** operation in 3DAM that writes inside a source tree, and it is
+    /// create-only: [`UploadCollision`] has no overwrite arm, so an existing file is never
+    /// replaced under any request. Convert's §5.1 guard is untouched and shares no code with this
+    /// path — see tech-spec 08 §5.1 for why that separation is what keeps the invariant structural.
+    ///
+    /// `staged` is a **local file already holding the bytes**, not the destination: the caller
+    /// streams the body to scratch first, so neither the transport nor the engine ever buffers a
+    /// large asset in memory. An `ApiClient` forwards those bytes to a server; `EmbeddedLibrary`
+    /// reads them straight through into the source.
+    async fn upload(
+        &self,
+        ctx: &AuthContext,
+        req: UploadRequest,
+        staged: &std::path::Path,
+    ) -> Result<UploadOutcome, LibError>;
+
     // ── sources ──────────────────────────────────────────────────────────────
     async fn list_sources(&self, ctx: &AuthContext) -> Result<Vec<SourceInfo>, LibError>;
 

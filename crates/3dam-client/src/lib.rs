@@ -581,6 +581,47 @@ impl LibraryService for ApiClient {
         self.post("/api/v1/convert", &req).await
     }
 
+    /// Forward the staged bytes to the server's upload route.
+    ///
+    /// The body is the file *handle*, not its contents: a connected CLI or desktop shell pushing a
+    /// 2 GB model must not need 2 GB of RAM to do it. Everything else about the request — the
+    /// destination, the name, the collision rule — rides as query parameters, which keeps the body
+    /// a pure byte stream and means the server can start writing before the upload finishes.
+    async fn upload(
+        &self,
+        _ctx: &AuthContext,
+        req: UploadRequest,
+        staged: &std::path::Path,
+    ) -> Result<UploadOutcome, LibError> {
+        let file = tokio::fs::File::open(staged)
+            .await
+            .map_err(|e| LibError::Internal(format!("staged upload: {e}")))?;
+        let mut url = self.url("/api/v1/upload")?;
+        url.query_pairs_mut()
+            .append_pair("source", &req.source.to_string())
+            .append_pair("folder", &req.folder)
+            .append_pair("name", &req.name)
+            // Spelled by the DTO's own serde naming rather than a local match, so the wire value
+            // cannot drift from what the server deserialises.
+            .append_pair(
+                "collision",
+                serde_json::to_value(req.collision)
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_owned))
+                    .unwrap_or_else(|| "fail".into())
+                    .as_str(),
+            );
+        let resp = self
+            .http
+            .post(url)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .body(reqwest::Body::from(file))
+            .send()
+            .await
+            .map_err(|e| LibError::SourceUnavailable(e.to_string()))?;
+        Self::decode(resp).await
+    }
+
     async fn list_sources(&self, _ctx: &AuthContext) -> Result<Vec<SourceInfo>, LibError> {
         self.get("/api/v1/sources").await
     }

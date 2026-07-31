@@ -32,6 +32,9 @@ uuid.workspace = true
 argon2.workspace = true
 # serve config file (tech-spec 09 §A.1).
 toml.workspace = true
+# Stages an upload body on real disk before it is written into a source (issue #80). The temp file
+# is removed on drop, so a client that disconnects mid-transfer leaves nothing behind.
+tempfile.workspace = true
 
 [dev-dependencies]
 # drive the router in-process (no port bind) via `ServiceExt::oneshot` (phase-5 integration tests).

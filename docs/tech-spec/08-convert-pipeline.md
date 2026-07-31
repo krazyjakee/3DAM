@@ -466,6 +466,38 @@ that keep the invariant intact rather than merely policy-gated:
 Replacing or overwriting an existing asset stays out of scope, and is not reachable by relaxing
 anything here.
 
+**Collision resolution is retry, not probe-then-write.** `FileSource::put` is create-only and
+answers `Conflict` when the name is taken, so `Suffix` asks for the next name and `Skip` stops.
+There is deliberately no `exists()` check whose answer could go stale before the write: the
+filesystem's own atomic create is the arbiter, so two clients uploading `brick.png` at the same
+moment get `brick.png` and `brick-1.png` rather than one silently overwriting the other. This is
+why the "already exists" failure is `Conflict` and not `BadRequest` — a caller has to be able to
+tell "that name is taken" (recoverable) from "that name is malformed" (never retry) without
+matching on message text.
+
+**Transport: one file per request, body is the bytes** (not multipart). A multipart parser has to
+be fed the whole request to find part boundaries, so a batch would share one failure domain — the
+last file's failure killing the nineteen that already transferred. One request per file makes
+fail-soft the default, makes per-file progress the transport's own upload progress, and makes
+cancelling one file just closing one connection. The body streams to scratch on real disk (never
+tmpfs — issue #87) and is never buffered in memory. The per-file ceiling (`[upload] max_file_mb`,
+file 09 §A.1) is enforced against both the declared `Content-Length` (an early-out) and the running
+byte total (the actual enforcement, since a client can lie or send chunked).
+
+**Uploaded files are catalogued through the same `detect_for_ingest` gate a scan uses,** and read
+from the destination rather than the staging copy. An upload must not mint a row a later scan of the
+same tree would decline to create, or the next rescan would delete the asset the user just uploaded;
+and metadata extraction resolves a model's external references relative to the file's own directory,
+so cataloguing the scratch copy would miss every sibling texture and buffer. Two cases are written
+but deliberately *not* catalogued, each reported to the client rather than silently dropped: an
+unsupported format, and content on the blocklist (issue #21) — so upload cannot become a way to
+reinstate bytes the user removed-and-blocked.
+
+**Upload creates no directory it does not fill.** The parent chain is created by `put`, after it has
+established the name is free, so a refused upload — a bad folder name, a collision under `Fail`, a
+`Skip` that writes nothing — leaves no empty directories behind in the user's tree. Being the one
+path that writes into a source, it must not mutate one on its failure path.
+
 ### 5.2 Atomic writes
 
 Every item writes to a temp file in the destination filesystem, `fsync`s, verifies the encode

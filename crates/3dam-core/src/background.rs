@@ -17,7 +17,6 @@
 //!   supplies them through [`PipelinePolicy`] so dam-core never depends on `server.db`.
 
 use super::*;
-use tokio::sync::Notify;
 
 /// The runtime policy a long-running server supplies so the pipeline honours the `auto_thumbnail` /
 /// `auto_analyze` feature flags — read fresh on every drain, so a live admin toggle takes effect on
@@ -42,7 +41,10 @@ impl EmbeddedLibrary {
     /// Two tasks: a *listener* that wakes the worker on every scan-completed event, and the *worker*
     /// that drains any startup backlog immediately, then drains again on each wake.
     pub fn start_background_pipeline(self: &Arc<Self>, policy: Arc<dyn PipelinePolicy>) {
-        let notify = Arc::new(Notify::new());
+        // Shared with the engine (`pipeline_wake`) rather than private to this function, so an
+        // ingest that is *not* a scan can ask for a drain too — upload (issue #80) writes its
+        // catalog row directly and would otherwise never reach this worker.
+        let notify = self.pipeline_wake.clone();
 
         // Listener: a scan finishing (full or watch-driven delta) means fresh assets to process. The
         // analysis pass emits `Analyze` job progress, not `Scan`, so this never re-triggers itself.

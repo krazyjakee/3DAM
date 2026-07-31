@@ -283,6 +283,28 @@ pub fn open_source(
     }
 }
 
+/// Can this source accept an upload, answered **without a network handshake** (issue #80)?
+///
+/// This exists so "can it be written to" has exactly one definition. The listing path needs the
+/// answer for every source on every render, and `open_source` on an SFTP/SMB connection is a full
+/// login — a sidebar would become N logins against hosts that may be asleep. So remote kinds answer
+/// statically here rather than being opened.
+///
+/// That static answer is *currently correct*, not merely cheap: neither remote backend implements
+/// the write side yet, so both inherit `FileSource::writable`'s `false`. **When slice 7 lands SFTP
+/// and SMB writes, this function is the one that must learn about it** — otherwise uploads would
+/// start succeeding through `run_upload` (which asks the opened source) while the picker kept
+/// hiding those destinations, and nothing would fail to compile to say so.
+pub fn writable_without_handshake(conn: &SourceConnection) -> bool {
+    match conn {
+        // The only kind whose answer varies, and the only one cheap enough to ask for real.
+        SourceConnection::LocalFs { root } => LocalFsSource::new(root).writable(),
+        SourceConnection::Sftp(_) | SourceConnection::Smb(_) => false,
+        // A peer's library is never a destination — it yields catalog rows, not a writable tree.
+        SourceConnection::Federated(_) => false,
+    }
+}
+
 // ── URI parsing helpers ─────────────────────────────────────────────────────────────────────────
 
 fn strip_scheme<'a>(uri: &'a str, scheme: &str) -> &'a str {
@@ -431,6 +453,15 @@ pub(crate) const FETCH_CHUNK: usize = 256 * 1024;
 /// two must agree — a rename here silently orphans whatever a previous build left behind.
 pub(crate) const SCRATCH_PREFIX: &str = "3dam-remote-";
 
+/// Filename prefix for an **inbound upload** staged in scratch (issue #80).
+///
+/// Public because the staging happens in the server's transport layer, not here — but it lives
+/// beside [`SCRATCH_PREFIX`] and is swept by the same [`clean_scratch`] for the same reason. A
+/// prefix the sweep does not know about is worse than no sweep: an upload killed at 3.5 GB of a
+/// 4 GB video leaves that file in the data dir forever, and a leading dot would hide it from `ls`
+/// as well.
+pub const UPLOAD_SCRATCH_PREFIX: &str = "3dam-upload-";
+
 /// Open a temp file for a remote download, **inside the engine's scratch directory**.
 ///
 /// The directory matters (issue #87): `tempfile`'s default is `std::env::temp_dir()`, which on most
@@ -483,10 +514,13 @@ pub(crate) fn temp_sink(
 /// a panic-abort, or a power cut mid-fetch. Without this, a crash during a large remote pass leaves
 /// multi-gigabyte files sitting in the data dir with nothing that will ever collect them.
 ///
-/// Deliberately unfiltered by age: this runs at engine open, and any `3dam-remote-*` file present at
-/// that moment belongs to a process that is no longer running. (Two engines sharing one data dir
-/// would race here — but they already race on `library.db`'s write lock, so that is not a new
-/// constraint.) Best-effort: a scratch directory we cannot read is not worth failing to start over.
+/// Deliberately unfiltered by age: this runs at engine open, and any matching file present at that
+/// moment belongs to a process that is no longer running. (Two engines sharing one data dir would
+/// race here — but they already race on `library.db`'s write lock, so that is not a new constraint.)
+/// Best-effort: a scratch directory we cannot read is not worth failing to start over.
+///
+/// Sweeps **both** things that stage bytes in scratch: remote downloads and inbound uploads. An
+/// upload can be larger than any download, since it is bounded only by `[upload] max_file_mb`.
 pub fn clean_scratch(scratch: &Path) -> usize {
     let Ok(entries) = std::fs::read_dir(scratch) else {
         return 0;
@@ -495,12 +529,13 @@ pub fn clean_scratch(scratch: &Path) -> usize {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        if name.starts_with(SCRATCH_PREFIX) && std::fs::remove_file(entry.path()).is_ok() {
+        let orphan = name.starts_with(SCRATCH_PREFIX) || name.starts_with(UPLOAD_SCRATCH_PREFIX);
+        if orphan && std::fs::remove_file(entry.path()).is_ok() {
             removed += 1;
         }
     }
     if removed > 0 {
-        tracing::info!(removed, "cleared orphaned remote downloads from scratch");
+        tracing::info!(removed, "cleared orphaned scratch files");
     }
     removed
 }
@@ -575,10 +610,20 @@ impl FileSource for LocalFsSource {
     /// or a directory the server process does not own — none of which the *kind* tells you. The
     /// answer feeds a destination picker, so being wrong here means offering the user a folder they
     /// cannot write to.
+    ///
+    /// **This creates and removes a file rather than reading the mode bits.** `Permissions::
+    /// readonly()` answers "is every write bit clear", which is not the same question and misses
+    /// all three cases above: an `ro` mount still reports mode 0755, a root-owned 0755 directory
+    /// looks writable to an unprivileged process, and on Windows the read-only attribute is ignored
+    /// for directories entirely — so it would answer "writable" for essentially every local root.
+    /// std's own documentation warns it "cannot be relied upon to predict whether attempts to …
+    /// write the file will actually succeed". The only honest probe is to try, and trying costs
+    /// about what a `stat` does.
     fn writable(&self) -> bool {
-        !std::fs::metadata(&self.root)
-            .map(|m| m.permissions().readonly())
-            .unwrap_or(true)
+        tempfile::Builder::new()
+            .prefix(".3dam-writable-")
+            .tempfile_in(&self.root)
+            .is_ok() // NamedTempFile removes itself on drop.
     }
 
     fn mkdir(&self, rel_path: &str) -> Result<(), LibError> {
@@ -594,8 +639,13 @@ impl FileSource for LocalFsSource {
 
         // Create-only. Checked here *and* enforced by the rename below, because this check alone
         // is a TOCTOU window — see the atomic-rename comment.
+        //
+        // `Conflict`, not `BadRequest`: "the name is taken" is the one failure a caller *routinely*
+        // recovers from (retry under a suffix, or report a skip), so it has to be distinguishable
+        // from "that name is malformed" without matching on message text. It is also the honest
+        // status — 409, not 400, since the request was well-formed and the world disagreed.
         if abs.exists() {
-            return Err(LibError::BadRequest(format!("{rel} already exists")));
+            return Err(LibError::Conflict(format!("{rel} already exists")));
         }
         if let Some(parent) = abs.parent() {
             std::fs::create_dir_all(parent)
@@ -625,7 +675,7 @@ impl FileSource for LocalFsSource {
         // could have created the path, and a plain rename would silently destroy their file.
         tmp.persist_noclobber(&abs).map_err(|e| {
             if e.error.kind() == std::io::ErrorKind::AlreadyExists {
-                LibError::BadRequest(format!("{rel} already exists"))
+                LibError::Conflict(format!("{rel} already exists"))
             } else {
                 LibError::Internal(format!("commit {rel}: {}", e.error))
             }
@@ -792,16 +842,51 @@ mod tests {
     fn clean_scratch_removes_orphans_and_leaves_everything_else() {
         let dir = tempfile::tempdir().unwrap();
         let orphan = dir.path().join(format!("{SCRATCH_PREFIX}abc123.mp4"));
+        // An interrupted *upload* strands bytes exactly the same way, and can be larger — it is
+        // bounded only by `[upload] max_file_mb`. A prefix the sweep does not know is worse than no
+        // sweep at all, because nothing else will ever collect it (issue #80).
+        let upload = dir
+            .path()
+            .join(format!("{UPLOAD_SCRATCH_PREFIX}def456.fbx"));
         let innocent = dir.path().join("library.db");
         std::fs::write(&orphan, b"stranded").unwrap();
+        std::fs::write(&upload, b"half an upload").unwrap();
         std::fs::write(&innocent, b"precious").unwrap();
 
-        assert_eq!(clean_scratch(dir.path()), 1);
+        assert_eq!(clean_scratch(dir.path()), 2);
         assert!(!orphan.exists(), "orphaned download survived the sweep");
+        assert!(!upload.exists(), "orphaned upload survived the sweep");
         assert!(
             innocent.exists(),
-            "the sweep must only ever match its own prefix"
+            "the sweep must only ever match its own prefixes"
         );
+    }
+
+    /// `writable()` has to answer "can this process create a file here", not "are the mode bits
+    /// clear". The two differ on the cases that actually occur: a directory owned by another user
+    /// with mode 0755 reads as writable by every mode-bit check and is not.
+    ///
+    /// (Assumes a non-root test runner, as the rest of the suite does: root bypasses the permission
+    /// check entirely and would genuinely be able to write here.)
+    #[test]
+    #[cfg(unix)]
+    fn writable_reflects_real_access_not_mode_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, src) = local_root();
+        assert!(src.writable(), "a fresh temp dir is writable");
+
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let answer = src.writable();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            !answer,
+            "a directory this process cannot create files in is not a destination"
+        );
+
+        // And the probe leaves nothing behind: it is called on every source listing.
+        assert!(src.writable());
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path()).unwrap().flatten().collect();
+        assert!(leftovers.is_empty(), "the probe littered: {leftovers:?}");
     }
 
     /// A scratch directory that does not exist is not an error worth failing startup over.
@@ -833,15 +918,25 @@ mod tests {
 
         // Create-only is the invariant the whole feature rests on (tech-spec 08 §5.1): a second
         // write to the same path must fail rather than replace, with no flag that changes it.
+        //
+        // Specifically `Conflict`, and upload's collision handling depends on that: `Suffix` and
+        // `Skip` recover from a taken name by matching this variant, so if it ever collapsed back
+        // into `BadRequest` they would become indistinguishable from a malformed-name rejection
+        // and either retry a name that can never succeed or skip a file the user meant to store.
         let err = src
             .put("Textures/brick.png", &mut &b"second"[..])
             .unwrap_err();
-        assert!(matches!(err, LibError::BadRequest(_)), "got {err:?}");
+        assert!(matches!(err, LibError::Conflict(_)), "got {err:?}");
         assert_eq!(
             std::fs::read(dir.path().join("Textures/brick.png")).unwrap(),
             b"first",
             "the original bytes are untouched"
         );
+
+        // The other half of that contract: a name we refuse to create is *not* a conflict, so a
+        // caller retrying under a suffix cannot loop on it.
+        let err = src.put("Textures/CON", &mut &b"x"[..]).unwrap_err();
+        assert!(matches!(err, LibError::BadRequest(_)), "got {err:?}");
     }
 
     /// The escape a lexical path check cannot catch: every string rule passes, and the write still

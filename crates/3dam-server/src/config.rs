@@ -22,6 +22,44 @@ pub struct ServeFile {
     pub resources: ResourcesBlock,
     #[serde(default)]
     pub accounts: AccountsBlock,
+    #[serde(default)]
+    pub upload: UploadBlock,
+}
+
+/// `[upload]` — the per-file size ceiling for writes into a source (issue #80).
+///
+/// Config, not a runtime flag, for the reason `[resources]` gives: "a reasonable maximum asset
+/// size" is a deployment property (disk, link speed, what the library holds), not a live exposure
+/// toggle. An audio library and a 3D one disagree by two orders of magnitude, and neither wants to
+/// discover the limit by having a drop fail halfway. Note that *whether* uploads are allowed at all
+/// remains a real runtime decision, made by `Scope::Write` and the `network_writes` flag — this
+/// only sizes them.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct UploadBlock {
+    /// Largest single uploaded file, in MiB. Default 2048 (2 GiB).
+    pub max_file_mb: Option<u64>,
+}
+
+/// Default per-file upload ceiling: 2 GiB. Chosen to clear a large uncompressed 3D scene or a
+/// video without ceremony, while still bounding what one request can write.
+pub const DEFAULT_MAX_UPLOAD_MB: u64 = 2048;
+
+impl UploadBlock {
+    /// The ceiling in bytes.
+    ///
+    /// `saturating_mul`, not `*`: an operator writing a very large number to mean "unlimited" is a
+    /// natural reading of an optional field, and a plain multiply would panic on overflow in a debug
+    /// build (taking down startup with a message naming no config key) or *wrap* in release — where
+    /// any multiple of 2^44 lands on a ceiling of 0 and silently rejects every non-empty upload.
+    /// A literal `0` is treated the same way as absurdly-large, since "allow nothing" is far more
+    /// likely a mistake than an intent, and disabling uploads is what the Write scope is for.
+    pub fn max_bytes(&self) -> u64 {
+        match self.max_file_mb {
+            Some(0) | None => DEFAULT_MAX_UPLOAD_MB,
+            Some(mb) => mb,
+        }
+        .saturating_mul(1024 * 1024)
+    }
 }
 
 /// `[resources]` — the good-neighbour knobs (tech-spec 14 §5). Unset values fall back to the

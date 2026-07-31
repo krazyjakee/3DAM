@@ -63,6 +63,14 @@ url  = "3dam://store.example"
 extractors = ["audio", "image", "3d-cheap"]   # e.g. defer 3d full-render on a GPU-less host
 watch      = true
 
+[upload]
+# Per-file ceiling for writes into a source (issue #80; the create-only path of file 08 §5.1).
+# Config rather than a runtime flag, for the same reason as [resources]: "a reasonable maximum
+# asset size" is a deployment property — an audio library and a 3D one disagree by two orders of
+# magnitude — not a live exposure toggle. *Whether* uploads are allowed at all remains a real
+# runtime decision, made by the Write scope and the network_writes flag below.
+max_file_mb = 2048
+
 # --- Feature flags: seed values only. Authoritative semantics + reconciliation: file 10. ---
 [flags]
 auth              = "off"        # off | anonymous | token | oidc   (one gate: web/API/MCP/federation)

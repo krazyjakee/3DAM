@@ -11,9 +11,14 @@ mod paths;
 mod resources;
 mod scan;
 pub mod semantic;
+mod upload;
 mod watch;
 
 pub use background::PipelinePolicy;
+/// Re-exported so a transport can stage an upload under a name the engine's scratch sweep knows
+/// (issue #80). The server stages the request body itself but must not depend on `dam-sources`
+/// directly — frontends reach the engine, not around it.
+pub use dam_sources::UPLOAD_SCRATCH_PREFIX;
 pub use paths::default_data_dir;
 pub use resources::ResourceOptions;
 
@@ -466,6 +471,15 @@ pub struct EmbeddedLibrary {
     /// under `cache/` — tens of thousands of inodes on a large library, minutes on a cold HDD —
     /// so the Settings screen must not pay it on every load. Invalidated on [`Self::clear_caches`].
     usage_cache: Mutex<Option<(std::time::Instant, CacheUsage, CacheUsage)>>,
+    /// Wake handle for the background pipeline's drain worker (issue #71).
+    ///
+    /// Held on the engine rather than owned privately by `start_background_pipeline` so that an
+    /// ingest which is *not* a scan can ask for a drain. Upload (issue #80) is the first: it writes
+    /// a catalog row directly, and the pipeline's only other trigger is a `Scan` job reaching
+    /// `Done`, so without this an uploaded asset would get its cheap tier and then wait for an
+    /// unrelated scan before it ever received an embedding or auto-tags — invisible to `similar`
+    /// and `dedup` in the meantime, and on an unwatched source that could be indefinitely.
+    pipeline_wake: Arc<tokio::sync::Notify>,
 }
 
 impl EmbeddedLibrary {
@@ -545,6 +559,7 @@ impl EmbeddedLibrary {
             fed: federation::PeerRegistry::new(),
             governor,
             usage_cache: Mutex::new(None),
+            pipeline_wake: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -567,6 +582,15 @@ impl EmbeddedLibrary {
         paths::scratch_dir(&self.data_dir)
     }
 
+    /// [`Self::scratch`], for transports that must stage bytes before handing them to the engine —
+    /// the upload route streams a request body here (issue #80). Public for the same reason the
+    /// directory exists: staging in `std::env::temp_dir()` would put a multi-gigabyte upload on
+    /// tmpfs (issue #87), so callers need somewhere correct to put it rather than a default that
+    /// silently reintroduces the bug.
+    pub fn scratch_dir(&self) -> PathBuf {
+        self.scratch()
+    }
+
     /// Announce that an asset's thread changed (issue #82). Rides `AssetChanged`, which already
     /// carries `source_id` — the attribution `Visibility::allows_event` filters on — so a comment
     /// event cannot reach a subscriber who cannot see the asset.
@@ -580,6 +604,34 @@ impl EmbeddedLibrary {
             source_id,
             kind: ChangeKind::Commented,
         });
+    }
+
+    /// Fill in [`SourceInfo::writable`] — can each of these accept an upload right now (issue #80)?
+    ///
+    /// The capability question itself belongs to `dam-sources`, which owns the write seam, so this
+    /// only transports the answer: see [`dam_sources::writable_without_handshake`] for why a remote
+    /// kind is answered statically rather than by opening it, and for the note that slice 7 must
+    /// update *that* function rather than this one.
+    ///
+    /// Runs on the blocking pool because probing a local root touches the filesystem, and a
+    /// `LocalFs` source can perfectly well be a mounted network share underneath.
+    async fn mark_writable(&self, sources: &mut [SourceInfo]) {
+        let ids: Vec<SourceId> = sources.iter().map(|s| s.id).collect();
+        let probed = self
+            .db(move |s| {
+                Ok(ids
+                    .into_iter()
+                    .filter(|id| {
+                        s.get_source_connection(id)
+                            .is_ok_and(|c| dam_sources::writable_without_handshake(&c))
+                    })
+                    .collect::<std::collections::HashSet<_>>())
+            })
+            .await
+            .unwrap_or_default();
+        for s in sources.iter_mut() {
+            s.writable = probed.contains(&s.id);
+        }
     }
 
     /// Run a synchronous store operation on the blocking pool (tech-spec 14).
@@ -1170,25 +1222,60 @@ impl LibraryService for EmbeddedLibrary {
             .await
     }
 
+    async fn upload(
+        &self,
+        ctx: &AuthContext,
+        req: UploadRequest,
+        staged: &std::path::Path,
+    ) -> Result<UploadOutcome, LibError> {
+        // Writing into a source is a library-wide capability today. When #42's per-source `write`
+        // grant lands this relaxes to a single predicate — "full visibility *or* a write grant on
+        // `req.source`" — rather than a retrofit; until then a restricted identity that can merely
+        // *see* a source must not be able to put files in it.
+        Self::require_full_visibility(ctx, "upload")?;
+
+        let scratch = self.scratch();
+        let staged = staged.to_path_buf();
+        let events = self.events.clone();
+        let outcome = self
+            .db(move |s| upload::run_upload(s, &events, req, &staged, &scratch))
+            .await?;
+
+        // Ask the background pipeline for a drain. `ingest_one` writes only the cheap tier, and the
+        // pipeline's other trigger is a `Scan` job completing — so without this an uploaded asset
+        // would carry no embedding and no auto-tags (invisible to `similar`/`dedup`) until some
+        // unrelated scan of that source happened to run. `Notify` holds one permit, so a
+        // twenty-file drop coalesces into a single follow-up pass rather than twenty.
+        if outcome.asset.is_some() {
+            self.pipeline_wake.notify_one();
+        }
+        Ok(outcome)
+    }
+
     async fn list_sources(&self, ctx: &AuthContext) -> Result<Vec<SourceInfo>, LibError> {
         let all = self.db(|s| s.list_sources()).await?;
         // An unshared source is absent from the listing (issue #42): filter, don't 403.
-        Ok(all
+        let mut visible: Vec<SourceInfo> = all
             .into_iter()
             .filter(|s| ctx.visibility.allows_source(&s.id))
-            .collect())
+            .collect();
+        self.mark_writable(&mut visible).await;
+        Ok(visible)
     }
 
     async fn get_source(&self, ctx: &AuthContext, id: &SourceId) -> Result<SourceInfo, LibError> {
         if !ctx.visibility.allows_source(id) {
             return Err(LibError::NotFound(format!("source {id}")));
         }
-        let id = *id;
-        self.db(move |s| {
-            s.get_source(&id)?
-                .ok_or_else(|| LibError::NotFound(format!("source {id}")))
-        })
-        .await
+        let sid = *id;
+        let mut info = self
+            .db(move |s| {
+                s.get_source(&sid)?
+                    .ok_or_else(|| LibError::NotFound(format!("source {sid}")))
+            })
+            .await?;
+        self.mark_writable(std::slice::from_mut(&mut info)).await;
+        Ok(info)
     }
 
     async fn list_folders(

@@ -16,6 +16,7 @@ mod comments;
 mod config;
 mod mcp;
 mod store;
+mod upload;
 
 use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -91,6 +92,27 @@ pub(crate) struct AppState {
     /// Readiness for `/readyz` (issue #75): `false` until the engine, stores, and background job
     /// pipeline are fully wired, then `true`. A load balancer routes traffic only once this holds.
     pub ready: Arc<std::sync::atomic::AtomicBool>,
+    /// Per-file upload ceiling in bytes (`[upload] max_file_mb`, issue #80).
+    pub max_upload_bytes: u64,
+}
+
+/// The audit actor string for a request (tech-spec 10 §4.5). A signed-in account records as
+/// `account:<username>`; a store-verified token as `token:<label>`; an unauthenticated localhost
+/// owner (under `Authentication = Off`) as `local-owner`. The prefixes keep attribution
+/// unambiguous — the bootstrap token is *labelled* "owner", so a bare name couldn't tell the
+/// no-credential local owner from the holder of that token.
+///
+/// Lives here rather than in one route module because every module that audits needs the identical
+/// string: the log's value is that an actor is greppable across `admin.*`, `comment.*`, and
+/// `source.upload` alike, which stops being true the moment two copies disagree.
+pub(crate) fn actor_of(ctx: &dam_api::service::AuthContext) -> String {
+    if let Some(acct) = &ctx.account {
+        return format!("account:{}", acct.username);
+    }
+    match &ctx.identity {
+        Some(label) => format!("token:{label}"),
+        None => "local-owner".to_string(),
+    }
 }
 
 /// Bridges the server's live feature flags to the engine's background pipeline (issue #71). The
@@ -251,6 +273,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
         // User accounts: claim/login/sessions (phase 6, issue #42) — 404 while the flag is off.
         .merge(authn::routes(state.clone()))
         .merge(comments::routes(state.clone()))
+        // The one write-into-source path (issue #80). Not gated at the router: it is guarded by the
+        // `Writer` extractor per-request, so an unauthorised caller gets a 403 that says why rather
+        // than a 404 implying the feature does not exist.
+        .merge(upload::routes())
         // The admin API (tech-spec 10 §5), guarded by the AdminAuth extractor.
         .merge(admin::routes(state.clone()))
         // SPA fallback: any non-API GET serves the embedded web client (tech-spec 09 §A.4).
@@ -290,6 +316,7 @@ pub fn router(
         shutdown,
         // The test seam is ready the moment it's built (no async pipeline warm-up to await).
         ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        max_upload_bytes: crate::config::UploadBlock::default().max_bytes(),
     })
 }
 
@@ -371,6 +398,7 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
         require_claim_token: file.accounts.require_claim_token == Some(true),
         shutdown: shutdown_rx,
         ready: ready.clone(),
+        max_upload_bytes: file.upload.max_bytes(),
     };
     let app = build_router(state);
 
@@ -635,6 +663,9 @@ async fn desktop_setup(
         require_claim_token: false,
         shutdown,
         ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        // The desktop shell reads no serve config file, so the built-in ceiling stands. A local
+        // drag-and-drop is the *least* constrained case anyway: no network hop to protect.
+        max_upload_bytes: crate::config::UploadBlock::default().max_bytes(),
     };
     tracing::info!(%actual, "3dam desktop server listening");
     Ok((
