@@ -238,6 +238,31 @@ impl FromRequestParts<AppState> for Writer {
     }
 }
 
+/// A context that may take part in a **discussion** (issue #82): it holds `Read`, and a cookie
+/// session passes CSRF on anything that mutates.
+///
+/// Deliberately `Read` and not `Write`. Requiring `Scope::Write` would conflate "may modify the
+/// library" with "may talk about it" and lock out the reviewing art director or client — precisely
+/// the person the feature exists for, and precisely the person a `viewer` account models. The
+/// identity requirement lives one layer down in the engine, which rejects anyone without a
+/// signed-in account, so widening the scope here does not widen who can post.
+pub struct Commenter(pub AuthContext);
+impl FromRequestParts<AppState> for Commenter {
+    type Rejection = ApiError;
+    async fn from_request_parts(parts: &mut Parts, st: &AppState) -> Result<Self, ApiError> {
+        let resolved = resolve(
+            &st.store,
+            bearer(parts),
+            cookie_value(&parts.headers, SESSION_COOKIE),
+        )?;
+        resolved.ctx.require(Scope::Read)?;
+        if parts.method != axum::http::Method::GET {
+            enforce_csrf(parts, &resolved)?;
+        }
+        Ok(Commenter(resolved.ctx))
+    }
+}
+
 /// A context that holds `Admin` — the entire `/admin/api` surface. Once auth is on this is never
 /// reachable anonymously (ADR 0004); under `Off` the local owner holds it (see [`Scopes::owner`]).
 /// The whole admin surface mutates or reads privileged state, so cookie sessions pass CSRF here

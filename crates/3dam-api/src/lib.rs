@@ -36,7 +36,7 @@ pub use event::{ChangeKind, EventTopic, JobEvent, LibraryEvent, SubscribeRequest
 pub use federation::{
     protocol_compatible, PeerAdvertise, VectorSimilarRequest, FEDERATION_PROTOCOL_VERSION,
 };
-pub use id::{AssetId, CollectionId, ContentHash, JobId, SourceId, TagId};
+pub use id::{AssetId, CollectionId, CommentId, ContentHash, JobId, SourceId, TagId};
 pub use page::{Cursor, ItemWarning, Page, PageParams, PartialStatus};
 pub use service::{
     AuthContext, EventStream, LibraryService, Scope, Scopes, Visibility, VisibilityScope, WhoAmI,

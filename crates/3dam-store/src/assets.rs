@@ -237,6 +237,140 @@ impl Store {
         .map_err(internal)
     }
 
+    // ── discussion threads (issue #82) ─────────────────────────────────────
+
+    /// Every message on an asset, oldest first. Tombstones are included with an empty body — the
+    /// thread has to stay coherent for anyone who replied to a since-deleted message.
+    pub fn list_comments(&self, asset: &AssetId) -> Result<Vec<Comment>, LibError> {
+        let conn = self.conn.lock().unwrap();
+        // UUIDv7 ids sort chronologically, so the primary key is the timeline.
+        let mut stmt = conn
+            .prepare(
+                "SELECT comment_id, asset_id, author, body, created_at, edited_at, deleted_at,
+                        reply_to
+                 FROM asset_comment WHERE asset_id = ?1 ORDER BY comment_id ASC",
+            )
+            .map_err(internal)?;
+        let rows = stmt
+            .query_map(params![asset.as_bytes().to_vec()], row_to_comment)
+            .map_err(internal)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(internal)
+    }
+
+    /// One message, or `NotFound`. Used by the edit/delete guards, which need the author and the
+    /// owning asset before they can decide anything.
+    pub fn get_comment(&self, id: &CommentId) -> Result<Comment, LibError> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT comment_id, asset_id, author, body, created_at, edited_at, deleted_at, reply_to
+             FROM asset_comment WHERE comment_id = ?1",
+            params![id.as_bytes().to_vec()],
+            row_to_comment,
+        )
+        .optional()
+        .map_err(internal)?
+        .ok_or_else(|| LibError::NotFound(format!("comment {id}")))
+    }
+
+    /// Append a message. `reply_to` is validated to belong to the same asset — a reply pointing at
+    /// another asset's thread would render as a dangling quote and leak that a message exists.
+    pub fn add_comment(
+        &self,
+        asset: &AssetId,
+        author: &str,
+        body: &str,
+        reply_to: Option<CommentId>,
+    ) -> Result<Comment, LibError> {
+        let conn = self.conn.lock().unwrap();
+        let asset_blob = asset.as_bytes().to_vec();
+        let exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM asset WHERE id = ?1",
+                params![asset_blob],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(internal)?
+            .is_some();
+        if !exists {
+            return Err(LibError::NotFound(format!("asset {asset}")));
+        }
+        if let Some(parent) = reply_to {
+            let same: bool = conn
+                .query_row(
+                    "SELECT 1 FROM asset_comment WHERE comment_id = ?1 AND asset_id = ?2",
+                    params![parent.as_bytes().to_vec(), asset_blob],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(internal)?
+                .is_some();
+            if !same {
+                return Err(LibError::BadRequest(
+                    "reply_to must name a message on the same asset".into(),
+                ));
+            }
+        }
+        let id = CommentId::new();
+        let now = now_ms();
+        conn.execute(
+            "INSERT INTO asset_comment (comment_id, asset_id, author, body, created_at, reply_to)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                id.as_bytes().to_vec(),
+                asset_blob,
+                author,
+                body,
+                now,
+                reply_to.map(|r| r.as_bytes().to_vec()),
+            ],
+        )
+        .map_err(internal)?;
+        Ok(Comment {
+            id,
+            asset: *asset,
+            author: CommentAuthor {
+                id: author.to_string(),
+                display: None,
+            },
+            body: body.to_string(),
+            created_at: now,
+            edited_at: None,
+            deleted_at: None,
+            reply_to,
+        })
+    }
+
+    /// Replace a message's text and stamp `edited_at`. Refuses a tombstone: editing a deleted
+    /// message would resurrect it without anyone having posted anything.
+    pub fn edit_comment(&self, id: &CommentId, body: &str) -> Result<(), LibError> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn
+            .execute(
+                "UPDATE asset_comment SET body = ?2, edited_at = ?3
+                 WHERE comment_id = ?1 AND deleted_at IS NULL",
+                params![id.as_bytes().to_vec(), body, now_ms()],
+            )
+            .map_err(internal)?;
+        if n == 0 {
+            return Err(LibError::NotFound(format!("comment {id}")));
+        }
+        Ok(())
+    }
+
+    /// Soft-delete: blank the body, stamp `deleted_at`, keep the row so replies keep their parent.
+    /// Idempotent — deleting an already-deleted message is a no-op, not an error.
+    pub fn delete_comment(&self, id: &CommentId) -> Result<(), LibError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE asset_comment SET body = '', deleted_at = ?2
+             WHERE comment_id = ?1 AND deleted_at IS NULL",
+            params![id.as_bytes().to_vec(), now_ms()],
+        )
+        .map_err(internal)?;
+        Ok(())
+    }
+
     pub fn set_media_attrs(&self, id: &AssetId, attrs: &MediaAttributes) -> Result<(), LibError> {
         let conn = self.conn.lock().unwrap();
         let key = id.as_bytes().to_vec();
@@ -622,6 +756,27 @@ impl Store {
             note: None,
         })
     }
+}
+
+/// Row → [`Comment`] for the shared column order the queries above use. `display` is always `None`
+/// here: resolving an account id to a name means reading `server.db`, which this crate cannot see.
+fn row_to_comment(r: &rusqlite::Row) -> rusqlite::Result<Comment> {
+    let id = CommentId(uuid_from_slice(&r.get::<_, Vec<u8>>(0)?));
+    let asset = blob_to_asset_id(&r.get::<_, Vec<u8>>(1)?);
+    let reply_to: Option<Vec<u8>> = r.get(7)?;
+    Ok(Comment {
+        id,
+        asset,
+        author: CommentAuthor {
+            id: r.get(2)?,
+            display: None,
+        },
+        body: r.get(3)?,
+        created_at: r.get(4)?,
+        edited_at: r.get(5)?,
+        deleted_at: r.get(6)?,
+        reply_to: reply_to.map(|b| CommentId(uuid_from_slice(&b))),
+    })
 }
 
 #[cfg(test)]

@@ -29,6 +29,7 @@ import type {
   PrefetchRequest,
   AssetSummary,
   FavoriteRequest,
+  Comment,
   FolderEntry,
   FolderListing,
   Note,
@@ -174,6 +175,14 @@ export const api = {
    *  note the server actually stored (trimmed), or `null` once cleared. */
   setNote: (id: AssetId, body: string) =>
     send<Note | null>("PUT", `${API}/assets/${id}/note`, { body }),
+
+  // per-asset discussion (issue #82) — 404s while the `user_accounts` flag is off
+  listComments: (id: AssetId) => get<Comment[]>(`${API}/assets/${id}/comments`),
+  postComment: (id: AssetId, body: string, replyTo?: string) =>
+    send<Comment>("POST", `${API}/assets/${id}/comments`, { body, reply_to: replyTo ?? null }),
+  editComment: (commentId: string, body: string) =>
+    send<Comment>("PUT", `${API}/comments/${commentId}`, { body }),
+  deleteComment: (commentId: string) => send<void>("DELETE", `${API}/comments/${commentId}`),
 
   /** "More like this" — cosine over embeddings, ranked in the asset's media space (tech-spec 05 §3). */
   findSimilar: (req: SimilarRequest) => send<Page<SimilarHit>>("POST", `${API}/similar`, req),

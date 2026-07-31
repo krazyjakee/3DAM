@@ -181,6 +181,27 @@ export interface Note {
   updated_by: string | null;
 }
 
+/** Who wrote a discussion message (issue #82). `display` is resolved server-side across the
+ *  database boundary and is `null` once the account is gone — the message survives its author. */
+export interface CommentAuthor {
+  id: string;
+  display: string | null;
+}
+
+/** One message in an asset's discussion thread. `deleted_at` marks a tombstone: the row survives so
+ *  replies keep their parent, with `body` blanked. Backend: GET/POST /api/v1/assets/{id}/comments,
+ *  PUT/DELETE /api/v1/comments/{id} — all 404 while the `user_accounts` flag is off. */
+export interface Comment {
+  id: string;
+  asset: AssetId;
+  author: CommentAuthor;
+  body: string;
+  created_at: number;
+  edited_at: number | null;
+  deleted_at: number | null;
+  reply_to: string | null;
+}
+
 export interface Asset {
   summary: AssetSummary;
   hash: ContentHash | null;
@@ -625,7 +646,8 @@ export type ChangeKind =
   | "retagged"
   | "license_set"
   | "metadata"
-  | "note_set";
+  | "note_set"
+  | "commented";
 /** Each per-asset variant carries the asset's `source_id`. That attribution is what lets the server
  *  evaluate a share-based visibility ceiling per event, so a restricted session gets a live stream
  *  for the sources it may reach instead of a silent socket (issue #42). `null` means unattributed;

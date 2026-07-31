@@ -58,6 +58,9 @@ export function useLiveUpdates(): void {
           // ["similar", id] — distinct roots from the grid's ["assets"]. Invalidate them too so an
           // analyze/convert that mutates the inspected asset refreshes the panel without a reload.
           qc.invalidateQueries({ queryKey: ["asset"] });
+      // Discussion rides `asset_changed` (kind `commented`) so it inherits the server's
+      // per-subscriber visibility filter — see `ChangeKind::Commented` (issue #82).
+      qc.invalidateQueries({ queryKey: ["comments"] });
           qc.invalidateQueries({ queryKey: ["similar"] });
           // Add/remove reshapes the folder tree and its subtree counts (issue #66).
           qc.invalidateQueries({ queryKey: ["folders"] });

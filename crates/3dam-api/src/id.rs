@@ -72,6 +72,11 @@ uuid_id!(
     /// A tag.
     TagId
 );
+uuid_id!(
+    /// One message in an asset's discussion thread (issue #82). UUIDv7, so thread order is the id
+    /// order — no separate sort key, and a reply can reference its parent without a join to time.
+    CommentId
+);
 
 /// Raw BLAKE3 digest over a file source's bytes. `None`-equivalent for federated assets
 /// (they have no local bytes — tech-spec 02 §2.2). Serialises as lowercase hex.

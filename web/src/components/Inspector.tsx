@@ -51,6 +51,7 @@ import { TilePreview } from "./TilePreview";
 import { Thumbnail } from "./Thumbnail";
 import { MediaIcon } from "./MediaIcon";
 import { PeerBadge } from "./PeerBadge";
+import { Discussion } from "./Discussion";
 import { Drawer } from "./Drawer";
 
 /** Inspector — a persistent right rail on `lg`, an overlay drawer below it (responsive + touch pass). Both
@@ -430,6 +431,11 @@ function Body({ asset }: { asset: Asset }) {
 
         {/* find similar — cosine over embeddings, ranked in this asset's media space (phase 3) */}
         <SimilarSection asset={asset} />
+
+        {/* discussion (issue #82) — deliberately *below* everything derived, and visually a message
+            list rather than a field, so it never reads as a second note box. Renders nothing at all
+            unless user accounts are on. */}
+        <Discussion asset={asset} />
       </div>
     </div>
   );

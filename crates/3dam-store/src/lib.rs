@@ -7,7 +7,7 @@ mod ann;
 mod schema;
 
 use dam_api::dto::*;
-use dam_api::id::{AssetId, CollectionId, ContentHash, JobId, SourceId};
+use dam_api::id::{AssetId, CollectionId, CommentId, ContentHash, JobId, SourceId};
 use dam_api::page::{Cursor, Page};
 use dam_api::service::Visibility;
 use dam_api::LibError;

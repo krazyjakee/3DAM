@@ -48,6 +48,14 @@ pub enum ChangeKind {
     Metadata,
     /// The user's free-text note was set or cleared (issue #81).
     NoteSet,
+    /// A discussion message was posted, edited, or deleted (issue #82).
+    ///
+    /// Deliberately a `ChangeKind` on the existing `AssetChanged` rather than a new event variant
+    /// with its own topic: `AssetChanged` already carries `source_id`, which is exactly what
+    /// [`Visibility::allows_event`](crate::service::Visibility::allows_event) filters on. Reusing it
+    /// means comment events cannot fan out to a subscriber who cannot see the asset — the leak is
+    /// closed by construction rather than by a filter someone has to remember to write.
+    Commented,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

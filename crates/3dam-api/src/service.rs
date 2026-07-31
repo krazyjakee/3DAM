@@ -10,7 +10,7 @@ use crate::dto::*;
 use crate::error::LibError;
 use crate::event::{LibraryEvent, SubscribeRequest};
 use crate::federation::VectorSimilarRequest;
-use crate::id::{AssetId, CollectionId, ContentHash, JobId, SourceId};
+use crate::id::{AssetId, CollectionId, CommentId, ContentHash, JobId, SourceId};
 use crate::page::{Page, PageParams};
 use async_trait::async_trait;
 use futures::Stream;
@@ -532,6 +532,40 @@ pub trait LibraryService: Send + Sync {
         id: &AssetId,
         req: NoteRequest,
     ) -> Result<Option<Note>, LibError>;
+
+    // ── discussion (issue #82) ───────────────────────────────────────────────
+    /// An asset's thread, oldest first, tombstones included. Gated on **read** access to the asset:
+    /// if you cannot see the asset you cannot see its discussion, because a message body can quote
+    /// a path or filename you were never meant to learn.
+    async fn list_comments(
+        &self,
+        ctx: &AuthContext,
+        asset: &AssetId,
+    ) -> Result<Vec<Comment>, LibError>;
+
+    /// Post a message. Requires a **signed-in account** plus read access to the asset — deliberately
+    /// *not* `Scope::Write`, which would conflate "may modify the library" with "may talk about it"
+    /// and lock out the reviewing art director who is the whole point of the feature. Anonymous and
+    /// bearer-token callers cannot post: a shared machine credential is not a person to attribute a
+    /// message to. Emits `AssetChanged { kind: Commented }`.
+    async fn post_comment(
+        &self,
+        ctx: &AuthContext,
+        asset: &AssetId,
+        req: NewComment,
+    ) -> Result<Comment, LibError>;
+
+    /// Edit one's own message. Author only — not even an admin may put words in someone's mouth.
+    async fn edit_comment(
+        &self,
+        ctx: &AuthContext,
+        id: &CommentId,
+        req: EditComment,
+    ) -> Result<Comment, LibError>;
+
+    /// Delete a message: the author, or any caller holding `Scope::Admin` (moderation). Soft —
+    /// leaves a tombstone so replies keep their parent.
+    async fn delete_comment(&self, ctx: &AuthContext, id: &CommentId) -> Result<(), LibError>;
 
     // ── collections / smart folders (phase 4) ────────────────────────────────
     /// All collections and smart folders. Manual folders carry an exact member count; a smart

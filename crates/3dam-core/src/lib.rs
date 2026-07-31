@@ -34,9 +34,9 @@ use dam_api::admin::{
 };
 use dam_api::dto::*;
 use dam_api::event::{ChangeKind, LibraryEvent, SubscribeRequest};
-use dam_api::id::{AssetId, CollectionId, ContentHash, JobId, SourceId};
+use dam_api::id::{AssetId, CollectionId, CommentId, ContentHash, JobId, SourceId};
 use dam_api::page::{Page, PageParams};
-use dam_api::service::{AuthContext, EventStream, LibraryService, Visibility};
+use dam_api::service::{AuthContext, EventStream, LibraryService, Scope, Visibility};
 use dam_api::LibError;
 use dam_store::Store;
 use futures::StreamExt;
@@ -309,6 +309,22 @@ fn png_content(bytes: Vec<u8>) -> AssetContent {
     }
 }
 
+/// The account id behind a request, or `Forbidden` (issue #82).
+///
+/// Posting requires a **person**, not merely a credential. A bearer token has an identity string
+/// but is typically a shared machine credential — attributing a conversation to one would be a
+/// fiction — and an anonymous caller has nothing to attribute at all. The embedded engine likewise
+/// has no account, which is consistent: discussion is a multi-user feature, and the single-user
+/// local library has notes.
+fn require_account(ctx: &AuthContext) -> Result<String, LibError> {
+    ctx.account
+        .as_ref()
+        .map(|a| a.account_id.clone())
+        .ok_or_else(|| {
+            LibError::Forbidden("posting to a discussion requires a signed-in account".into())
+        })
+}
+
 /// Map a media-handler fault onto the service error model (tech-spec 03 §5). `Unsupported` becomes
 /// a 415 so the web thumbnail falls back to the honest typed tile.
 fn map_handler_err(e: dam_media::HandlerError) -> LibError {
@@ -549,6 +565,21 @@ impl EmbeddedLibrary {
     /// never the OS temp dir. Cheap to recompute; handed to every `open_source` call.
     fn scratch(&self) -> PathBuf {
         paths::scratch_dir(&self.data_dir)
+    }
+
+    /// Announce that an asset's thread changed (issue #82). Rides `AssetChanged`, which already
+    /// carries `source_id` — the attribution `Visibility::allows_event` filters on — so a comment
+    /// event cannot reach a subscriber who cannot see the asset.
+    async fn emit_commented(&self, asset: AssetId) {
+        let source_id = self
+            .db(move |s| s.asset_source(&asset))
+            .await
+            .unwrap_or(None);
+        let _ = self.events.send(LibraryEvent::AssetChanged {
+            id: asset,
+            source_id,
+            kind: ChangeKind::Commented,
+        });
     }
 
     /// Run a synchronous store operation on the blocking pool (tech-spec 14).
@@ -1745,6 +1776,88 @@ impl LibraryService for EmbeddedLibrary {
             kind: ChangeKind::NoteSet,
         });
         Ok(note)
+    }
+
+    async fn list_comments(
+        &self,
+        ctx: &AuthContext,
+        asset: &AssetId,
+    ) -> Result<Vec<Comment>, LibError> {
+        // Read access to the asset is the whole gate: a message body can quote a path or filename
+        // from a source this caller was never meant to reach.
+        self.require_asset_visible(ctx, asset).await?;
+        let asset = *asset;
+        self.db(move |s| s.list_comments(&asset)).await
+    }
+
+    async fn post_comment(
+        &self,
+        ctx: &AuthContext,
+        asset: &AssetId,
+        req: NewComment,
+    ) -> Result<Comment, LibError> {
+        self.require_asset_visible(ctx, asset).await?;
+        let author = require_account(ctx)?;
+        let body = req.body.trim().to_string();
+        if body.is_empty() {
+            return Err(LibError::BadRequest("a message needs a body".into()));
+        }
+        let aid = *asset;
+        let reply_to = req.reply_to;
+        let comment = self
+            .db(move |s| s.add_comment(&aid, &author, &body, reply_to))
+            .await?;
+        self.emit_commented(aid).await;
+        Ok(comment)
+    }
+
+    async fn edit_comment(
+        &self,
+        ctx: &AuthContext,
+        id: &CommentId,
+        req: EditComment,
+    ) -> Result<Comment, LibError> {
+        let cid = *id;
+        let existing = self.db(move |s| s.get_comment(&cid)).await?;
+        self.require_asset_visible(ctx, &existing.asset).await?;
+        let author = require_account(ctx)?;
+        // Author only — an admin may *remove* a message (moderation) but never rewrite one, since
+        // an edited message still carries its original author's name.
+        if existing.author.id != author {
+            return Err(LibError::Forbidden(
+                "only the author may edit a message".into(),
+            ));
+        }
+        let body = req.body.trim().to_string();
+        if body.is_empty() {
+            return Err(LibError::BadRequest(
+                "a message needs a body (delete it instead)".into(),
+            ));
+        }
+        self.db(move |s| s.edit_comment(&cid, &body)).await?;
+        let updated = self.db(move |s| s.get_comment(&cid)).await?;
+        self.emit_commented(existing.asset).await;
+        Ok(updated)
+    }
+
+    async fn delete_comment(&self, ctx: &AuthContext, id: &CommentId) -> Result<(), LibError> {
+        let cid = *id;
+        let existing = self.db(move |s| s.get_comment(&cid)).await?;
+        self.require_asset_visible(ctx, &existing.asset).await?;
+        // The author, or a moderator. Checked against the *scope*, never the role name — `Scope` is
+        // the single place a capability gains meaning (tech-spec 10 §4.2).
+        let is_author = ctx
+            .account
+            .as_ref()
+            .is_some_and(|a| a.account_id == existing.author.id);
+        if !is_author && !ctx.scopes.has(Scope::Admin) {
+            return Err(LibError::Forbidden(
+                "only the author or an admin may delete a message".into(),
+            ));
+        }
+        self.db(move |s| s.delete_comment(&cid)).await?;
+        self.emit_commented(existing.asset).await;
+        Ok(())
     }
 
     /// A job is readable when every source it touches is within the caller's ceiling — see

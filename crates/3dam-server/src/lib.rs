@@ -12,6 +12,7 @@
 mod admin;
 mod auth;
 mod authn;
+mod comments;
 mod config;
 mod mcp;
 mod store;
@@ -249,6 +250,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/mcp", post(mcp_http))
         // User accounts: claim/login/sessions (phase 6, issue #42) — 404 while the flag is off.
         .merge(authn::routes(state.clone()))
+        .merge(comments::routes(state.clone()))
         // The admin API (tech-spec 10 §5), guarded by the AdminAuth extractor.
         .merge(admin::routes(state.clone()))
         // SPA fallback: any non-API GET serves the embedded web client (tech-spec 09 §A.4).

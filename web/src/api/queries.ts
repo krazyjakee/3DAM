@@ -39,6 +39,7 @@ export const qk = {
   whoami: ["whoami"] as const,
   assets: ["assets"] as const,
   asset: (id: AssetId) => ["asset", id] as const,
+  comments: (id: AssetId) => ["comments", id] as const,
   stats: ["stats"] as const,
   sources: ["sources"] as const,
   jobs: ["jobs"] as const,
@@ -258,6 +259,50 @@ export function useSetNote() {
       );
       qc.invalidateQueries({ queryKey: qk.assets });
     },
+  });
+}
+
+// ── per-asset discussion (issue #82) ────────────────────────────────────────
+
+/** An asset's thread. Only enabled once the caller knows accounts are on — the whole surface 404s
+ *  otherwise, and a query that always fails would spam the error toast. */
+export function useComments(id: AssetId | null, enabled: boolean) {
+  return useQuery({
+    queryKey: qk.comments(id ?? ""),
+    queryFn: () => api.listComments(id as AssetId),
+    enabled: !!id && enabled,
+  });
+}
+
+/** Post / edit / delete, each refreshing just this asset's thread. Unlike the note editor there is
+ *  no autosave race to protect against: a message is an explicit send, so refetching is exactly
+ *  what the user expects to see. */
+export function usePostComment(id: AssetId) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ body, replyTo }: { body: string; replyTo?: string }) =>
+      api.postComment(id, body, replyTo),
+    meta: { errorPrefix: "Couldn’t post" },
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.comments(id) }),
+  });
+}
+
+export function useEditComment(id: AssetId) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ commentId, body }: { commentId: string; body: string }) =>
+      api.editComment(commentId, body),
+    meta: { errorPrefix: "Couldn’t save the edit" },
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.comments(id) }),
+  });
+}
+
+export function useDeleteComment(id: AssetId) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (commentId: string) => api.deleteComment(commentId),
+    meta: { errorPrefix: "Couldn’t delete" },
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.comments(id) }),
   });
 }
 

@@ -509,6 +509,38 @@ pub const MIGRATIONS: &[&str] = &[
         UPDATE asset_fts SET filename = new.filename WHERE rowid = new.rowid;
     END;
     "#,
+    // ── V14: per-asset discussion threads (issue #82) ────────────────────────────────────────────
+    // The append-only counterpart to `asset_note` (V12): a note is one durable editable annotation,
+    // a thread is authored history. Both live in `library.db` because both are per-asset.
+    //
+    // `author` is an **account id, held as a soft reference across the database boundary** — the
+    // accounts themselves live in `server.db`, which this database cannot join against. That is
+    // deliberate, not an oversight: the alternative (a foreign key, or a cascade) would delete a
+    // person's messages when their account is removed, silently rewriting a project's history. The
+    // id is kept forever and resolved to a display name at read time; when it no longer resolves,
+    // the message renders as an unresolved author rather than disappearing.
+    //
+    // `deleted_at` is a soft delete for the same reason: hard-deleting a message somebody replied
+    // to would orphan the reply. The row survives as a tombstone with its body blanked.
+    //
+    // `comment_id` is a UUIDv7, so `ORDER BY comment_id` *is* chronological order — the index below
+    // exists for the per-asset filter, not to make time sortable.
+    //
+    // Deliberately **not** joined to `asset_fts`: indexing conversation makes search noisy, and
+    // notes are the curated text that should be findable. Revisit on evidence.
+    r#"
+    CREATE TABLE asset_comment (
+        comment_id BLOB PRIMARY KEY,
+        asset_id   BLOB NOT NULL REFERENCES asset(id) ON DELETE CASCADE,
+        author     TEXT NOT NULL,
+        body       TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        edited_at  INTEGER,
+        deleted_at INTEGER,
+        reply_to   BLOB REFERENCES asset_comment(comment_id) ON DELETE SET NULL
+    ) STRICT;
+    CREATE INDEX idx_comment_asset ON asset_comment(asset_id, comment_id);
+    "#,
 ];
 
 #[cfg(test)]

@@ -15,7 +15,7 @@ use dam_api::admin::{
 use dam_api::dto::*;
 use dam_api::event::EventTopic;
 use dam_api::event::{LibraryEvent, SubscribeRequest};
-use dam_api::id::{AssetId, CollectionId, ContentHash, JobId, SourceId};
+use dam_api::id::{AssetId, CollectionId, CommentId, ContentHash, JobId, SourceId};
 use dam_api::page::{Page, PageParams};
 use dam_api::service::{AuthContext, EventStream, LibraryService, WhoAmI};
 use dam_api::{ErrorBody, LibError, PeerAdvertise};
@@ -733,6 +733,50 @@ impl LibraryService for ApiClient {
             .await
             .map_err(|e| LibError::SourceUnavailable(e.to_string()))?;
         Self::decode(resp).await
+    }
+
+    async fn list_comments(
+        &self,
+        _ctx: &AuthContext,
+        asset: &AssetId,
+    ) -> Result<Vec<Comment>, LibError> {
+        self.get(&format!("/api/v1/assets/{asset}/comments")).await
+    }
+
+    async fn post_comment(
+        &self,
+        _ctx: &AuthContext,
+        asset: &AssetId,
+        req: NewComment,
+    ) -> Result<Comment, LibError> {
+        self.post(&format!("/api/v1/assets/{asset}/comments"), &req)
+            .await
+    }
+
+    async fn edit_comment(
+        &self,
+        _ctx: &AuthContext,
+        id: &CommentId,
+        req: EditComment,
+    ) -> Result<Comment, LibError> {
+        let resp = self
+            .http
+            .put(self.url(&format!("/api/v1/comments/{id}"))?)
+            .json(&req)
+            .send()
+            .await
+            .map_err(|e| LibError::SourceUnavailable(e.to_string()))?;
+        Self::decode(resp).await
+    }
+
+    async fn delete_comment(&self, _ctx: &AuthContext, id: &CommentId) -> Result<(), LibError> {
+        let resp = self
+            .http
+            .delete(self.url(&format!("/api/v1/comments/{id}"))?)
+            .send()
+            .await
+            .map_err(|e| LibError::SourceUnavailable(e.to_string()))?;
+        Self::expect_no_content(resp).await
     }
 
     async fn list_collections(&self, _ctx: &AuthContext) -> Result<Vec<Collection>, LibError> {
