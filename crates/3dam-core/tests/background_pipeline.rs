@@ -10,11 +10,22 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn unique_tmp() -> PathBuf {
+    // Per-process atomic counter as well as a timestamp, for the reason `scan.rs` documents:
+    // these tests run in parallel within one process and `as_nanos()` can coincide for two that
+    // start in the same clock tick, silently sharing a data dir. The window is only as narrow as
+    // `open` is fast, so it widens whenever engine startup gains work.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    std::env::temp_dir().join(format!("3dam-pipeline-{}-{}", std::process::id(), nanos))
+    std::env::temp_dir().join(format!(
+        "3dam-pipeline-{}-{}-{}",
+        std::process::id(),
+        nanos,
+        n
+    ))
 }
 
 /// Both toggles on — the default hosted-mode posture.
