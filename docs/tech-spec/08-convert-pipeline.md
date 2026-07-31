@@ -445,6 +445,27 @@ file. This is the hard non-destructive line: 3DAM will not, under any flag combi
 over a catalogued original. In-place conversion is expressed as "output to a different root",
 never as overwriting the source.
 
+**Upload is the one sanctioned write-into-source path, and it is create-only** (issue #80).
+
+The invariant above is about *overwriting catalogued originals* — "write **over**", "never
+overwrite sources silently" — not about the existence of any write whatsoever. Creating a **new**
+file, at an explicit user request, at a path where nothing exists, destroys nothing. The upload
+surface is therefore permitted to write inside a source tree, under three structural constraints
+that keep the invariant intact rather than merely policy-gated:
+
+1. **Create-only.** Upload has no `Overwrite` collision rule *at all* — only `Fail` (default),
+   `Suffix`, and `Skip`. Clobbering an existing file in a source is not expressible in the API, so
+   no flag combination can produce it.
+2. **A separate write path.** Upload does **not** route through the convert pipeline. Convert's
+   guard here stays absolute and never grows an "unless…" clause; the two cannot be confused,
+   because they share no code.
+3. **The same atomic discipline** as §5.2: temp file in the destination filesystem → `fsync` →
+   atomic rename. A crash leaves a collectable temp file, never a half-written asset that a watcher
+   might ingest mid-write.
+
+Replacing or overwriting an existing asset stays out of scope, and is not reachable by relaxing
+anything here.
+
 ### 5.2 Atomic writes
 
 Every item writes to a temp file in the destination filesystem, `fsync`s, verifies the encode

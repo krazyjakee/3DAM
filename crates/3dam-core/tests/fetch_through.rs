@@ -306,3 +306,53 @@ async fn an_unreachable_remote_source_records_an_error_without_aborting() {
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// Convert's source-safety guard (tech-spec 08 §5.1) is **absolute** and must stay that way.
+///
+/// Issue #80 adds an upload path that deliberately *does* write inside a source tree. The whole
+/// argument for why that is safe rests on the two paths sharing no code and this guard never
+/// growing an "unless…" clause — so it is worth a test that fails loudly if someone ever relaxes it
+/// to make upload easier.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn convert_still_refuses_to_write_inside_a_source() {
+    let tmp = unique_tmp();
+    let src = tmp.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    write_png(&src.join("input.png"), 16, 16);
+
+    let ctx = AuthContext::embedded();
+    let (lib, _sid) = scanned(&tmp.join("data"), &src).await;
+    let id = id_of(&lib, &ctx, "input.png").await;
+
+    for dest in [src.clone(), src.join("nested/deeper")] {
+        let err = lib
+            .convert(
+                &ctx,
+                ConvertRequest {
+                    inputs: vec![id],
+                    target: ConvertTarget::Image {
+                        format: "jpeg".into(),
+                        max_edge: None,
+                        quality: None,
+                    },
+                    output_dir: dest.to_string_lossy().into_owned(),
+                    dry_run: false,
+                    on_collision: CollisionRule::Suffix,
+                },
+            )
+            .await
+            .expect_err("convert must refuse an output dir inside a registered source");
+        assert!(
+            matches!(err, dam_api::LibError::BadRequest(_)),
+            "expected a refusal, got {err:?}"
+        );
+    }
+    // Not even a stray temp file: the guard fires before any item is planned.
+    assert_eq!(
+        std::fs::read_dir(&src).unwrap().count(),
+        1,
+        "the source tree is untouched"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}

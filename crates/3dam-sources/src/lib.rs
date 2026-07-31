@@ -15,6 +15,7 @@ use dam_api::LibError;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+pub mod safe_name;
 #[cfg(feature = "sftp")]
 mod sftp;
 #[cfg(feature = "smb")]
@@ -65,6 +66,49 @@ pub trait FileSource: Send + Sync {
     /// Resolve an entry's bytes to a local path for the media handlers. Local → in place; remote →
     /// a downloaded temp file. Guards against `..` traversal out of the source root.
     fn fetch(&self, rel_path: &str) -> Result<Fetched, LibError>;
+
+    // ── write side (issue #80) ───────────────────────────────────────────────
+    //
+    // Upload is the *one* sanctioned path that writes into a source tree, and it is create-only
+    // (tech-spec 08 §5.1). The three methods below are deliberately the whole of it: there is no
+    // `delete`, no `rename`, and no overwrite parameter, so "3DAM modified my file" is not
+    // expressible through this trait at all.
+
+    /// Can this source be written to *right now*?
+    ///
+    /// Defaults to `false`, so a new backend is read-only until someone opts in deliberately — the
+    /// safe direction for a trait whose other methods only ever read. Implementations should probe
+    /// real writability (a read-only mount, a share the credential cannot write) rather than
+    /// trusting the source kind, because the UI uses this to decide what to offer as a destination
+    /// *before* the user picks files rather than failing after they drop two hundred of them.
+    fn writable(&self) -> bool {
+        false
+    }
+
+    /// Create a directory and any missing parents under the source root.
+    ///
+    /// Idempotent: an existing directory is success, not a conflict.
+    fn mkdir(&self, _rel_path: &str) -> Result<(), LibError> {
+        Err(LibError::Unsupported(
+            "this source kind is read-only".into(),
+        ))
+    }
+
+    /// Create a **new** file under the source root, streaming from `bytes`.
+    ///
+    /// **Create-only, and that is load-bearing**: an existing path is an error, never an overwrite.
+    /// The caller resolves collisions (fail / suffix / skip) *before* calling — there is no
+    /// overwrite flag to get wrong, which is what keeps the non-destructive invariant structural
+    /// rather than policy-dependent.
+    ///
+    /// Implementations write to a temp path on the destination filesystem, `fsync`, then atomically
+    /// rename into place, so a crash leaves a collectable partial file rather than a half-written
+    /// asset that a watcher might ingest mid-write (tech-spec 08 §5.2).
+    fn put(&self, _rel_path: &str, _bytes: &mut dyn std::io::Read) -> Result<(), LibError> {
+        Err(LibError::Unsupported(
+            "this source kind is read-only".into(),
+        ))
+    }
 }
 
 // ── connection model (persisted per source, tech-spec 02 §3 `source.connection`) ────────────────
@@ -526,6 +570,108 @@ impl FileSource for LocalFsSource {
         }
         Ok(Fetched::InPlace(abs))
     }
+
+    /// Probed, not assumed (issue #80). A local source can sit on a read-only mount, a full disk,
+    /// or a directory the server process does not own — none of which the *kind* tells you. The
+    /// answer feeds a destination picker, so being wrong here means offering the user a folder they
+    /// cannot write to.
+    fn writable(&self) -> bool {
+        !std::fs::metadata(&self.root)
+            .map(|m| m.permissions().readonly())
+            .unwrap_or(true)
+    }
+
+    fn mkdir(&self, rel_path: &str) -> Result<(), LibError> {
+        let rel = safe_name::check_rel_path(rel_path)?;
+        let abs = self.resolve_within(&rel)?;
+        std::fs::create_dir_all(&abs).map_err(|e| LibError::Internal(format!("create {rel}: {e}")))
+    }
+
+    fn put(&self, rel_path: &str, bytes: &mut dyn std::io::Read) -> Result<(), LibError> {
+        use std::io::Write;
+        let rel = safe_name::check_rel_path(rel_path)?;
+        let abs = self.resolve_within(&rel)?;
+
+        // Create-only. Checked here *and* enforced by the rename below, because this check alone
+        // is a TOCTOU window — see the atomic-rename comment.
+        if abs.exists() {
+            return Err(LibError::BadRequest(format!("{rel} already exists")));
+        }
+        if let Some(parent) = abs.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| LibError::Internal(format!("create parent of {rel}: {e}")))?;
+        }
+
+        // Temp file in the *destination* directory, so the rename below is same-filesystem and
+        // therefore atomic. A temp in /tmp could land on another mount and degrade to a copy,
+        // which is exactly the half-written-file window this is here to close (tech-spec 08 §5.2).
+        let dir = abs.parent().unwrap_or(&self.root);
+        let mut tmp = tempfile::Builder::new()
+            .prefix(".3dam-upload-")
+            .tempfile_in(dir)
+            .map_err(|e| LibError::Internal(format!("temp file in {}: {e}", dir.display())))?;
+        std::io::copy(bytes, &mut tmp)
+            .map_err(|e| LibError::Internal(format!("write {rel}: {e}")))?;
+        tmp.flush()
+            .map_err(|e| LibError::Internal(format!("flush {rel}: {e}")))?;
+        // fsync before the rename: a rename is atomic with respect to *ordering*, not durability,
+        // so without this a power cut can leave the name pointing at unwritten blocks.
+        tmp.as_file()
+            .sync_all()
+            .map_err(|e| LibError::Internal(format!("fsync {rel}: {e}")))?;
+
+        // `persist_noclobber` fails rather than replacing, which closes the TOCTOU window the
+        // `exists()` check above leaves open: between that check and this call another writer
+        // could have created the path, and a plain rename would silently destroy their file.
+        tmp.persist_noclobber(&abs).map_err(|e| {
+            if e.error.kind() == std::io::ErrorKind::AlreadyExists {
+                LibError::BadRequest(format!("{rel} already exists"))
+            } else {
+                LibError::Internal(format!("commit {rel}: {}", e.error))
+            }
+        })?;
+        Ok(())
+    }
+}
+
+impl LocalFsSource {
+    /// Join a **validated** relative path onto the root and prove the result is still inside it
+    /// after symlink resolution.
+    ///
+    /// The lexical guard in `safe_name` cannot see a symlink: if `Textures/` is a link to `/etc`,
+    /// then `Textures/passwd` passes every string check and still escapes. So the deepest existing
+    /// ancestor is canonicalised and compared against the canonical root — checking the ancestor
+    /// rather than the target because the target is a file we are about to *create* and so does not
+    /// exist yet.
+    fn resolve_within(&self, rel: &str) -> Result<PathBuf, LibError> {
+        let root = self
+            .root
+            .canonicalize()
+            .map_err(|e| LibError::SourceUnavailable(format!("source root: {e}")))?;
+        let abs = root.join(rel);
+
+        let mut probe = abs.as_path();
+        let existing = loop {
+            if probe.exists() {
+                break probe;
+            }
+            match probe.parent() {
+                // Walked above the root without finding anything that exists: the root itself was
+                // canonicalised above, so this cannot be inside it.
+                Some(p) if p.starts_with(&root) => probe = p,
+                _ => break root.as_path(),
+            }
+        };
+        let real = existing
+            .canonicalize()
+            .map_err(|e| LibError::Internal(format!("resolve {rel}: {e}")))?;
+        if !real.starts_with(&root) {
+            return Err(LibError::BadRequest(format!(
+                "{rel} resolves outside the source root"
+            )));
+        }
+        Ok(abs)
+    }
 }
 
 pub(crate) fn system_time_ms(t: std::time::SystemTime) -> Option<i64> {
@@ -665,5 +811,107 @@ mod tests {
             clean_scratch(Path::new("/nonexistent-3dam-scratch-cf81")),
             0
         );
+    }
+
+    // ── upload write path (issue #80) ──────────────────────────────────────
+
+    fn local_root() -> (tempfile::TempDir, LocalFsSource) {
+        let dir = tempfile::tempdir().unwrap();
+        let src = LocalFsSource::new(dir.path());
+        (dir, src)
+    }
+
+    #[test]
+    fn put_creates_a_file_and_refuses_to_overwrite_it() {
+        let (dir, src) = local_root();
+        src.put("Textures/brick.png", &mut &b"first"[..]).unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("Textures/brick.png")).unwrap(),
+            b"first",
+            "parents are created and the bytes land"
+        );
+
+        // Create-only is the invariant the whole feature rests on (tech-spec 08 §5.1): a second
+        // write to the same path must fail rather than replace, with no flag that changes it.
+        let err = src
+            .put("Textures/brick.png", &mut &b"second"[..])
+            .unwrap_err();
+        assert!(matches!(err, LibError::BadRequest(_)), "got {err:?}");
+        assert_eq!(
+            std::fs::read(dir.path().join("Textures/brick.png")).unwrap(),
+            b"first",
+            "the original bytes are untouched"
+        );
+    }
+
+    /// The escape a lexical path check cannot catch: every string rule passes, and the write still
+    /// lands outside the root unless the destination is canonicalised.
+    #[test]
+    #[cfg(unix)]
+    fn put_refuses_a_symlinked_escape() {
+        let (dir, src) = local_root();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("escape")).unwrap();
+
+        let err = src.put("escape/stolen.png", &mut &b"x"[..]).unwrap_err();
+        assert!(matches!(err, LibError::BadRequest(_)), "got {err:?}");
+        assert!(
+            !outside.path().join("stolen.png").exists(),
+            "nothing may be written outside the source root"
+        );
+    }
+
+    #[test]
+    fn put_rejects_hostile_names_before_touching_the_filesystem() {
+        let (dir, src) = local_root();
+        for bad in [
+            "../escape.png",
+            "/etc/passwd",
+            "CON.png",
+            "a\u{202E}gnp.exe",
+        ] {
+            assert!(src.put(bad, &mut &b"x"[..]).is_err(), "must reject {bad:?}");
+        }
+        // Not one stray file, not even a temp: validation happens before any write.
+        let left: Vec<_> = std::fs::read_dir(dir.path()).unwrap().flatten().collect();
+        assert!(
+            left.is_empty(),
+            "rejected uploads left {} entries",
+            left.len()
+        );
+    }
+
+    #[test]
+    fn mkdir_is_idempotent_and_guarded() {
+        let (dir, src) = local_root();
+        src.mkdir("Environment/Rock").unwrap();
+        src.mkdir("Environment/Rock").unwrap(); // existing is success, not a conflict
+        assert!(dir.path().join("Environment/Rock").is_dir());
+        assert!(src.mkdir("../escape").is_err());
+    }
+
+    /// A source kind that has not opted in stays read-only — the default that makes adding a
+    /// backend safe rather than accidentally writable.
+    #[test]
+    fn remote_backends_are_not_writable_yet() {
+        struct ReadOnly;
+        impl FileSource for ReadOnly {
+            fn walk(
+                &self,
+                _sink: &mut dyn FnMut(Result<FileEntry, LibError>) -> bool,
+            ) -> Result<(), LibError> {
+                Ok(())
+            }
+            fn fetch(&self, _rel: &str) -> Result<Fetched, LibError> {
+                Err(LibError::NotFound("x".into()))
+            }
+        }
+        let s = ReadOnly;
+        assert!(!s.writable());
+        assert!(matches!(s.mkdir("a"), Err(LibError::Unsupported(_))));
+        assert!(matches!(
+            s.put("a.png", &mut &b""[..]),
+            Err(LibError::Unsupported(_))
+        ));
     }
 }

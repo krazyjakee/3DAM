@@ -360,6 +360,10 @@ inspector work across all three types.
   catalog becomes queryable immediately (§6.7). Mix both kinds freely in one library.
 - **Watch** local sources for changes; re-scan deltas automatically.
 - Non-destructive: catalogue in place, never copy or move originals by default.
+- **Upload** is the one path that writes *into* a source, and it is **create-only** — it adds new
+  files at an explicit user request and can never overwrite an existing one (issue #80;
+  [tech-spec 08 §5.1](tech-spec/08-convert-pipeline.md)). Everything else 3DAM produces
+  (conversions, exports, thumbnails, previews) lands outside every registered source tree.
 - Robust to offline/unreachable sources (mark offline, keep cached metadata/results usable).
 
 ### 6.2 Analysis & automation (the differentiator)
