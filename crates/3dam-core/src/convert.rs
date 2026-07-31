@@ -10,10 +10,12 @@
 //! the caller). The job/progress-streamed model layers on later without changing these types.
 
 use dam_api::dto::*;
-use dam_api::id::AssetId;
+use dam_api::id::{AssetId, SourceId};
 use dam_api::LibError;
 use dam_store::Store;
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 /// Run a convert plan against the store. `dry_run` writes nothing.
 pub(crate) fn run_convert(store: &Store, req: ConvertRequest) -> Result<ConvertReport, LibError> {
@@ -41,14 +43,53 @@ pub(crate) fn run_convert(store: &Store, req: ConvertRequest) -> Result<ConvertR
         ..Default::default()
     };
 
+    // One backend per distinct source across the batch, opened on first use (issue #48). Converting
+    // ten files off one SFTP host must not mean ten SSH handshakes.
+    let mut backends: Backends = HashMap::new();
+
     for input in &req.inputs {
-        let item = plan_and_maybe_encode(store, *input, &req, &output_dir, target_media, &ext);
+        let item = plan_and_maybe_encode(
+            store,
+            *input,
+            &req,
+            &output_dir,
+            target_media,
+            &ext,
+            &mut backends,
+        );
         tally(&mut report, &item);
         report.items.push(item);
     }
     Ok(report)
 }
 
+/// Lazily-opened `FileSource` per source id, including the failure — a host that is down should
+/// report the same reason on every item from it, not be retried once per file.
+type Backends = HashMap<SourceId, Result<Arc<dyn dam_sources::FileSource>, String>>;
+
+/// Rebuild (or recall) the backend for one source.
+fn backend_for<'a>(
+    store: &Store,
+    backends: &'a mut Backends,
+    source_id: &SourceId,
+) -> &'a Result<Arc<dyn dam_sources::FileSource>, String> {
+    backends.entry(*source_id).or_insert_with(|| {
+        let opened = store
+            .get_source_connection(source_id)
+            .and_then(|c| dam_sources::open_source(&c));
+        match opened {
+            Ok(fs) => Ok(Arc::from(fs)),
+            Err(e) => {
+                let msg = e.to_string();
+                // Surface the offline state where a user will see it, not only in the log.
+                let _ = store.set_source_error(source_id, &msg);
+                Err(msg)
+            }
+        }
+    })
+}
+
+#[allow(clippy::too_many_arguments)] // the per-item plan context; a struct would just rename it
 fn plan_and_maybe_encode(
     store: &Store,
     input: AssetId,
@@ -56,6 +97,7 @@ fn plan_and_maybe_encode(
     output_dir: &Path,
     target_media: MediaType,
     ext: &str,
+    backends: &mut Backends,
 ) -> ConvertItemReport {
     // Resolve the asset + its on-disk source path.
     let asset = match store.get_asset(&input) {
@@ -75,6 +117,9 @@ fn plan_and_maybe_encode(
         }
         Err(e) => return failed_item(input, asset.path.clone(), String::new(), e.to_string()),
     };
+    // The asset's *logical* location, used for every reported `input_path`. For a remote asset the
+    // bytes are read from a temp file with a random name, which would be meaningless (and alarming)
+    // in a report — what the user converted is `sftp://host/root/path`, and that is what is shown.
     let abs_input = PathBuf::from(&src_root).join(&asset.path);
 
     // Media-type mismatch → unsupported (fail-soft, not a batch abort — §4.1).
@@ -148,8 +193,34 @@ fn plan_and_maybe_encode(
         };
     }
 
-    // Commit: encode into memory, then write atomically under output_dir.
-    match encode(&abs_input, &asset.summary.format, &req.target) {
+    // Commit. Materialise the input locally first (issue #48): in place for a local source, a temp
+    // download for SFTP/SMB. Non-destructive either way — `fetch` only ever reads, and the output
+    // still goes to `output_dir` via temp→atomic-rename, never back to the source (§5.1).
+    let fetched = match backend_for(store, backends, &asset.source_id) {
+        Ok(fs) => match fs.fetch(&asset.path) {
+            Ok(f) => f,
+            Err(e) => {
+                return failed_item(
+                    input,
+                    abs_input.to_string_lossy().into_owned(),
+                    planned_str,
+                    e.to_string(),
+                )
+            }
+        },
+        Err(e) => {
+            return failed_item(
+                input,
+                abs_input.to_string_lossy().into_owned(),
+                planned_str,
+                e.clone(),
+            )
+        }
+    };
+
+    // Encode into memory, then write atomically under output_dir. The temp download (if any) lives
+    // exactly as long as this item — one asset's worth of scratch, whatever the batch size.
+    match encode(fetched.path(), &asset.summary.format, &req.target) {
         Ok(bytes) => match atomic_write(&planned, &bytes) {
             Ok(()) => {
                 let out_len = bytes.len() as u64;

@@ -51,8 +51,13 @@ pub struct AnalysisTarget {
     /// The source this asset belongs to — attribution for the `AssetChanged` event the pass emits per
     /// analysed asset, and for the analyse job's own `sources` set (issue #42).
     pub source_id: SourceId,
-    /// Absolute source root the relative `path` joins onto.
-    pub source_uri: String,
+    /// How to rebuild this asset's source backend, secret included — the pass fetches its bytes
+    /// through `FileSource::fetch` rather than joining a root onto `path`, so an SFTP/SMB asset
+    /// materialises to a temp file exactly as it does during a scan (issue #48). Held per target
+    /// (not per source) because targets arrive as one flat list; the runner de-duplicates by
+    /// `source_id` so a backend is opened once per source, not once per asset.
+    pub connection: SourceConnection,
+    /// Path relative to the source root, normalised to `/`.
     pub path: String,
     pub media: MediaType,
     pub format: String,

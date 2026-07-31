@@ -6,8 +6,19 @@ impl Store {
     // ── analysis / automation (tech-spec 05, phase 3) ───────────────────────
 
     /// The assets an analysis pass should process: everything behind `current_version` (the incremental
-    /// Plan gate, §1.2/§7.2), or `force`-all, or a specific `ids` set. Joins the source so the runner can
-    /// resolve each file. Skips offline/federated sources (no bytes to decode).
+    /// Plan gate, §1.2/§7.2), or `force`-all, or a specific `ids` set. Carries each asset's source
+    /// *connection* so the runner can rebuild the backend and fetch bytes through it.
+    ///
+    /// Only **federated** sources are excluded: a peer yields catalog rows, not bytes, so there is
+    /// nothing local to decode (its derived data belongs to the peer that owns it). SFTP/SMB assets
+    /// are targets like any other and reach their bytes through `FileSource::fetch` — issue #48.
+    /// Before that they were filtered out here by `s.kind = 'local_fs'`, which meant a remote asset
+    /// was never even *planned* for analysis: no embedding, no derived signals, no auto-tags, and no
+    /// error either, because nothing had gone wrong — it simply was not on the list.
+    ///
+    /// A row whose stored connection cannot be parsed is dropped rather than defaulted: an
+    /// unparseable connection cannot be fetched from, and a target that can never succeed is worse
+    /// than one that was never listed (it would fail every pass, forever, at whatever version gate).
     pub fn list_analysis_targets(
         &self,
         current_version: i64,
@@ -18,7 +29,7 @@ impl Store {
         let mut sql = String::from(
             "SELECT a.id, s.connection, a.path, a.media_type, a.format, a.content_hash, a.source_id
              FROM asset a JOIN source s ON s.id = a.source_id
-             WHERE s.kind = 'local_fs'",
+             WHERE s.kind <> 'federated'",
         );
         if !force {
             sql.push_str(&format!(" AND a.analysis_version < {current_version}"));
@@ -41,24 +52,27 @@ impl Store {
                 let format: String = r.get(4)?;
                 let hash: Option<Vec<u8>> = r.get(5)?;
                 let source_id = blob_to_source_id(&r.get::<_, Vec<u8>>(6)?);
-                // local_fs display URI is the (canonical) source root the analyzer joins onto.
-                let source_uri = parse_connection(&connection)
-                    .map(|c| c.display_uri())
-                    .unwrap_or_default();
-                Ok(AnalysisTarget {
-                    id,
-                    source_id,
-                    source_uri,
-                    path,
-                    media: MediaType::parse(&media_s).unwrap_or(MediaType::Image),
-                    format,
-                    content_hash: hash
-                        .and_then(|h| <[u8; 32]>::try_from(h.as_slice()).ok())
-                        .map(ContentHash),
-                })
+                Ok(parse_connection(&connection)
+                    .ok()
+                    .map(|connection| AnalysisTarget {
+                        id,
+                        source_id,
+                        connection,
+                        path,
+                        media: MediaType::parse(&media_s).unwrap_or(MediaType::Image),
+                        format,
+                        content_hash: hash
+                            .and_then(|h| <[u8; 32]>::try_from(h.as_slice()).ok())
+                            .map(ContentHash),
+                    }))
             })
             .map_err(internal)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(internal)
+        Ok(rows
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(internal)?
+            .into_iter()
+            .flatten()
+            .collect())
     }
 
     /// Persist the derived image signals (§5, §6) into the existing `image_attr` row. The row is created
@@ -816,5 +830,100 @@ impl UnionFind {
             map.entry(root).or_default().push(i);
         }
         map.into_values().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dam_sources::{FederatedConfig, SftpConfig, SourceConnection};
+
+    fn sftp_conn() -> SourceConnection {
+        SourceConnection::Sftp(SftpConfig {
+            host: "example.invalid".into(),
+            port: 22,
+            username: "u".into(),
+            base_path: "/assets".into(),
+            password: Some("p".into()),
+            private_key: None,
+            passphrase: None,
+        })
+    }
+
+    /// Add one source and one asset on it; return the store and the asset id.
+    fn store_with_asset_on(conn: &SourceConnection, kind_name: &str) -> (Store, AssetId) {
+        let store = Store::open_in_memory().unwrap();
+        let src = store.add_source(conn, kind_name, false).unwrap();
+        let (id, _) = store
+            .upsert_asset(&NewAsset {
+                source_id: src,
+                path: "textures/brick.png".into(),
+                filename: "brick.png".into(),
+                content_hash: None,
+                size_bytes: Some(1),
+                source_modified_at: None,
+                scanned_at: now_ms(),
+                media_type: MediaType::Image,
+                format: "png".into(),
+            })
+            .unwrap();
+        (store, id)
+    }
+
+    /// The bug behind issue #48: `WHERE s.kind = 'local_fs'` meant an SFTP/SMB asset was never even
+    /// *planned* for analysis. It produced no error, because nothing failed — the asset simply was
+    /// not on the list, so it sat at `analysis_version = 0` forever with no embedding, no derived
+    /// signals, and no auto-tags, while the job it should have been part of reported success.
+    #[test]
+    fn remote_assets_are_planned_for_analysis() {
+        let (store, id) = store_with_asset_on(&sftp_conn(), "remote");
+        let targets = store.list_analysis_targets(1, false, &[]).unwrap();
+        assert_eq!(targets.len(), 1, "an SFTP asset must be an analysis target");
+        assert_eq!(targets[0].id, id);
+        assert!(
+            matches!(targets[0].connection, SourceConnection::Sftp(_)),
+            "the target carries the connection the runner fetches through"
+        );
+    }
+
+    /// The one exclusion that must survive: a federated peer yields catalog rows, not bytes. There
+    /// is nothing local to decode, and its derived data belongs to the peer that owns it — so
+    /// widening the filter for SFTP/SMB must not accidentally sweep peers back in.
+    #[test]
+    fn federated_assets_are_never_analysis_targets() {
+        let (store, _) = store_with_asset_on(
+            &SourceConnection::Federated(FederatedConfig {
+                endpoint: "http://peer.invalid:7878".into(),
+                token: None,
+            }),
+            "peer",
+        );
+        assert!(
+            store
+                .list_analysis_targets(1, false, &[])
+                .unwrap()
+                .is_empty(),
+            "a federated asset has no local bytes and must not be planned"
+        );
+    }
+
+    /// A row whose stored connection blob cannot be parsed is dropped, not defaulted. A target that
+    /// can never be fetched would fail every pass forever; leaving it off the list is the honest
+    /// outcome, and keeps the warning count meaningful.
+    #[test]
+    fn an_unparseable_connection_drops_the_target() {
+        let (store, _) = store_with_asset_on(&sftp_conn(), "remote");
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute("UPDATE source SET connection = 'not json'", [])
+                .unwrap();
+        }
+        assert!(
+            store
+                .list_analysis_targets(1, false, &[])
+                .unwrap()
+                .is_empty(),
+            "an unfetchable target must not be planned"
+        );
     }
 }

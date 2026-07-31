@@ -16,7 +16,8 @@ use dam_api::event::{ChangeKind, LibraryEvent};
 use dam_api::id::JobId;
 use dam_store::{AnalysisTarget, ImageAnalysis, Store};
 use rayon::prelude::*;
-use std::path::{Component, Path};
+use std::collections::HashMap;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -82,6 +83,15 @@ pub(crate) fn run_analyze(
     let done = AtomicU64::new(0);
     let warnings = AtomicU64::new(0);
 
+    // Rebuild each distinct source's backend **once**, before the fan-out. Opening per asset would
+    // mean an SSH handshake or an SMB session setup per file, which for a remote pass is most of the
+    // wall clock. `FileSource` is `Send + Sync`, so one instance serves every worker.
+    //
+    // A source that won't open (host down, credentials rotated) is recorded here, not raised: its
+    // assets each fail their own item below, exactly like an undecodable file. Degrade one edge, not
+    // the job — golden rule 6.
+    let backends = open_backends(&store, &targets);
+
     // Run on the bounded background pool (not the global rayon pool) so a whole-library pass leaves
     // cores free for interactive inspector reads instead of pinning every core (tech-spec 14).
     pool.install(|| {
@@ -97,7 +107,12 @@ pub(crate) fn run_analyze(
         if cancel.load(Ordering::Relaxed) {
             return;
         }
-        match analyze_one(&store, t, model.as_deref()) {
+        let outcome = match backends.get(&t.source_id) {
+            Some(Ok(fs)) => analyze_one(&store, t, model.as_deref(), fs.as_ref()),
+            Some(Err(e)) => Err(e.clone()),
+            None => Err("source backend missing".to_string()),
+        };
+        match outcome {
             Ok(()) => {
                 let _ = events.send(LibraryEvent::AssetChanged {
                     id: t.id,
@@ -134,14 +149,52 @@ pub(crate) fn run_analyze(
     tracing::info!(%job, done, warnings, "analysis finished");
 }
 
+/// Rebuild one `FileSource` per distinct source in `targets` (issue #48).
+///
+/// The result is keyed by `source_id` so the fan-out is a map lookup, and holds the *error* for a
+/// source that could not be opened rather than dropping it — otherwise its assets would silently
+/// vanish from the pass instead of each reporting why they were skipped. The error is also written
+/// to `source.last_error`, so the offline state surfaces in the sources list and not only in a log
+/// line nobody reads.
+fn open_backends(
+    store: &Store,
+    targets: &[AnalysisTarget],
+) -> HashMap<dam_api::id::SourceId, Result<Arc<dyn dam_sources::FileSource>, String>> {
+    let mut out: HashMap<_, Result<Arc<dyn dam_sources::FileSource>, String>> = HashMap::new();
+    for t in targets {
+        if out.contains_key(&t.source_id) {
+            continue;
+        }
+        let entry = match dam_sources::open_source(&t.connection) {
+            Ok(fs) => Ok(Arc::from(fs)),
+            Err(e) => {
+                let msg = e.to_string();
+                let _ = store.set_source_error(&t.source_id, &msg);
+                tracing::warn!(source = %t.source_id, error = %msg, "source unavailable for analysis");
+                Err(msg)
+            }
+        };
+        out.insert(t.source_id, entry);
+    }
+    out
+}
+
 /// Analyse one asset end-to-end: extract features, derive signals, classify → suggest, index the
 /// embedding, and mark it analysed at the current version. Fail-soft per stage.
+///
+/// Bytes arrive through `fs.fetch` (issue #48): in place for a local source — the same path the old
+/// root-join produced, minus the chance of disagreeing with the scan about it — and a temp file for
+/// SFTP/SMB. The temp is owned by `fetched` and deleted when this function returns, so peak scratch
+/// usage across a remote pass is bounded by the background pool's width times the largest asset,
+/// not by the size of the batch.
 fn analyze_one(
     store: &Store,
     t: &AnalysisTarget,
     model: Option<&dyn crate::semantic::SemanticModel>,
+    fs: &dyn dam_sources::FileSource,
 ) -> Result<(), String> {
-    let abs = resolve(&t.source_uri, &t.path)?;
+    let fetched = fs.fetch(&t.path).map_err(|e| e.to_string())?;
+    let abs = fetched.path().to_path_buf();
     let det = dam_media::Detected {
         media: t.media,
         format: t.format.clone(),
@@ -578,16 +631,6 @@ fn suggest_all(store: &Store, id: &dam_api::id::AssetId, suggestions: &[(&str, f
             tracing::warn!(asset = %id, tag = name, error = %e, "suggest_tag failed");
         }
     }
-}
-
-/// Resolve a source root + stored relative path to an absolute file, traversal-guarded (same rule as
-/// `read_asset_file`). A stored path that escapes its root is rejected — defence in depth.
-fn resolve(source_uri: &str, rel_path: &str) -> Result<std::path::PathBuf, String> {
-    let rel = Path::new(rel_path);
-    if rel.components().any(|c| matches!(c, Component::ParentDir)) {
-        return Err("asset path escapes its source root".into());
-    }
-    Ok(Path::new(source_uri).join(rel))
 }
 
 /// Owned-vector adapter over the shared in-place L2 normaliser (`dam_media::l2_normalise`), so the
