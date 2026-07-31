@@ -447,6 +447,68 @@ pub const MIGRATIONS: &[&str] = &[
         UPDATE asset_fts SET filename = new.filename WHERE rowid = new.rowid;
     END;
     "#,
+    // ── V13: folder names as a searchable column (issue #66) ─────────────────────────────────────
+    // Artists organise assets into hierarchies that carry real meaning — `Environment/Rock/Cliffs/`,
+    // an asset pack's own layout — and until now that structure was navigable but not *findable*.
+    // The folder tree could take you to `Cliffs/` only if you already knew where to look; typing
+    // "cliffs" found nothing, because nothing indexed the directory a file sits in.
+    //
+    // The segments are tokenised with the same splitter filenames use (`search::tokenize_name`), so
+    // `Weapons_AK47/` yields `weapons`, `ak47`, `ak`, `47`. The **filename is excluded** — it is
+    // already its own column, and duplicating it here would double-count a name match and quietly
+    // distort bm25.
+    //
+    // Unlike `tokens`/`tags`/`text`, this column is *derivable*: it is a pure function of
+    // `asset.path`, which is a base-table column. So it is back-filled in place here rather than
+    // seeded empty, and a future rebuild could recompute it instead of stashing it — though the
+    // tokeniser lives in Rust, so the back-fill below is a coarser SQL approximation (whole segments
+    // only, lowercased) that the next scan refines. That asymmetry is deliberate: a fresh install
+    // and a scan-since-upgrade get the good tokens, and an un-rescanned upgrade still gets whole
+    // folder names, which is the case the issue actually cares about.
+    r#"
+    CREATE TEMP TABLE _fts_stash AS
+        SELECT rowid AS rid, tokens, tags, note, text FROM asset_fts;
+
+    DROP TRIGGER asset_fts_ai;
+    DROP TRIGGER asset_fts_ad;
+    DROP TRIGGER asset_fts_au;
+    DROP TABLE asset_fts;
+
+    CREATE VIRTUAL TABLE asset_fts USING fts5(
+        filename,
+        tokens,
+        tags,
+        note,
+        folder,
+        text,
+        tokenize = "unicode61 remove_diacritics 2"
+    );
+
+    -- Back-fill `folder` from the stored path: everything up to the last '/', with separators
+    -- turned into spaces so FTS sees one term per segment. Files at the source root have no '/'
+    -- and get ''.
+    INSERT INTO asset_fts(rowid, filename, tokens, tags, note, folder, text)
+        SELECT a.rowid, a.filename, COALESCE(s.tokens, ''), COALESCE(s.tags, ''),
+               COALESCE(s.note, ''),
+               CASE WHEN instr(a.path, '/') > 0
+                    THEN replace(lower(rtrim(substr(a.path, 1, length(a.path) - length(a.filename)), '/')), '/', ' ')
+                    ELSE '' END,
+               COALESCE(s.text, '')
+        FROM asset a LEFT JOIN _fts_stash s ON s.rid = a.rowid;
+
+    DROP TABLE _fts_stash;
+
+    CREATE TRIGGER asset_fts_ai AFTER INSERT ON asset BEGIN
+        INSERT INTO asset_fts(rowid, filename, tokens, tags, note, folder, text)
+            VALUES (new.rowid, new.filename, '', '', '', '', '');
+    END;
+    CREATE TRIGGER asset_fts_ad AFTER DELETE ON asset BEGIN
+        DELETE FROM asset_fts WHERE rowid = old.rowid;
+    END;
+    CREATE TRIGGER asset_fts_au AFTER UPDATE OF filename ON asset BEGIN
+        UPDATE asset_fts SET filename = new.filename WHERE rowid = new.rowid;
+    END;
+    "#,
 ];
 
 #[cfg(test)]
@@ -467,51 +529,89 @@ mod tests {
     /// is to upgrade a *populated* database — a fresh one is empty when the migration runs, so every
     /// other test in the workspace exercises the SQL without exercising the data movement.
     ///
-    /// `tokens`, `tags`, and `text` exist nowhere but inside `asset_fts`: losing them silently
-    /// un-indexes filename sub-tokens, every tag, and every document body, with no error and no way
-    /// to notice short of a user's search going quiet. V7 and V11 set the stash-and-restore
-    /// precedent; this pins it so a fourth rebuild cannot quietly skip a column.
+    /// `tokens`, `tags`, `note`, and `text` exist nowhere but inside `asset_fts`: losing them
+    /// silently un-indexes filename sub-tokens, every tag, every user note, and every document body,
+    /// with no error and no way to notice short of a user's search going quiet. V7, V11, V12, and
+    /// V13 are the rebuilds so far; this walks a *populated* database through the last two of them
+    /// in sequence, so a value dropped by either shows up here.
     #[test]
-    fn v12_rebuild_preserves_the_index_only_columns() {
+    fn the_fts_rebuilds_preserve_the_index_only_columns() {
+        // Populate at V11, before `note` and `folder` exist.
         let conn = db_at(11);
         conn.execute_batch(
             "INSERT INTO source (id, name, kind, connection, created_at, updated_at)
                 VALUES (x'01', 's', 'local_fs', '/tmp', 0, 0);
              INSERT INTO asset (id, source_id, path, filename, scanned_at, media_type, format,
                                 created_at, updated_at)
-                VALUES (x'02', x'01', 'a/ak47_lowpoly.fbx', 'ak47_lowpoly.fbx', 0, 'model', 'fbx', 0, 0);
+                VALUES (x'02', x'01', 'Weapons/Rifles/ak47_lowpoly.fbx', 'ak47_lowpoly.fbx', 0,
+                        'model', 'fbx', 0, 0);
              UPDATE asset_fts SET tokens = 'ak47 ak 47 low poly fbx', tags = 'rifle weapon',
                                   text = 'the quick brown fox';",
         )
         .unwrap();
 
+        // V12 adds `note` (and drops the dead V1 `asset.notes` column) …
         conn.execute_batch(MIGRATIONS[11]).unwrap();
-
-        let (tokens, tags, note, text): (String, String, String, String) = conn
-            .query_row("SELECT tokens, tags, note, text FROM asset_fts", [], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-            })
-            .unwrap();
-        assert_eq!(
-            tokens, "ak47 ak 47 low poly fbx",
-            "tokens lost in the rebuild"
-        );
-        assert_eq!(tags, "rifle weapon", "tags lost in the rebuild");
-        assert_eq!(
-            text, "the quick brown fox",
-            "document text lost in the rebuild"
-        );
-        assert_eq!(
-            note, "",
-            "the new column starts empty; the write path fills it"
-        );
-
-        // The vestigial V1 `asset.notes` column is gone, so there is exactly one place a note lives.
         let has_notes_column: bool = conn
             .prepare("SELECT * FROM asset")
             .unwrap()
             .column_names()
             .contains(&"notes");
         assert!(!has_notes_column, "dead asset.notes column survived V12");
+        conn.execute_batch("UPDATE asset_fts SET note = 'client rejected this variant';")
+            .unwrap();
+
+        // … V13 adds `folder`, which must carry the note across as well as the older three.
+        conn.execute_batch(MIGRATIONS[12]).unwrap();
+
+        let (tokens, tags, note, folder, text): (String, String, String, String, String) = conn
+            .query_row(
+                "SELECT tokens, tags, note, folder, text FROM asset_fts",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            tokens, "ak47 ak 47 low poly fbx",
+            "tokens lost in a rebuild"
+        );
+        assert_eq!(tags, "rifle weapon", "tags lost in a rebuild");
+        assert_eq!(
+            note, "client rejected this variant",
+            "note lost in a rebuild"
+        );
+        assert_eq!(
+            text, "the quick brown fox",
+            "document text lost in a rebuild"
+        );
+        // `folder` is the one column a rebuild can *derive* rather than carry: it back-fills from
+        // `asset.path`, minus the filename. The SQL back-fill is whole-segment only (the real
+        // tokeniser is in Rust and refines this on the next scan), which is what this asserts.
+        assert_eq!(
+            folder, "weapons rifles",
+            "folder was not back-filled from the stored path"
+        );
+    }
+
+    /// A file at the source root has no folder to index, and must not pick up its own filename —
+    /// the back-fill's `substr` arithmetic is easy to get one character wrong.
+    #[test]
+    fn the_folder_backfill_leaves_root_level_files_empty() {
+        let conn = db_at(11);
+        conn.execute_batch(
+            "INSERT INTO source (id, name, kind, connection, created_at, updated_at)
+                VALUES (x'01', 's', 'local_fs', '/tmp', 0, 0);
+             INSERT INTO asset (id, source_id, path, filename, scanned_at, media_type, format,
+                                created_at, updated_at)
+                VALUES (x'02', x'01', 'loose.png', 'loose.png', 0, 'image', 'png', 0, 0);",
+        )
+        .unwrap();
+        conn.execute_batch(MIGRATIONS[11]).unwrap();
+        conn.execute_batch(MIGRATIONS[12]).unwrap();
+
+        let folder: String = conn
+            .query_row("SELECT folder FROM asset_fts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(folder, "", "a root-level file has no folder terms");
     }
 }

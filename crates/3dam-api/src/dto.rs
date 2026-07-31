@@ -526,9 +526,19 @@ pub enum FacetField {
     DocumentClass,
     /// User-flagged favourite (issue #63). Presence of the filter means "favourites only".
     Favorite,
-    /// Source-relative path prefix (issue #66) — scopes the browse to a folder subtree. The value is
-    /// the prefix (e.g. `Environment/Rock/`); an empty prefix matches everything.
+    /// Source-relative path prefix (issue #66) — scopes the browse to a folder subtree, **including
+    /// everything below it**. The value is the prefix (e.g. `Environment/Rock/`); an empty prefix
+    /// matches everything.
     Path,
+    /// Source-relative folder, matched **exactly** (issue #66): assets whose immediate parent is
+    /// this folder, excluding anything in a deeper subfolder. The value is the same prefix form
+    /// [`Path`](Self::Path) takes (`Environment/Rock/`); an empty value means the source root, so
+    /// `folder = ""` is the loose files at the top level rather than "everything".
+    ///
+    /// A separate field rather than an op on `Path` because both readings are legitimate scopes a
+    /// user saves into a smart folder, and overloading `Eq` would silently re-scope every folder
+    /// filter already stored.
+    Folder,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

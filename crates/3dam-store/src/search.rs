@@ -12,7 +12,7 @@ use std::path::Path;
 
 /// The ranking expression for the `asset_fts` index, with **explicit per-column weights**.
 ///
-/// Column order matches the V12 index: `filename, tokens, tags, note, text`. More negative =
+/// Column order matches the V13 index: `filename, tokens, tags, note, folder, text`. More negative =
 /// better, so a larger weight pulls a match toward the top:
 /// - `filename` 10 — the user typed a name; the file called that is the answer.
 /// - `tokens`    5 — filename-derived sub-tokens (`ak47` inside `ak47_lowpoly.fbx`), the same
@@ -20,11 +20,13 @@ use std::path::Path;
 /// - `tags`      4 — curated/accepted labels, deliberate but not what was typed.
 /// - `note`      3 — the user's own prose about this asset: authored, but about it rather than
 ///   naming it.
+/// - `folder`    2 — the directory the user filed it under. Deliberate organisation, but shared by
+///   every sibling, so any one hit says less about *this* asset than a note does.
 /// - `text`      1 — extracted body prose: the widest recall and the weakest per-hit evidence.
 ///
 /// These order results *within* a tier. They are deliberately **not** relied on to keep documents
 /// off the top — see [`AUTHORED_TIER`] for why that needs more than a weight.
-pub(crate) const FTS_RANK: &str = "bm25(asset_fts, 10.0, 5.0, 4.0, 3.0, 1.0)";
+pub(crate) const FTS_RANK: &str = "bm25(asset_fts, 10.0, 5.0, 4.0, 3.0, 2.0, 1.0)";
 
 /// The **primary** sort key: 0 for a row matching in an *authored* column, 1 for an
 /// extracted-body-text-only match. Any filename/token/tag/note hit therefore outranks every
@@ -44,10 +46,15 @@ pub(crate) const FTS_RANK: &str = "bm25(asset_fts, 10.0, 5.0, 4.0, 3.0, 1.0)";
 /// corpus size, or term distribution. Recall is untouched — the document still matches and still
 /// appears, it just appears below the file that is actually named after the query.
 ///
-/// The tier is *authored*, not merely name-ish: a user's `note` (issue #81) joins filename, tokens,
-/// and tags on the near side of the line. Someone who typed "client rejected this variant" onto an
-/// asset said something deliberate about it, and that should not sort below a 40-page PDF that
-/// happens to contain the word "variant" — which is precisely the failure this tier exists to stop.
+/// The tier is *authored*, not merely name-ish: a user's `note` (issue #81) and the `folder` they
+/// filed the asset under (issue #66) join filename, tokens, and tags on the near side of the line.
+/// Someone who typed "client rejected this variant" onto an asset, or put it in `Environment/Rock/
+/// Cliffs/`, said something deliberate about it, and that should not sort below a 40-page PDF that
+/// happens to contain the word — which is precisely the failure this tier exists to stop.
+///
+/// `folder` matters here more than its weight suggests: searching "cliffs" is often the *only* way
+/// a user can express "that folder", and a body-text tier would bury the whole directory under any
+/// document that mentions the word once.
 ///
 /// `{col1 col2} : (expr)` is FTS5's column-filter syntax; the expression is parenthesised because
 /// the filter binds to the term that follows it, not to a whole boolean chain.
@@ -56,7 +63,26 @@ pub(crate) const AUTHORED_TIER: &str =
 
 /// Wrap a MATCH expression so it only searches the authored columns (see [`AUTHORED_TIER`]).
 pub(crate) fn authored_scoped(match_expr: &str) -> String {
-    format!("{{filename tokens tags note}} : ({match_expr})")
+    format!("{{filename tokens tags note folder}} : ({match_expr})")
+}
+
+/// The searchable folder terms for a source-relative path: every directory segment above the file,
+/// tokenised exactly as a filename would be, so `Weapons_AK47/rifle.fbx` is findable by `weapons`,
+/// `ak47`, `ak`, or `47`.
+///
+/// The filename is deliberately **excluded** — it has its own column, and repeating it here would
+/// double-count a name match and distort the ranking it is supposed to lead.
+pub fn folder_terms(rel_path: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let segments = rel_path.split('/').count().saturating_sub(1);
+    for seg in rel_path.split('/').take(segments) {
+        for tok in tokenize_name(seg) {
+            if !out.contains(&tok) {
+                out.push(tok);
+            }
+        }
+    }
+    out.join(" ")
 }
 
 /// Split a filename (or free text) into lowercase search tokens. Splits on non-alphanumeric runs

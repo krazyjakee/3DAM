@@ -206,7 +206,10 @@ export type FacetField =
   | "license"
   | "usage_right"
   | "favorite"
+  /** Folder subtree — this prefix and everything below it (issue #66). */
   | "path"
+  /** One folder exactly — its own files, excluding deeper subfolders (issue #66). */
+  | "folder"
   // image (image_attr)
   | "width"
   | "height"

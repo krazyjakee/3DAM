@@ -51,6 +51,7 @@ pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             format,
             source,
             path,
+            no_subfolders,
             limit,
             mode,
         } => {
@@ -80,7 +81,13 @@ pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             }
             if let Some(p) = path {
                 filters.push(Filter {
-                    field: FacetField::Path,
+                    // Two readings of "in this folder": the subtree (default) or the folder's own
+                    // files (`--no-subfolders`). Separate facets, so a saved query means one thing.
+                    field: if no_subfolders {
+                        FacetField::Folder
+                    } else {
+                        FacetField::Path
+                    },
                     op: FilterOp::Eq,
                     value: FilterValue::Str(p),
                 });

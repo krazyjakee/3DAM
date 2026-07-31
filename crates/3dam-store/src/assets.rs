@@ -110,12 +110,18 @@ impl Store {
         };
         // Enrich the FTS row with filename-derived tokens (M2) so an embedded term like the `ak47`
         // in `ak47_lowpoly.fbx` is searchable immediately at scan — the `asset_fts` row itself was
-        // created by the insert trigger with the raw filename. Best-effort: a token failure never
-        // sinks the ingest.
+        // created by the insert trigger with the raw filename — plus the tokenised directory
+        // segments above it (issue #66), so the hierarchy an artist filed the asset under is
+        // findable by name and not only by walking the tree. Both are pure functions of data the
+        // row already carries, so this is the right place: a moved file is a new `(source_id, path)`
+        // and comes back through here with its new folder. Best-effort: a token failure never sinks
+        // the ingest.
         let tokens = crate::search::tokenize_name(&a.filename).join(" ");
+        let folder = crate::search::folder_terms(&a.path);
         let _ = conn.execute(
-            "UPDATE asset_fts SET tokens = ?2 WHERE rowid = (SELECT rowid FROM asset WHERE id = ?1)",
-            params![id.as_bytes().to_vec(), tokens],
+            "UPDATE asset_fts SET tokens = ?2, folder = ?3
+             WHERE rowid = (SELECT rowid FROM asset WHERE id = ?1)",
+            params![id.as_bytes().to_vec(), tokens, folder],
         );
         Ok((id, is_new))
     }

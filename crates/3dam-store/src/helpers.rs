@@ -440,6 +440,23 @@ pub(crate) fn apply_filter(
                 ))
             }
         },
+        // The same subtree, minus its subtrees (issue #66): everything under the prefix with no
+        // further `/` after it — the folder's own files. That second pattern is the whole
+        // difference, and it is also why an empty value is meaningful here where it is a no-op for
+        // `Path`: it selects the loose files sitting in the source root.
+        Folder => match &f.value {
+            FilterValue::Str(prefix) => {
+                let esc = escape_like(prefix);
+                where_sql.push_str(" AND path LIKE ? ESCAPE '\\' AND path NOT LIKE ? ESCAPE '\\'");
+                binds.push(Value::Text(format!("{esc}%")));
+                binds.push(Value::Text(format!("{esc}%/%")));
+            }
+            _ => {
+                return Err(LibError::BadRequest(
+                    "folder filter wants a string path".into(),
+                ))
+            }
+        },
     }
     Ok(())
 }
@@ -678,6 +695,7 @@ mod tests {
             DocumentClass => (FilterOp::Eq, FilterValue::Str("license".into())),
             Favorite => (FilterOp::Eq, FilterValue::Bool(true)),
             Path => (FilterOp::Eq, FilterValue::Str("Environment/".into())),
+            Folder => (FilterOp::Eq, FilterValue::Str("Environment/Rock/".into())),
         };
         Filter { field, op, value }
     }
@@ -697,6 +715,7 @@ mod tests {
             UsageRight,
             Favorite,
             Path,
+            Folder,
             // Image attrs.
             Width,
             Height,

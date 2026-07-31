@@ -55,6 +55,9 @@ pub(crate) enum Cmd {
         /// source-relative, so this requires `--source`.
         #[arg(long, requires = "source")]
         path: Option<String>,
+        /// With `--path`, list only that folder's own files and not its subfolders.
+        #[arg(long, requires = "path")]
+        no_subfolders: bool,
         #[arg(long, default_value_t = 50)]
         limit: u32,
         /// Match strategy (semantic-search M5): `lexical` (FTS + synonyms), `hybrid` (also pulls in

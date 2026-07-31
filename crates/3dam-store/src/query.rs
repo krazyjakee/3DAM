@@ -762,6 +762,126 @@ mod tests {
         assert_eq!(scoped("Environment/"), 3);
         assert_eq!(scoped("Environment/Rock/"), 2);
         assert_eq!(scoped(""), 5);
+
+        // `Folder` is the same scope minus its subtrees — "what is filed *here*" (issue #66). The
+        // pair is the point: `Environment/` holds three assets in total but nothing at its own
+        // level, which is exactly the distinction the subfolder toggle exposes.
+        let here = |prefix: &str| {
+            let req = QueryRequest {
+                filters: vec![Filter {
+                    field: FacetField::Folder,
+                    op: FilterOp::Eq,
+                    value: FilterValue::Str(prefix.into()),
+                }],
+                ..Default::default()
+            };
+            query_all(&store, &req).unwrap().total.unwrap()
+        };
+        assert_eq!(
+            here("Environment/"),
+            0,
+            "no files sit directly in Environment/"
+        );
+        assert_eq!(here("Environment/Rock/"), 2);
+        // Empty prefix means the source root, *not* "everything" — the one place `Folder` and
+        // `Path` deliberately disagree.
+        assert_eq!(here(""), 1, "only the loose file at the top level");
+    }
+
+    /// Issue #66's discovery half: a folder name is meaning the catalog should be able to find, not
+    /// just navigate to. Before this, `Cliffs/` was reachable only by walking the tree — typing
+    /// "cliffs" matched nothing, because no column held the directory a file sits in.
+    #[test]
+    fn folder_names_are_searchable() {
+        let store = Store::open_in_memory().unwrap();
+        let src = store
+            .add_source(
+                &SourceConnection::LocalFs {
+                    root: "/tmp".into(),
+                },
+                "t",
+                false,
+            )
+            .unwrap();
+        let mk = |path: &str| {
+            store
+                .upsert_asset(&NewAsset {
+                    source_id: src,
+                    path: path.to_string(),
+                    filename: path.rsplit('/').next().unwrap().to_string(),
+                    content_hash: None,
+                    size_bytes: Some(1),
+                    source_modified_at: None,
+                    scanned_at: now_ms(),
+                    media_type: MediaType::Image,
+                    format: "png".into(),
+                })
+                .unwrap();
+        };
+        mk("Environment/Rock/Cliffs/a.png");
+        mk("Environment/Rock/Cliffs/b.png");
+        mk("Weapons_AK47/rifle.png");
+        mk("loose.png");
+
+        let mut hits = search(&store, "cliffs");
+        hits.sort();
+        assert_eq!(
+            hits,
+            vec!["a.png", "b.png"],
+            "a folder name finds its files"
+        );
+
+        // Segments tokenise like filenames do, so a packed name is reachable by its parts.
+        assert_eq!(search(&store, "weapons"), vec!["rifle.png"]);
+        assert_eq!(search(&store, "ak47"), vec!["rifle.png"]);
+        assert_eq!(search(&store, "47"), vec!["rifle.png"]);
+
+        // The filename is *not* folded into the folder column — it has its own, and duplicating it
+        // would double-count a name match and quietly distort the ranking it is meant to lead.
+        assert!(
+            search(&store, "loose").contains(&"loose.png".to_string()),
+            "a root-level file is still findable by name"
+        );
+    }
+
+    /// A folder match is authored, so it outranks body prose — but never the file actually named
+    /// after the query. Both halves matter: the first is why folder joins the authored tier at all,
+    /// the second is why its weight sits below `filename`.
+    #[test]
+    fn a_filename_outranks_a_folder_match() {
+        let store = Store::open_in_memory().unwrap();
+        let src = store
+            .add_source(
+                &SourceConnection::LocalFs {
+                    root: "/tmp".into(),
+                },
+                "t",
+                false,
+            )
+            .unwrap();
+        let mk = |path: &str| {
+            store
+                .upsert_asset(&NewAsset {
+                    source_id: src,
+                    path: path.to_string(),
+                    filename: path.rsplit('/').next().unwrap().to_string(),
+                    content_hash: None,
+                    size_bytes: Some(1),
+                    source_modified_at: None,
+                    scanned_at: now_ms(),
+                    media_type: MediaType::Image,
+                    format: "png".into(),
+                })
+                .unwrap();
+        };
+        mk("Cliffs/texture.png");
+        mk("Misc/cliffs.png");
+
+        assert_eq!(
+            search(&store, "cliffs"),
+            vec!["cliffs.png", "texture.png"],
+            "the file named after the query beats the one merely filed under it"
+        );
     }
 
     fn search(store: &Store, text: &str) -> Vec<String> {

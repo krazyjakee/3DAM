@@ -350,6 +350,23 @@ function Breadcrumb() {
           </Fragment>
         );
       })}
+      {/* Subtree vs this-folder-only (issue #66). Only meaningful once a folder is actually
+          selected — at the source root "include subfolders" off would mean the loose files at the
+          top level, which is a real scope but not one worth a control nobody asked for. */}
+      {state.path && (
+        <label
+          className="ml-auto flex shrink-0 items-center gap-1.5 pl-3 select-none coarse:min-h-11"
+          title="Off: show only the files filed directly in this folder, not those in its subfolders."
+        >
+          <input
+            type="checkbox"
+            className="accent-accent"
+            checked={state.subfolders}
+            onChange={(e) => patch({ subfolders: e.target.checked })}
+          />
+          <span>Subfolders</span>
+        </label>
+      )}
     </nav>
   );
 }

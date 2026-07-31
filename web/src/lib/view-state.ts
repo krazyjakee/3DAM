@@ -31,6 +31,11 @@ export interface ViewState {
    *  directory subtree. Always paired with a `source` (paths are source-relative), and mutually
    *  exclusive with a collection. Empty/absent = the whole source (or library). */
   path: string | null;
+  /** Whether a `path` scope reaches into subfolders (issue #66). `true` (the default, and the
+   *  original behaviour) browses the whole subtree; `false` shows only that folder's own files —
+   *  the difference between "everything in Environment/" and "what's actually filed at this level".
+   *  Only meaningful alongside `path`; carried as `sub=0` so the common case leaves the URL clean. */
+  subfolders: boolean;
   /** Advanced Search: structured attribute filters (typed dropdown/range/toggle controls over the
    *  per-media attr columns) plus tag filters. Carried as a JSON `Filter[]` in the `adv` URL param so
    *  a whole faceted query stays linkable. AND-ed with the sidebar facets and text search. */
@@ -69,6 +74,7 @@ export function useViewState() {
       collection: params.get("col"),
       fav: params.get("fav") === "1",
       path: params.get("path"),
+      subfolders: params.get("sub") !== "0",
       adv: parseAdv(params.get("adv")),
       sort: (params.get("sort") as SortField | null) ?? "name",
       dir: (params.get("dir") as SortDir | null) ?? "asc",
@@ -96,6 +102,7 @@ export function useViewState() {
           if ("collection" in next) set("col", next.collection);
           if ("fav" in next) set("fav", next.fav ? "1" : null);
           if ("path" in next) set("path", next.path);
+          if ("subfolders" in next) set("sub", next.subfolders ? null : "0");
           if ("adv" in next) set("adv", next.adv && next.adv.length ? JSON.stringify(next.adv) : null);
           if ("sort" in next) set("sort", next.sort);
           if ("dir" in next) set("dir", next.dir);
@@ -118,8 +125,15 @@ export function useViewState() {
       filters.push({ field: "license", op: "eq", value: { str: state.license } });
     if (state.tag) filters.push({ field: "tag", op: "eq", value: { str: state.tag } });
     if (state.fav) filters.push({ field: "favorite", op: "eq", value: { bool: true } });
-    // Folder scope (issue #66): a source-relative path prefix restricts the browse to a subtree.
-    if (state.path) filters.push({ field: "path", op: "eq", value: { str: state.path } });
+    // Folder scope (issue #66). Two readings, two facets: `path` is the prefix and everything
+    // below it, `folder` is that one directory's own files. They are separate fields rather than one
+    // field with a modifier so a saved smart folder means exactly one of them, forever.
+    if (state.path)
+      filters.push({
+        field: state.subfolders ? "path" : "folder",
+        op: "eq",
+        value: { str: state.path },
+      });
     // Advanced Search structured/tag filters, AND-ed onto the sidebar facets.
     filters.push(...state.adv);
     return {
