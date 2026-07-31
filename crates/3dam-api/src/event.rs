@@ -24,6 +24,9 @@ pub enum LibraryEvent {
         source_id: Option<SourceId>,
         kind: ChangeKind,
     },
+    // Struct-shaped, not `AssetRemoved(AssetId)`: with internal tagging (`tag = "type"`) serde
+    // cannot serialize a newtype variant whose inner type is a scalar (AssetId is a hex string),
+    // so the newtype form failed to serialize and every removal was silently dropped over WS.
     AssetRemoved {
         id: AssetId,
         #[serde(default)]
@@ -80,4 +83,94 @@ pub enum EventTopic {
     Sources,
     Jobs,
     Analysis,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dto::{
+        AssetSummary, JobKind, JobState, JobStatus, LicenseBadge, MediaType, Origin, Progress,
+    };
+    use crate::id::JobId;
+
+    fn asset_summary() -> AssetSummary {
+        AssetSummary {
+            id: AssetId::new(),
+            name: "kick.wav".into(),
+            media: MediaType::Audio,
+            format: "wav".into(),
+            size: 1024,
+            license: LicenseBadge::default(),
+            top_tags: vec!["drum".into()],
+            origin: Origin::Local,
+            key_attrs: Default::default(),
+            favorite: false,
+            source_id: Some(SourceId::new()),
+        }
+    }
+
+    fn job_status() -> JobStatus {
+        JobStatus {
+            id: JobId::new(),
+            kind: JobKind::Scan,
+            state: JobState::Running,
+            progress: Progress::default(),
+            error: None,
+            sources: vec![SourceId::new()],
+        }
+    }
+
+    /// Every `LibraryEvent` variant must serialize and round-trip. This guards the internal-tag
+    /// pitfall: `#[serde(tag = "type")]` cannot serialize a *newtype* variant whose inner type is a
+    /// scalar (e.g. `AssetRemoved(AssetId)` — AssetId is a string), which silently failed over WS.
+    #[test]
+    fn every_library_event_round_trips() {
+        let events = vec![
+            LibraryEvent::AssetAdded(asset_summary()),
+            LibraryEvent::AssetChanged {
+                id: AssetId::new(),
+                source_id: Some(SourceId::new()),
+                kind: ChangeKind::Reanalyzed,
+            },
+            LibraryEvent::AssetRemoved {
+                id: AssetId::new(),
+                source_id: Some(SourceId::new()),
+            },
+            // `None` attribution is a real wire case (unattributed / older peer) — cover it too.
+            LibraryEvent::AssetRemoved {
+                id: AssetId::new(),
+                source_id: None,
+            },
+            LibraryEvent::SourceState {
+                id: SourceId::new(),
+                state: SourceState::Online,
+            },
+            LibraryEvent::JobProgress(job_status()),
+            LibraryEvent::CatalogReset,
+        ];
+
+        for ev in &events {
+            // Must not error — the internally-tagged newtype-scalar case fails here.
+            let json = serde_json::to_string(ev).expect("LibraryEvent must serialize");
+            let back: LibraryEvent =
+                serde_json::from_str(&json).expect("LibraryEvent must deserialize");
+            // Re-serialize and compare wire form (LibraryEvent isn't PartialEq).
+            let json2 = serde_json::to_string(&back).expect("round-trip must serialize");
+            assert_eq!(json, json2, "round-trip changed the wire form for {ev:?}");
+        }
+    }
+
+    /// The removal event carries its id under `id` (struct variant), internally tagged by `type`.
+    #[test]
+    fn asset_removed_wire_shape() {
+        let id = AssetId::new();
+        let json = serde_json::to_string(&LibraryEvent::AssetRemoved {
+            id,
+            source_id: None,
+        })
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "asset_removed");
+        assert_eq!(v["id"], id.to_string());
+    }
 }
