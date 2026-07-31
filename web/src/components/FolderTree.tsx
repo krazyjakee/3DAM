@@ -4,10 +4,23 @@ import { useFolders } from "@/api/queries";
 import type { SourceId } from "@/api/types";
 import { useViewState } from "@/lib/view-state";
 
+/** Choosing a folder as a *destination* rather than navigating to it (issue #80).
+ *
+ *  Supplying this switches what a row's label does: it reports the prefix to the caller instead of
+ *  scoping the Browser, and "active" means chosen rather than currently-browsed. The tree is
+ *  otherwise identical — the lazy fetching, nesting, and counts are the point of reusing it, and a
+ *  second copy of them would be one more thing to keep in step with `list_folders`. */
+export interface FolderSelection {
+  /** The chosen source-relative prefix; `""` is the source root. Trailing slash, as nodes emit. */
+  current: string;
+  onSelect: (prefix: string) => void;
+}
+
 /** Lazy folder tree for one source (issue #66). Rendered beneath an expanded source row: each node
  *  fetches only its immediate children, and only once it is opened — so a deep hierarchy costs
  *  nothing until the user actually browses into it. Selecting a folder scopes the Browser to that
- *  subtree (source + path-prefix filter, deep-linked via the `path` URL param).
+ *  subtree (source + path-prefix filter, deep-linked via the `path` URL param) — unless `select` is
+ *  given, in which case the folder is being picked as an upload destination instead.
  *
  *  Rows nest via left padding keyed off `depth`; the chevron toggles expansion, the label navigates. */
 export function FolderTree({
@@ -15,11 +28,13 @@ export function FolderTree({
   prefix,
   depth,
   onNavigate,
+  select,
 }: {
   source: SourceId;
   prefix: string;
   depth: number;
   onNavigate?: () => void;
+  select?: FolderSelection;
 }) {
   const folders = useFolders(source, prefix, true);
 
@@ -41,6 +56,7 @@ export function FolderTree({
           count={e.asset_count}
           depth={depth}
           onNavigate={onNavigate}
+          select={select}
         />
       ))}
     </>
@@ -54,6 +70,7 @@ function FolderNode({
   count,
   depth,
   onNavigate,
+  select,
 }: {
   source: SourceId;
   prefix: string;
@@ -61,13 +78,20 @@ function FolderNode({
   count: number;
   depth: number;
   onNavigate?: () => void;
+  select?: FolderSelection;
 }) {
   const { state, patch } = useViewState();
   const [open, setOpen] = useState(false);
-  const active = state.source === source && state.path === prefix && !state.collection;
+  const active = select
+    ? select.current === prefix
+    : state.source === source && state.path === prefix && !state.collection;
   // Folder scope is a facet: it pairs with the source, and (like the other facets) exits collection
   // mode. Media/license/tag filters compose on top, so "images under Environment/Rock/" works.
   const scope = () => {
+    if (select) {
+      select.onSelect(prefix);
+      return;
+    }
     patch({ source, path: prefix, collection: null });
     onNavigate?.();
   };
@@ -110,7 +134,13 @@ function FolderNode({
         </button>
       </div>
       {open && (
-        <FolderTree source={source} prefix={prefix} depth={depth + 1} onNavigate={onNavigate} />
+        <FolderTree
+          source={source}
+          prefix={prefix}
+          depth={depth + 1}
+          onNavigate={onNavigate}
+          select={select}
+        />
       )}
     </>
   );

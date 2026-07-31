@@ -4,6 +4,7 @@ import { Workspace } from "./components/Workspace";
 import { Settings } from "./components/Settings";
 import { Duplicates } from "./components/Duplicates";
 import { Blocklist } from "./components/Blocklist";
+import { Upload } from "./components/Upload";
 import { Toaster } from "./components/Toaster";
 import { AuthGate } from "./components/AuthGate";
 import { ApiError, type VersionInfo } from "./api/client";
@@ -86,6 +87,8 @@ export function App() {
             <Route path="/duplicates" element={<Duplicates />} />
             {/* Rescan blocklist management (issue #21). */}
             <Route path="/blocklist" element={<Blocklist />} />
+            {/* Writing files into a source — the one write-into-source path (issue #80). */}
+            <Route path="/upload" element={<Upload />} />
             {/* URL owns view state via ?query params (lib/view-state.ts); one workspace route. */}
             <Route path="*" element={<Workspace />} />
           </Routes>

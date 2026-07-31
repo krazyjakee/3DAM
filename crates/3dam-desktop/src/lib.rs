@@ -95,7 +95,15 @@ pub fn run(args: Vec<OsString>) -> u8 {
             let mut win = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url))
                 .title("3DAM")
                 .inner_size(1200.0, 760.0)
-                .min_inner_size(720.0, 480.0);
+                .min_inner_size(720.0, 480.0)
+                // Let OS file drops reach the *page* (issue #80). Tauri enables this on every
+                // window by default, and while enabled it intercepts drops at the native layer and
+                // the webview never fires an HTML5 `drop` event — so the shared Upload drop zone
+                // would work in a browser and do nothing here, silently and only in the desktop
+                // build. We deliberately do not want the native drag-drop events either: golden
+                // rule 1 says the web client *is* the UI, so the drop zone is web code and this
+                // shell's job is only to stop swallowing its events.
+                .disable_drag_drop_handler();
             if let Some(script) = &init_script {
                 win = win.initialization_script(script);
             }

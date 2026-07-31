@@ -611,19 +611,48 @@ impl FileSource for LocalFsSource {
     /// answer feeds a destination picker, so being wrong here means offering the user a folder they
     /// cannot write to.
     ///
-    /// **This creates and removes a file rather than reading the mode bits.** `Permissions::
-    /// readonly()` answers "is every write bit clear", which is not the same question and misses
-    /// all three cases above: an `ro` mount still reports mode 0755, a root-owned 0755 directory
-    /// looks writable to an unprivileged process, and on Windows the read-only attribute is ignored
-    /// for directories entirely — so it would answer "writable" for essentially every local root.
-    /// std's own documentation warns it "cannot be relied upon to predict whether attempts to …
-    /// write the file will actually succeed". The only honest probe is to try, and trying costs
-    /// about what a `stat` does.
+    /// **Asks the kernel; does not write anything.** Both halves of that matter.
+    ///
+    /// *Not the mode bits*: `Permissions::readonly()` answers "is every write bit clear", which
+    /// misses all three cases above — an `ro` mount still reports mode 0755, and a root-owned 0755
+    /// directory looks writable to an unprivileged process. std's own docs warn it "cannot be
+    /// relied upon to predict whether attempts to … write the file will actually succeed".
+    /// `faccessat` answers the real question: it consults ownership, ACLs *and* mount flags
+    /// (`EROFS`). `AT_EACCESS` asks about the effective uid, which is the one that will do the
+    /// write. `X_OK` as well as `W_OK` because creating a file needs search permission on the
+    /// directory too.
+    ///
+    /// *And not a create-then-delete probe*, which was the obvious alternative and is a trap: this
+    /// runs on **every** source listing, and creating a file inside a watched source root makes the
+    /// watcher fire (`Create(File)`/`Remove(File)` are content changes) and debounce-rescan the
+    /// whole source. The web client invalidates its source list when a scan completes, which
+    /// refetches, which probes again — an endless rescan of a folder nobody touched.
     fn writable(&self) -> bool {
-        tempfile::Builder::new()
-            .prefix(".3dam-writable-")
-            .tempfile_in(&self.root)
-            .is_ok() // NamedTempFile removes itself on drop.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let Ok(path) = std::ffi::CString::new(self.root.as_os_str().as_bytes()) else {
+                return false; // an interior NUL cannot name a real directory
+            };
+            // SAFETY: `path` is a valid NUL-terminated C string that outlives the call, and
+            // `faccessat` only reads it.
+            unsafe {
+                libc::faccessat(
+                    libc::AT_FDCWD,
+                    path.as_ptr(),
+                    libc::W_OK | libc::X_OK,
+                    libc::AT_EACCESS,
+                ) == 0
+            }
+        }
+        // Windows has no cheap equivalent (the read-only attribute is ignored for directories, and
+        // a real answer means consulting the DACL), so this errs toward *offering* the destination
+        // and letting `put` report the failure. The alternative — probing by creating a file — is
+        // the rescan loop described above, which is a worse failure than an honest error at commit.
+        #[cfg(not(unix))]
+        {
+            self.root.is_dir()
+        }
     }
 
     fn mkdir(&self, rel_path: &str) -> Result<(), LibError> {
@@ -669,6 +698,28 @@ impl FileSource for LocalFsSource {
         tmp.as_file()
             .sync_all()
             .map_err(|e| LibError::Internal(format!("fsync {rel}: {e}")))?;
+
+        // Widen the mode *before* the rename, so the file is never visible at its real name with
+        // the wrong permissions.
+        //
+        // `tempfile` creates at 0600 — correct for a temp file, wrong for the asset it becomes. A
+        // source is a shared project folder whose other files are 0644; an uploaded texture only
+        // the server's uid can read is one nobody else on the machine, and no DCC tool running as
+        // another user, can open. Applying the umask (0666 &! umask) would be more faithful still,
+        // but reading the umask means temporarily setting it, which races every other thread in the
+        // process — so this takes the conventional default rather than a racy approximation of it.
+        //
+        // Through the open descriptor, not the path: the destination is a user-chosen directory
+        // that may be group- or world-writable, and a path-based `set_permissions` there could be
+        // redirected by someone swapping the temp name for a symlink between creation and this
+        // call. The fd already refers to the file we made, so there is nothing to redirect.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tmp.as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o644))
+                .map_err(|e| LibError::Internal(format!("chmod {rel}: {e}")))?;
+        }
 
         // `persist_noclobber` fails rather than replacing, which closes the TOCTOU window the
         // `exists()` check above leaves open: between that check and this call another writer
@@ -866,6 +917,10 @@ mod tests {
     /// clear". The two differ on the cases that actually occur: a directory owned by another user
     /// with mode 0755 reads as writable by every mode-bit check and is not.
     ///
+    /// It must also answer *without writing anything*, since it runs on every source listing and a
+    /// create-then-delete inside a watched root makes the watcher rescan the source — see the
+    /// second half of this test.
+    ///
     /// (Assumes a non-root test runner, as the rest of the suite does: root bypasses the permission
     /// check entirely and would genuinely be able to write here.)
     #[test]
@@ -883,10 +938,17 @@ mod tests {
             "a directory this process cannot create files in is not a destination"
         );
 
-        // And the probe leaves nothing behind: it is called on every source listing.
+        // The probe must not *touch* the tree, not merely tidy up after itself. This runs on every
+        // source listing, and `Create(File)` + `Remove(File)` both pass the watcher's
+        // `is_content_change` filter — so a create-then-delete probe inside a watched root triggers
+        // a debounced delta rescan, whose completion invalidates the client's source list, which
+        // refetches, which probes again. A folder nobody touched rescans forever.
         assert!(src.writable());
         let leftovers: Vec<_> = std::fs::read_dir(dir.path()).unwrap().flatten().collect();
-        assert!(leftovers.is_empty(), "the probe littered: {leftovers:?}");
+        assert!(
+            leftovers.is_empty(),
+            "the probe touched the tree: {leftovers:?}"
+        );
     }
 
     /// A scratch directory that does not exist is not an error worth failing startup over.
@@ -904,6 +966,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let src = LocalFsSource::new(dir.path());
         (dir, src)
+    }
+
+    /// An uploaded asset must be readable by more than the server's own uid.
+    ///
+    /// `tempfile` creates at 0600 and `persist` keeps the mode, so without an explicit widening a
+    /// file uploaded into a shared project folder is one no teammate — and no DCC tool running as
+    /// another user — can open. Only running a real upload and looking at the result surfaces this.
+    #[test]
+    #[cfg(unix)]
+    fn put_leaves_a_file_others_can_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, src) = local_root();
+        src.put("brick.png", &mut &b"pixels"[..]).unwrap();
+        let mode = std::fs::metadata(dir.path().join("brick.png"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o644, "got {mode:o}");
     }
 
     #[test]

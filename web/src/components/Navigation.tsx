@@ -25,6 +25,7 @@ import {
   Star,
   Sun,
   Trash2,
+  Upload as UploadIcon,
   WifiOff,
 } from "lucide-react";
 import {
@@ -222,6 +223,7 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
   const { confirm } = useDialogs();
   const { gate } = useWriteGate();
   const canAdmin = useCan("admin");
+  const canWrite = useCan("write");
   const [showAdd, setShowAdd] = useState(false);
   // Sharing (user accounts, issue #42): the Share… affordance is admin-only and needs the
   // `user_accounts` flag on — /api/version already reports it, so no extra query.
@@ -450,6 +452,18 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
       <div className="mt-auto" />
       {/* Light/dark theme (issue #62) — cycles system → light → dark, persisted. */}
       <ThemeToggle />
+      {/* Upload (issue #80). Absent, not disabled, for a caller without `write`: the whole surface
+          is a write action, so a greyed-out entry would only advertise something they can never do
+          — unlike a per-asset control, where the row still has a read purpose. */}
+      {canWrite && (
+        <Link
+          to="/upload"
+          onClick={onNavigate}
+          className="flex items-center gap-2 border-t border-border px-3 py-2 text-xs text-fg-dim hover:text-accent coarse:min-h-11"
+        >
+          <UploadIcon size={14} /> Upload assets
+        </Link>
+      )}
       {/* Duplicate / dedupe review (issue #8). */}
       <Link
         to="/duplicates"
