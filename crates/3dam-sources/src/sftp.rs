@@ -10,7 +10,7 @@
 //! (tech-spec 10 owns a real keyring later), and the server host key is trust-on-first-use
 //! (accepted) — a documented v1 limitation, revisited with the auth work.
 
-use crate::{guard_rel_path, temp_from_bytes, Fetched, FileEntry, FileSource, SftpConfig};
+use crate::{guard_rel_path, Fetched, FileEntry, FileSource, SftpConfig};
 use dam_api::LibError;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
@@ -34,12 +34,14 @@ pub struct SftpSource {
     cfg: SftpConfig,
     rt: Runtime,
     session: Mutex<russh_sftp::client::SftpSession>,
+    /// Where downloads are materialised (issue #87) — under the data dir, not the OS temp dir.
+    scratch: std::path::PathBuf,
     /// Keeps the SSH connection alive for as long as the source exists.
     _handle: Mutex<russh::client::Handle<Client>>,
 }
 
 impl SftpSource {
-    pub fn connect(cfg: SftpConfig) -> Result<SftpSource, LibError> {
+    pub fn connect(cfg: SftpConfig, scratch: std::path::PathBuf) -> Result<SftpSource, LibError> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -49,6 +51,7 @@ impl SftpSource {
             cfg,
             rt,
             session: Mutex::new(session),
+            scratch,
             _handle: Mutex::new(handle),
         })
     }
@@ -165,17 +168,41 @@ impl FileSource for SftpSource {
         Ok(())
     }
 
+    /// Download to a scratch file, **streaming** (issue #87).
+    ///
+    /// `SftpSession::read` returns the whole file as a `Vec<u8>`, which meant a remote asset was
+    /// held entirely in memory *and* then written to a tmpfs temp file — two full copies in RAM for
+    /// a file that may be gigabytes. `open` hands back an `AsyncRead` instead, so bytes go
+    /// chunk-by-chunk from the socket to disk and peak memory is one buffer.
     fn fetch(&self, rel_path: &str) -> Result<Fetched, LibError> {
         guard_rel_path(rel_path)?;
         let abs = self.remote_path(rel_path);
-        let bytes = self.rt.block_on(async {
+        let mut sink = crate::temp_sink(rel_path, &self.scratch)?;
+        self.rt.block_on(async {
+            use tokio::io::AsyncReadExt;
             let session = self.session.lock().await;
-            session
-                .read(abs.clone())
+            let mut remote = session
+                .open(abs.clone())
                 .await
-                .map_err(|e| LibError::SourceUnavailable(format!("read {abs}: {e}")))
+                .map_err(|e| LibError::SourceUnavailable(format!("open {abs}: {e}")))?;
+            let mut buf = vec![0u8; crate::FETCH_CHUNK];
+            loop {
+                let n = remote
+                    .read(&mut buf)
+                    .await
+                    .map_err(|e| LibError::SourceUnavailable(format!("read {abs}: {e}")))?;
+                if n == 0 {
+                    break;
+                }
+                // A blocking write inside `block_on` is fine here: this runtime is current-thread
+                // and private to the source, and the caller already handed off via `spawn_blocking`.
+                std::io::Write::write_all(&mut sink, &buf[..n])
+                    .map_err(|e| LibError::Internal(format!("scratch write: {e}")))?;
+            }
+            Ok::<(), LibError>(())
         })?;
-        temp_from_bytes(rel_path, &bytes)
+        std::io::Write::flush(&mut sink).ok();
+        Ok(Fetched::Temp(sink))
     }
 }
 

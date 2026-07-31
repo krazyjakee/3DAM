@@ -9,7 +9,7 @@
 //! Only the default SMB port is supported in v1 (share_connect resolves the server from the UNC);
 //! a non-default port is rejected up front rather than silently ignored.
 
-use crate::{guard_rel_path, temp_from_bytes, Fetched, FileEntry, FileSource, SmbConfig};
+use crate::{guard_rel_path, Fetched, FileEntry, FileSource, SmbConfig};
 use dam_api::LibError;
 use futures::StreamExt;
 use smb::resource::{Directory, Resource};
@@ -21,17 +21,17 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::runtime::Runtime;
 
-const READ_CHUNK: usize = 256 * 1024;
-
 pub struct SmbSource {
     cfg: SmbConfig,
     rt: Runtime,
     client: Client,
     unc: UncPath,
+    /// Where downloads are materialised (issue #87) — under the data dir, not the OS temp dir.
+    scratch: std::path::PathBuf,
 }
 
 impl SmbSource {
-    pub fn connect(cfg: SmbConfig) -> Result<SmbSource, LibError> {
+    pub fn connect(cfg: SmbConfig, scratch: std::path::PathBuf) -> Result<SmbSource, LibError> {
         if cfg.port != 445 {
             return Err(LibError::Unsupported(format!(
                 "SMB on a non-default port ({}) is not supported in this build",
@@ -66,6 +66,7 @@ impl SmbSource {
             rt,
             client,
             unc,
+            scratch,
         })
     }
 
@@ -124,11 +125,17 @@ impl FileSource for SmbSource {
         Ok(())
     }
 
+    /// Download to a scratch file, **streaming** (issue #87). The read loop already worked in
+    /// blocks; it used to accumulate them into one `Vec<u8>` that was then written out, so a large
+    /// asset sat in memory twice over. Now each block goes straight to disk.
     fn fetch(&self, rel_path: &str) -> Result<Fetched, LibError> {
         guard_rel_path(rel_path)?;
         let unc = self.unc_for(rel_path);
-        let bytes = self.rt.block_on(read_file(&self.client, &unc))?;
-        temp_from_bytes(rel_path, &bytes)
+        let mut sink = crate::temp_sink(rel_path, &self.scratch)?;
+        self.rt
+            .block_on(read_file_into(&self.client, &unc, &mut sink))?;
+        std::io::Write::flush(&mut sink).ok();
+        Ok(Fetched::Temp(sink))
     }
 }
 
@@ -168,8 +175,12 @@ async fn list_dir(
     Ok(out)
 }
 
-/// Read a whole remote file into memory (needed for the content hash anyway — §2.2).
-async fn read_file(client: &Client, unc: &UncPath) -> Result<Vec<u8>, LibError> {
+/// Copy a remote file block-by-block into `out`, never holding more than one block in memory.
+async fn read_file_into<W: std::io::Write>(
+    client: &Client,
+    unc: &UncPath,
+    out: &mut W,
+) -> Result<(), LibError> {
     let args = FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_read(true));
     let resource = client
         .create_file(unc, &args)
@@ -179,8 +190,7 @@ async fn read_file(client: &Client, unc: &UncPath) -> Result<Vec<u8>, LibError> 
         Resource::File(f) => f,
         _ => return Err(LibError::SourceUnavailable("smb path is not a file".into())),
     };
-    let mut out = Vec::new();
-    let mut buf = vec![0u8; READ_CHUNK];
+    let mut buf = vec![0u8; crate::FETCH_CHUNK];
     let mut pos: u64 = 0;
     loop {
         let n = file
@@ -190,11 +200,12 @@ async fn read_file(client: &Client, unc: &UncPath) -> Result<Vec<u8>, LibError> 
         if n == 0 {
             break;
         }
-        out.extend_from_slice(&buf[..n]);
+        out.write_all(&buf[..n])
+            .map_err(|e| LibError::Internal(format!("scratch write: {e}")))?;
         pos += n as u64;
     }
     let _ = file.close().await;
-    Ok(out)
+    Ok(())
 }
 
 /// Join a base dir and a source-relative path into a `\`-separated share path.

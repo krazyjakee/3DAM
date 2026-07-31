@@ -18,7 +18,11 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 /// Run a convert plan against the store. `dry_run` writes nothing.
-pub(crate) fn run_convert(store: &Store, req: ConvertRequest) -> Result<ConvertReport, LibError> {
+pub(crate) fn run_convert(
+    store: &Store,
+    req: ConvertRequest,
+    scratch: &Path,
+) -> Result<ConvertReport, LibError> {
     if req.output_dir.trim().is_empty() {
         return Err(LibError::BadRequest("output_dir is required".into()));
     }
@@ -56,6 +60,7 @@ pub(crate) fn run_convert(store: &Store, req: ConvertRequest) -> Result<ConvertR
             target_media,
             &ext,
             &mut backends,
+            scratch,
         );
         tally(&mut report, &item);
         report.items.push(item);
@@ -72,11 +77,12 @@ fn backend_for<'a>(
     store: &Store,
     backends: &'a mut Backends,
     source_id: &SourceId,
+    scratch: &Path,
 ) -> &'a Result<Arc<dyn dam_sources::FileSource>, String> {
     backends.entry(*source_id).or_insert_with(|| {
         let opened = store
             .get_source_connection(source_id)
-            .and_then(|c| dam_sources::open_source(&c));
+            .and_then(|c| dam_sources::open_source(&c, scratch));
         match opened {
             Ok(fs) => Ok(Arc::from(fs)),
             Err(e) => {
@@ -98,6 +104,7 @@ fn plan_and_maybe_encode(
     target_media: MediaType,
     ext: &str,
     backends: &mut Backends,
+    scratch: &Path,
 ) -> ConvertItemReport {
     // Resolve the asset + its on-disk source path.
     let asset = match store.get_asset(&input) {
@@ -196,7 +203,7 @@ fn plan_and_maybe_encode(
     // Commit. Materialise the input locally first (issue #48): in place for a local source, a temp
     // download for SFTP/SMB. Non-destructive either way — `fetch` only ever reads, and the output
     // still goes to `output_dir` via temp→atomic-rename, never back to the source (§5.1).
-    let fetched = match backend_for(store, backends, &asset.source_id) {
+    let fetched = match backend_for(store, backends, &asset.source_id, scratch) {
         Ok(fs) => match fs.fetch(&asset.path) {
             Ok(f) => f,
             Err(e) => {

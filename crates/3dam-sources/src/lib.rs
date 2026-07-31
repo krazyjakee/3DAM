@@ -201,17 +201,32 @@ impl SourceConnection {
 }
 
 /// Build the concrete backend for a connection. Remote kinds require the matching crate feature.
-pub fn open_source(conn: &SourceConnection) -> Result<Box<dyn FileSource>, LibError> {
+/// `scratch` is where a remote backend materialises downloaded bytes (issue #87). It is a required
+/// positional argument rather than an option with a default, for the same reason `Visibility` is:
+/// the sensible-looking default (`std::env::temp_dir()`) is the wrong one on most Linux hosts, and a
+/// caller that inherited it by omission would reintroduce the bug in silence. Local sources ignore
+/// it — they never copy anything.
+pub fn open_source(
+    conn: &SourceConnection,
+    scratch: &Path,
+) -> Result<Box<dyn FileSource>, LibError> {
+    let _ = scratch; // only the remote backends materialise bytes
     match conn {
         SourceConnection::LocalFs { root } => Ok(Box::new(LocalFsSource::new(root))),
         #[cfg(feature = "sftp")]
-        SourceConnection::Sftp(cfg) => Ok(Box::new(sftp::SftpSource::connect(cfg.clone())?)),
+        SourceConnection::Sftp(cfg) => Ok(Box::new(sftp::SftpSource::connect(
+            cfg.clone(),
+            scratch.to_path_buf(),
+        )?)),
         #[cfg(not(feature = "sftp"))]
         SourceConnection::Sftp(_) => Err(LibError::Unsupported(
             "SFTP support is not compiled into this build".into(),
         )),
         #[cfg(feature = "smb")]
-        SourceConnection::Smb(cfg) => Ok(Box::new(smb::SmbSource::connect(cfg.clone())?)),
+        SourceConnection::Smb(cfg) => Ok(Box::new(smb::SmbSource::connect(
+            cfg.clone(),
+            scratch.to_path_buf(),
+        )?)),
         #[cfg(not(feature = "smb"))]
         SourceConnection::Smb(_) => Err(LibError::Unsupported(
             "SMB support is not compiled into this build".into(),
@@ -363,24 +378,87 @@ pub(crate) fn guard_rel_path(rel_path: &str) -> Result<(), LibError> {
     Ok(())
 }
 
-/// Materialise remote bytes into a temp file suffixed with the entry's logical extension.
+/// Transfer buffer for a streaming remote fetch. This is now the *whole* memory cost of downloading
+/// an asset, however large it is (issue #87) — 256 KiB is big enough to keep a network round-trip
+/// amortised and small enough that a pool of concurrent fetches is still nothing.
+pub(crate) const FETCH_CHUNK: usize = 256 * 1024;
+
+/// Filename prefix every remote download carries. Also what [`clean_scratch`] matches on, so the
+/// two must agree — a rename here silently orphans whatever a previous build left behind.
+pub(crate) const SCRATCH_PREFIX: &str = "3dam-remote-";
+
+/// Open a temp file for a remote download, **inside the engine's scratch directory**.
+///
+/// The directory matters (issue #87): `tempfile`'s default is `std::env::temp_dir()`, which on most
+/// Linux distributions is a tmpfs — RAM backed by swap. That was harmless when this seam only
+/// carried small files, and stopped being harmless once video became a media type and analyse and
+/// convert started fetching remote bytes too. `scratch` is a directory under the user's data dir,
+/// which they chose and which is real disk.
+///
+/// Falls back to the OS temp dir if `scratch` is unusable — a read-only or missing data dir should
+/// degrade to the old behaviour, not fail the fetch.
+///
+/// The suffix preserves the entry's logical extension so extension-keyed detection (tech-spec 04 §7)
+/// still works on a file whose stem is random.
 #[cfg(any(feature = "sftp", feature = "smb"))]
-pub(crate) fn temp_from_bytes(rel_path: &str, bytes: &[u8]) -> Result<Fetched, LibError> {
-    use std::io::Write;
+pub(crate) fn temp_sink(
+    rel_path: &str,
+    scratch: &Path,
+) -> Result<tempfile::NamedTempFile, LibError> {
     let suffix = Path::new(rel_path)
         .extension()
         .and_then(|e| e.to_str())
         .map(|e| format!(".{e}"))
         .unwrap_or_default();
-    let mut file = tempfile::Builder::new()
-        .prefix("3dam-remote-")
-        .suffix(&suffix)
-        .tempfile()
-        .map_err(|e| LibError::Internal(format!("temp file: {e}")))?;
-    file.write_all(bytes)
-        .map_err(|e| LibError::Internal(format!("temp write: {e}")))?;
-    file.flush().ok();
-    Ok(Fetched::Temp(file))
+    let build = || {
+        tempfile::Builder::new()
+            .prefix(SCRATCH_PREFIX)
+            .suffix(&suffix)
+            .tempfile_in(scratch)
+    };
+    match build() {
+        Ok(f) => Ok(f),
+        Err(e) => {
+            tracing::warn!(
+                scratch = %scratch.display(),
+                error = %e,
+                "scratch dir unusable; falling back to the OS temp dir"
+            );
+            tempfile::Builder::new()
+                .prefix(SCRATCH_PREFIX)
+                .suffix(&suffix)
+                .tempfile()
+                .map_err(|e| LibError::Internal(format!("temp file: {e}")))
+        }
+    }
+}
+
+/// Delete stale remote downloads left in `scratch` by a previous run.
+///
+/// [`Fetched::Temp`] removes its file on drop, which covers every normal path — but not a kill -9,
+/// a panic-abort, or a power cut mid-fetch. Without this, a crash during a large remote pass leaves
+/// multi-gigabyte files sitting in the data dir with nothing that will ever collect them.
+///
+/// Deliberately unfiltered by age: this runs at engine open, and any `3dam-remote-*` file present at
+/// that moment belongs to a process that is no longer running. (Two engines sharing one data dir
+/// would race here — but they already race on `library.db`'s write lock, so that is not a new
+/// constraint.) Best-effort: a scratch directory we cannot read is not worth failing to start over.
+pub fn clean_scratch(scratch: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(scratch) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with(SCRATCH_PREFIX) && std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        tracing::info!(removed, "cleared orphaned remote downloads from scratch");
+    }
+    removed
 }
 
 // ── local filesystem source ───────────────────────────────────────────────────────────────────
@@ -519,5 +597,73 @@ mod tests {
     fn rejects_traversal() {
         assert!(guard_rel_path("../etc/passwd").is_err());
         assert!(guard_rel_path("a/b/c.png").is_ok());
+    }
+
+    /// The point of issue #87: a download must land in the *given* directory, not
+    /// `std::env::temp_dir()`. On most Linux hosts the latter is a tmpfs, so a multi-gigabyte
+    /// remote video would be written into RAM.
+    #[test]
+    #[cfg(any(feature = "sftp", feature = "smb"))]
+    fn a_download_lands_in_the_given_scratch_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = temp_sink("Textures/brick_wall.png", dir.path()).unwrap();
+        assert_eq!(
+            f.path().parent(),
+            Some(dir.path()),
+            "download escaped the scratch dir"
+        );
+        // The logical extension survives, so extension-keyed detection still works on a file whose
+        // stem is random (tech-spec 04 §7).
+        assert_eq!(
+            f.path().extension().and_then(|e| e.to_str()),
+            Some("png"),
+            "logical extension lost: {}",
+            f.path().display()
+        );
+        assert!(f
+            .path()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with(SCRATCH_PREFIX));
+    }
+
+    /// An unusable scratch dir degrades to the OS temp dir rather than failing the fetch — a
+    /// read-only or missing data dir should cost you the tmpfs fix, not the download.
+    #[test]
+    #[cfg(any(feature = "sftp", feature = "smb"))]
+    fn an_unusable_scratch_dir_falls_back_instead_of_failing() {
+        let missing = Path::new("/nonexistent-3dam-scratch-cf81/nope");
+        let f = temp_sink("a.bin", missing).expect("fetch must not fail on a bad scratch dir");
+        assert_ne!(f.path().parent(), Some(missing));
+    }
+
+    /// `Fetched::Temp` cleans up on drop, which covers every normal path but not a kill -9 mid-fetch.
+    /// Without the startup sweep, a crash during a large remote pass strands gigabytes in the data
+    /// dir with nothing that will ever collect them.
+    #[test]
+    fn clean_scratch_removes_orphans_and_leaves_everything_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let orphan = dir.path().join(format!("{SCRATCH_PREFIX}abc123.mp4"));
+        let innocent = dir.path().join("library.db");
+        std::fs::write(&orphan, b"stranded").unwrap();
+        std::fs::write(&innocent, b"precious").unwrap();
+
+        assert_eq!(clean_scratch(dir.path()), 1);
+        assert!(!orphan.exists(), "orphaned download survived the sweep");
+        assert!(
+            innocent.exists(),
+            "the sweep must only ever match its own prefix"
+        );
+    }
+
+    /// A scratch directory that does not exist is not an error worth failing startup over.
+    #[test]
+    fn clean_scratch_tolerates_a_missing_dir() {
+        assert_eq!(
+            clean_scratch(Path::new("/nonexistent-3dam-scratch-cf81")),
+            0
+        );
     }
 }

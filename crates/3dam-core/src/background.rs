@@ -118,9 +118,10 @@ impl EmbeddedLibrary {
         let model = self.semantic.clone();
         let pool = self.bg_pool.clone();
         let governor = self.governor.clone();
+        let scratch = self.scratch();
         let outcome = tokio::task::spawn_blocking(move || {
             crate::analysis::run_analyze(
-                store, events, job, targets, cancel, model, &pool, &governor,
+                store, events, job, targets, cancel, model, &pool, &governor, &scratch,
             );
         })
         .await;

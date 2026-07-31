@@ -76,6 +76,7 @@ pub(crate) fn run_analyze(
     model: Option<Arc<dyn crate::semantic::SemanticModel>>,
     pool: &rayon::ThreadPool,
     governor: &crate::resources::Governor,
+    scratch: &Path,
 ) {
     let total = targets.len() as u64;
     let _ = store.update_job_progress(&job, JobState::Running, 0, Some(total), None);
@@ -90,7 +91,7 @@ pub(crate) fn run_analyze(
     // A source that won't open (host down, credentials rotated) is recorded here, not raised: its
     // assets each fail their own item below, exactly like an undecodable file. Degrade one edge, not
     // the job — golden rule 6.
-    let backends = open_backends(&store, &targets);
+    let backends = open_backends(&store, &targets, scratch);
 
     // Run on the bounded background pool (not the global rayon pool) so a whole-library pass leaves
     // cores free for interactive inspector reads instead of pinning every core (tech-spec 14).
@@ -159,13 +160,14 @@ pub(crate) fn run_analyze(
 fn open_backends(
     store: &Store,
     targets: &[AnalysisTarget],
+    scratch: &Path,
 ) -> HashMap<dam_api::id::SourceId, Result<Arc<dyn dam_sources::FileSource>, String>> {
     let mut out: HashMap<_, Result<Arc<dyn dam_sources::FileSource>, String>> = HashMap::new();
     for t in targets {
         if out.contains_key(&t.source_id) {
             continue;
         }
-        let entry = match dam_sources::open_source(&t.connection) {
+        let entry = match dam_sources::open_source(&t.connection, scratch) {
             Ok(fs) => Ok(Arc::from(fs)),
             Err(e) => {
                 let msg = e.to_string();

@@ -115,7 +115,7 @@ fn gen_thumbnail(
 
     // Cache miss: resolve the source file (in place for local, downloaded for remote). `fetch`
     // guards `..` traversal out of the source root.
-    let fetched = fetch_asset(store, asset)?;
+    let fetched = fetch_asset(store, asset, &paths::scratch_dir(data_dir))?;
     let det = dam_media::Detected {
         media: asset.summary.media,
         format: asset.summary.format.clone(),
@@ -235,7 +235,7 @@ fn gen_model_preview_impl(
         return Ok(preview_content(bytes)); // cache hit → no source access at all
     }
 
-    let fetched = fetch_asset(store, asset)?;
+    let fetched = fetch_asset(store, asset, &paths::scratch_dir(data_dir))?;
     let bytes =
         dam_render::model_preview_blob(fetched.path(), &asset.summary.format).map_err(|e| {
             if matches!(e, dam_render::RenderError::Decode(_)) {
@@ -320,23 +320,31 @@ fn map_handler_err(e: dam_media::HandlerError) -> LibError {
 
 /// Rebuild the asset's source backend and resolve its bytes to a local path (in place for local,
 /// downloaded to a temp file for SFTP/SMB). Traversal-guarded inside `fetch`. Pure/blocking.
-fn fetch_asset(store: &Store, asset: &Asset) -> Result<dam_sources::Fetched, LibError> {
+fn fetch_asset(
+    store: &Store,
+    asset: &Asset,
+    scratch: &Path,
+) -> Result<dam_sources::Fetched, LibError> {
     let conn = store.get_source_connection(&asset.source_id)?;
-    let fs = dam_sources::open_source(&conn)?;
+    let fs = dam_sources::open_source(&conn, scratch)?;
     fs.fetch(&asset.path)
 }
 
 /// Read an asset's bytes for a preview, bounded by the content cap. The size gate is checked
 /// against the stored size *before* any (possibly remote) fetch, so an oversized asset never
 /// triggers a download. Pure/blocking — called inside a `spawn_blocking` closure.
-fn read_asset_content(store: &Store, asset: &Asset) -> Result<AssetContent, LibError> {
+fn read_asset_content(
+    store: &Store,
+    asset: &Asset,
+    scratch: &Path,
+) -> Result<AssetContent, LibError> {
     let size = asset.summary.size;
     if size > MAX_CONTENT_BYTES {
         return Err(LibError::Unsupported(format!(
             "asset is {size} bytes; preview content is capped at {MAX_CONTENT_BYTES} bytes"
         )));
     }
-    let fetched = fetch_asset(store, asset)?;
+    let fetched = fetch_asset(store, asset, scratch)?;
     let abs = fetched.path();
     let bytes = std::fs::read(abs)
         .map_err(|e| LibError::Internal(format!("read {}: {e}", abs.display())))?;
@@ -387,10 +395,15 @@ fn resolve_sibling(base: &str, rel: &str) -> Result<String, LibError> {
 
 /// Read a file relative to `asset`'s directory within the same source, bounded by the content cap.
 /// Pure/blocking — called inside a `spawn_blocking` closure. Powers loose-glTF external buffers (#56).
-fn read_related_content(store: &Store, asset: &Asset, rel: &str) -> Result<AssetContent, LibError> {
+fn read_related_content(
+    store: &Store,
+    asset: &Asset,
+    rel: &str,
+    scratch: &Path,
+) -> Result<AssetContent, LibError> {
     let target = resolve_sibling(&asset.path, rel)?;
     let conn = store.get_source_connection(&asset.source_id)?;
-    let fs = dam_sources::open_source(&conn)?;
+    let fs = dam_sources::open_source(&conn, scratch)?;
     let fetched = fs.fetch(&target)?;
     let abs = fetched.path();
     let meta = std::fs::metadata(abs)
@@ -454,6 +467,15 @@ impl EmbeddedLibrary {
         resources: ResourceOptions,
     ) -> Result<EmbeddedLibrary, LibError> {
         let resources = resources.or_env();
+        // Scratch for remote downloads (issue #87). Created up front so `temp_sink` never has to,
+        // and swept of anything a previous run left behind: `Fetched::Temp` cleans up on drop, but
+        // a kill -9 mid-fetch can strand a multi-gigabyte file with nothing to collect it.
+        let scratch = paths::scratch_dir(data_dir);
+        if let Err(e) = std::fs::create_dir_all(&scratch) {
+            tracing::warn!(dir = %scratch.display(), error = %e, "could not create scratch dir; remote fetches will fall back to the OS temp dir");
+        } else {
+            dam_sources::clean_scratch(&scratch);
+        }
         let dir = data_dir.to_path_buf();
         let store = tokio::task::spawn_blocking(move || Store::open(&dir))
             .await
@@ -471,6 +493,7 @@ impl EmbeddedLibrary {
             events.clone(),
             tokio::runtime::Handle::current(),
             governor.clone(),
+            scratch.clone(),
         );
         // NB: watchers are *not* started here. Auto-rescan only makes sense for long-running roles
         // (serve/mcp), which call `start_watchers()` explicitly. A run-and-exit CLI command must not
@@ -520,6 +543,12 @@ impl EmbeddedLibrary {
     /// stall startup.
     pub fn start_watchers(&self) {
         self.watchers.start_all();
+    }
+
+    /// Where remote fetches materialise their bytes (issue #87) — real disk under the data dir,
+    /// never the OS temp dir. Cheap to recompute; handed to every `open_source` call.
+    fn scratch(&self) -> PathBuf {
+        paths::scratch_dir(&self.data_dir)
     }
 
     /// Run a synchronous store operation on the blocking pool (tech-spec 14).
@@ -910,10 +939,11 @@ impl LibraryService for EmbeddedLibrary {
     ) -> Result<AssetContent, LibError> {
         self.require_asset_visible(ctx, id).await?;
         let id = *id;
+        let scratch = self.scratch();
         let local = self
             .db(move |s| {
                 let asset = s.get_asset(&id)?;
-                read_asset_content(s, &asset)
+                read_asset_content(s, &asset, &scratch)
             })
             .await;
         match local {
@@ -936,10 +966,11 @@ impl LibraryService for EmbeddedLibrary {
         let id = *id;
         let rel = rel.to_string();
         let rel2 = rel.clone();
+        let scratch = self.scratch();
         let local = self
             .db(move |s| {
                 let asset = s.get_asset(&id)?;
-                read_related_content(s, &asset, &rel2)
+                read_related_content(s, &asset, &rel2, &scratch)
             })
             .await;
         match local {
@@ -1103,7 +1134,9 @@ impl LibraryService for EmbeddedLibrary {
                 self.require_asset_visible(ctx, id).await?;
             }
         }
-        self.db(move |s| convert::run_convert(s, req)).await
+        let scratch = self.scratch();
+        self.db(move |s| convert::run_convert(s, req, &scratch))
+            .await
     }
 
     async fn list_sources(&self, ctx: &AuthContext) -> Result<Vec<SourceInfo>, LibError> {
@@ -1449,8 +1482,11 @@ impl LibraryService for EmbeddedLibrary {
         let store = self.store.clone();
         let events = self.events.clone();
         let governor = self.governor.clone();
+        let scratch = self.scratch();
         tokio::task::spawn_blocking(move || {
-            scan::run_scan(store, events, job, sources, mode, cancel, &governor);
+            scan::run_scan(
+                store, events, job, sources, mode, cancel, &governor, &scratch,
+            );
         });
 
         Ok(job)
@@ -1489,8 +1525,11 @@ impl LibraryService for EmbeddedLibrary {
         let model = self.semantic.clone();
         let pool = self.bg_pool.clone();
         let governor = self.governor.clone();
+        let scratch = self.scratch();
         tokio::task::spawn_blocking(move || {
-            analysis::run_analyze(store, events, job, targets, cancel, model, &pool, &governor);
+            analysis::run_analyze(
+                store, events, job, targets, cancel, model, &pool, &governor, &scratch,
+            );
         });
         Ok(job)
     }

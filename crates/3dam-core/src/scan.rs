@@ -22,6 +22,7 @@ use tokio::sync::broadcast;
 
 const PROGRESS_EVERY: u64 = 16;
 
+#[allow(clippy::too_many_arguments)] // the job runner's full context; a struct would just rename it
 pub(crate) fn run_scan(
     store: Arc<Store>,
     events: broadcast::Sender<LibraryEvent>,
@@ -30,6 +31,7 @@ pub(crate) fn run_scan(
     mode: ScanMode,
     cancel: Arc<AtomicBool>,
     governor: &crate::resources::Governor,
+    scratch: &Path,
 ) {
     // Establish the progress denominator up front so the job shows a real percentage + ETA rather
     // than an indeterminate bar. A **full** scan re-reads every file (and new files matter), so we
@@ -40,7 +42,7 @@ pub(crate) fn run_scan(
     // listed): off only by files added/removed since the last scan, and the bar clamps at 100%.
     // `None` ⇒ nothing countable ⇒ indeterminate bar, which still works.
     let total = match mode {
-        ScanMode::Full => count_total(&store, &sources, &cancel),
+        ScanMode::Full => count_total(&store, &sources, &cancel, scratch),
         ScanMode::Delta => {
             let n: u64 = sources.iter().map(|s| s.stats.asset_count).sum();
             (n > 0).then_some(n)
@@ -69,7 +71,7 @@ pub(crate) fn run_scan(
                 continue;
             }
         };
-        let fs = match open_source(&conn) {
+        let fs = match open_source(&conn, scratch) {
             Ok(fs) => fs,
             Err(e) => {
                 let _ = store.set_source_error(&sid, &e.to_string());
@@ -330,7 +332,12 @@ fn key_attrs_of(attrs: &MediaAttributes) -> SmallMap {
 /// is simply left out of the estimate (the main pass reports its actual error); if nothing can be
 /// counted we return `None` and the job falls back to an indeterminate bar. Walks only list metadata
 /// (no byte fetch/hash), so this is far cheaper than the main pass it precedes.
-fn count_total(store: &Store, sources: &[SourceInfo], cancel: &AtomicBool) -> Option<u64> {
+fn count_total(
+    store: &Store,
+    sources: &[SourceInfo],
+    cancel: &AtomicBool,
+    scratch: &Path,
+) -> Option<u64> {
     let mut total: u64 = 0;
     let mut counted_any = false;
     for src in sources {
@@ -343,7 +350,7 @@ fn count_total(store: &Store, sources: &[SourceInfo], cancel: &AtomicBool) -> Op
         let Ok(conn) = store.get_source_connection(&src.id) else {
             continue;
         };
-        let Ok(fs) = open_source(&conn) else {
+        let Ok(fs) = open_source(&conn, scratch) else {
             continue;
         };
         let mut n: u64 = 0;
