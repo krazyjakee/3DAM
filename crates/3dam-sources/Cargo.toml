@@ -28,6 +28,11 @@ russh = { workspace = true, optional = true }
 russh-sftp = { workspace = true, optional = true }
 smb = { workspace = true, optional = true }
 
+[dev-dependencies]
+# The in-process SFTP test server (tests/support) binds a real loopback listener, so the test
+# build needs tokio's `net` on top of the feature set the library itself uses.
+tokio = { workspace = true, features = ["net"] }
+
 # `faccessat` for the upload writability probe (issue #80) — see `LocalFsSource::writable`.
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

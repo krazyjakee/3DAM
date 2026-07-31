@@ -290,16 +290,28 @@ pub fn open_source(
 /// login — a sidebar would become N logins against hosts that may be asleep. So remote kinds answer
 /// statically here rather than being opened.
 ///
-/// That static answer is *currently correct*, not merely cheap: neither remote backend implements
-/// the write side yet, so both inherit `FileSource::writable`'s `false`. **When slice 7 lands SFTP
-/// and SMB writes, this function is the one that must learn about it** — otherwise uploads would
-/// start succeeding through `run_upload` (which asks the opened source) while the picker kept
-/// hiding those destinations, and nothing would fail to compile to say so.
+/// **The remote answer is a capability, not a probe** (slice 7). SFTP and SMB now implement the
+/// write side, so they report `true` — meaning "this kind can be written to", not "this credential
+/// can write here". Whether the account actually has permission is settled by the first `put`,
+/// which fails with a clear error. That is a real step down from the local answer, and it is the
+/// price of not opening a connection per source per render: the alternative is a sidebar that
+/// stalls on a sleeping NAS to answer a question the upload itself will answer anyway.
+///
+/// The failure mode this leaves is one file failing where the picker implied it would work — which
+/// is exactly what the per-file, fail-soft upload transport was built to absorb.
+/// Feature-gated per kind, because a backend compiled out cannot write any more than one that was
+/// never implemented — `open_source` answers `Unsupported` for both, and the picker should say so
+/// the same way.
 pub fn writable_without_handshake(conn: &SourceConnection) -> bool {
     match conn {
         // The only kind whose answer varies, and the only one cheap enough to ask for real.
         SourceConnection::LocalFs { root } => LocalFsSource::new(root).writable(),
-        SourceConnection::Sftp(_) | SourceConnection::Smb(_) => false,
+        SourceConnection::Sftp(_) => cfg!(feature = "sftp"),
+        // The port check mirrors `SmbSource::connect`, which refuses a non-default port outright.
+        // Offering such a source would not be the documented "the credential might lack permission"
+        // trade-off — it is a build-level impossibility, knowable here without a handshake, and
+        // every file in the drop would fail with `Unsupported` rather than anything actionable.
+        SourceConnection::Smb(cfg) => cfg!(feature = "smb") && cfg.port == 445,
         // A peer's library is never a destination — it yields catalog rows, not a writable tree.
         SourceConnection::Federated(_) => false,
     }
@@ -1066,10 +1078,11 @@ mod tests {
         assert!(src.mkdir("../escape").is_err());
     }
 
-    /// A source kind that has not opted in stays read-only — the default that makes adding a
-    /// backend safe rather than accidentally writable.
+    /// A backend that has not opted in stays read-only — the default that makes *adding* a source
+    /// kind safe rather than accidentally writable. (SFTP and SMB have since opted in explicitly;
+    /// this pins the default they had to override, not their current answer.)
     #[test]
-    fn remote_backends_are_not_writable_yet() {
+    fn a_backend_that_does_not_opt_in_is_read_only() {
         struct ReadOnly;
         impl FileSource for ReadOnly {
             fn walk(

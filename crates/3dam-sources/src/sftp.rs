@@ -204,6 +204,225 @@ impl FileSource for SftpSource {
         std::io::Write::flush(&mut sink).ok();
         Ok(Fetched::Temp(sink))
     }
+
+    // ── write side (issue #80 slice 7) ───────────────────────────────────────
+
+    /// The *kind* can be written to; whether this credential can is settled by [`Self::put`].
+    ///
+    /// Unlike the local backend, which answers by asking the kernel, there is no way to test remote
+    /// write access without a round trip — and this is consulted for every source in a listing. See
+    /// [`crate::writable_without_handshake`] for why that budget matters. Answering `true` here
+    /// means the destination picker offers the source and the *first* file reports a permission
+    /// problem, rather than all of them failing after the user has dropped two hundred.
+    fn writable(&self) -> bool {
+        true
+    }
+
+    fn mkdir(&self, rel_path: &str) -> Result<(), LibError> {
+        let rel = crate::safe_name::check_rel_path(rel_path)?;
+        // Idempotent, like the local impl and like `mkdir -p`: every ancestor is created, and one
+        // that already exists is success. SFTP has no `create_dir_all`, so walk the components —
+        // and swallow *each* failure, because "already exists" is not distinguishable from a real
+        // error in SSH_FX_FAILURE. A genuine problem surfaces on the `put` that follows.
+        let mut acc = String::new();
+        for seg in rel.split('/') {
+            if !acc.is_empty() {
+                acc.push('/');
+            }
+            acc.push_str(seg);
+            let abs = self.remote_path(&acc);
+            let _ = self.rt.block_on(async {
+                let session = self.session.lock().await;
+                session.create_dir(abs).await
+            });
+        }
+        // Confirm the leaf really is there, so a caller is not told a directory exists when the
+        // whole walk silently failed.
+        let abs = self.remote_path(&rel);
+        self.rt.block_on(async {
+            let session = self.session.lock().await;
+            session
+                .metadata(abs.clone())
+                .await
+                .map_err(|e| LibError::SourceUnavailable(format!("mkdir {abs}: {e}")))
+                .and_then(|m| {
+                    if m.is_dir() {
+                        Ok(())
+                    } else {
+                        Err(LibError::Conflict(format!(
+                            "{rel} exists and is not a folder"
+                        )))
+                    }
+                })
+        })
+    }
+
+    /// Create a **new** remote file, streaming from `bytes`.
+    ///
+    /// Two protocol facts carry the non-destructive invariant here, and neither is a convention we
+    /// have to remember:
+    ///
+    /// 1. **`CREATE | EXCLUDE` is SFTP's `O_EXCL`** — the server itself refuses if the name is
+    ///    taken, atomically. That is what reserves the `.part` name against a second uploader.
+    /// 2. **`SSH_FXP_RENAME` is specified to fail when the destination exists**
+    ///    (draft-ietf-secsh-filexfer-02 §6.5), unlike POSIX `rename(2)` which replaces silently.
+    ///
+    /// The `.part`-then-rename shape is what keeps a crash from leaving a half-written file at the
+    /// real name for the next scan to catalogue as a truncated asset.
+    ///
+    /// **The one honest caveat**: fact 2 is the server's to honour, and we cannot verify it from
+    /// here. OpenSSH implements it as stat-then-rename, which is spec-correct but not atomic, so a
+    /// file appearing in that window would be replaced. The pre-check below closes the ordinary
+    /// case; a server that implements rename with POSIX overwrite semantics would defeat both. This
+    /// is strictly weaker than the local backend's `persist_noclobber`, and it is weaker because of
+    /// the protocol, not the implementation.
+    fn put(&self, rel_path: &str, bytes: &mut dyn std::io::Read) -> Result<(), LibError> {
+        use russh_sftp::protocol::OpenFlags;
+        use tokio::io::AsyncWriteExt;
+
+        let rel = crate::safe_name::check_rel_path(rel_path)?;
+        let abs = self.remote_path(&rel);
+        // A *unique* staging name, not `{abs}.3dam-part`. A fixed one would be a shared resource:
+        // an orphan left by a `kill -9` would make that filename permanently un-uploadable, since
+        // every retry would hit the `EXCLUDE` reservation and fail with an error the user cannot
+        // act on — and two concurrent uploads of the same name would collide on the staging file
+        // rather than on the destination, which is where the collision belongs.
+        let part = format!("{abs}.{}.3dam-part", stage_nonce());
+
+        self.rt.block_on(async {
+            let session = self.session.lock().await;
+
+            // Cheap, clear rejection before transferring anything. Not the guarantee — that is the
+            // rename — but it turns the common case into a `Conflict` the user can act on rather
+            // than a transfer that is thrown away at the end.
+            if session.try_exists(abs.clone()).await.unwrap_or(false) {
+                return Err(LibError::Conflict(format!("{rel} already exists")));
+            }
+
+            // Create the parent chain, as the local backend does — and only now, *after* the name
+            // has been found free, so a *collision* creates nothing at all. Upload relies on that:
+            // it deliberately does not call `mkdir` first. Levels created here are rolled back
+            // below if the transfer itself then fails.
+            let mut made: Vec<String> = Vec::new();
+            if let (Some(dir), _) = crate::safe_name::split_parent(&rel) {
+                let mut acc = String::new();
+                for seg in dir.split('/') {
+                    if !acc.is_empty() {
+                        acc.push('/');
+                    }
+                    acc.push_str(seg);
+                    // Ignored per level: SFTP reports "already exists" as an undifferentiated
+                    // failure, so the only honest test is whether the `.part` open below works.
+                    if session.create_dir(self.remote_path(&acc)).await.is_ok() {
+                        made.push(acc.clone());
+                    }
+                }
+            }
+
+            // `CREATE | EXCLUDE` on a name we just minted: this can only fail for a real reason,
+            // never because a previous attempt left something behind.
+            let opened = session
+                .open_with_flags(
+                    part.clone(),
+                    OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE,
+                )
+                .await;
+            let mut remote = match opened {
+                Ok(f) => f,
+                Err(e) => {
+                    rollback_dirs(&session, self, &made).await;
+                    return Err(LibError::SourceUnavailable(format!(
+                        "create staging {rel}: {e}"
+                    )));
+                }
+            };
+
+            // Stream: peak memory is one buffer whatever the file's size, matching `fetch`.
+            let mut buf = vec![0u8; crate::FETCH_CHUNK];
+            let outcome = async {
+                loop {
+                    let n = bytes
+                        .read(&mut buf)
+                        .map_err(|e| LibError::Internal(format!("read staged bytes: {e}")))?;
+                    if n == 0 {
+                        break;
+                    }
+                    remote
+                        .write_all(&buf[..n])
+                        .await
+                        .map_err(|e| LibError::SourceUnavailable(format!("write {rel}: {e}")))?;
+                }
+                remote
+                    .flush()
+                    .await
+                    .map_err(|e| LibError::SourceUnavailable(format!("flush {rel}: {e}")))?;
+                remote
+                    .shutdown()
+                    .await
+                    .map_err(|e| LibError::SourceUnavailable(format!("close {rel}: {e}")))?;
+                Ok::<(), LibError>(())
+            }
+            .await;
+
+            // Close the handle *before* unlinking. A POSIX server is happy to remove an open file,
+            // but Windows servers refuse with a sharing violation — which would leave the staging
+            // file behind on exactly the platform where that is hardest to notice.
+            let _ = remote.shutdown().await;
+            drop(remote);
+
+            if let Err(e) = outcome {
+                let _ = session.remove_file(part.clone()).await;
+                rollback_dirs(&session, self, &made).await;
+                return Err(e);
+            }
+
+            match session.rename(part.clone(), abs.clone()).await {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    let _ = session.remove_file(part.clone()).await;
+                    rollback_dirs(&session, self, &made).await;
+                    // A spec-compliant server refuses the rename precisely because the name was
+                    // taken in the meantime — which is a collision, not a transport failure, and
+                    // the caller's `Suffix`/`Skip` handling keys off that distinction.
+                    if session.try_exists(abs.clone()).await.unwrap_or(false) {
+                        Err(LibError::Conflict(format!("{rel} already exists")))
+                    } else {
+                        Err(LibError::SourceUnavailable(format!("commit {rel}: {e}")))
+                    }
+                }
+            }
+        })
+    }
+}
+
+/// A per-attempt token for the staging filename — process id plus a monotonic counter, which is
+/// enough to be unique among every attempt this process makes and every other process on the host.
+/// It does not need to be unguessable: the name is `EXCLUDE`-created, so a guess cannot hijack it.
+fn stage_nonce() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Remove directory levels this `put` created, deepest first, after it failed.
+///
+/// Best-effort and deliberately narrow: `remove_dir` fails on a non-empty directory, which is
+/// exactly the guard wanted — anything another upload has since put in there stops the rollback
+/// dead rather than taking someone else's file with it.
+async fn rollback_dirs(
+    session: &russh_sftp::client::SftpSession,
+    src: &SftpSource,
+    made: &[String],
+) {
+    for rel in made.iter().rev() {
+        if session.remove_dir(src.remote_path(rel)).await.is_err() {
+            break; // non-empty (or refused): every shallower level is non-empty too
+        }
+    }
 }
 
 /// Join a base directory and a source-relative path into a `/`-separated remote path.

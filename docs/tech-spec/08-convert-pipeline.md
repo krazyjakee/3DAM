@@ -475,6 +475,28 @@ why the "already exists" failure is `Conflict` and not `BadRequest` — a caller
 tell "that name is taken" (recoverable) from "that name is malformed" (never retry) without
 matching on message text.
 
+**How each backend carries create-only** (issue #80 slice 7). The invariant is the same everywhere;
+what differs is the mechanism, and one backend is genuinely weaker:
+
+| Backend | Create-only mechanism | Atomic visibility |
+|---|---|---|
+| Local | `persist_noclobber` — rename that refuses to replace | temp in the destination dir → `fsync` → rename |
+| SFTP | `CREATE\|EXCLUDE` (SFTP's `O_EXCL`) on a `.part`, then a rename the spec requires the server to refuse when the target exists (draft-ietf-secsh-filexfer-02 §6.5) | `.part` → rename |
+| SMB | `CreateDisposition::Create` = SMB2 `FILE_CREATE` (MS-SMB2 §2.2.13); the *server* fails the open when the name exists | **none** — see below |
+
+SMB's create-only guarantee is the strongest of the three (refusal is the operation's own semantics,
+not a separate step), but the `smb` crate exposes no rename, so bytes must land at their final name
+as they arrive. Nothing is ever *replaced*, but a transfer that dies leaves a short file at the real
+name rather than a collectable `.part`; the failure path deletes it, which covers everything except
+the process being killed. A later scan would then catalogue a truncated asset. This is a crate
+limitation rather than a design choice, and it is the one place a backend is materially weaker than
+the local one — revisit if `smb` grows `SET_INFO`/`FileRenameInformation`.
+
+SFTP's rename step is the server's to honour. OpenSSH implements it as stat-then-rename, which is
+spec-correct but not atomic; a pre-check closes the ordinary case, and a server implementing rename
+with POSIX overwrite semantics would defeat both. Weaker than `persist_noclobber`, and weaker
+because of the protocol rather than the implementation.
+
 **Transport: one file per request, body is the bytes** (not multipart). A multipart parser has to
 be fed the whole request to find part boundaries, so a batch would share one failure domain — the
 last file's failure killing the nineteen that already transferred. One request per file makes
