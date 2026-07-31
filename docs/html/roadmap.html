@@ -409,17 +409,22 @@ DOM-based this is cheap:</p>
 <h2 id="release-distribution">Release &amp; distribution</h2>
 <p>The <strong>canonical release plan lives in
 <a href="tech-spec/15-observability-config-testing-packaging.md">tech-spec 15</a> §15.5</strong> (implementable CI
-detail); the scaffold is at <a href="../.github/workflows/release.yml"><code>.github/workflows/release.yml</code></a>. In
-brief, following the pattern proven in the sibling <em>mogen</em> project:</p>
+detail); the live pipeline is at <a href="../.github/workflows/release.yml"><code>.github/workflows/release.yml</code></a>.
+In brief:</p>
 <ul>
-<li><strong>Trigger:</strong> push a <code>v*</code> tag (plus manual <code>workflow_dispatch</code>); <code>contents: write</code> to cut the release.</li>
+<li><strong>Trigger:</strong> push a <code>v*</code> tag (plus manual <code>workflow_dispatch</code>); <code>contents: write</code> to cut the release.
+  A tag whose version disagrees with <code>[workspace.package] version</code> fails before anything builds.</li>
 <li><strong>Build matrix</strong> (<code>fail-fast: false</code>): Linux (<code>x86_64-unknown-linux-gnu</code>), macOS (Intel +
-  <code>aarch64</code>), Windows (<code>x86_64-pc-windows-msvc</code>).</li>
-<li><strong>Web client first.</strong> A release builds the React web client and embeds its static assets into the
-  <code>3dam</code> binary (<code>rust-embed</code>) <em>before</em> <code>cargo build</code>, so one binary serves the web UI with no
-  separate deploy — then a single <code>cargo build -p 3dam --release --locked --target &lt;triple&gt;</code>.</li>
-<li><strong>Per-OS packaging:</strong> Linux <code>tar.gz</code> + <code>.deb</code> (<code>cargo-deb</code>); Windows <code>.zip</code> + <code>.msi</code> (<code>cargo-wix</code>);
-  macOS <code>.app</code> in a <code>.dmg</code>. Publish collects artifacts, generates <code>SHA256SUMS</code>, creates the release.</li>
+  <code>aarch64</code>), Windows (<code>x86_64-pc-windows-msvc</code>). A manual run defaults to Linux only — this repo is
+  private, so macOS bills at 10x and Windows at 2x.</li>
+<li><strong>Web client once.</strong> The React client + WASM islands are built in a single job and downloaded by
+  every build leg, so all four binaries embed identical assets (<code>rust-embed</code>) and only that job needs
+  pnpm/wasm-pack — then <code>cargo build -p dam --release --locked --target &lt;triple&gt;</code>.</li>
+<li><strong>Per-OS packaging</strong> is all one tool, <code>cargo tauri bundle</code>, which already holds the app metadata:
+  Linux <code>tar.gz</code> + <code>.deb</code> + <code>.AppImage</code>; Windows <code>.zip</code> + <code>.msi</code> + NSIS <code>-setup.exe</code>; macOS <code>tar.gz</code>
+  + <code>.dmg</code>. Each leg then <strong>smoke-tests its own unpacked artifact</strong> (<code>--version</code>, <code>stats --json</code>, and
+  <code>serve</code> answering <code>/healthz</code> with the embedded client). Publish collects artifacts, generates
+  <code>SHA256SUMS</code>, creates the release.</li>
 <li><strong>v1 decisions:</strong> unsigned (accept Gatekeeper/SmartScreen warnings); <strong>GitHub Releases is the sole
   v1 channel</strong> (Homebrew tap + <code>cargo-binstall</code> fast-follow) — <a href="adr/0009-v1-scope-decisions.md">ADR 0009 §10</a>.</li>
 </ul>

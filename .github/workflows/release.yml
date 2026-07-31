@@ -1,267 +1,413 @@
 # ============================================================================
-# TEMPLATE — cross-platform release pipeline for 3DAM.
+# Cross-platform release pipeline for 3DAM (issue #45, PRODUCT_SPEC §9 phase 7).
 #
-# Adapted from the sibling `mogen` project's release workflow. See
-# docs/tech-spec/15-observability-config-testing-packaging.md §15.5
-# ("Packaging & release") for the rationale and how 3DAM differs (single
-# `3dam` binary; the React web client is built and embedded before
-# `cargo build`; heavier native deps).
+# Canonical plan: docs/tech-spec/15-observability-config-testing-packaging.md §15.5.
 #
-# This is a SCAFFOLD. It does NOT auto-run: the `push: tags` trigger is
-# commented out so it can't fail on a tag before the app is release-ready.
-# The workspace exists now: the package is `dam` (Cargo forbids a leading
-# digit, ADR 0010) and its bin target is `3dam` — cargo selectors use
-# `-p dam`; artifact paths use `3dam`. App icons live in
-# crates/3dam-desktop/icons/ (32/128/256 PNGs + icon.ico + icon.icns,
-# regenerable from icon.png). Linux deb/AppImage packaging goes through the
-# Tauri bundler (`cargo tauri bundle`, see xtask `bundle` and
-# crates/3dam-desktop/tauri.conf.json). Before enabling:
-#   1. Add `[package.metadata.wix]` as needed for the Windows .msi.
-#   2. Uncomment the `push: tags` trigger.
-# Items marked TODO are placeholders to confirm.
+# Shape:
+#   plan  → resolve tag/version + which targets to build
+#   web   → build the React client + WASM islands ONCE, share as an artifact
+#   build → per-target: cargo build, portable archive, smoke test, native installers
+#   publish → tag-only: checksum everything and cut the GitHub Release
+#
+# Two things worth knowing before editing:
+#
+# 1. The web client is built once, in its own job, and downloaded by every build leg. It is
+#    platform-independent, so building it four times would be four chances to differ — and it
+#    keeps pnpm/node/wasm-pack off the macOS and Windows runners entirely. `cargo xtask wasm`
+#    *silently succeeds* when wasm-pack is missing (xtask/src/main.rs), which would ship a
+#    client whose viewer islands fail to load, so the web job asserts its outputs exist
+#    rather than trusting the exit code.
+#
+# 2. Native installers come from the Tauri bundler, which the repo already depends on and has
+#    fully configured (crates/3dam-desktop/tauri.conf.json: identifier, publisher, category,
+#    all six icons). It produces deb/AppImage, app/dmg and msi/nsis from one config —
+#    downloading WiX and NSIS itself on Windows — so there is no cargo-wix/cargo-deb, no
+#    hand-rolled Info.plist, and no second source of truth for app metadata.
+#
+# Signing/notarization is deliberately absent: tech-spec 15 §15.5 "Open questions" records the
+# 2026-07-06 decision to ship v1 unsigned and accept the Gatekeeper/SmartScreen warnings.
 # ============================================================================
 name: release
 
 on:
-  # TODO: enable once the `3dam` crate builds. Until then, run manually via
-  # the Actions tab (workflow_dispatch) to test.
-  # push:
-  #   tags:
-  #     - "v*"
-  workflow_dispatch: {}
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: >-
+          Which targets to build. This repo is private, so runner minutes are billed with
+          multipliers (macOS 10x, Windows 2x, Linux 1x) — keep pipeline test runs on `linux`.
+        type: choice
+        options: [linux, macos, windows, all]
+        default: linux
 
 permissions:
   contents: write
+
+# Two tags pushed in quick succession would otherwise race to create the same GitHub Release.
+# Never cancel in progress: a half-finished release build is worse than a slow one.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-    name: build (${{ matrix.target }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-          - os: macos-latest
-            target: aarch64-apple-darwin
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-
+  # ── plan ──────────────────────────────────────────────────────────────────
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
 
-      # `@stable` (>= MSRV) is fine for release builds. MSRV drift is guarded by the
-      # accurate `rust-version = "1.91"` in the workspace Cargo.toml: the resolver honors
-      # it and fails fast on an older toolchain. We deliberately do NOT add a separate
-      # `@1.91` MSRV-verification job — the tree compiles Assimp from source (cmake/C++),
-      # so a dedicated MSRV build would be costly for little gain over the Cargo check.
-      # When wiring real push-triggered CI, revisit whether a cheap `cargo +1.91 metadata`
-      # (or `cargo check` on a lighter feature set) is worth adding here.
+      # A tag must agree with the workspace version. The Tauri bundler reads the version from
+      # Cargo.toml while the archive names come from the tag, so a mismatch would ship a
+      # `3dam-v0.2.0-…tar.gz` next to a `3DAM_0.1.1_amd64.deb` — same commit, two versions,
+      # and nothing downstream would notice. Fail here instead.
+      - name: Resolve tag and version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `cargo pkgid` prints `path+file:///…/crates/3dam#dam@0.1.1`; the version is
+          # everything after the last `@`. Preferred over `cargo metadata | jq` so the check
+          # needs nothing beyond cargo and can be exercised locally.
+          #
+          # `--locked` is load-bearing, not decoration: without it cargo would silently
+          # regenerate a stale Cargo.lock and report the *new* Cargo.toml version, so a bump
+          # that forgot the lockfile would pass this check and instead fail every build leg at
+          # `cargo build --locked` — after paying for a full Assimp compile on 10x-billed macOS.
+          crate_version="$(cargo pkgid --locked -p dam)"
+          crate_version="${crate_version##*@}"
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            tag="${GITHUB_REF_NAME}"
+            version="${tag#v}"
+            if [[ "${version}" != "${crate_version}" ]]; then
+              echo "::error::tag ${tag} implies version ${version}, but the workspace is at ${crate_version}. Bump [workspace.package] version in Cargo.toml (and Cargo.lock) to match, or retag."
+              exit 1
+            fi
+          else
+            # A manual run is not a release: name artifacts after the commit so they can never
+            # be mistaken for a published version.
+            version="${crate_version}"
+            tag="dev-${GITHUB_SHA::7}"
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "Building ${tag} (version ${version})"
+
+      - name: Select build matrix
+        id: matrix
+        shell: bash
+        env:
+          # A tag push always builds everything; only a manual run can narrow it.
+          SELECTION: ${{ github.event_name == 'workflow_dispatch' && inputs.targets || 'all' }}
+        run: |
+          set -euo pipefail
+          linux='{"os":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu","bundles":"deb,appimage"}'
+          mac_intel='{"os":"macos-15-intel","target":"x86_64-apple-darwin","bundles":"app,dmg"}'
+          mac_arm='{"os":"macos-15","target":"aarch64-apple-darwin","bundles":"app,dmg"}'
+          windows='{"os":"windows-2025","target":"x86_64-pc-windows-msvc","bundles":"msi,nsis"}'
+          case "${SELECTION}" in
+            linux)   include="[${linux}]" ;;
+            macos)   include="[${mac_intel},${mac_arm}]" ;;
+            windows) include="[${windows}]" ;;
+            *)       include="[${linux},${mac_intel},${mac_arm},${windows}]" ;;
+          esac
+          echo "matrix={\"include\":${include}}" >> "$GITHUB_OUTPUT"
+          echo "Targets: ${SELECTION}"
+
+  # ── web client ────────────────────────────────────────────────────────────
+  web:
+    name: web client
+    # Gated on `plan` purely for cost: a tag/version mismatch should not also burn a full
+    # wasm-pack + pnpm build in parallel before anyone sees the error.
+    needs: [plan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: web
 
-      # --- Web client (3DAM-specific) --------------------------------------
-      # Build the React web UI and leave its static assets where the `3dam`
-      # binary embeds them (e.g. web/dist via rust-embed) BEFORE cargo build.
-      # Guarded so it no-ops until the web client exists.
-      - name: Set up pnpm
-        if: hashFiles('web/package.json') != ''
-        uses: pnpm/action-setup@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+
+      - uses: pnpm/action-setup@v4
         with:
           version: 9
 
-      - name: Set up Node
-        if: hashFiles('web/package.json') != ''
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: pnpm
           cache-dependency-path: web/pnpm-lock.yaml
 
+      # web/src/wasm/ is gitignored (a build artifact), and web/src/islands/index.ts imports
+      # `@/wasm/dam_viewer.js`, so vite cannot resolve it on a clean checkout without this.
+      - name: Build WASM viewer islands
+        run: cargo xtask wasm
+
+      - name: Assert the islands were actually built
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f web/src/wasm/dam_viewer.js
+          test -f web/src/wasm/dam_viewer_bg.wasm
+
       - name: Build web client
-        if: hashFiles('web/package.json') != ''
         working-directory: web
         run: |
           pnpm install --frozen-lockfile
           pnpm run build
 
-      # --- Native deps & build ---------------------------------------------
-      # The Tauri desktop shell (ADR 0013) needs GTK3 + WebKitGTK 4.1 (+ librsvg for
-      # icon handling); the rest of the tree wants ssl/pkg-config. The headless-serve
-      # software rasteriser (Mesa lavapipe/llvmpipe) is a runtime concern, not a build dep.
+      - name: Assert the client bundle exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f web/dist/index.html
+          test -d web/dist/assets
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+          if-no-files-found: error
+          retention-days: 1
+
+  # ── per-target build, package, smoke test ─────────────────────────────────
+  build:
+    name: build (${{ matrix.target }})
+    needs: [plan, web]
+    runs-on: ${{ matrix.os }}
+    # Every leg cmake-builds Assimp + Draco from source, so these are long. The cap is well
+    # above a cold build but well below the 6-hour default, so a wedged step (a serve that
+    # never dies, a bundler waiting on input) fails in an hour instead of billing for six.
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      TAG: ${{ needs.plan.outputs.tag }}
+      VERSION: ${{ needs.plan.outputs.version }}
+      TARGET: ${{ matrix.target }}
+      # The macOS images ship CMake 4.x while Linux/Windows are on 3.31. CMake 4 removed
+      # compatibility with pre-3.5 minimums and flips a batch of policies to NEW; the vendored
+      # Assimp tree declares minimums as low as 3.8 (openddlparser) and 3.10 (zlib), and
+      # Assimp/Draco are a known casualty of that switch. Setting the floor is free on the
+      # runners that don't need it, and cheaper than discovering it on a 10x-billed leg.
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Fetch the prebuilt web client
+        uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+
+      # dam-server embeds web/dist via rust-embed and degrades to a "bundle not present"
+      # placeholder rather than failing the build, so an empty download would produce a
+      # binary that looks fine until someone opens it.
+      - name: Assert the client is present to embed
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f web/dist/index.html
+          test -d web/dist/assets
+
+      # GTK3 + WebKitGTK 4.1 for the Tauri shell (ADR 0013); librsvg2-dev is load-bearing for
+      # the AppImage bundler's linuxdeploy gtk plugin, which aborts without librsvg-2.0.pc.
+      # Deliberately no libasound2-dev: cpal is not in this dependency tree.
       - name: Install Linux deps
         if: runner.os == 'Linux'
-        uses: awalsh128/cache-apt-pkgs-action@v1
-        with:
-          packages: >-
-            libgtk-3-dev libwebkit2gtk-4.1-dev librsvg2-dev
-            libssl-dev pkg-config
-          version: 1.0
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev libwebkit2gtk-4.1-dev librsvg2-dev libssl-dev pkg-config
 
       - name: Build 3dam
-        # Package `dam`, bin `3dam` (ADR 0010).
         run: cargo build -p dam --release --locked --target ${{ matrix.target }}
 
-      # --- Packaging --------------------------------------------------------
-      - name: Package (unix tarball)
-        if: runner.os != 'Windows'
+      # NOTE: the portable archive MUST be cut before the Tauri bundler runs. The bundler
+      # rewrites the built binary in place ("Patching … with bundle type information: deb"),
+      # stamping a fixed-width token that `tauri::process` reads back at runtime. Since
+      # tauri-bundler 2.9 it snapshots and restores the pristine binary afterwards — but only
+      # on the success path, so a bundler run that fails partway leaves the stamp behind.
+      # Verified locally: after a failed AppImage bundle the binary still read
+      # `__TAURI_BUNDLE_TYPE_VAR_APP` instead of `…_UNK`. Archiving first means the portable
+      # download can't inherit that.
+      - name: Package portable archive
         shell: bash
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
-          target="${{ matrix.target }}"
-          out="3dam-${tag}-${target}.tar.gz"
+          # `if`, not `[[ … ]] && bin=…`: under `set -e` an AND-list that evaluates false is
+          # fatal when it is the last statement in the script, so the short form only works by
+          # accident of where it sits. Don't leave that for the next person reordering steps.
+          bin=3dam
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then bin=3dam.exe; fi
+          rm -rf dist && mkdir -p dist
+          cp "target/${TARGET}/release/${bin}" "dist/${bin}"
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then
+            (cd dist && 7z a -tzip "../3dam-${TAG}-${TARGET}.zip" "${bin}" >/dev/null)
+          else
+            chmod +x "dist/${bin}"
+            tar -czf "3dam-${TAG}-${TARGET}.tar.gz" -C dist "${bin}"
+          fi
 
-          rm -rf dist
-          mkdir -p dist
-          cp "target/${target}/release/3dam" dist/3dam
-          chmod +x dist/3dam
-          tar -czf "${out}" -C dist 3dam
-
-      - name: Package (windows zip)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $tag = $env:GITHUB_REF_NAME
-          $target = "${{ matrix.target }}"
-          $out = "3dam-$tag-$target.zip"
-
-          if (Test-Path dist) { Remove-Item -Recurse -Force dist }
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item "target/$target/release/3dam.exe" "dist/3dam.exe"
-          Push-Location dist
-          Compress-Archive -Path "3dam.exe" -DestinationPath "../$out" -Force
-          Pop-Location
-
-      - name: Install tauri-cli
-        if: runner.os == 'Linux'
-        run: cargo install tauri-cli --version '^2' --locked
-
-      # `cargo tauri bundle` packages the *already-built* binary: tauri.conf.json's
-      # `mainBinaryName: "3dam"` points the bundler at target/<triple>/release/3dam
-      # from the build step above — no second cargo build. (Locally: `cargo xtask bundle`.)
-      # AppImage additionally needs librsvg2-dev (installed above) for the
-      # linuxdeploy gtk plugin.
-      - name: Package .deb + .AppImage (linux, Tauri bundler)
-        if: runner.os == 'Linux'
+      # The acceptance criterion for issue #45 is that each artifact actually launches on a
+      # clean machine. A GitHub runner IS a clean machine, so run the check against the
+      # unpacked archive rather than the build tree — that also proves the archive itself is
+      # well-formed, not just the binary that went into it.
+      - name: Smoke-test the packaged artifact
         shell: bash
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
-          target="${{ matrix.target }}"
-          (cd crates/3dam-desktop && cargo tauri bundle --target "${target}")
-          cp "target/${target}/release/bundle/deb/"*.deb "3dam-${tag}-${target}.deb"
-          cp "target/${target}/release/bundle/appimage/"*.AppImage "3dam-${tag}-${target}.AppImage"
+          bin=3dam
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then bin=3dam.exe; fi
+          rm -rf smoke && mkdir -p smoke/unpacked smoke/data
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then
+            7z x -osmoke/unpacked "3dam-${TAG}-${TARGET}.zip" >/dev/null
+          else
+            tar -xzf "3dam-${TAG}-${TARGET}.tar.gz" -C smoke/unpacked
+          fi
+          exe="./smoke/unpacked/${bin}"
 
-      - name: Install cargo-wix
-        if: runner.os == 'Windows'
-        uses: taiki-e/install-action@v2
+          # 1. The CLI role answers, and ships the version this run claims to ship.
+          got="$("${exe}" --version)"
+          echo "reported: ${got}"
+          [[ "${got}" == "3dam ${VERSION}" ]]
+
+          # 2. The engine opens a fresh catalog — which runs every schema migration — and
+          #    emits the JSON contract the CLI promises.
+          "${exe}" --data smoke/data stats --json | grep -q '"total"'
+
+          # 3. The serve role binds, answers /healthz, and serves the *embedded* client.
+          #    Grepping for `assets/` distinguishes the real bundle from dam-server's
+          #    "web client bundle is not present" placeholder, which has no asset refs.
+          #    Two reasons for the redirect + trap. Under `set -e` a failing assertion below
+          #    would otherwise skip the kill and leave a server holding the runner open; and a
+          #    background process inheriting the step's stdout keeps the step alive until that
+          #    pipe closes, so it must be sent to a file and then actually reaped with `wait`
+          #    (`3dam serve` drains connections for up to 10s after SIGTERM).
+          "${exe}" serve --data smoke/data --addr 127.0.0.1:7878 > smoke/serve.log 2>&1 &
+          server=$!
+          trap 'kill "${server}" 2>/dev/null || true; wait "${server}" 2>/dev/null || true' EXIT
+          ready=""
+          for _ in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:7878/healthz >/dev/null 2>&1; then ready=1; break; fi
+            sleep 1
+          done
+          if [[ -z "${ready}" ]]; then
+            echo "::error::serve never answered /healthz within 60s on ${TARGET}"
+            cat smoke/serve.log || true
+            exit 1
+          fi
+          index="$(curl -fsS http://127.0.0.1:7878/)"
+          grep -qi '<!doctype html' <<<"${index}"
+          grep -q 'assets/' <<<"${index}"
+          echo "smoke test passed for ${TARGET}"
+
+      - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-wix
+          tool: cargo-binstall
 
-      - name: Stage Windows app icon (.ico)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $target = "${{ matrix.target }}"
-          Copy-Item "crates/3dam-desktop/icons/icon.ico" "target/$target/release/AppIcon.ico"
+      # Prebuilt, because `cargo install tauri-cli` compiles the whole cargo-mobile2 tree
+      # (~10-15 min) and Swatinem/rust-cache does not cache ~/.cargo/bin, so it would be
+      # paid again on every single run of every leg.
+      # `--version` with an explicit requirement, rather than the `crate@^2` shorthand, which
+      # binstall documents only for exact versions.
+      - name: Install tauri-cli
+        run: cargo binstall -y --locked --version '^2' tauri-cli
 
-      - name: Package .msi (windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $tag = $env:GITHUB_REF_NAME
-          $target = "${{ matrix.target }}"
-          $out = "3dam-$tag-$target.msi"
-          cargo wix -p dam --no-build --nocapture --target $target --output $out
-
-      - name: Package .dmg (macos)
-        if: runner.os == 'macOS'
+      # Run from the desktop crate; the CLI resolves the workspace target dir via
+      # `cargo metadata`, so this writes to target/<triple>/release/bundle/ at the repo root.
+      - name: Bundle native installers
         shell: bash
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
-          target="${{ matrix.target }}"
-          version="${tag#v}"
-          app="3DAM.app"
+          (cd crates/3dam-desktop && cargo tauri bundle --target "${TARGET}" --bundles "${{ matrix.bundles }}")
 
-          rm -rf "${app}" dmg-staging
-          mkdir -p "${app}/Contents/MacOS" "${app}/Contents/Resources"
-          cp "target/${target}/release/3dam" "${app}/Contents/MacOS/3dam"
-          chmod +x "${app}/Contents/MacOS/3dam"
+      # Driven off matrix.bundles so what we asked the bundler for and what we require it to
+      # have produced cannot drift. Each format must yield EXACTLY one file: a `nullglob` loop
+      # would treat "the bundler produced nothing" as success, the upload's
+      # `if-no-files-found: error` would still be satisfied by the portable archive, and the
+      # run would go green having shipped a release with no installers in it. More than one
+      # match matters too — a multi-language WiX config emits one .msi per language, and a
+      # blind `cp` loop would silently keep whichever sorted last.
+      - name: Collect installers
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          out="target/${TARGET}/release/bundle"
+          base="3dam-${TAG}-${TARGET}"
 
-          iconset="AppIcon.iconset"
-          rm -rf "${iconset}"
-          mkdir -p "${iconset}"
-          sips -z 16   16   crates/3dam-desktop/icons/icon.png --out "${iconset}/icon_16x16.png"     >/dev/null
-          sips -z 32   32   crates/3dam-desktop/icons/icon.png --out "${iconset}/icon_16x16@2x.png"  >/dev/null
-          sips -z 32   32   crates/3dam-desktop/icons/icon.png --out "${iconset}/icon_32x32.png"     >/dev/null
-          sips -z 64   64   crates/3dam-desktop/icons/icon.png --out "${iconset}/icon_32x32@2x.png"  >/dev/null
-          sips -z 128  128  crates/3dam-desktop/icons/icon.png --out "${iconset}/icon_128x128.png"   >/dev/null
-          sips -z 256  256  crates/3dam-desktop/icons/icon.png --out "${iconset}/icon_128x128@2x.png">/dev/null
-          sips -z 256  256  crates/3dam-desktop/icons/icon.png --out "${iconset}/icon_256x256.png"   >/dev/null
-          sips -z 512  512  crates/3dam-desktop/icons/icon.png --out "${iconset}/icon_256x256@2x.png">/dev/null
-          cp crates/3dam-desktop/icons/icon.png "${iconset}/icon_512x512.png"
-          iconutil -c icns "${iconset}" -o "${app}/Contents/Resources/AppIcon.icns"
+          collect() { # <bundle-dir> <glob> <destination>
+            local dir="$1" pat="$2" dest="$3"
+            local matches=("${out}/${dir}"/${pat})
+            if [[ ${#matches[@]} -ne 1 ]]; then
+              echo "::error::${dir}: expected exactly 1 ${pat}, found ${#matches[@]} in ${out}/${dir}"
+              exit 1
+            fi
+            cp "${matches[0]}" "${dest}"
+            echo "  ${matches[0]} -> ${dest}"
+          }
 
-          cat > "${app}/Contents/Info.plist" <<PLIST
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>CFBundleName</key><string>3DAM</string>
-            <key>CFBundleDisplayName</key><string>3DAM</string>
-            <key>CFBundleIdentifier</key><string>com.cattrall.threedam</string>
-            <key>CFBundleVersion</key><string>${version}</string>
-            <key>CFBundleShortVersionString</key><string>${version}</string>
-            <key>CFBundleExecutable</key><string>3dam</string>
-            <key>CFBundleIconFile</key><string>AppIcon</string>
-            <key>CFBundlePackageType</key><string>APPL</string>
-            <key>LSMinimumSystemVersion</key><string>10.13</string>
-            <key>NSHighResolutionCapable</key><true/>
-          </dict>
-          </plist>
-          PLIST
+          # `app` builds the .app that the .dmg wraps; only the .dmg is shipped.
+          IFS=',' read -ra requested <<< "${{ matrix.bundles }}"
+          for want in "${requested[@]}"; do
+            case "${want}" in
+              deb)      collect deb      '*.deb'      "${base}.deb" ;;
+              appimage) collect appimage '*.AppImage' "${base}.AppImage" ;;
+              dmg)      collect dmg      '*.dmg'      "${base}.dmg" ;;
+              msi)      collect msi      '*.msi'      "${base}.msi" ;;
+              # NSIS emits an installer .exe; name it so it cannot be mistaken for the binary.
+              nsis)     collect nsis     '*.exe'      "${base}-setup.exe" ;;
+              app)      ;;
+              *)        echo "::error::unhandled bundle type '${want}'"; exit 1 ;;
+            esac
+          done
+          ls -la "${base}"*
 
-          mkdir dmg-staging
-          mv "${app}" "dmg-staging/${app}"
-          ln -s /Applications dmg-staging/Applications
-
-          out="3dam-${tag}-${target}.dmg"
-          hdiutil create \
-            -volname "3DAM" \
-            -srcfolder dmg-staging \
-            -ov -format UDZO \
-            "${out}"
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+      # `error`, not `warn`: with `warn`, a leg that produced nothing still passes but creates
+      # no artifact object at all, and `publish` then fails downloading it — a confusing
+      # failure a long way from the cause.
+      - uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.target }}
-          path: |
-            3dam-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
-            3dam-${{ github.ref_name }}-${{ matrix.target }}.zip
-            3dam-${{ github.ref_name }}-${{ matrix.target }}.deb
-            3dam-${{ github.ref_name }}-${{ matrix.target }}.AppImage
-            3dam-${{ github.ref_name }}-${{ matrix.target }}.msi
-            3dam-${{ github.ref_name }}-${{ matrix.target }}.dmg
-          if-no-files-found: warn
+          path: 3dam-${{ needs.plan.outputs.tag }}-${{ matrix.target }}*
+          if-no-files-found: error
 
+  # ── publish ───────────────────────────────────────────────────────────────
+  # `needs: [build]` means a failed leg blocks the release even with fail-fast disabled, so a
+  # tag can never publish a partial set of platforms.
   publish:
     name: publish
     runs-on: ubuntu-latest
     needs: [build]
-    # Only publish a GitHub Release for real tag pushes, never for manual
-    # workflow_dispatch test runs.
     if: startsWith(github.ref, 'refs/tags/')
     steps:
       - name: Download artifacts
@@ -274,24 +420,19 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          rm -f SHA256SUMS
           shopt -s nullglob
-          for f in 3dam-*.tar.gz 3dam-*.zip 3dam-*.deb 3dam-*.AppImage 3dam-*.msi 3dam-*.dmg; do
-            sha256sum "$f" >> SHA256SUMS
-          done
-          if [[ ! -s SHA256SUMS ]]; then
-            echo "No release archives found to checksum" >&2
+          files=(3dam-*)
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo "::error::no release artifacts were downloaded"
             exit 1
           fi
+          sha256sum "${files[@]}" > SHA256SUMS
+          cat SHA256SUMS
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            3dam-*.tar.gz
-            3dam-*.zip
-            3dam-*.deb
-            3dam-*.AppImage
-            3dam-*.msi
-            3dam-*.dmg
+            3dam-*
             SHA256SUMS
+          fail_on_unmatched_files: true

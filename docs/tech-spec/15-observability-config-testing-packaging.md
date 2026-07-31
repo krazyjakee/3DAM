@@ -326,78 +326,145 @@ not trusted:
 ## 15.5 Packaging & release
 
 This is the canonical **release & distribution** plan (referenced from PRODUCT_SPEC §8), in
-implementable CI detail, and reflects the existing scaffold at
-[`.github/workflows/release.yml`](../../.github/workflows/release.yml) — currently a
-**template** whose `push: tags` trigger is commented out so it cannot fail before the `3dam`
-crate exists (only `workflow_dispatch` is live). The mechanics below are what that scaffold
-implements once the crate lands.
+implementable CI detail, and describes the **live** pipeline at
+[`.github/workflows/release.yml`](../../.github/workflows/release.yml) (issue #45). It runs four
+jobs: `plan` → `web` → `build` (matrix) → `publish`.
 
 ### 15.5.1 Trigger & permissions
 
-- **Trigger:** push a `v*` tag (to be uncommented once `3dam` builds), plus manual
-  `workflow_dispatch` for test runs. `permissions: contents: write` so the publish job can
-  create the release. The `publish` job is gated on `startsWith(github.ref, 'refs/tags/')`, so
-  a manual dispatch builds artifacts but never cuts a release.
+- **Trigger:** push a `v*` tag, plus manual `workflow_dispatch` for test runs.
+  `permissions: contents: write` so the publish job can create the release. The `publish` job
+  is gated on `startsWith(github.ref, 'refs/tags/')`, so a manual dispatch builds artifacts but
+  never cuts a release.
+- **`publish` needs `build`**, so with `fail-fast: false` a single failing platform still
+  blocks the release: a tag can never publish a partial set of OSes.
+- **Cost control.** The repository is private, so runner minutes bill with multipliers —
+  **macOS 10x, Windows 2x, Linux 1x** — against a build that compiles Assimp from source on
+  every target. A manual dispatch therefore takes a `targets` input (`linux` | `macos` |
+  `windows` | `all`) that **defaults to `linux`**, so iterating on the pipeline costs the
+  cheapest runner. A tag push always builds everything.
 
-### 15.5.2 Build matrix
+### 15.5.2 Version/tag agreement (checked before anything builds)
+
+The Tauri bundler derives installer names from `[workspace.package] version` in `Cargo.toml`,
+while the archives are named from the git tag. If those disagree, one commit ships
+`3dam-v0.2.0-…tar.gz` alongside `3DAM_0.1.1_amd64.deb` and nothing downstream notices. `plan`
+resolves the version with `cargo pkgid -p dam` (no `jq` dependency, so the check is
+reproducible locally) and **fails the run** on a mismatch. A non-tag run is named
+`dev-<short-sha>` so manual artifacts can never be mistaken for a published version.
+
+### 15.5.3 Build matrix
 
 `fail-fast: false`, one runner per target — a build failure on one OS does not cancel the
-others:
+others. The matrix is emitted as JSON by `plan` so the dispatch input can narrow it:
 
 | Target triple | Runner | Notes |
 |---------------|--------|-------|
-| `x86_64-unknown-linux-gnu` | `ubuntu-22.04` | egui + wgpu/Vulkan + audio native deps |
-| `x86_64-apple-darwin` | `macos-15-intel` | Intel mac |
-| `aarch64-apple-darwin` | `macos-latest` | Apple Silicon |
-| `x86_64-pc-windows-msvc` | `windows-latest` | MSVC toolchain |
+| `x86_64-unknown-linux-gnu` | `ubuntu-22.04` | Oldest supported glibc, for the widest binary compatibility. Deprecation begins 2026-09-17 (longer queue times); **retired 2027-04-17**, with brownouts in the preceding March/April windows. Move to `ubuntu-24.04` before then. |
+| `x86_64-apple-darwin` | `macos-15-intel` | Intel mac. Actions ends x86_64 macOS support in Aug 2027; `macos-26-intel` also exists if a newer base is wanted. |
+| `aarch64-apple-darwin` | `macos-15` | Apple Silicon. Pinned rather than `macos-latest`, which migrated to macOS 26 over June–July 2026. |
+| `x86_64-pc-windows-msvc` | `windows-2025` | MSVC toolchain. |
 
 Toolchain via **`dtolnay/rust-toolchain`** pinned to the target triple; caching via
-**`Swatinem/rust-cache`**.
+**`Swatinem/rust-cache`** (keyed per target, so the legs cannot collide).
 
-### 15.5.3 Build the web client first, then embed it
+### 15.5.4 Build the web client **once**, then embed it everywhere
 
-Unlike the sibling *mogen*, a 3DAM release must **build the React web client and embed its
-static assets into the `3dam` binary before `cargo build`**, so the single binary serves the
-web UI with no separate deploy:
+A 3DAM release must **build the React web client and embed its static assets into the `3dam`
+binary before `cargo build`**, so the single binary serves the web UI with no separate deploy.
+The client is platform-independent, so it is built in **one** `web` job and consumed by every
+build leg as an artifact — four identical builds would be four chances to diverge, and this
+keeps pnpm/Node/wasm-pack off the macOS and Windows runners entirely.
 
-1. Set up **pnpm** + **Node 20** (guarded on `hashFiles('web/package.json')` so the steps
-   no-op until the web client exists).
-2. `pnpm install --frozen-lockfile && pnpm run build` in `web/`, producing `web/dist`.
-3. `3dam` embeds `web/dist` via **`rust-embed`** at compile time.
-4. **Then** `cargo build -p 3dam --release --locked --target <triple>` — one binary, three
-   roles ([09](09-server-and-web-client.md)), so packaging is simpler than mogen's two-binary
-   case.
+1. Set up **pnpm** + **Node 20**, and a Rust toolchain with the `wasm32-unknown-unknown` target.
+2. Install **`wasm-pack`** and run `cargo xtask wasm`, producing `web/src/wasm/`.
+3. `pnpm install --frozen-lockfile && pnpm run build` in `web/`, producing `web/dist`.
+4. Upload `web/dist` as an artifact; each build leg downloads it before `cargo build`.
+5. `3dam` embeds `web/dist` via **`rust-embed`** at compile time, then
+   `cargo build -p dam --release --locked --target <triple>`.
+
+Two **silent-success traps** are asserted against rather than trusted, because both produce a
+green build that is quietly broken:
+
+- `cargo xtask wasm` **returns success when `wasm-pack` is missing** (it is designed to skip
+  gracefully for local native-only builds). `web/src/wasm/` is gitignored and
+  `web/src/islands/index.ts` imports `@/wasm/dam_viewer.js` behind a `@ts-ignore`, so `tsc -b`
+  passes and only `vite build` fails — the job therefore asserts `dam_viewer.js` and
+  `dam_viewer_bg.wasm` exist.
+- `dam-server` **degrades to a "web client bundle is not present" placeholder** when `web/dist`
+  exists but is *empty* — rust-embed only checks that the folder exists, so the binary compiles
+  and serves a stub instead of the UI. (A *missing* `web/dist` is by contrast a hard compile
+  error: rust-embed refuses unless `allow_missing` is set, and it is not. `web/.gitignore`
+  ignores `dist/`, so on a clean checkout the directory does not exist and
+  `actions/download-artifact` is what creates it — which makes the empty case the reachable
+  failure.) Each build leg therefore asserts the downloaded client is present before building.
 
 The `--locked` flag makes the build **reproducible** against the committed lockfile
 (PRODUCT_SPEC §8 reproducibility).
 
-### 15.5.4 Linux system dependencies
+### 15.5.5 Linux system dependencies
 
-Heavier than mogen's, because of the egui/eframe stack *plus* 3DAM's own media deps. Installed
-via `awalsh128/cache-apt-pkgs-action`:
+Installed with plain `apt-get` (not `awalsh128/cache-apt-pkgs-action`, which can cache an empty
+package set after a resolution failure and then fail confusingly at the build step instead):
 
-- **egui/eframe / windowing:** `libgtk-3-dev`, `libxkbcommon-dev`, `libwayland-dev`,
-  `libxcb-render0-dev`, `libxcb-shape0-dev`, `libxcb-xfixes0-dev`, `libxcb1-dev`.
-- **3DAM's own:** audio (`libasound2-dev` for `cpal`), TLS/util (`libssl-dev`, `pkg-config`);
-  `wgpu`/Vulkan and image/3D loaders resolve through these + crates.
+- **Tauri shell ([ADR 0013](../adr/0013-desktop-shell-tauri.md)):** `libgtk-3-dev`,
+  `libwebkit2gtk-4.1-dev` (present in jammy universe), `libssl-dev`, `pkg-config`.
+- **`librsvg2-dev` is load-bearing for the AppImage**, not merely for icons: linuxdeploy's gtk
+  plugin aborts with `there is no 'libdir' variable for 'librsvg-2.0' library` without it.
+- **No `libasound2-dev`** — `cpal` is not in this dependency tree. (The `xkbcommon`/`wayland`/
+  `xcb` set the egui client needed is likewise gone; see ADR 0013.)
 - The **headless-serve software rasteriser** (Mesa lavapipe/llvmpipe, PRODUCT_SPEC §6.8) is a
   **runtime** concern on the serve target, **not a build dependency** — it is not installed
   here.
 
-### 15.5.5 Per-OS packaging
+### 15.5.6 Per-OS packaging
+
+Every native installer comes from **one tool, `cargo tauri bundle`**, which the repo already
+depends on and has fully configured in
+[`crates/3dam-desktop/tauri.conf.json`](../../crates/3dam-desktop/tauri.conf.json) (identifier,
+publisher, category, descriptions, all six icons). Using cargo-deb/cargo-wix instead would mean
+maintaining that same app metadata a second and third time, in two more formats:
 
 | OS | Artifacts | Tooling |
 |----|-----------|---------|
-| **Linux** | `tar.gz` of the binary **+** `.deb` | `tar`; **`cargo-deb`** (`--no-build --target`) — needs `[package.metadata.deb]` |
-| **Windows** | `.zip` **+** `.msi` | `Compress-Archive`; **`cargo-wix`** (`--no-build --target`) with a generated `.ico` via ImageMagick from `assets/icon.png` — needs `[package.metadata.wix]` |
-| **macOS** | `.dmg` wrapping a `.app` bundle | hand-built `.app` (iconset via `sips`/`iconutil`, generated `Info.plist`), wrapped with **`hdiutil`** (`UDZO`) |
+| **Linux** | `tar.gz` of the binary **+** `.deb` **+** `.AppImage` | `tar`; `cargo tauri bundle --bundles deb,appimage` |
+| **Windows** | `.zip` **+** `.msi` **+** NSIS `-setup.exe` | `7z`; `cargo tauri bundle --bundles msi,nsis` |
+| **macOS** | `tar.gz` of the binary **+** `.dmg` | `tar`; `cargo tauri bundle --bundles app,dmg` (`app` builds the `.app` the `.dmg` wraps; only the `.dmg` is uploaded) |
 
-All packaging steps consume the already-built binary (`--no-build`) so nothing recompiles per
-package format. Each names its artifact `3dam-<tag>-<target>.<ext>` and uploads via
-`actions/upload-artifact` (`if-no-files-found: warn`, since not every format exists on every
-OS).
+On Windows the bundler **downloads its own toolchains** — WiX 3.14.1 (`wix314-binaries.zip`)
+and NSIS 3.11 plus `nsis_tauri_utils.dll` — hash-verified and cached under `%LOCALAPPDATA%\tauri`.
+No toolset need be preinstalled on the runner, but two things follow: the bundle step **needs
+network** on a cold cache, and the MSI needs Windows' **VBSCRIPT optional feature**, which is
+enabled on runner images today but has a deprecation announced. That is the part of this
+pipeline most likely to break first.
 
-### 15.5.6 Publish
+Ordering constraint: **the portable archive must be cut before the bundler runs.** The bundler
+rewrites the built binary in place (`Patching … with bundle type information: deb`), stamping a
+fixed-width token that `tauri::process` reads back at runtime. Since tauri-bundler 2.9 it
+snapshots and restores the pristine binary afterwards — but only on the success path, so a run
+that fails partway leaves the stamp behind (confirmed by inspection: after a failed AppImage
+bundle the binary still read `__TAURI_BUNDLE_TYPE_VAR_APP` rather than `…_UNK`). Archiving
+first keeps the portable download clean regardless of how the bundler exits.
+
+Each artifact is renamed `3dam-<tag>-<target>.<ext>` and uploaded via `actions/upload-artifact`
+with **`if-no-files-found: error`** — with `warn`, a leg that produced nothing still passes but
+creates no artifact object at all, and `publish` then fails while downloading it, a long way
+from the cause.
+
+### 15.5.7 Smoke-testing the artifact
+
+Acceptance for packaging is that the artifact *launches*, not that it builds. A CI runner is a
+clean machine, so each leg unpacks its own archive into a fresh directory and, against that
+copy (which also proves the archive is well-formed):
+
+1. `3dam --version` matches the version this run claims to ship.
+2. `3dam --data <tmp> stats --json` opens a fresh catalog — running every schema migration —
+   and emits the documented JSON.
+3. `3dam serve` binds, answers `/healthz`, and serves the **embedded** client: the response
+   body is grepped for `assets/`, which the "bundle is not present" placeholder does not
+   contain, so a binary built without `web/dist` fails here instead of shipping.
+
+### 15.5.8 Publish
 
 A `publish` job (`needs: [build]`, tag-gated):
 
@@ -420,9 +487,9 @@ packaging/release scope:
 - ~~**Code signing & notarization.**~~ **Decided (2026-07-06): unsigned for v1.** Accept the
   Gatekeeper (macOS `.dmg`) and SmartScreen (Windows `.msi`) warnings as mogen does — no Apple
   Developer ID + notarization or Windows signing certificate, and no signing/notarization/stapling
-  steps in §15.5.5 for v1. Revisit post-v1.
+  steps in §15.5.6 for v1. Revisit post-v1.
 - **Distribution channels beyond GitHub Releases.** Homebrew tap, winget, AUR,
-  `cargo-binstall` — which, and when. All TBD; GitHub Releases is the v1 channel (§15.5.6).
+  `cargo-binstall` — which, and when. All TBD; GitHub Releases is the v1 channel (§15.5.8).
 
 Owned in this file, surfaced for the roll-up ([00](00-overview.md) §Open questions):
 

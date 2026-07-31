@@ -225,17 +225,22 @@ DOM-based this is cheap:
 
 The **canonical release plan lives in
 [tech-spec 15](tech-spec/15-observability-config-testing-packaging.md) §15.5** (implementable CI
-detail); the scaffold is at [`.github/workflows/release.yml`](../.github/workflows/release.yml). In
-brief, following the pattern proven in the sibling *mogen* project:
+detail); the live pipeline is at [`.github/workflows/release.yml`](../.github/workflows/release.yml).
+In brief:
 
 - **Trigger:** push a `v*` tag (plus manual `workflow_dispatch`); `contents: write` to cut the release.
+  A tag whose version disagrees with `[workspace.package] version` fails before anything builds.
 - **Build matrix** (`fail-fast: false`): Linux (`x86_64-unknown-linux-gnu`), macOS (Intel +
-  `aarch64`), Windows (`x86_64-pc-windows-msvc`).
-- **Web client first.** A release builds the React web client and embeds its static assets into the
-  `3dam` binary (`rust-embed`) *before* `cargo build`, so one binary serves the web UI with no
-  separate deploy — then a single `cargo build -p 3dam --release --locked --target <triple>`.
-- **Per-OS packaging:** Linux `tar.gz` + `.deb` (`cargo-deb`); Windows `.zip` + `.msi` (`cargo-wix`);
-  macOS `.app` in a `.dmg`. Publish collects artifacts, generates `SHA256SUMS`, creates the release.
+  `aarch64`), Windows (`x86_64-pc-windows-msvc`). A manual run defaults to Linux only — this repo is
+  private, so macOS bills at 10x and Windows at 2x.
+- **Web client once.** The React client + WASM islands are built in a single job and downloaded by
+  every build leg, so all four binaries embed identical assets (`rust-embed`) and only that job needs
+  pnpm/wasm-pack — then `cargo build -p dam --release --locked --target <triple>`.
+- **Per-OS packaging** is all one tool, `cargo tauri bundle`, which already holds the app metadata:
+  Linux `tar.gz` + `.deb` + `.AppImage`; Windows `.zip` + `.msi` + NSIS `-setup.exe`; macOS `tar.gz`
+  + `.dmg`. Each leg then **smoke-tests its own unpacked artifact** (`--version`, `stats --json`, and
+  `serve` answering `/healthz` with the embedded client). Publish collects artifacts, generates
+  `SHA256SUMS`, creates the release.
 - **v1 decisions:** unsigned (accept Gatekeeper/SmartScreen warnings); **GitHub Releases is the sole
   v1 channel** (Homebrew tap + `cargo-binstall` fast-follow) — [ADR 0009 §10](adr/0009-v1-scope-decisions.md).
 
