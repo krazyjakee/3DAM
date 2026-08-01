@@ -173,6 +173,8 @@ jobs:
         working-directory: web
         run: |
           pnpm install --frozen-lockfile
+          pnpm run lint
+          pnpm run typecheck
           pnpm run build
 
       - name: Assert the client bundle exists
