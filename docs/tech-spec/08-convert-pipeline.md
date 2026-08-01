@@ -587,6 +587,17 @@ tmpfs — issue #87) and is never buffered in memory. The per-file ceiling (`[up
 file 09 §A.1) is enforced against both the declared `Content-Length` (an early-out) and the running
 byte total (the actual enforcement, since a client can lie or send chunked).
 
+**A batch is therefore a client-side notion, and so is its summary.** One request per file means
+there is no server-side upload *job*: nothing on the server knows that twenty requests were one
+drop, and inventing a job row to say so would mean re-describing progress the transport already
+reports natively. The consequence is that "N uploaded, M skipped, K failed" — the one aggregate line
+the user reads after a drop (issue #80 acceptance, which words it as a "job summary") — is assembled
+by the client from the outcomes it already holds, and raised as a toast. This is the one place where
+a multi-item operation in 3DAM is deliberately *not* a job with progress events (golden rule 5): the
+rule exists so long work does not block a UI, and one-request-per-file already satisfies that with
+less machinery. Nothing else about upload is exempt — fail-soft per item, per-file progress, and
+per-file cancellation are all still there, just carried by the transport rather than by a job.
+
 **Uploaded files are catalogued through the same `detect_for_ingest` gate a scan uses,** and read
 from the destination rather than the staging copy. An upload must not mint a row a later scan of the
 same tree would decline to create, or the next rescan would delete the asset the user just uploaded;

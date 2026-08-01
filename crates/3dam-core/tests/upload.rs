@@ -188,6 +188,118 @@ async fn suffix_disambiguates_and_skip_leaves_the_original() {
     );
 }
 
+/// "Uploading N files into a chosen folder writes all N" — and one bad item does not sink the batch.
+///
+/// Every other test here uploads exactly one file, so nothing pinned the behaviour of a *mixed*
+/// drop, which is the ordinary case rather than the edge one. This batch is deliberately hostile in
+/// the middle — a colliding name, a traversal attempt, and a format nothing can catalogue, each
+/// sitting between two good files — so an engine that aborted on the first refusal would fail here
+/// rather than merely look like a quiet day.
+///
+/// Fail-soft is a per-item property of the *engine* call, not only of the transport: the client
+/// issues one request per file (tech-spec 08 §5.1), so this loop is what that client does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mixed_batch_writes_every_good_file_and_one_bad_item_does_not_sink_it() {
+    let (lib, sid, src, staged) = fixture().await;
+    let ctx = AuthContext::embedded();
+    let tmp = src.parent().unwrap().to_path_buf();
+
+    // The name the batch is going to collide with, already sitting in the destination folder.
+    std::fs::create_dir_all(src.join("Textures")).unwrap();
+    std::fs::write(src.join("Textures/brick.png"), b"the original bytes").unwrap();
+
+    // Distinct pixels per file. Identical bytes would let a content-hash coincidence stand in for
+    // the thing under test, and the claim is that three *different* assets land.
+    let wall = tmp.join("wall.png");
+    write_png(&wall, 24, 24);
+    let floor = tmp.join("floor.png");
+    write_png(&floor, 8, 8);
+    let odd = tmp.join("notes.xyzzy");
+    std::fs::write(&odd, b"not a media file").unwrap();
+
+    let batch: Vec<(&str, &Path)> = vec![
+        ("brick.png", staged.as_path()),
+        ("../escaped.png", wall.as_path()),
+        ("wall.png", wall.as_path()),
+        ("notes.xyzzy", odd.as_path()),
+        ("floor.png", floor.as_path()),
+    ];
+
+    let mut ok = Vec::new();
+    let mut failed = Vec::new();
+    for (name, source_file) in batch {
+        match lib
+            .upload(
+                &ctx,
+                req(sid, "Textures", name, UploadCollision::Suffix),
+                source_file,
+            )
+            .await
+        {
+            Ok(out) => ok.push((name, out)),
+            Err(e) => failed.push((name, e)),
+        }
+    }
+
+    assert_eq!(
+        failed.len(),
+        1,
+        "only the traversal attempt fails: {:?}",
+        failed
+            .iter()
+            .map(|(n, e)| (n, e.to_string()))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(failed[0].0, "../escaped.png");
+    assert!(matches!(failed[0].1, LibError::BadRequest(_)));
+    assert!(
+        !src.join("escaped.png").exists() && !tmp.join("escaped.png").exists(),
+        "and it wrote nothing, inside the root or out of it"
+    );
+    assert_eq!(ok.len(), 4, "every other file in the drop landed");
+
+    // The collision stepped around the existing file under `Suffix` — it did not replace it, and it
+    // did not take the batch down with it either.
+    let brick = &ok.iter().find(|(n, _)| *n == "brick.png").unwrap().1;
+    assert_eq!(brick.path, "Textures/brick-1.png");
+    assert_eq!(
+        std::fs::read(src.join("Textures/brick.png")).unwrap(),
+        b"the original bytes",
+        "the file the batch stepped around is byte-identical"
+    );
+
+    // The unsupported file is stored and *reported*, not silently dropped and not refused.
+    let notes = &ok.iter().find(|(n, _)| *n == "notes.xyzzy").unwrap().1;
+    assert!(notes.asset.is_none());
+    assert!(notes
+        .uncatalogued_reason
+        .as_deref()
+        .is_some_and(|r| r.contains("not catalogued")));
+    assert!(src.join("Textures/notes.xyzzy").exists());
+
+    // Everything that could be catalogued was, and is findable — writing the bytes is only half of
+    // what "uploaded into a managed library" promises.
+    for name in [
+        "Textures/brick-1.png",
+        "Textures/wall.png",
+        "Textures/floor.png",
+    ] {
+        assert!(src.join(name).exists(), "{name} is on disk");
+    }
+    let catalogued: Vec<_> = ok.iter().filter(|(_, o)| o.asset.is_some()).collect();
+    assert_eq!(catalogued.len(), 3, "the three images are catalogued");
+
+    let hits = lib.query(&ctx, QueryRequest::default()).await.unwrap();
+    for (_, out) in &catalogued {
+        let id = out.asset.unwrap();
+        assert!(
+            hits.items.iter().any(|a| a.id == id),
+            "{} is queryable immediately",
+            out.path
+        );
+    }
+}
+
 /// The destination folder the user picked is part of the promise: a name that climbs out of it must
 /// be refused even though it would still land inside the source root.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

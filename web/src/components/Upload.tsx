@@ -14,9 +14,11 @@ import {
 } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { api, ApiError } from "@/api/client";
-import { qk, useSources, useVersion } from "@/api/queries";
+import { qk, useCan, useSources, useVersion } from "@/api/queries";
 import type { SourceId, SourceInfo, UploadCollision, UploadOutcome } from "@/api/types";
+import { AUTH_COPY } from "@/lib/auth";
 import { bytes } from "@/lib/format";
+import { toast } from "@/lib/toast";
 import { FolderTree } from "./FolderTree";
 
 /** How many files travel at once.
@@ -49,13 +51,48 @@ let seq = 0;
 function unwritableReason(s: SourceInfo): string | null {
   if (s.kind === "federated") return "a peer's library is read-only";
   if (s.writable) return null;
-  if (s.kind === "sftp" || s.kind === "smb") return "remote sources cannot be written to yet";
+  // SFTP and SMB *do* have a write side (issue #80 slice 7), so an unwritable one is a property of
+  // this build rather than of the protocol: the backend was compiled out, or it is an SMB share on a
+  // non-default port, which `SmbSource::connect` refuses outright. Neither is fixable by the user
+  // changing permissions, which is why it doesn't share the local wording below.
+  if (s.kind === "sftp" || s.kind === "smb")
+    return "this server can't write here — backend not built in, or a non-default SMB port";
   return "not writable — check permissions on the folder";
+}
+
+/** One line for the batch that just finished, raised as a toast.
+ *
+ *  There is deliberately no server-side upload *job* to report: the transport is one request per
+ *  file, which is what makes per-file progress and fail-soft free rather than invented (tech-spec 08
+ *  §5.1, and `dam-server`'s `upload` module). The batch therefore only exists on this side of the
+ *  wire, so its summary is assembled here. The rows keep the per-file detail; this answers "did my
+ *  drop land?" without the user reading twenty of them — and it survives navigating away from the
+ *  list, since the toast viewport sits above every route. */
+function summarise(results: Item[]): void {
+  if (!results.length) return;
+  const written = results.filter((r) => r.state === "done");
+  const uncatalogued = written.filter((r) => r.outcome?.uncatalogued_reason).length;
+  const skipped = results.filter((r) => r.state === "skipped").length;
+  const failed = results.filter((r) => r.state === "error").length;
+
+  const parts = [`${written.length} uploaded`];
+  if (skipped) parts.push(`${skipped} skipped (name already taken)`);
+  if (failed) parts.push(`${failed} failed`);
+  // Stored-but-not-catalogued is part of the "uploaded" count, not an alternative to it, so it is
+  // appended rather than listed alongside — otherwise the numbers would appear not to add up.
+  const suffix = uncatalogued ? ` — ${uncatalogued} stored but not catalogued` : "";
+  const message = `${parts.join(", ")}${suffix}`;
+
+  // A batch with any failure is an error toast: those linger, and a success toast that auto-dismisses
+  // in 3.5s is exactly the wrong lifetime for "one of your files didn't make it".
+  if (failed) toast.error(message);
+  else toast.success(message);
 }
 
 export function Upload() {
   const sources = useSources();
   const version = useVersion();
+  const canWrite = useCan("write");
   const qc = useQueryClient();
   const [source, setSource] = useState<SourceId | null>(null);
   const [folder, setFolder] = useState("");
@@ -150,6 +187,14 @@ export function Upload() {
     if (!source || running) return;
     setRunning(true);
 
+    // What the batch summary counts, accumulated by the workers themselves rather than read back
+    // out of `items` when the run ends. `items` is the wrong source for two reasons: a `setItems`
+    // closure captured at click time is stale by the first await, and the list deliberately keeps
+    // rows from *earlier* batches until the user clears them — summarising it would re-report
+    // yesterday's failures every time. Pushing is safe without a lock because JS is single-threaded
+    // and every push happens synchronously after its own await resumes.
+    const results: Item[] = [];
+
     const worker = async () => {
       for (;;) {
         // `shift()` is the whole synchronisation story: JS is single-threaded and there is no
@@ -175,21 +220,26 @@ export function Upload() {
               }
             },
           );
-          patchItem(item.id, {
+          const patch: Partial<Item> = {
             state: outcome.skipped ? "skipped" : "done",
             progress: 1,
             outcome,
-          });
+          };
+          patchItem(item.id, patch);
+          results.push({ ...item, ...patch });
         } catch (e) {
-          patchItem(item.id, {
+          const patch: Partial<Item> = {
             state: "error",
             error: e instanceof ApiError ? e.message : String(e),
-          });
+          };
+          patchItem(item.id, patch);
+          results.push({ ...item, ...patch });
         }
       }
     };
     await Promise.all(Array.from({ length: CONCURRENCY }, worker));
 
+    summarise(results);
     setRunning(false);
     // The server's `asset_added` events already invalidate these over the WebSocket, but an upload
     // that was stored-but-not-catalogued emits none — and the folder counts still moved.
@@ -210,21 +260,25 @@ export function Upload() {
   // the version query so a slow first load doesn't flash "disabled" at an enabled server.
   if (version.isSuccess && version.data.upload !== true) {
     return (
-      <div className="mx-auto flex min-h-dvh max-w-4xl flex-col gap-4 p-6 text-sm">
-        <header className="flex items-center justify-between">
-          <h1 className="flex items-center gap-2 text-lg font-semibold text-fg">
-            <UploadIcon size={18} className="text-fg-dim" /> Upload assets
-          </h1>
-          <Link to="/" className="text-xs text-accent hover:underline">
-            ← Back to library
-          </Link>
-        </header>
-        <p className="rounded border border-border bg-panel p-3 text-xs text-fg-dim">
-          Uploads are disabled on this server. Writing files into a source is off by default — an
-          admin can turn it on in Settings, or with{" "}
-          <code className="font-mono text-fg">3dam admin flag upload on</code>.
-        </p>
-      </div>
+      <Unavailable>
+        Uploads are disabled on this server. Writing files into a source is off by default — an
+        admin can turn it on in Settings, or with{" "}
+        <code className="font-mono text-fg">3dam admin flag upload on</code>.
+      </Unavailable>
+    );
+  }
+
+  // The caller holds no write scope: the same deep-link hole one gate further in. The route already
+  // 403s per file, but a working source picker and drop zone that only fail after the bytes have
+  // been chosen is the "disables rather than 403s" rule (issue #80 §3) applied to everything except
+  // the view itself. `useCan` is optimistic while `/whoami` is in flight, so this settles on a real
+  // read-only token rather than flashing at every cold load.
+  if (!canWrite) {
+    return (
+      <Unavailable>
+        {AUTH_COPY.needsWrite} Uploading writes files into a source, so it needs write access even
+        where browsing does not.
+      </Unavailable>
     );
   }
 
@@ -425,6 +479,27 @@ export function Upload() {
           </div>
         </section>
       )}
+    </div>
+  );
+}
+
+/** The "you can't do this here" shell — same header, one explanation.
+ *
+ *  Both refusals (the deployment doesn't do uploads; this caller may not write) look identical to
+ *  the user and differ only in the sentence, so they share a frame rather than drifting into two
+ *  near-identical panels. */
+function Unavailable({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="mx-auto flex min-h-dvh max-w-4xl flex-col gap-4 p-6 text-sm">
+      <header className="flex items-center justify-between">
+        <h1 className="flex items-center gap-2 text-lg font-semibold text-fg">
+          <UploadIcon size={18} className="text-fg-dim" /> Upload assets
+        </h1>
+        <Link to="/" className="text-xs text-accent hover:underline">
+          ← Back to library
+        </Link>
+      </header>
+      <p className="rounded border border-border bg-panel p-3 text-xs text-fg-dim">{children}</p>
     </div>
   );
 }

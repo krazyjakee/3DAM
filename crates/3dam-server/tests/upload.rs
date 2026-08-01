@@ -313,6 +313,51 @@ async fn there_is_no_overwrite_collision_value_on_the_wire() {
     assert_eq!(std::fs::read(src.join("brick.png")).unwrap(), b"original");
 }
 
+/// A hostile name has to be refused *at the transport*, not merely deep in the engine.
+///
+/// The name battery is exhaustive in `dam-sources` and the engine boundary is covered in
+/// `dam-core/tests/upload.rs`, but neither sees this route's own handling of it: the query string is
+/// where an attacker-influenced filename actually enters, and the body is streamed to scratch before
+/// the engine is ever asked about the name. What is asserted here is that the refusal survives that
+/// trip — a 400 (malformed, never retry) rather than the 409 a taken name gets, and not one byte
+/// left anywhere in or beside the source.
+#[tokio::test]
+async fn a_hostile_name_is_refused_at_the_route_and_writes_nothing() {
+    let (app, store, _lib, src, sid) = harness().await;
+    let outside = src.parent().unwrap().join("escaped.png");
+
+    for name in [
+        "../escaped.png",
+        "..%2Fescaped.png",
+        "sub/nested.png",
+        "CON",
+    ] {
+        let (st, body) = upload(
+            &app,
+            &format!("source={sid}&folder=Textures&name={name}"),
+            None,
+            png_bytes(8, 8),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{name}: {body}");
+    }
+
+    assert!(!outside.exists(), "nothing escaped the source root");
+    assert!(
+        !src.join("escaped.png").exists() && !src.join("Textures").exists(),
+        "a refused upload creates neither the file nor the folder it named"
+    );
+
+    // A refused write into a source is exactly what the audit log is read for afterwards.
+    let audit = store.list_audit(50).unwrap();
+    assert!(
+        audit.iter().any(|e| e.action == "source.upload.refused"),
+        "expected a source.upload.refused entry, got {:?}",
+        audit.iter().map(|e| &e.action).collect::<Vec<_>>()
+    );
+}
+
 /// "Off means the surface disappears" (CLAUDE.md rule 4, ADR 0004). Upload ships **off**: a token
 /// minted for tagging must not have silently gained the ability to write files into the user's
 /// project folders the day this feature deployed, which is exactly what sharing `Scope::Write`
