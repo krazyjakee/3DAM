@@ -506,6 +506,17 @@ function Unavailable({ children }: { children: React.ReactNode }) {
 
 function Row({ item, onRemove }: { item: Item; onRemove: () => void }) {
   const pct = Math.round(item.progress * 100);
+  const name = item.outcome?.path ?? item.file.name;
+  const nameId = `upload-name-${item.id}`;
+  const stateId = `upload-state-${item.id}`;
+  const terminalAnnouncement =
+    item.state === "done"
+      ? `${name} uploaded`
+      : item.state === "skipped"
+        ? `${name} skipped because a file of that name already exists`
+        : item.state === "error"
+          ? `${name} upload failed: ${item.error}`
+          : "";
   return (
     <li className="flex items-center gap-2 rounded px-2 py-1 text-xs">
       <StateIcon state={item.state} />
@@ -513,16 +524,26 @@ function Row({ item, onRemove }: { item: Item; onRemove: () => void }) {
           *which* file failed matters at least as much as why. Both sides truncate; both carry the
           full text in a title. */}
       <span
+        id={nameId}
         className="min-w-[7rem] flex-1 truncate text-fg"
-        title={item.outcome?.path ?? item.file.name}
+        title={name}
       >
-        {item.outcome?.path ?? item.file.name}
+        {name}
       </span>
 
       {item.state === "uploading" && (
         <>
-          <div className="h-1 w-24 shrink-0 overflow-hidden rounded bg-surface-2">
+          <div
+            className="h-1 w-24 shrink-0 overflow-hidden rounded bg-surface-2"
+            role="progressbar"
+            aria-labelledby={`${nameId} ${stateId}`}
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={pct}
+            aria-valuetext={`${pct}% uploaded`}
+          >
             <div
+              aria-hidden="true"
               className="h-full rounded"
               style={{
                 width: `${pct}%`,
@@ -531,7 +552,9 @@ function Row({ item, onRemove }: { item: Item; onRemove: () => void }) {
               }}
             />
           </div>
-          <span className="shrink-0 tabular-nums text-fg-dim">{pct}%</span>
+          <span id={stateId} className="shrink-0 tabular-nums text-fg-dim">
+            {pct}% uploaded
+          </span>
         </>
       )}
 
@@ -563,6 +586,10 @@ function Row({ item, onRemove }: { item: Item; onRemove: () => void }) {
           {item.error}
         </span>
       )}
+
+      <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">
+        {terminalAnnouncement}
+      </span>
 
       {(item.state === "queued" || item.state === "error") && (
         <button

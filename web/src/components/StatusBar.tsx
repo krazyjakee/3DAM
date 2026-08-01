@@ -5,6 +5,7 @@ import { authApi } from "@/api/auth";
 import { useConnection, type ConnState } from "@/api/connection";
 import type { JobStatus, MediaType } from "@/api/types";
 import { clearToken, getServer, isRemote, serverLabel } from "@/lib/server";
+import { toast } from "@/lib/toast";
 import { useEscape, useFocusTrap } from "@/lib/use-focus-trap";
 import { ConnectDialog } from "./ConnectDialog";
 import { AccountLoginForm, TokenLoginForm } from "./AuthGate";
@@ -18,22 +19,49 @@ export function StatusBar() {
   const jobs = useJobs({});
   const cancel = useCancelJob();
   const conn = useConnection();
+  const [cancelling, setCancelling] = useState<Set<string>>(() => new Set());
 
   const active = (jobs.data?.items ?? []).filter(
     (j) => j.state === "running" || j.state === "queued",
   );
 
+  useEffect(() => {
+    const activeIds = new Set(active.map((job) => job.id));
+    setCancelling((current) => {
+      const next = new Set([...current].filter((id) => activeIds.has(id)));
+      return next.size === current.size ? current : next;
+    });
+  }, [active]);
+
+  const cancelJob = (id: string) => {
+    if (cancelling.has(id)) return;
+    setCancelling((current) => new Set(current).add(id));
+    cancel.mutate(id, {
+      onError: () => {
+        setCancelling((current) => {
+          const next = new Set(current);
+          next.delete(id);
+          return next;
+        });
+      },
+    });
+  };
+
   return (
-    <footer className="flex h-7 shrink-0 items-center gap-3 border-t border-border bg-surface px-3 text-[11px] text-fg-dim">
-      <JobAnnouncer active={active} />
+    <footer className="flex h-7 shrink-0 items-center gap-3 border-t border-border bg-surface px-3 text-[11px] text-fg-dim coarse:h-auto coarse:min-h-11">
+      <JobAnnouncer jobs={jobs.data?.items ?? []} />
       {active.length === 0 ? (
         <span className="flex-1">Idle</span>
       ) : active.length === 1 ? (
         <div className="flex min-w-0 flex-1 items-center">
-          <JobPill job={active[0]} onCancel={() => cancel.mutate(active[0].id)} />
+          <JobPill
+            job={active[0]}
+            cancelling={cancelling.has(active[0].id)}
+            onCancel={() => cancelJob(active[0].id)}
+          />
         </div>
       ) : (
-        <AggregateJobs jobs={active} onCancel={(id) => cancel.mutate(id)} />
+        <AggregateJobs jobs={active} cancelling={cancelling} onCancel={cancelJob} />
       )}
       <MediaBreakdown />
       <ConnectionPill state={conn.state} />
@@ -220,23 +248,36 @@ function MediaBreakdown() {
 }
 
 /** Screen-reader announcements for background jobs (a11y hardening, issue #44). A polite, visually
- *  hidden live region that speaks only coarse lifecycle transitions — jobs starting, or all jobs
- *  finishing — rather than every progress tick, so assistive tech isn't spammed with percentages
- *  (the visual JobPill still shows the live %). */
-function JobAnnouncer({ active }: { active: JobStatus[] }) {
+ *  hidden live region speaks only lifecycle transitions rather than every progress tick. Cancelled
+ *  jobs also raise a visible toast, so cancellation feedback isn't available only to AT users. */
+function JobAnnouncer({ jobs }: { jobs: JobStatus[] }) {
   const [msg, setMsg] = useState("");
-  const prev = useRef(0);
-  const count = active.length;
+  const previous = useRef<Map<string, JobStatus["state"]> | null>(null);
   useEffect(() => {
-    if (count > prev.current) {
-      const kinds = [...new Set(active.map((j) => j.kind))].join(", ");
-      setMsg(`${count} background ${count === 1 ? "task" : "tasks"} running: ${kinds}`);
-    } else if (count === 0 && prev.current > 0) {
-      setMsg("Background tasks complete");
-    }
-    prev.current = count;
-    // Keyed on the active-job count only: announce start/finish, not each progress update.
-  }, [count]);
+    const next = new Map(jobs.map((job) => [job.id, job.state]));
+    const transitions = jobs.flatMap((job) => {
+      if (!previous.current) {
+        return job.state === "queued" || job.state === "running"
+          ? [`${job.kind} job started`]
+          : [];
+      }
+      const oldState = previous.current?.get(job.id);
+      if (oldState === job.state) return [];
+      if (job.state === "done") return [`${job.kind} job complete`];
+      if (job.state === "failed") return [`${job.kind} job failed`];
+      if (job.state === "cancelled") {
+        toast.info(`${job.kind} job cancelled`);
+        return [];
+      }
+      if (!oldState && (job.state === "queued" || job.state === "running")) {
+        return [`${job.kind} job started`];
+      }
+      return [];
+    });
+    if (transitions.length) setMsg(transitions.join(". "));
+    previous.current = next;
+    // Keyed on states only: progress updates re-render the component but never change the message.
+  }, [jobs]);
   return (
     <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">
       {msg}
@@ -273,15 +314,24 @@ function ConnectionPill({ state }: { state: ConnState }) {
 }
 
 /** The single-job readout: kind, a progress bar, %, ETA, the current item, and a cancel button. */
-function JobPill({ job, onCancel }: { job: JobStatus; onCancel: () => void }) {
+function JobPill({
+  job,
+  cancelling,
+  onCancel,
+}: {
+  job: JobStatus;
+  cancelling: boolean;
+  onCancel: () => void;
+}) {
   const { done, total, current } = job.progress;
   const pct = total ? Math.min(100, Math.round((done / total) * 100)) : null;
   const eta = useEta(job.id, done, total ?? null);
+  const label = `${job.kind} job${current ? `: ${current}` : ""}`;
   return (
     <div className="flex min-w-0 items-center gap-2">
-      <Loader2 size={12} className="animate-spin text-accent" />
+      <Loader2 size={12} className="animate-spin text-accent" aria-hidden="true" />
       <span className="capitalize">{job.kind}</span>
-      <ProgressBar pct={pct} />
+      <ProgressBar pct={pct} label={label} done={done} total={total} current={current} />
       <span className="tabular-nums">{pct != null ? `${pct}%` : done.toLocaleString()}</span>
       {eta && <span className="tabular-nums text-fg-dim">~{eta} left</span>}
       {current && (
@@ -289,8 +339,17 @@ function JobPill({ job, onCancel }: { job: JobStatus; onCancel: () => void }) {
           {current}
         </span>
       )}
-      <button className="text-fg-dim hover:text-danger" onClick={onCancel} title="Cancel">
-        <X size={12} />
+      <button
+        className="flex shrink-0 items-center justify-center gap-1 text-fg-dim hover:text-danger disabled:cursor-not-allowed disabled:opacity-60 coarse:min-h-11 coarse:min-w-11"
+        onClick={onCancel}
+        disabled={cancelling}
+        aria-label={cancelling ? `Cancelling ${label}` : `Cancel ${label}`}
+      >
+        {cancelling ? (
+          <span className="text-[10px]">Cancelling…</span>
+        ) : (
+          <X size={12} aria-hidden="true" />
+        )}
       </button>
     </div>
   );
@@ -298,7 +357,15 @@ function JobPill({ job, onCancel }: { job: JobStatus; onCancel: () => void }) {
 
 /** Concurrent jobs condensed into one bar: aggregate done/total across all active jobs, an overall %
  *  and ETA, expandable to the individual jobs (each cancellable). */
-function AggregateJobs({ jobs, onCancel }: { jobs: JobStatus[]; onCancel: (id: string) => void }) {
+function AggregateJobs({
+  jobs,
+  cancelling,
+  onCancel,
+}: {
+  jobs: JobStatus[];
+  cancelling: Set<string>;
+  onCancel: (id: string) => void;
+}) {
   const [open, setOpen] = useState(false);
   const done = jobs.reduce((s, j) => s + j.progress.done, 0);
   const totals = jobs.map((j) => j.progress.total);
@@ -314,9 +381,9 @@ function AggregateJobs({ jobs, onCancel }: { jobs: JobStatus[]; onCancel: (id: s
 
   return (
     <div className="relative flex min-w-0 flex-1 items-center gap-2">
-      <Loader2 size={12} className="shrink-0 animate-spin text-accent" />
+      <Loader2 size={12} className="shrink-0 animate-spin text-accent" aria-hidden="true" />
       <button
-        className="flex items-center gap-1 capitalize hover:text-fg"
+        className="flex items-center gap-1 capitalize hover:text-fg coarse:min-h-11"
         onClick={() => setOpen((o) => !o)}
         title="Show individual jobs"
         aria-expanded={open}
@@ -328,7 +395,12 @@ function AggregateJobs({ jobs, onCancel }: { jobs: JobStatus[]; onCancel: (id: s
           style={{ transform: open ? "none" : "rotate(180deg)" }}
         />
       </button>
-      <ProgressBar pct={pct} />
+      <ProgressBar
+        pct={pct}
+        label={`${label} aggregate progress`}
+        done={done}
+        total={total}
+      />
       <span className="tabular-nums">
         {pct != null ? `${pct}%` : `${done.toLocaleString()} done`}
       </span>
@@ -340,13 +412,21 @@ function AggregateJobs({ jobs, onCancel }: { jobs: JobStatus[]; onCancel: (id: s
             const p = j.progress.total
               ? Math.min(100, Math.round((j.progress.done / j.progress.total) * 100))
               : null;
+            const jobLabel = `${j.kind} job${j.progress.current ? `: ${j.progress.current}` : ""}`;
+            const isCancelling = cancelling.has(j.id);
             return (
               <div
                 key={j.id}
                 className="flex items-center gap-2 rounded px-1.5 py-1 hover:bg-surface-2"
               >
                 <span className="w-16 shrink-0 capitalize text-fg-muted">{j.kind}</span>
-                <ProgressBar pct={p} />
+                <ProgressBar
+                  pct={p}
+                  label={jobLabel}
+                  done={j.progress.done}
+                  total={j.progress.total}
+                  current={j.progress.current}
+                />
                 <span className="w-9 shrink-0 text-right tabular-nums">
                   {p != null ? `${p}%` : j.progress.done.toLocaleString()}
                 </span>
@@ -356,11 +436,16 @@ function AggregateJobs({ jobs, onCancel }: { jobs: JobStatus[]; onCancel: (id: s
                   </span>
                 )}
                 <button
-                  className="shrink-0 text-fg-dim hover:text-danger"
+                  className="flex shrink-0 items-center justify-center gap-1 text-fg-dim hover:text-danger disabled:cursor-not-allowed disabled:opacity-60 coarse:min-h-11 coarse:min-w-11"
                   onClick={() => onCancel(j.id)}
-                  title="Cancel this job"
+                  disabled={isCancelling}
+                  aria-label={isCancelling ? `Cancelling ${jobLabel}` : `Cancel ${jobLabel}`}
                 >
-                  <X size={12} />
+                  {isCancelling ? (
+                    <span className="text-[10px]">Cancelling…</span>
+                  ) : (
+                    <X size={12} aria-hidden="true" />
+                  )}
                 </button>
               </div>
             );
@@ -371,10 +456,36 @@ function AggregateJobs({ jobs, onCancel }: { jobs: JobStatus[]; onCancel: (id: s
   );
 }
 
-function ProgressBar({ pct }: { pct: number | null }) {
+function ProgressBar({
+  pct,
+  label,
+  done,
+  total,
+  current,
+}: {
+  pct: number | null;
+  label: string;
+  done: number;
+  total: number | null;
+  current?: string | null;
+}) {
+  const determinate = total != null && total > 0;
+  const valueText =
+    determinate
+      ? `${done.toLocaleString()} of ${total.toLocaleString()}${current ? `, ${current}` : ""}`
+      : `${done.toLocaleString()} complete${current ? `, ${current}` : ""}`;
   return (
-    <div className="h-1 w-24 shrink-0 overflow-hidden rounded bg-surface-2">
+    <div
+      className="h-1 w-24 shrink-0 overflow-hidden rounded bg-surface-2"
+      role="progressbar"
+      aria-label={label}
+      aria-valuemin={0}
+      aria-valuemax={determinate ? total : 100}
+      aria-valuenow={determinate ? Math.min(done, total) : undefined}
+      aria-valuetext={determinate ? valueText : `Indeterminate, ${valueText}`}
+    >
       <div
+        aria-hidden="true"
         className="h-full rounded"
         style={{
           width: pct != null ? `${pct}%` : "40%",
