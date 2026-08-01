@@ -2,6 +2,7 @@ import type React from "react";
 import { useEffect, useRef, useState } from "react";
 import {
   Box,
+  ClipboardCopy,
   Grid3x3,
   PanelRightClose,
   PanelRightOpen,
@@ -40,6 +41,7 @@ import type {
   TagRef,
 } from "@/api/types";
 import { bytes, duration, mediaLabel, originLabel, relTime } from "@/lib/format";
+import { copyText } from "@/lib/clipboard";
 import { DUPLICATE_QUERY_LIMIT } from "@/lib/limits";
 import { peerReadOnlyTitle } from "@/lib/origin";
 import { hasInteractive3D } from "@/lib/model-formats";
@@ -398,7 +400,7 @@ function Body({ asset }: { asset: Asset }) {
             )}
           <Field label="Origin" value={originLabel(summary.origin)} />
           <Field label="Source" value={sourceName} />
-          <Field label="Path" value={asset.path} mono />
+          <Field label="Path" value={asset.path} mono copyable />
           {asset.hash && <Field label="Hash" value={asset.hash.slice(0, 16) + "…"} mono />}
         </Group>
 
@@ -1200,15 +1202,38 @@ function Group({ title, children }: { title: string; children: React.ReactNode }
   );
 }
 
-function Field({ label, value, mono }: { label: string; value: string; mono?: boolean }) {
+function Field({
+  label,
+  value,
+  mono,
+  copyable,
+}: {
+  label: string;
+  value: string;
+  mono?: boolean;
+  copyable?: boolean;
+}) {
   return (
     <div className="flex items-baseline justify-between gap-2 text-[11px]">
       <span className="shrink-0 text-fg-dim">{label}</span>
-      <span
-        className={`min-w-0 truncate text-right text-fg-muted ${mono ? "font-mono text-[10px]" : ""}`}
-        title={value}
-      >
-        {value}
+      <span className="flex min-w-0 items-center gap-1">
+        <span
+          className={`min-w-0 truncate text-right text-fg-muted ${mono ? "font-mono text-[10px]" : ""}`}
+          title={value}
+        >
+          {value}
+        </span>
+        {copyable && (
+          <button
+            type="button"
+            className="flex shrink-0 items-center justify-center text-fg-dim hover:text-fg coarse:min-h-11 coarse:min-w-11"
+            title={`Copy ${label.toLowerCase()}`}
+            aria-label={`Copy ${label.toLowerCase()}`}
+            onClick={() => void copyText(value, label)}
+          >
+            <ClipboardCopy size={12} />
+          </button>
+        )}
       </span>
     </div>
   );

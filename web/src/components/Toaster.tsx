@@ -35,7 +35,20 @@ export function Toaster() {
             }}
           >
             <Icon size={15} className="mt-px shrink-0" style={{ color: ACCENT[t.kind] }} />
-            <span className="min-w-0 flex-1 break-words text-fg">{t.message}</span>
+            <div className="min-w-0 flex-1 text-fg">
+              <p className="break-words">{t.message}</p>
+              {t.manualCopy && (
+                <textarea
+                  readOnly
+                  rows={2}
+                  value={t.manualCopy.value}
+                  aria-label={t.manualCopy.label}
+                  spellCheck={false}
+                  onFocus={(e) => e.currentTarget.select()}
+                  className="field mt-2 resize-none font-mono text-[10px]"
+                />
+              )}
+            </div>
             <button
               type="button"
               aria-label="Dismiss notification"

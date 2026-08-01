@@ -26,7 +26,9 @@ import {
 } from "@/api/queries";
 import type { AssetSummary } from "@/api/types";
 import { AUTH_COPY } from "@/lib/auth";
+import { copyText } from "@/lib/clipboard";
 import { localOnly, PEER_READONLY_SET, peerReadOnlyTitle } from "@/lib/origin";
+import { errorMessage, toast } from "@/lib/toast";
 import { useViewState } from "@/lib/view-state";
 
 export interface MenuState {
@@ -146,9 +148,11 @@ export function ContextMenu({
   const copyPath = async () => {
     try {
       const full = await api.getAsset(ids[0]);
-      await navigator.clipboard?.writeText(full.path);
-    } catch {
-      /* clipboard blocked / fetch failed — fail-soft, no crash */
+      await copyText(full.path, "Path");
+    } catch (error) {
+      // The clipboard helper owns clipboard failures. Reaching here means the path itself could not
+      // be loaded, so there is no value to expose for manual copying.
+      toast.error(`Couldn’t load path: ${errorMessage(error)}`);
     }
   };
 

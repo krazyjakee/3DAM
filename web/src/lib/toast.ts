@@ -10,6 +10,15 @@ export interface Toast {
   id: number;
   kind: ToastKind;
   message: string;
+  /** A full value that remains selectable when an automatic copy action fails. */
+  manualCopy?: {
+    label: string;
+    value: string;
+  };
+}
+
+export interface ToastOptions {
+  manualCopy?: Toast["manualCopy"];
 }
 
 let toasts: Toast[] = [];
@@ -21,12 +30,16 @@ function emit() {
 }
 
 /** Errors linger (the user may need to read/act); successes auto-dismiss quickly. */
-function push(kind: ToastKind, message: string): number {
+function push(kind: ToastKind, message: string, options?: ToastOptions): number {
   const id = nextId++;
-  toasts = [...toasts, { id, kind, message }];
+  toasts = [...toasts, { id, kind, message, ...options }];
   emit();
-  const ttl = kind === "error" ? 7000 : 3500;
-  setTimeout(() => dismiss(id), ttl);
+  // A manual-copy fallback stays until explicitly dismissed: the user may need time to select the
+  // complete value and switch to the destination. Ordinary errors still clear after seven seconds.
+  if (!options?.manualCopy) {
+    const ttl = kind === "error" ? 7000 : 3500;
+    setTimeout(() => dismiss(id), ttl);
+  }
   return id;
 }
 
@@ -37,7 +50,7 @@ export function dismiss(id: number) {
 
 export const toast = {
   success: (m: string) => push("success", m),
-  error: (m: string) => push("error", m),
+  error: (m: string, options?: ToastOptions) => push("error", m, options),
   info: (m: string) => push("info", m),
 };
 
