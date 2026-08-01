@@ -50,11 +50,11 @@ Packages are named `dam-*` (Cargo forbids leading digits); directories are brand
 
 | Directory | Package | Role | Notes |
 |---|---|---|---|
-| `3dam-api` | `dam-api` | The seam: `LibraryService` trait, DTOs, `AuthContext`, `Scope`/`Scopes`, events | Foundational. serde-only, no other `dam-*` deps. |
+| `3dam-api` | `dam-api` | The seam: `LibraryService` trait, DTOs, `AuthContext`, `Scope`/`Scopes`, events | Foundational. Direct external deps are serde, serde_json, thiserror, uuid, async-trait, and futures; no other `dam-*` deps. |
 | `3dam-store` | `dam-store` | Synchronous SQLite catalog (`library.db`); schema + migrations | Private to `dam-core`. Never exposed to frontends. |
 | `3dam-media` | `dam-media` | `detect()` / `detect_for_ingest()` / `extract_metadata()` (cheap tier) / `render_thumbnail()` (images + video poster frames) / `extract_text()` / convert / feature extraction | symphonia (audio), image (rasters) + `dds`/`ktx2`/`texture2ddecoder` (GPU texture containers, issue #49), gltf (3D) + Assimp's own exporter for model→GLB convert (behind `model-convert`), a **discovered `ffprobe`/`ffmpeg`** (video, [ADR 0015](docs/adr/0015-video-decode-backend.md)), lopdf + zip/quick-xml (documents). |
 | `3dam-sources` | `dam-sources` | `FileSource` + local/SFTP/SMB; `SourceConnection` | SFTP/SMB behind cargo features. |
-| `3dam-core` | `dam-core` | **The engine.** `EmbeddedLibrary` impls `LibraryService`; scan/analyze/convert/export jobs, watch/auto-rescan, events, thumbnail cache | Pure logic — no UI, transport, or GPU. |
+| `3dam-core` | `dam-core` | **The engine.** `EmbeddedLibrary` impls `LibraryService`; scan/analyze/convert/export jobs, watch/auto-rescan, events, thumbnail cache, federated fan-out | No UI/server/windowing dependency. Directly uses `dam-client` for outbound federation and optionally `dam-render` behind `render`; `dam-server` enables rendering. |
 | `3dam-client` | `dam-client` | `ApiClient` impls `LibraryService` over HTTP/WS | The "connected" backend (CLI/GUI `--connect`). |
 | `3dam-server` | `dam-server` | axum server: `/api/v1` REST + WS, embedded web client (`rust-embed`), auth/admin, MCP mount; owns `server.db` (tokens, flags, audit) | Wraps an `EmbeddedLibrary`. |
 | `3dam-frontend` | `dam-frontend` | `Backend`/`open_backend` + `Role`/`classify` dispatch glue | Tiny; shared by CLI + GUI. |
@@ -66,7 +66,9 @@ Packages are named `dam-*` (Cargo forbids leading digits); directories are brand
 
 ### Dependency flow
 
-`dam-api` is the root (serde-only). `dam-media`/`dam-sources` are leaf handlers → `dam-store` → `dam-core` (engine). `dam-client` implements the same trait over HTTP. `dam-server` wraps `dam-core`. `dam-frontend` glues embedded+connected; `dam-cli` sits on `dam-frontend`+`dam-server`; `dam-desktop` sits on `dam-server` (in-process serve) + Tauri; `dam` dispatches into cli/desktop. `dam-render`/`dam-viewer` are independent GPU crates.
+The exact direct internal graph is [tech-spec 01 §2](docs/tech-spec/01-architecture-and-crates.md#2-the-shipped-direct-graph) and is enforced by `cargo xtask check-deps`. In summary, `dam-api` has no internal dependency; media, sources, client, store, and core descend toward that contract. `dam-core` directly uses `dam-client` for federation and has the graph's only optional internal edge, `dam-core → dam-render`. `dam-server` enables that render feature and wraps core. `dam-frontend` glues embedded+connected service implementations; CLI consumes that glue and server commands; desktop depends on frontend+server and reaches core/render only transitively. `dam` dispatches into CLI/desktop. `dam-render` and `dam-viewer` have no internal edges.
+
+Direct edges are the only edges whitelisted. Optional edges remain direct and their optional status is enforced; dependencies reached through an allowed direct edge are transitive and must not be added to the whitelist. When an internal manifest edge changes, update the whitelist, tech-spec 01/affected ADR, and the crate-map summaries here and in README in the same change.
 
 ### Data & storage
 
@@ -112,8 +114,8 @@ Server tests exercise the axum router in-process via `ServiceExt::oneshot` (no s
 
 ```bash
 cargo xtask ci          # fmt --check + clippy -D warnings + tests + web build (the canonical pre-push gate)
-cargo xtask web         # build the React client → web/dist/ (builds wasm first; skips gracefully if pnpm missing)
-cargo xtask wasm        # wasm-pack build dam-viewer → web/src/wasm/ (skips gracefully if wasm-pack missing)
+cargo xtask web         # build React → web/dist/; skips if pnpm is absent, otherwise requires wasm-pack
+cargo xtask wasm        # wasm-pack build dam-viewer → web/src/wasm/; missing wasm-pack is an error
 cargo xtask packaging   # render shell completions + man pages → packaging/ by *running* the
                         # built 3dam (`3dam completions <shell>` / `3dam man`, ADR 0009 §10).
                         # --target <triple> finds a cross-built binary, as release CI does.
@@ -121,7 +123,7 @@ cargo xtask bundle      # package the desktop app (deb/AppImage): web → releas
                         # `cargo tauri bundle` (skips gracefully if tauri-cli missing; the bundler
                         #  wraps the pre-built target/release/3dam via mainBinaryName — dam-desktop
                         #  itself stays a lib)
-cargo xtask check-deps  # dependency-direction guard (placeholder, not yet enforced)
+cargo xtask check-deps  # exact direct-edge + optional-status guard; also runs inside `xtask ci`
 ```
 
 ### Web client
@@ -140,7 +142,7 @@ pnpm wasm         # cargo xtask wasm
 
 ### Prerequisites for the full build
 
-`wasm-pack` (WASM viewer) and `pnpm` (web) are optional for a native-only Rust build — xtask skips them gracefully — but required for a complete `serve` (and desktop shell) with a real web client. Linux builds need the usual system libs (GTK3 + **webkit2gtk-4.1** for the Tauri shell, ssl/pkg-config; see `.github/workflows/release.yml`).
+`wasm-pack` (WASM viewer) and `pnpm` (web) are optional for a native-only Rust build, but both are required for a complete `serve` (and desktop shell) with a real web client. `cargo xtask web` may skip when pnpm itself is absent; once a web build is requested, a missing `wasm-pack` is a hard error rather than a silent partial success. Linux builds need the usual system libs (GTK3 + **webkit2gtk-4.1** for the Tauri shell, ssl/pkg-config; see `.github/workflows/release.yml`).
 
 ---
 
@@ -175,7 +177,7 @@ pnpm wasm         # cargo xtask wasm
 - **`detect()` vs `detect_for_ingest()`.** The first answers "what is this file?"; the second answers "should the catalog hold it?" and is what a **scan** must call. It drops **documents** (never other media) found under dependency/build/VCS directories, so one `npm install` can't bury a project's assets under thousands of `README.md`s. A root `LICENSE.txt` is deliberately kept — the licence surface points at it.
 - **Some searchable text lives *only* in the FTS index, not in any base-table column.** `asset_fts` carries `tokens` (filename sub-tokens), `tags`, `note`, `folder` (tokenised directory segments, written at scan), and `text` (extracted document body, written by the analyse pass). Search ranks in **two levels**: a categorical tier (`search::AUTHORED_TIER`) that puts any filename/token/tag/**note**/**folder** match above every body-text-only match, then weighted bm25 (`search::FTS_RANK`) within the tier. Don't collapse that to weights alone — bm25 saturates term frequency, so a sufficiently repetitive document ties any finite filename weight. And because `tokens`/`tags`/`text` have no home outside the index, **any FTS rebuild must stash and restore them** — V7, V11, V12, and V13 are the worked precedents, and `schema::tests::the_fts_rebuilds_preserve_the_index_only_columns` is the regression guard. Two columns are exceptions that a rebuild can *derive* rather than carry: `note` is mirrored in `asset_note`, and `folder` is a pure function of `asset.path` (V13 back-fills it in SQL, coarser than the Rust tokeniser, and the next scan refines it).
 - **Newer-schema DBs are rejected.** If you bump the schema and then run an older binary against that DB, it refuses to open by design.
-- **Release CI is live, and the web client is built once for all four targets.** `.github/workflows/release.yml` fires on `v*` tag pushes (issue #45). A tag whose version disagrees with `[workspace.package] version` is rejected before anything builds — the Tauri bundler names installers from Cargo.toml while the archives are named from the tag, so a mismatch would ship two versions of the same commit. The React client + WASM islands are built in **one** `web` job and downloaded by every build leg, so all four binaries embed identical assets and only that job needs pnpm/wasm-pack; note `cargo xtask wasm` **silently succeeds** when `wasm-pack` is absent, so the job asserts its outputs exist rather than trusting the exit code. Native installers (`.deb`/`.AppImage`, `.dmg`, `.msi`/NSIS) all come from `cargo tauri bundle`, which already owns the app metadata — there is no cargo-deb/cargo-wix. The portable archive must be cut *before* bundling: the bundler stamps a bundle-type token into the binary and only restores the pristine copy on its success path, so a bundler run that fails partway leaves the stamp behind. Because this is a **private** repo, runner minutes bill at 10x for macOS and 2x for Windows, so a manual run defaults to Linux only and takes a `targets` input to widen it.
+- **Release CI is live, and the web client is built once for all four targets.** `.github/workflows/release.yml` fires on `v*` tag pushes (issue #45). A tag whose version disagrees with `[workspace.package] version` is rejected before anything builds — the Tauri bundler names installers from Cargo.toml while the archives are named from the tag, so a mismatch would ship two versions of the same commit. The React client + WASM islands are built in **one** `web` job and downloaded by every build leg, so all four binaries embed identical assets and only that job needs pnpm/wasm-pack; `cargo xtask wasm` fails fast when `wasm-pack` is absent, and the job also asserts the generated artifacts exist. Native installers (`.deb`/`.AppImage`, `.dmg`, `.msi`/NSIS) all come from `cargo tauri bundle`, which already owns the app metadata — there is no cargo-deb/cargo-wix. The portable archive must be cut *before* bundling: the bundler stamps a bundle-type token into the binary and only restores the pristine copy on its success path, so a bundler run that fails partway leaves the stamp behind. Because this is a **private** repo, runner minutes bill at 10x for macOS and 2x for Windows, so a manual run defaults to Linux only and takes a `targets` input to widen it.
 - **`cargo tauri bundle` now depends on `cargo xtask packaging` having run.** Shell completions and man pages (ADR 0009 §10) are rendered by *running the built binary* — `3dam completions <shell>` and `3dam man` are hidden verbs, so the clap tree in `dam-cli` stays the only copy of the grammar and there is no build script duplicating it. `xtask packaging` stages the output under `packaging/`, which `tauri.conf.json` names under `bundle.linux.deb.files`; the Tauri bundler treats a **missing source file as a hard error**, and its source paths resolve relative to the `tauri.conf.json` directory, not the workspace root. So a bare `cargo tauri bundle` on a fresh clone fails until you stage — `cargo xtask bundle` does it for you, and release CI has its own step. Note `packaging/` is top-level and *not* under `target/`: the deb config needs a literal path, and a `[build] target-dir` override (one is set on this machine) moves `target/` somewhere else entirely — which is also why `xtask packaging` shells out to `cargo run` instead of executing a binary path it built by hand. The AppImage deliberately gets none of this (separate `files` map, and the files are inert in an image that is never installed system-wide).
 
 ---

@@ -4,6 +4,15 @@ Status: **Accepted (draft)** · Date: 2026-07-06 · Deciders: 3DAM core
 Related: [0001 — 3D render backend](0001-3d-render-backend.md),
 [PRODUCT_SPEC.md](../PRODUCT_SPEC.md) §4.3, [3d-handler-notes.md](../3d-handler-notes.md)
 
+> **Shipped-graph amendment (2026-08-01):** the ownership boundary remains accepted, but the
+> original “core must not depend on render” follow-up described below was too strict for the
+> implemented orchestration. `dam-core` has an **optional direct dependency** on `dam-render`,
+> activated by its `render` feature; `dam-server` enables that feature to produce server-side 3D
+> thumbnails. Thus a default `dam-core` library build remains GPU-free, while the server-enabled
+> dependency tree contains wgpu. The invariant is that GPU/window types do not enter core's public
+> contract, `dam-render` alone owns wgpu, and it owns no window or event loop. See
+> [tech-spec 01 §2](../tech-spec/01-architecture-and-crates.md#2-the-shipped-direct-graph).
+
 ## Context
 
 3DAM is "one engine, three roles" ([PRODUCT_SPEC.md](../PRODUCT_SPEC.md) §4.2): `3dam-core`
@@ -72,8 +81,8 @@ Rules:
 **Negative / risks**
 
 - Requires discipline: it's tempting to let a `wgpu::Device` leak into core for convenience.
-  A dependency-direction check (core must not depend on render) should be enforced, ideally
-  in CI.
+  The shipped dependency guard therefore checks that the edge stays optional and that no other
+  GPU/windowing edge is introduced.
 - The GUI toolkit must expose a wgpu surface we can render into; both egui-wgpu and Iced do,
   but this couples the boundary to that assumption — revisit if the toolkit choice changes.
 
@@ -81,5 +90,5 @@ Rules:
 
 - When the toolkit ADR lands, confirm the surface-sharing mechanism (egui-wgpu
   `CallbackTrait` / paint callback, or Iced custom shader widget).
-- Add a CI guard (e.g. a `cargo-deny`/graph check or a test) asserting `3dam-core` has no GPU
-  crate in its dependency tree.
+- ~~Add a dependency graph guard.~~ Done: `cargo xtask check-deps` enforces the reviewed direct
+  graph and the optional status of `dam-core → dam-render`; it runs as part of `cargo xtask ci`.

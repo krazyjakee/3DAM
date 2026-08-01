@@ -206,6 +206,7 @@ cargo fmt --all --check                       # format check
 cargo clippy --all-targets -- -D warnings     # lint
 
 cargo xtask ci                                # the canonical pre-push gate (fmt + clippy + tests + web build)
+cargo xtask check-deps                        # enforce the exact direct internal crate graph
 cargo xtask web                               # build the React client → web/dist/
 cargo xtask wasm                              # wasm-pack build the dam-viewer islands
 cargo xtask packaging                         # stage shell completions + man pages → packaging/
@@ -215,6 +216,15 @@ cargo xtask bundle                            # package the desktop app (deb/App
 The crate layout, seams, and data model are documented in
 [`CLAUDE.md`](CLAUDE.md), the numbered deep specs under
 [`docs/tech-spec/`](docs/tech-spec/), and the ADRs in [`docs/adr/`](docs/adr/).
+
+The shipped dependency graph is documented in
+[`tech-spec 01 §2`](docs/tech-spec/01-architecture-and-crates.md#2-the-shipped-direct-graph).
+Two engine edges are deliberate: `dam-core` uses `dam-client` directly for outbound federated
+queries, and optionally uses `dam-render` behind its `render` feature; `dam-server` enables that
+feature for server-side 3D thumbnails. Direct internal edges (including optional status) are
+enforced by `cargo xtask check-deps`; transitive reachability is not a direct edge. Any graph change
+must update the whitelist, tech-spec/affected ADR, and the summary crate maps in this README and
+`CLAUDE.md` together.
 
 ## Contributing
 

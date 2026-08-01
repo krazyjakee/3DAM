@@ -1,325 +1,213 @@
 # 01 — Architecture & crates
 
-> **Amendment ([ADR 0013](../adr/0013-desktop-shell-tauri.md), 2026-07-16):** wherever this spec
-> says `3dam-gui` (the egui desktop client), the shipped crate is now **`3dam-desktop`** — a Tauri
-> webview shell that boots `dam-server` in-process (loopback, ephemeral port) and renders the
-> embedded web client, or navigates to a remote `3dam serve` in `--connect` mode. The desktop shell
-> therefore sits on `3dam-server` rather than holding a `LibraryService` directly; the role dispatch
-> (§5) and every other crate boundary are unchanged. The egui client's design record is
-> [12-desktop-gui.md](12-desktop-gui.md) (superseded).
+Status: **Shipped** · Scope: the Cargo workspace, its direct internal dependency graph, role
+dispatch, and embedded/connected service wiring.
 
-Status: **Draft v0.1** · Scope: the Cargo workspace — the authoritative crate list and each crate's job, the dependency-direction rules and their CI enforcement, the embedded-vs-connected `LibraryService` wiring, the single-binary role dispatch, and compile-time feature gating.
-
-This file is the low-level companion to [PRODUCT_SPEC.md](../PRODUCT_SPEC.md) §4 (system architecture) and §7 (candidate stack), and to [DESIGN_GUIDELINES.md](../DESIGN_GUIDELINES.md) §2 (architecture guidelines). The product spec establishes *one binary, three roles over a shared `3dam-core` engine*, clients depending on a `LibraryService` seam rather than the engine directly, and a safe-by-default server. This file turns that shape into a concrete crate layout, names the dependency edges that are allowed to exist (and how CI forbids the rest), and gives Rust-ish pseudocode for the two mechanisms that make the shape work: **role dispatch** (how one binary becomes GUI/CLI/server/MCP) and **`LibraryService` selection** (how a front-end picks the in-process engine vs a remote API client). It does not re-decide the render crate boundary — that is [ADR 0002](../adr/0002-3d-render-crate-boundary.md) — nor does it own the `LibraryService` trait's methods and DTOs, which belong to [03-library-service-and-api.md](03-library-service-and-api.md). It fixes the crate *names* the rest of the spec references.
+This file records the architecture that is present in the manifests. The Cargo package names are
+`dam-*`, their directories are `crates/3dam-*`, Rust imports use `dam_*`, and the shipped binary is
+`3dam` ([ADR 0010](../adr/0010-cargo-package-naming.md)). `Cargo.toml` is authoritative for whether
+an edge exists; the whitelist in `xtask/src/main.rs` is the enforcement copy of that graph.
 
 ---
 
-## 1. The workspace at a glance
+## 1. Workspace and ownership
 
-One Cargo workspace, one shipped binary (`3dam`), one non-Rust codebase (the web client, in `web/`, owned by [09-server-and-web-client.md](09-server-and-web-client.md)). Everything else is a library crate that the binary and its siblings compose.
+One Rust workspace produces one shipped binary and one React client. The desktop application is a
+Tauri shell over that same web client; the removed egui `3dam-gui` crate is historical and is not
+part of the current graph ([ADR 0013](../adr/0013-desktop-shell-tauri.md)).
 
-```
-3dam/                              (workspace root: Cargo.toml [workspace])
-├── crates/
-│   ├── 3dam-core/                 pure engine: library model, scan/watch,
-│   │                              analysis + convert orchestration, query.
-│   │                              NO UI, NO transport, NO GPU.
-│   ├── 3dam-api/                  the LibraryService trait + shared DTOs + error
-│   │                              model (the seam). Depended on by everyone.
-│   ├── 3dam-render/               wgpu renderer (ADR 0002). Owns GPU, not windows.
-│   ├── 3dam-media/                MediaHandler trait + audio/image/3D handlers.
-│   ├── 3dam-sources/              Source trait + local FS / SFTP / SMB / federated.
-│   ├── 3dam-store/                SQLite metadata store + vector index + blob cache.
-│   ├── 3dam-client/               API-client LibraryService (HTTP/WS → remote serve).
-│   ├── 3dam-server/              axum server: HTTP/WS API, web-asset host, MCP mount,
-│   │                              auth, feature-flag/accounts store.
-│   ├── 3dam-gui/                  native desktop shell (egui/eframe or Iced).
-│   ├── 3dam-cli/                  clap command tree + human/--json/--csv rendering.
-│   └── 3dam/                      THE binary. Role dispatch only; ~no logic.
-├── web/                           React + CSS web client (non-Rust; file 09).
-└── xtask/                         dev-only automation (CI checks, packaging).
-```
+| Directory | Package | Ownership |
+|---|---|---|
+| `crates/3dam-api` | `dam-api` | `LibraryService`, DTOs, auth context, events, and public errors |
+| `crates/3dam-store` | `dam-store` | SQLite catalog, migrations, queries, and optional ANN index |
+| `crates/3dam-media` | `dam-media` | media detection, metadata, thumbnails, features, and conversion |
+| `crates/3dam-sources` | `dam-sources` | local, SFTP, and SMB file-source implementations and connection types |
+| `crates/3dam-render` | `dam-render` | headless wgpu model rendering; no window or event loop |
+| `crates/3dam-viewer` | `dam-viewer` | browser WASM viewer islands; GPU dependencies are wasm-target-only |
+| `crates/3dam-core` | `dam-core` | embedded engine and `LibraryService` implementation; jobs, federation, and orchestration |
+| `crates/3dam-client` | `dam-client` | remote HTTP/WebSocket `LibraryService` implementation |
+| `crates/3dam-server` | `dam-server` | axum API, embedded web assets, auth/admin, MCP, and `server.db` |
+| `crates/3dam-frontend` | `dam-frontend` | backend selection and role classification shared by CLI and desktop |
+| `crates/3dam-desktop` | `dam-desktop` | Tauri shell; boots an in-process server or opens a remote server |
+| `crates/3dam-cli` | `dam-cli` | clap command tree, command execution, and output rendering |
+| `crates/3dam` | `dam` | `3dam` binary entry point and role dispatch |
+| `xtask` | `xtask` | development, dependency, web, and packaging automation |
 
-`3dam-core` is deliberately *not* the crate every front-end imports. Front-ends import **`3dam-api`** (the seam) and one implementation behind it. That inversion — the trait in its own tiny crate — is what lets `3dam-cli` and `3dam-gui` link *either* the embedded engine *or* the API client without either front-end depending on `3dam-core` transitively when connected. See §4.
-
-### Why these boundaries
-
-Each crate is a seam the product spec already drew (DESIGN_GUIDELINES §2):
-
-| Crate | Owns (this spec's file) | Key external deps (PRODUCT_SPEC §7) |
-|-------|-------------------------|-------------------------------------|
-| `3dam-api` | `LibraryService` trait, DTOs, error taxonomy — [03](03-library-service-and-api.md) | `serde` only (no runtime, no I/O) |
-| `3dam-core` | library/query, scan/watch, analysis + convert orchestration — [05](05-analysis-similarity-dedup.md), [08](08-convert-pipeline.md) | `tokio`, `rayon`, `candle`/`ort` (feature-gated) |
-| `3dam-render` | wgpu render-to-texture, software raster — [06](06-3d-render.md), [ADR 0002](../adr/0002-3d-render-crate-boundary.md) | `wgpu`, `glam` (**no `winit`**) |
-| `3dam-media` | `MediaHandler` trait + format handlers — [04](04-media-handlers.md) | `symphonia`, `image`, `img_hash`, `gltf`, `realfft` |
-| `3dam-sources` | `Source` trait, file + federated sources — [07](07-sources-and-federation.md) | `russh`, an SMB crate; federated source uses `3dam-client` |
-| `3dam-store` | SQLite schema, migrations, vector index, blob cache — [02](02-data-model-and-storage.md) | `sqlx`/`rusqlite`, `sqlite-vec`/`usearch` |
-| `3dam-client` | API-client `LibraryService` impl — [03](03-library-service-and-api.md) | `reqwest`, `tokio-tungstenite` |
-| `3dam-server` | axum host, API, MCP mount, auth, flags/accounts — [09](09-server-and-web-client.md), [10](10-auth-accounts-and-flags.md), [11](11-mcp-server.md) | `axum`, `hyper`, `rmcp`, `rustls`, `oauth2`, `argon2`, `keyring` |
-| `3dam-gui` | desktop shell, viewer embed — [12](12-desktop-gui.md) | `egui`/`eframe` or `iced`, `egui-wgpu` |
-| `3dam-cli` | clap tree, output formats, exit codes — [13](13-cli.md) | `clap` |
-| `3dam` | role dispatch (§5) | — (glue only) |
-
-The trait crate `3dam-api` is intentionally the thinnest thing in the workspace: it depends on `serde` and nothing else, so it costs nothing to link everywhere and imposes no transitive weight (no runtime, no GPU, no HTTP) on a consumer that only needs the DTOs.
+`dam-api` is intentionally small, but it is not serde-only. Its public async service and DTO
+contract directly uses `serde`, `serde_json`, `thiserror`, `uuid`, `async-trait`, and `futures`.
+It has no internal `dam-*` dependency, transport implementation, database, UI, or GPU dependency.
 
 ---
 
-## 2. Dependency graph & direction rules
+## 2. The shipped direct graph
 
-The whole architecture is one invariant: **dependencies point down, never up.** UI, transport, and GPU may depend on the engine; the engine depends on none of them. This is DESIGN_GUIDELINES §2 ("Layered core… the core depends on neither") and ADR 0002's core-has-no-GPU rule, expressed as a DAG.
+The following is the complete allowlist of **direct internal package dependencies**. An asterisk
+marks an optional Cargo dependency; all other edges are required manifest dependencies.
 
+```text
+dam
+├── dam-cli
+├── dam-desktop
+└── dam-frontend
+
+dam-cli
+├── dam-api
+├── dam-client
+├── dam-core
+├── dam-frontend
+├── dam-media
+└── dam-server
+
+dam-desktop
+├── dam-frontend
+└── dam-server
+
+dam-frontend
+├── dam-api
+├── dam-client
+└── dam-core
+
+dam-server
+├── dam-api
+└── dam-core                (enables `render` and `model-convert`)
+
+dam-core
+├── dam-api
+├── dam-client              (federated peer transport)
+├── dam-media
+├── dam-render *            (`render` feature)
+├── dam-sources
+└── dam-store
+
+dam-store
+├── dam-api
+└── dam-sources             (connection persistence types; network features disabled)
+
+dam-media   ──► dam-api
+dam-sources ──► dam-api
+dam-client  ──► dam-api
 ```
-                         ┌───────────────┐
-                         │     3dam      │  (binary: role dispatch)
-                         └──┬────┬────┬──┘
-              ┌─────────────┘    │    └─────────────┐
-              ▼                  ▼                  ▼
-        ┌───────────┐      ┌───────────┐      ┌────────────┐
-        │ 3dam-cli  │      │ 3dam-gui  │      │3dam-server │
-        └─────┬─────┘      └──┬─────┬──┘      └──────┬─────┘
-              │               │     │                │
-              │               │     ▼                │
-              │               │ ┌───────────┐        │
-              │               │ │3dam-render│        │   (GUI + server render;
-              │               │ │  (wgpu)   │        │    CLI too, feature-gated)
-              │               │ └─────┬─────┘        │
-              │               │       │              │
-    ┌─────────┴───────────────┴───────┼──────────────┴──────────┐
-    │                                 │                          │
-    ▼           front-ends select a LibraryService impl:         ▼
-┌───────────┐                                            ┌───────────────┐
-│3dam-client│  (API-client impl: connected mode)         │   3dam-core   │
-│ HTTP/WS   │                                            │ (in-proc impl:│
-└─────┬─────┘                                            │  embedded)    │
-      │                                                  └──┬────┬────┬──┘
-      │                                                     ▼    ▼    ▼
-      │                                          ┌──────────┐ ┌───────┐ ┌──────────┐
-      │                                          │3dam-media│ │3dam-  │ │3dam-store│
-      │                                          │(handlers)│ │sources│ │ (SQLite  │
-      │                                          └────┬─────┘ └───┬───┘ │ +vec+blob│
-      │                                               │           │     └──────────┘
-      │                                               ▼           │
-      │                                         (3dam-media uses  │
-      │                                          3dam-render for  │
-      │                                          3D thumbnails)   │
-      │                                                           │
-      └──────────────────► 3dam-api ◄──────────────────────────┘
-             everyone depends on the seam crate (trait + DTOs).
-             3dam-api depends on nothing but serde.
 
-  3dam-sources' *federated* source depends on 3dam-client (a peer is queried
-  over the same API a connected client uses). 3dam-server depends on 3dam-core
-  (embedded engine it serves) + 3dam-render (headless thumbnails).
-```
+`dam-api`, `dam-render`, and `dam-viewer` have no direct internal dependencies. External crates are
+not part of the internal-edge whitelist; their placement is governed by the rules below and the
+owning manifest.
 
-### The rules, stated so CI can check them
+### Direct, optional, and transitive rules
 
-1. **`3dam-core` depends on nothing UI, transport, or GPU.** No `wgpu`, `winit`, `egui`, `iced`, `axum`, `hyper`, `reqwest`, `rmcp`, `tao`, or any windowing/HTTP crate anywhere in its dependency tree. (ADR 0002; PRODUCT_SPEC §4.3.) It *may* depend on `3dam-api`, `3dam-media`, `3dam-sources`, `3dam-store`, `tokio`, `rayon`, and the ML runtime.
-2. **`3dam-render` owns wgpu but not the window.** It depends on `wgpu` and `glam`; it **must not** depend on `winit` (or `tao`/`eframe`/`iced` windowing). Windowing and the event loop belong to `3dam-gui` (ADR 0002). It does not depend on `3dam-core`'s I/O — only on the pure geometry/camera math types (which live in `3dam-core` per ADR 0002, GPU-free).
-3. **`3dam-api` depends on nothing but `serde`.** No runtime, no I/O. It is the seam; if it grows a heavy dependency the seam has leaked.
-4. **No front-end depends on `3dam-store` directly.** GUI/CLI/web reach data only through a `LibraryService` (DESIGN_GUIDELINES §1.4: "no front-end reaches past the engine's API"). Only `3dam-core` (and, transitively, `3dam-server`) touches `3dam-store`.
-5. **The graph is acyclic.** The one edge that *looks* like a cycle — `3dam-sources`' federated source using `3dam-client` — is not: `3dam-client` depends on `3dam-api` only, not on `3dam-core`, so `core → sources → client → api` is a straight descent.
+- A **direct edge** is a `dam-*` dependency declared by one package manifest. Every such edge must
+  appear above and in `ALLOWED_DAM_EDGES`; a new or removed edge is an architecture change, not a
+  routine manifest edit.
+- An **optional edge** is still a direct edge and is checked as such. Currently only
+  `dam-core → dam-render` is optional. The `dam-core/render` feature activates it.
+- A **transitive dependency** is inherited through a permitted direct edge and is not itself added
+  to the internal whitelist. For example, `dam-desktop` reaches `dam-core`, `dam-render`, and the
+  store transitively through `dam-server`; those are not direct desktop edges.
+- Cargo feature unification can activate an optional transitive dependency without changing the
+  direct graph. `dam-server` enables `dam-core/render`, so the full `dam` binary contains wgpu even
+  though a default standalone `dam-core` consumer does not.
+- No frontend may add a direct `dam-store` dependency. CLI, desktop, and web functionality cross
+  the `LibraryService` boundary; persistence types are not a frontend API.
+- The graph must remain acyclic. Cargo rejects dependency cycles; `cargo xtask check-deps` rejects
+  direct internal edges outside the exact reviewed whitelist.
 
-### Enforcing it in CI
+### Deliberate engine exceptions
 
-Discipline alone is insufficient (ADR 0002 "Negative/risks"). Three layered guards, run in CI and available locally via `cargo xtask ci`:
+The engine is UI- and server-agnostic, but “no transport or GPU” is not an accurate statement about
+every build of its dependency graph. Two reviewed exceptions implement shipped capabilities:
 
-- **`cargo-deny` bans, per crate.** A `deny.toml` with `[bans]` entries asserting forbidden crates never appear in a given crate's tree. The load-bearing one:
+1. **Federation: `dam-core → dam-client` is required.** Federated query fan-out runs in the querying
+   engine. A peer is called through the same versioned HTTP API as any connected client, so core
+   reuses `ApiClient` instead of growing a second protocol implementation. This gives core an
+   outbound transport dependency, but not an inbound server dependency: `dam-client` descends only
+   to `dam-api`, so there is no `core ↔ server` cycle. Federation remains an off-by-default runtime
+   server capability; the Cargo edge exists in every core build.
+2. **Server rendering: `dam-core → dam-render` is optional.** Thumbnail orchestration belongs to the
+   engine and calls the renderer behind `dam-core/render`. `dam-server` deliberately enables that
+   feature so serve can create 3D turntable thumbnails. A consumer of `dam-core` without `render`
+   does not pull wgpu. `dam-render` owns GPU code and remains window-free; no wgpu type is part of
+   core's public data/service contract ([ADR 0002](../adr/0002-3d-render-crate-boundary.md)).
 
-  ```toml
-  # deny.toml — enforced by `cargo deny check bans`
-  [bans]
-  # 3dam-core (and thus the CLI/server engine path) must never pull in GPU/UI/HTTP.
-  deny = [
-    { name = "wgpu",  wrappers = ["3dam-render"] },  # only 3dam-render may depend on wgpu
-    { name = "winit" },                               # nobody but the GUI shell; never render/core
-    { name = "axum",  wrappers = ["3dam-server"] },
-    { name = "reqwest", wrappers = ["3dam-client"] },
-  ]
-  ```
+These exceptions do not permit `dam-core` to depend on `dam-server`, Tauri/windowing, or frontend
+crates. New transport, UI, or GPU edges require an ADR amendment and an explicit whitelist change.
 
-  Run once per crate root (`cargo deny --manifest-path crates/3dam-core/Cargo.toml check bans`) so a violation is attributed to the crate that introduced it.
+### Enforcement and drift review
 
-- **A graph-shape test in `xtask`.** `cargo xtask check-deps` runs `cargo metadata`, builds the dependency DAG, and asserts the allowed-edge whitelist from §2 above — failing on any edge not in the list and on any cycle. This catches an *internal* edge (e.g. someone making `3dam-core` depend on `3dam-server`) that `cargo-deny`'s crate bans would miss.
+`cargo xtask check-deps` reads `cargo metadata`, compares all direct internal dependencies (including
+optional status) with `ALLOWED_DAM_EDGES`, and fails for both unreviewed manifest edges and stale
+whitelist entries. It runs inside `cargo xtask ci`.
 
-- **The compile itself.** Because `3dam-api` carries the trait and `3dam-core` implements it, a front-end that tries to reach `3dam-store` directly simply won't have it in scope — the boundary is partly enforced by what each crate re-exports. `3dam-store` types are not re-exported from `3dam-api`.
+When an internal edge or its optional status changes, the same change must review and update:
 
-CI runs `cargo deny check bans`, `cargo xtask check-deps`, `cargo clippy --all-targets --all-features -D warnings`, and the test suite on the full feature matrix (§6). Cross-cutting CI/packaging detail is [15-observability-config-testing-packaging.md](15-observability-config-testing-packaging.md).
+1. the affected `Cargo.toml`;
+2. `ALLOWED_DAM_EDGES` in `xtask/src/main.rs`;
+3. this section and any affected ADR amendment; and
+4. the summary crate maps in `CLAUDE.md` and `README.md`.
+
+This four-file review is deliberately lightweight: the detailed graph has one design source, while
+summary guidance is explicitly included in review rather than silently generated and forgotten.
 
 ---
 
-## 3. The `LibraryService` seam (placement only)
+## 3. `LibraryService` and backend selection
 
-Every front-end talks to one trait, `LibraryService`, living in **`3dam-api`**. Its methods, DTOs, error model, pagination, and streaming are **owned by [03-library-service-and-api.md](03-library-service-and-api.md)** — do not duplicate them here. This file cares only about *where it sits* and *which two crates implement it*:
+`LibraryService` lives in `dam-api`. It has two Rust implementations:
 
-```rust
-// crate: 3dam-api — the seam. Signatures are illustrative; file 03 is authoritative.
-#[async_trait]
-pub trait LibraryService: Send + Sync {
-    async fn search(&self, q: SearchQuery)   -> Result<Page<AssetHit>, Error>;
-    async fn get_asset(&self, id: AssetId)   -> Result<Asset, Error>;
-    async fn find_similar(&self, r: SimRef)  -> Result<Page<AssetHit>, Error>;
-    // …tags, sources, convert jobs, live-update stream — all in file 03.
-}
-```
+- `EmbeddedLibrary` in `dam-core` executes against the in-process catalog and workers.
+- `ApiClient` in `dam-client` calls a remote `3dam serve` over HTTP/WebSocket.
 
-Two implementations satisfy it, in two different crates (this is the "embedded vs connected" split of PRODUCT_SPEC §4.2):
+`dam-frontend::open_backend` selects between those implementations for CLI use. The browser client
+uses the HTTP API directly. The Tauri desktop shell does not hold a `LibraryService`: in embedded
+mode it starts `dam-server` on a loopback ephemeral port and loads its web client; in connected mode
+it navigates to the remote server ([ADR 0013](../adr/0013-desktop-shell-tauri.md)).
 
-- **`EmbeddedLibrary` in `3dam-core`** — wraps the in-process engine (store + handlers + sources). This is the standalone, no-network path.
-- **`ApiClient` in `3dam-client`** — implements the same trait by calling a remote `3dam serve` over HTTP/WebSocket. This is the connected path; the web client is always this shape (from JS, not this crate).
-
-The server's job is to expose the *same* surface: `3dam-server` mounts an `EmbeddedLibrary` behind an axum router so the HTTP/WS API mirrors the trait method-for-method (file 03), and the MCP server ([11-mcp-server.md](11-mcp-server.md)) is *also* just an in-process consumer of `EmbeddedLibrary` — peer to the HTTP API, not a subprocess shim (PRODUCT_SPEC §6.10).
+Federation is separate from frontend connected mode. `--connect` selects the service used by this
+frontend. A federated source makes the selected engine fan out to peer servers, which is why the
+engine itself owns the `dam-client` edge ([07](07-sources-and-federation.md)).
 
 ---
 
-## 4. Embedded vs connected: front-end wiring
+## 4. One binary, four roles
 
-A front-end (GUI or CLI) does not know or care whether the engine is local. It receives a `Box<dyn LibraryService>` at startup, chosen by one selection function. The decision is: **did the invocation ask to connect to a remote server?** (`--connect host:port`, PRODUCT_SPEC §6.8) — if so, connected; otherwise, embedded.
+`dam-frontend::classify` selects the role; the `dam` package performs the final dispatch:
 
-```rust
-// crate: 3dam-cli / 3dam-gui share this via a small helper (could live in 3dam-api
-// as a constructor module, or a tiny 3dam-frontend crate — see Open questions).
+| Invocation | Role | Implementation path |
+|---|---|---|
+| `3dam` | Desktop | `dam-desktop`; Tauri over local or remote `dam-server` |
+| `3dam <verb> …` | CLI | `dam-cli`; embedded or connected `LibraryService` |
+| `3dam serve …` | HTTP/WS server | CLI grammar dispatches to `dam-server` |
+| `3dam mcp …` | stdio MCP server | CLI grammar dispatches to `dam-server` over an embedded engine |
 
-pub enum Backend {
-    /// Standalone: engine linked directly in-process. No network.
-    Embedded { library_path: PathBuf },
-    /// Thin client: talk to a remote `3dam serve` over its API.
-    Connected { endpoint: Url, auth: AuthConfig },
-}
-
-/// Resolve a LibraryService from how the tool was invoked.
-pub async fn open_backend(b: Backend) -> Result<Box<dyn LibraryService>, Error> {
-    match b {
-        Backend::Embedded { library_path } => {
-            // Pulls in 3dam-core → store/handlers/sources. Heavy link, no network.
-            let engine = dam_core::EmbeddedLibrary::open(&library_path).await?;
-            Ok(Box::new(engine))
-        }
-        Backend::Connected { endpoint, auth } => {
-            // Pulls in 3dam-client only. No engine, no store, no GPU for data ops.
-            let client = dam_client::ApiClient::connect(endpoint, auth).await?;
-            Ok(Box::new(client))
-        }
-    }
-}
-```
-
-Consequences worth stating:
-
-- **The front-end code above the trait is identical in both modes** — the whole point of the seam (DESIGN_GUIDELINES §1.4). A view calls `library.search(q)`; whether that is a function call or an HTTP round-trip is invisible.
-- **Link weight differs by mode but not by build.** Both `3dam-core` and `3dam-client` are linked into the shipped binary (so `--connect` works without a reinstall); which one runs is a startup decision. A build that wants a *thin-client-only* binary can drop the embedded engine behind a feature (`embedded-engine`, §6) — but the default binary carries both.
-- **Auth lives on the connected path only.** `AuthConfig` (anonymous / token / OIDC) is carried by `ApiClient`; the embedded engine has no auth surface because there is no boundary to guard (auth is a *serve*-side concern — [10-auth-accounts-and-flags.md](10-auth-accounts-and-flags.md)).
-- **Federation is not this.** Adding a peer as a *source* (PRODUCT_SPEC §4.4) happens *inside* the embedded engine via `3dam-sources`' federated source — it reuses `3dam-client` under the hood but is orthogonal to whether *this* front-end is embedded or connected. `--connect` picks your backend; `source add 3dam://…` adds a peer to whatever backend you have. See [07-sources-and-federation.md](07-sources-and-federation.md).
+Role selection is a runtime decision. The shipped `dam` package directly links CLI, desktop, and
+frontend dispatch glue; it does not use the old proposed role-level Cargo feature matrix.
 
 ---
 
-## 5. One binary, three (four) roles: dispatch
+## 5. Compile-time and runtime gates
 
-`3dam` is the only binary. It contains almost no logic — it parses enough of `argv` to pick a role, then hands off to the owning crate. The four roles (PRODUCT_SPEC §4.1, plus MCP stdio from §6.10):
+The current Cargo features are narrow dependency/build gates:
 
-| Invocation | Role | Handed to |
-|------------|------|-----------|
-| `3dam` (no args, or a GUI-ish arg) | GUI client | `3dam-gui` |
-| `3dam <verb> …` (e.g. `scan`, `search`) | CLI client | `3dam-cli` |
-| `3dam serve …` | Server | `3dam-server` |
-| `3dam mcp …` | MCP stdio server | `3dam-server` (stdio transport) over an embedded engine |
+| Package feature | Effect | Default |
+|---|---|---|
+| `dam-core/render` | activates optional `dam-render`; enabled by `dam-server` | off in core |
+| `dam-core/model-convert` | forwards to `dam-media/model-convert`; enabled by `dam-server` | off in core |
+| `dam-core/semantic` | adds Candle, tokenizers, image, and ORT model runtimes | off |
+| `dam-media/model-convert` | adds Assimp model export | off in media |
+| `dam-sources/sftp`, `smb` | adds the corresponding network source backend | on by default in sources; explicitly enabled by core |
+| `dam-store/ann` | adds the optional HNSW similarity index | off |
 
-`serve` and `mcp` are, at the CLI-grammar level, just clap subcommands of the CLI tree ([13-cli.md](13-cli.md)) — but they dispatch into `3dam-server`, not into ordinary CLI command handling, because they start long-lived services rather than run-and-exit verbs.
-
-```rust
-// crate: 3dam — src/main.rs. The entire binary is essentially this.
-fn main() -> ExitCode {
-    // Peek at argv to choose a role before doing heavy clap parsing.
-    match dam_cli::classify(std::env::args_os()) {
-        Role::Gui => dam_gui::run(),                 // default: no verb → desktop shell
-        Role::Serve(cfg_args) => dam_server::serve(cfg_args), // long-lived axum service
-        Role::Mcp(mcp_args) => dam_server::mcp_stdio(mcp_args), // stdio MCP, embedded engine
-        Role::Cli(argv) => dam_cli::run(argv),       // verb-driven, run-and-exit
-    }
-}
-```
-
-```rust
-// crate: 3dam-cli — the classifier. Keeps dispatch rules in one place.
-pub fn classify(args: impl Iterator<Item = OsString>) -> Role {
-    let mut args = args.skip(1).peekable();       // skip argv[0]
-    match args.peek().and_then(|s| s.to_str()) {
-        None                     => Role::Gui,     // `3dam`  → GUI
-        Some("serve")            => Role::Serve(collect(args)),
-        Some("mcp")              => Role::Mcp(collect(args)),
-        Some(v) if is_verb(v)    => Role::Cli(collect_all()),   // scan/search/similar/…
-        Some(_unknown)           => Role::Cli(collect_all()),   // let clap emit the error
-    }
-}
-```
-
-Notes on the dispatch:
-
-- **GUI is the no-verb default** (PRODUCT_SPEC §4.1). A bare `3dam` launches the desktop shell; every other role is reached by a leading token.
-- **`serve` and `mcp` route to `3dam-server`, not CLI verbs.** Both start a service. `serve` mounts the HTTP/WS API + MCP-over-HTTP + web host on one port ([09](09-server-and-web-client.md), [11](11-mcp-server.md)); `mcp` runs *only* the MCP tool surface over stdio against an embedded engine (no network, no running server — PRODUCT_SPEC §6.10). They share the tool implementations; only the transport differs.
-- **A GUI/CLI role still picks a backend (§4).** After `classify` chooses `Cli` or `Gui`, that front-end parses `--connect` and calls `open_backend`. Role dispatch (which front-end) and backend selection (which `LibraryService`) are two independent decisions.
-- **The classifier lives in `3dam-cli`** so the grammar has one owner; the binary crate stays a four-line match and pulls in no parsing logic of its own.
+The web viewer's dependencies are selected with `cfg(target_arch = "wasm32")`, not a Cargo feature.
+Server feature flags such as federation, auth, accounts, MCP, network writes, and analysis are
+runtime configuration in `server.db`; they do not remove Cargo dependencies from a built binary.
+Do not describe runtime flags as compile-time graph boundaries.
 
 ---
 
-## 6. Compile-time feature gating
+## 6. Boundary checklist
 
-Optional capabilities are Cargo features so a build can be trimmed — a CI-only CLI need not link wgpu or an ML runtime; a metadata-only serve host need not carry embedding models. Features gate *compilation and dependencies*, distinct from the *runtime* feature flags an operator toggles on a running server ([10-auth-accounts-and-flags.md](10-auth-accounts-and-flags.md)). The two must not be confused: a capability the server can turn on at runtime must first be *compiled in* by a feature here.
-
-Proposed feature axes (declared on the crates that own each dependency, then re-exported up through the binary's `Cargo.toml`):
-
-| Feature | Gates | Default? | Lives on |
-|---------|-------|----------|----------|
-| `media-audio` | `symphonia`, FFT/DSP, `cpal`/`rodio` audio handler | yes | `3dam-media` |
-| `media-image` | `image`, `imageproc`, `img_hash` handler | yes | `3dam-media` |
-| `media-3d` | `gltf`/FBX/OBJ loaders + 3D handler | yes | `3dam-media` |
-| `render` | `3dam-render` (wgpu) — thumbnails + viewer | yes (bin) | `3dam-media`, `3dam-gui`, `3dam-server` |
-| `render-software` | software raster (lavapipe/llvmpipe) fallback for headless serve | server default | `3dam-render` ([06](06-3d-render.md)) |
-| `ml` | `candle`/`ort` inference for embeddings ([05](05-analysis-similarity-dedup.md)) | yes | `3dam-core` |
-| `embedded-engine` | link `3dam-core` into a front-end (embedded backend, §4) | yes | `3dam-cli`, `3dam-gui` |
-| `server` | `3dam-server`: axum, auth, flags/accounts | yes (bin) | binary |
-| `mcp` | `rmcp` + MCP tool surface ([11](11-mcp-server.md)) | yes | `3dam-server` |
-| `source-sftp` | `russh`/`ssh2` SFTP source ([07](07-sources-and-federation.md)) | yes | `3dam-sources` |
-| `source-smb` | SMB/Samba source | yes | `3dam-sources` |
-| `federation` | federated-peer source (needs `3dam-client`) | yes | `3dam-sources` |
-| `auth-oidc` | `oauth2`/`openidconnect` beyond token auth ([10](10-auth-accounts-and-flags.md)) | no | `3dam-server` |
-
-Illustrative manifest wiring (the binary re-exports feature groups so packagers pick a profile):
-
-```toml
-# crates/3dam/Cargo.toml
-[features]
-default   = ["full"]
-full      = ["gui", "cli", "server", "all-media", "render", "ml",
-             "all-sources", "federation", "mcp"]
-all-media = ["media-audio", "media-image", "media-3d"]
-all-sources = ["source-sftp", "source-smb"]
-
-# A trimmed CI build:  cargo build -p 3dam --no-default-features \
-#     --features "cli,media-image,media-3d"   # no audio, no server, no ML, no GPU
-
-gui    = ["3dam-gui", "embedded-engine", "render"]
-cli    = ["3dam-cli"]
-server = ["3dam-server", "3dam-server/mcp"]
-render = ["3dam-media/render", "3dam-gui?/render", "3dam-server?/render"]
-ml     = ["3dam-core/ml"]
-# …media-*, source-*, federation forward to the owning crate similarly.
-```
-
-Rules for features:
-
-- **A missing media feature degrades, never breaks** (DESIGN_GUIDELINES §6, fail-soft). A binary built without `media-audio` reports audio files as an unhandled type, it does not fail the scan.
-- **`render` off ⇒ no wgpu anywhere.** Geometry stats still come from the cheap header-scan tier (PRODUCT_SPEC §6.2) via `3dam-core` pure math (ADR 0002); only thumbnails/turntables/viewer are lost. A GPU-less serve host builds `render` + `render-software` and falls back at runtime ([06](06-3d-render.md)).
-- **Server-side runtime flags presuppose their feature.** The admin surface only offers the MCP toggle if the binary was built with `mcp`; likewise OIDC requires `auth-oidc`. Absent-feature capabilities are shown as unavailable, not merely off (detail: [10-auth-accounts-and-flags.md](10-auth-accounts-and-flags.md)).
-- **CI tests a matrix, not just `--all-features`.** At minimum: default, `--no-default-features --features cli`, a metadata-only serve profile, and `--all-features`. This keeps the fail-soft paths honest (§2, and [15](15-observability-config-testing-packaging.md)).
-
----
-
-## Open questions
-
-- ~~**Frontend-shared helper crate.**~~ **Decided (2026-07-06): a tiny `3dam-frontend` crate**
-  holds `open_backend`/`Backend` (§4) and `classify`/`Role` (§5), shared by `3dam-cli` and
-  `3dam-gui` — so the GUI reaches the backend constructor without linking the clap grammar.
-- **Where ADR-0002's pure geometry/camera math lives.** ADR 0002 places `Mesh`/`Aabb`/camera/pick math in `3dam-core` (GPU-free) so both `3dam-render` and headless logic reuse it. If that math grows large it may warrant its own `3dam-geometry` crate below `3dam-core`; deferred to [06](06-3d-render.md).
-- **Default binary size vs thin-client builds.** The default binary links both `3dam-core` and `3dam-client` (§4) so `--connect` needs no reinstall. Whether we also ship an official *thin-client* profile (`--no-default-features --features "gui,cli"` without `embedded-engine`) for size-sensitive distribution is a packaging call — [15](15-observability-config-testing-packaging.md).
-- **`3dam-store` visibility.** Rule 4 forbids front-ends depending on `3dam-store`. Whether `3dam-store` is a fully private implementation detail of `3dam-core` (not published, not in the front-end lockfile path) or a workspace crate others *could* import but are CI-forbidden from, affects how strict the guard in §2 must be. Coordinate with [02](02-data-model-and-storage.md).
+- Public service and DTO changes begin in `dam-api` and stay synchronized with server, client, and
+  `web/src/api/types.ts`.
+- Frontends use `LibraryService`/HTTP, never `dam-store` internals.
+- `dam-render` may use wgpu but not Tauri, winit, or another window/event-loop owner.
+- `dam-core` may use outbound HTTP only through the reviewed `dam-client` federation edge.
+- GPU code reaches core only through the optional `dam-render` edge and `render` feature.
+- Any direct internal graph change follows the four-file review in §2 before the whitelist changes.

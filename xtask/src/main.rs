@@ -211,73 +211,92 @@ struct CargoPackage {
 #[derive(Deserialize)]
 struct CargoDependency {
     name: String,
+    optional: bool,
 }
 
 /// Direct internal dependency edges allowed by the current architecture (tech-spec 01 §2 and
-/// `CLAUDE.md`'s crate map). External crates are deliberately outside this graph-shape check.
-const ALLOWED_DAM_EDGES: &[(&str, &str)] = &[
-    ("dam", "dam-cli"),
-    ("dam", "dam-desktop"),
-    ("dam", "dam-frontend"),
-    ("dam-cli", "dam-api"),
-    ("dam-cli", "dam-client"),
-    ("dam-cli", "dam-core"),
-    ("dam-cli", "dam-frontend"),
-    ("dam-cli", "dam-media"),
-    ("dam-cli", "dam-server"),
-    ("dam-client", "dam-api"),
-    ("dam-core", "dam-api"),
-    ("dam-core", "dam-client"),
-    ("dam-core", "dam-media"),
-    ("dam-core", "dam-render"),
-    ("dam-core", "dam-sources"),
-    ("dam-core", "dam-store"),
-    ("dam-desktop", "dam-frontend"),
-    ("dam-desktop", "dam-server"),
-    ("dam-frontend", "dam-api"),
-    ("dam-frontend", "dam-client"),
-    ("dam-frontend", "dam-core"),
-    ("dam-media", "dam-api"),
-    ("dam-server", "dam-api"),
-    ("dam-server", "dam-core"),
-    ("dam-sources", "dam-api"),
-    ("dam-store", "dam-api"),
-    ("dam-store", "dam-sources"),
+/// `CLAUDE.md`'s crate map). The bool records Cargo's `optional` status; external crates are
+/// deliberately outside this graph-shape check. When this changes, follow tech-spec 01's graph
+/// review and update its graph, affected ADRs, CLAUDE.md, and README.md in the same change.
+const ALLOWED_DAM_EDGES: &[(&str, &str, bool)] = &[
+    ("dam", "dam-cli", false),
+    ("dam", "dam-desktop", false),
+    ("dam", "dam-frontend", false),
+    ("dam-cli", "dam-api", false),
+    ("dam-cli", "dam-client", false),
+    ("dam-cli", "dam-core", false),
+    ("dam-cli", "dam-frontend", false),
+    ("dam-cli", "dam-media", false),
+    ("dam-cli", "dam-server", false),
+    ("dam-client", "dam-api", false),
+    ("dam-core", "dam-api", false),
+    ("dam-core", "dam-client", false),
+    ("dam-core", "dam-media", false),
+    ("dam-core", "dam-render", true),
+    ("dam-core", "dam-sources", false),
+    ("dam-core", "dam-store", false),
+    ("dam-desktop", "dam-frontend", false),
+    ("dam-desktop", "dam-server", false),
+    ("dam-frontend", "dam-api", false),
+    ("dam-frontend", "dam-client", false),
+    ("dam-frontend", "dam-core", false),
+    ("dam-media", "dam-api", false),
+    ("dam-server", "dam-api", false),
+    ("dam-server", "dam-core", false),
+    ("dam-sources", "dam-api", false),
+    ("dam-store", "dam-api", false),
+    ("dam-store", "dam-sources", false),
 ];
 
 fn product_package(name: &str) -> bool {
     name == "dam" || name.starts_with("dam-")
 }
 
-fn unexpected_edges(metadata: &CargoMetadata) -> Vec<(String, String)> {
+fn dependency_drift(
+    metadata: &CargoMetadata,
+) -> (Vec<(String, String, bool)>, Vec<(String, String, bool)>) {
     let packages: HashSet<&str> = metadata
         .packages
         .iter()
         .map(|package| package.name.as_str())
         .filter(|name| product_package(name))
         .collect();
-    let allowed: HashSet<(&str, &str)> = ALLOWED_DAM_EDGES.iter().copied().collect();
-    let mut unexpected = metadata
+    let allowed: HashSet<(&str, &str, bool)> = ALLOWED_DAM_EDGES.iter().copied().collect();
+    let actual: HashSet<(&str, &str, bool)> = metadata
         .packages
         .iter()
         .filter(|package| packages.contains(package.name.as_str()))
         .flat_map(|package| {
             let packages = &packages;
-            let allowed = &allowed;
             package.dependencies.iter().filter_map(move |dependency| {
-                let edge = (package.name.as_str(), dependency.name.as_str());
-                (packages.contains(dependency.name.as_str()) && !allowed.contains(&edge))
-                    .then(|| (edge.0.to_owned(), edge.1.to_owned()))
+                packages.contains(dependency.name.as_str()).then_some((
+                    package.name.as_str(),
+                    dependency.name.as_str(),
+                    dependency.optional,
+                ))
             })
         })
+        .collect();
+    let mut unexpected = actual
+        .difference(&allowed)
+        .map(|(from, to, optional)| ((*from).to_owned(), (*to).to_owned(), *optional))
+        .collect::<Vec<_>>();
+    let mut missing = allowed
+        .difference(&actual)
+        .filter(|edge| {
+            let (from, to, _) = **edge;
+            packages.contains(from) && packages.contains(to)
+        })
+        .map(|(from, to, optional)| ((*from).to_owned(), (*to).to_owned(), *optional))
         .collect::<Vec<_>>();
     unexpected.sort();
-    unexpected.dedup();
-    unexpected
+    missing.sort();
+    (unexpected, missing)
 }
 
-/// Assert the allowed internal-edge whitelist over `cargo metadata`. Cargo itself rejects cycles;
-/// this guard catches a new upward or cross-layer edge before it becomes accepted architecture.
+/// Assert the exact internal-edge whitelist over `cargo metadata`. Cargo itself rejects cycles;
+/// this guard catches new edges, removed edges, and optional-status changes before the manifest and
+/// architecture guidance can silently diverge.
 fn check_deps() -> bool {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     eprintln!("$ cargo metadata --no-deps --format-version 1");
@@ -303,28 +322,33 @@ fn check_deps() -> bool {
             return false;
         }
     };
-    let unexpected = unexpected_edges(&metadata);
-    if unexpected.is_empty() {
+    let (unexpected, missing) = dependency_drift(&metadata);
+    if unexpected.is_empty() && missing.is_empty() {
         eprintln!("check-deps: dependency directions are valid");
         return true;
     }
-    eprintln!("check-deps: unexpected internal dependency edges:");
-    for (from, to) in unexpected {
-        eprintln!("  {from} -> {to}");
+    if !unexpected.is_empty() {
+        eprintln!("check-deps: unexpected internal dependency edges:");
+        for (from, to, optional) in unexpected {
+            eprintln!("  {from} -> {to} (optional: {optional})");
+        }
     }
+    if !missing.is_empty() {
+        eprintln!("check-deps: stale or optional-status-mismatched whitelist edges:");
+        for (from, to, optional) in missing {
+            eprintln!("  {from} -> {to} (optional: {optional})");
+        }
+    }
+    eprintln!("check-deps: follow the architecture review in tech-spec 01 §2");
     false
 }
 
 /// Build the web client into `web/dist/` (consumed by the server's `rust-embed`, tech-spec 09 §A.4).
 /// Skips gracefully with a hint if `pnpm` is absent — the native build still works against whatever
-/// `web/dist/` already exists (the server serves a build hint when it is empty).
+/// `web/dist/` already exists (the server serves a build hint when it is empty). `wasm-pack` is not
+/// optional when pnpm is present: Vite resolves the generated module while bundling, so fail before
+/// starting the web build when that prerequisite is missing.
 fn build_web() -> bool {
-    // The WASM viewer islands (tech-spec 09 §B.3) are built first so their pkg exists under
-    // web/src/wasm/ before Vite bundles them into dist/ — one `rust-embed` step then ships both
-    // the React bundle and the `.wasm` in the single binary (§A.4).
-    if !build_wasm() {
-        return false;
-    }
     let web = Path::new(env!("CARGO_MANIFEST_DIR")).join("../web");
     if which("pnpm").is_none() {
         eprintln!(
@@ -332,20 +356,29 @@ fn build_web() -> bool {
         );
         return true;
     }
-    run_in(&web, "pnpm", &["install", "--frozen-lockfile"]) && run_in(&web, "pnpm", &["build"])
+    // The WASM viewer islands (tech-spec 09 §B.3) are built first so their pkg exists under
+    // web/src/wasm/ before Vite bundles them into dist/ — one `rust-embed` step then ships both
+    // the React bundle and the `.wasm` in the single binary (§A.4).
+    if !build_wasm() {
+        return false;
+    }
+    run_in(&web, "pnpm", &["install", "--frozen-lockfile"])
+        && run_in(&web, "pnpm", &["build"])
+        && require_artifacts("xtask web", &web.join("dist"), WEB_ARTIFACTS)
 }
 
 /// Build the `dam-viewer` WASM islands (3D + waveform, tech-spec 09 §B.3 / ADR 0009 §9) with
 /// `wasm-pack` into `web/src/wasm/` (a gitignored build artifact the web client lazily imports).
-/// Skips gracefully with a hint if `wasm-pack` is absent, mirroring the `pnpm` handling above — the
-/// native build still works; only the browser 3D/waveform islands are unavailable until it is built.
+/// The generated module is a required Vite input, so unlike an entirely skipped web build this task
+/// must fail when `wasm-pack` is absent. Otherwise a clean checkout reaches Vite before reporting a
+/// misleading missing-module error.
 fn build_wasm() -> bool {
     if which("wasm-pack").is_none() {
         eprintln!(
-            "xtask wasm: `wasm-pack` not found — skipping island build (install with \
-             `cargo install wasm-pack` to build the 3D/waveform viewers)."
+            "xtask wasm: required tool `wasm-pack` was not found; install it with \
+             `cargo install wasm-pack`, then retry `cargo xtask wasm` or `cargo xtask web`."
         );
-        return true;
+        return false;
     }
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     // wasm-pack's --out-dir is relative to the crate, so resolve it to an absolute path.
@@ -371,7 +404,47 @@ fn build_wasm() -> bool {
             "dam_viewer",
             "--release",
         ],
-    )
+    ) && require_artifacts("xtask wasm", &out_dir, WASM_ARTIFACTS)
+}
+
+#[derive(Clone, Copy)]
+enum ArtifactKind {
+    File,
+    Directory,
+}
+
+const WASM_ARTIFACTS: &[(&str, ArtifactKind)] = &[
+    ("dam_viewer.js", ArtifactKind::File),
+    ("dam_viewer_bg.wasm", ArtifactKind::File),
+];
+
+const WEB_ARTIFACTS: &[(&str, ArtifactKind)] = &[
+    ("index.html", ArtifactKind::File),
+    ("assets", ArtifactKind::Directory),
+];
+
+/// Verify the build outputs consumed by the next stage. Keeping these checks beside the local
+/// builders means release builds cannot accidentally enforce a different artifact contract.
+fn require_artifacts(task: &str, base: &Path, artifacts: &[(&str, ArtifactKind)]) -> bool {
+    let missing = artifacts
+        .iter()
+        .filter_map(|(relative, kind)| {
+            let path = base.join(relative);
+            let exists = match kind {
+                ArtifactKind::File => path.is_file(),
+                ArtifactKind::Directory => path.is_dir(),
+            };
+            (!exists).then(|| path.display().to_string())
+        })
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return true;
+    }
+    eprintln!("{task}: build completed without required artifact(s):");
+    for path in missing {
+        eprintln!("  {path}");
+    }
+    false
 }
 
 /// Like [`which`], but for cargo subcommands (`cargo-tauri` etc.), which only answer `--version`
@@ -420,6 +493,17 @@ fn run(cmd: &str, args: &[&str]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "3dam-xtask-{name}-{}-{}",
+            std::process::id(),
+            TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
 
     fn package(name: &str, dependencies: &[&str]) -> CargoPackage {
         CargoPackage {
@@ -428,6 +512,7 @@ mod tests {
                 .iter()
                 .map(|name| CargoDependency {
                     name: (*name).to_owned(),
+                    optional: false,
                 })
                 .collect(),
         }
@@ -441,7 +526,9 @@ mod tests {
                 package("dam-api", &["serde"]),
             ],
         };
-        assert!(unexpected_edges(&metadata).is_empty());
+        let (unexpected, missing) = dependency_drift(&metadata);
+        assert!(unexpected.is_empty());
+        assert!(missing.is_empty());
     }
 
     #[test]
@@ -452,9 +539,55 @@ mod tests {
                 package("dam-server", &["dam-api"]),
             ],
         };
+        let (unexpected, missing) = dependency_drift(&metadata);
         assert_eq!(
-            unexpected_edges(&metadata),
-            vec![("dam-api".to_owned(), "dam-server".to_owned())]
+            unexpected,
+            vec![("dam-api".to_owned(), "dam-server".to_owned(), false)]
         );
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn dependency_guard_reports_optional_status_drift() {
+        let mut core = package("dam-core", &["dam-render"]);
+        core.dependencies[0].optional = false;
+        let metadata = CargoMetadata {
+            packages: vec![core, package("dam-render", &[])],
+        };
+        let (unexpected, missing) = dependency_drift(&metadata);
+        assert_eq!(
+            unexpected,
+            vec![("dam-core".to_owned(), "dam-render".to_owned(), false)]
+        );
+        assert_eq!(
+            missing,
+            vec![("dam-core".to_owned(), "dam-render".to_owned(), true)]
+        );
+    }
+
+    #[test]
+    fn dependency_guard_reports_stale_whitelist_edges() {
+        let metadata = CargoMetadata {
+            packages: vec![package("dam-client", &[]), package("dam-api", &[])],
+        };
+        let (unexpected, missing) = dependency_drift(&metadata);
+        assert!(unexpected.is_empty());
+        assert_eq!(
+            missing,
+            vec![("dam-client".to_owned(), "dam-api".to_owned(), false)]
+        );
+    }
+
+    #[test]
+    fn artifact_guard_requires_each_file_and_directory() {
+        let root = temp_dir("artifacts");
+        std::fs::create_dir_all(root.join("assets")).unwrap();
+        std::fs::write(root.join("index.html"), "<!doctype html>").unwrap();
+        assert!(require_artifacts("test", &root, WEB_ARTIFACTS));
+
+        std::fs::remove_file(root.join("index.html")).unwrap();
+        assert!(!require_artifacts("test", &root, WEB_ARTIFACTS));
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

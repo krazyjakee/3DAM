@@ -17,8 +17,8 @@ the **library crates are `dam_*`**, not `3dam_*`.
 Split the three concerns that "crate name" was conflating:
 
 1. **Cargo package names use the `dam-` prefix** — `dam-api`, `dam-store`, `dam-media`,
-   `dam-sources`, `dam-render`, `dam-core`, `dam-client`, `dam-server`, `dam-frontend`,
-   `dam-gui`, `dam-cli`, and `dam` (the binary package). These are cargo-legal, and their
+   `dam-sources`, `dam-render`, `dam-viewer`, `dam-core`, `dam-client`, `dam-server`,
+   `dam-frontend`, `dam-desktop`, `dam-cli`, and `dam` (the binary package). These are cargo-legal, and their
    auto-derived library names are `dam_api`, `dam_core`, … — matching the tech-spec pseudocode
    verbatim.
 2. **Directories keep the branded `3dam-` names** — `crates/3dam-api`, `crates/3dam-core`, … —
@@ -32,7 +32,7 @@ Split the three concerns that "crate name" was conflating:
 
 - Code imports read `dam_core`, `dam_api`, `dam_store`, … exactly as tech-spec 01 §4–§5 wrote
   them; nothing in the design pseudocode changes.
-- `cargo-deny`'s per-crate bans and the future `xtask check-deps` whitelist must reference the
+- The implemented `cargo xtask check-deps` whitelist references the
   **package** names (`dam-render`, `dam-server`, …), not `3dam-*`.
 - Tech-spec 01's crate table should be read as "package `dam-x` in `crates/3dam-x`". The
   `3dam-*` spelling remains the *product/brand* name for the workspace and the binary.

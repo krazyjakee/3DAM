@@ -377,20 +377,22 @@ build leg as an artifact — four identical builds would be four chances to dive
 keeps pnpm/Node/wasm-pack off the macOS and Windows runners entirely.
 
 1. Set up **pnpm** + **Node 20**, and a Rust toolchain with the `wasm32-unknown-unknown` target.
-2. Install **`wasm-pack`** and run `cargo xtask wasm`, producing `web/src/wasm/`.
-3. `pnpm install --frozen-lockfile && pnpm run build` in `web/`, producing `web/dist`.
+2. Install **`wasm-pack`** and run `cargo xtask web`. The task builds the viewer islands into
+   `web/src/wasm/`, then installs the locked pnpm dependencies and builds `web/dist`.
+3. The task verifies the exact WASM inputs Vite needs (`dam_viewer.js` and
+   `dam_viewer_bg.wasm`) and the client outputs the native build embeds (`index.html` and
+   `assets/`). A missing `wasm-pack` is an early, actionable error rather than a skipped build.
 4. Upload `web/dist` as an artifact; each build leg downloads it before `cargo build`.
 5. `3dam` embeds `web/dist` via **`rust-embed`** at compile time, then
    `cargo build -p dam --release --locked --target <triple>`.
 
-Two **silent-success traps** are asserted against rather than trusted, because both produce a
-green build that is quietly broken:
+Required outputs are asserted rather than inferred from process exit codes:
 
-- `cargo xtask wasm` **returns success when `wasm-pack` is missing** (it is designed to skip
-  gracefully for local native-only builds). `web/src/wasm/` is gitignored and
-  `web/src/islands/index.ts` imports `@/wasm/dam_viewer.js` behind a `@ts-ignore`, so `tsc -b`
-  passes and only `vite build` fails — the job therefore asserts `dam_viewer.js` and
-  `dam_viewer_bg.wasm` exist.
+- `web/src/wasm/` is gitignored and `web/src/islands/index.ts` imports
+  `@/wasm/dam_viewer.js` behind a `@ts-ignore`, so `tsc -b` passes without the generated module
+  and only Vite reports it later. `cargo xtask wasm` therefore treats `wasm-pack` as required and
+  asserts `dam_viewer.js` and `dam_viewer_bg.wasm` itself. The release runs `cargo xtask web`, so
+  local and release builds use the same prerequisite and artifact checks.
 - `dam-server` **degrades to a "web client bundle is not present" placeholder** when `web/dist`
   exists but is *empty* — rust-embed only checks that the folder exists, so the binary compiles
   and serves a stub instead of the UI. (A *missing* `web/dist` is by contrast a hard compile

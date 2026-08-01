@@ -46,6 +46,12 @@ Consequences for the architecture rules:
   the egui-side wgpu-24 viewer, rodio audio path, and DMSH native decoder are retired with the
   crate. `dam-render` (server-side turntable thumbnails + DMSH blob) is unaffected.
 
+> **Dependency-graph amendment (2026-08-01):** the corresponding direct internal edges are
+> `dam-desktop → dam-server` and `dam-desktop → dam-frontend`; there is no `dam-gui` package and no
+> direct desktop-to-core/client/render edge. The desktop reaches the engine and server-enabled
+> optional renderer transitively through `dam-server`. Tech-spec 01 and the `check-deps` whitelist
+> are authoritative for the complete shipped graph.
+
 ## Alternatives considered
 
 - **Keep egui and continue manual parity** — rejected: double implementation cost per feature,

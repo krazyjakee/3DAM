@@ -13,10 +13,9 @@
 #
 # 1. The web client is built once, in its own job, and downloaded by every build leg. It is
 #    platform-independent, so building it four times would be four chances to differ — and it
-#    keeps pnpm/node/wasm-pack off the macOS and Windows runners entirely. `cargo xtask wasm`
-#    *silently succeeds* when wasm-pack is missing (xtask/src/main.rs), which would ship a
-#    client whose viewer islands fail to load, so the web job asserts its outputs exist
-#    rather than trusting the exit code.
+#    keeps pnpm/node/wasm-pack off the macOS and Windows runners entirely. `cargo xtask web`
+#    treats the generated WASM module as a required Vite input and verifies both the island and
+#    client outputs, so local and release builds enforce the same artifact contract.
 #
 # 2. Native installers come from the Tauri bundler, which the repo already depends on and has
 #    fully configured (crates/3dam-desktop/tauri.conf.json: identifier, publisher, category,
@@ -157,32 +156,15 @@ jobs:
           cache: pnpm
           cache-dependency-path: web/pnpm-lock.yaml
 
-      # web/src/wasm/ is gitignored (a build artifact), and web/src/islands/index.ts imports
-      # `@/wasm/dam_viewer.js`, so vite cannot resolve it on a clean checkout without this.
-      - name: Build WASM viewer islands
-        run: cargo xtask wasm
-
-      - name: Assert the islands were actually built
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -f web/src/wasm/dam_viewer.js
-          test -f web/src/wasm/dam_viewer_bg.wasm
-
+      # This is the same entry point developers use locally. It builds WASM first, fails with an
+      # actionable prerequisite error on a clean checkout without wasm-pack, and verifies the
+      # generated WASM and Vite artifacts before returning success.
       - name: Build web client
-        working-directory: web
         run: |
-          pnpm install --frozen-lockfile
+          cargo xtask web
+          cd web
           pnpm run lint
           pnpm run typecheck
-          pnpm run build
-
-      - name: Assert the client bundle exists
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -f web/dist/index.html
-          test -d web/dist/assets
 
       - uses: actions/upload-artifact@v4
         with:

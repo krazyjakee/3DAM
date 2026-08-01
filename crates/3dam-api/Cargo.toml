@@ -3,7 +3,7 @@ name = "dam-api"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "The LibraryService seam: trait, DTOs, and error model. Depends on serde only (plus async-trait/futures for the async trait)."
+description = "Lightweight LibraryService seam: async trait, DTOs, and public error model."
 
 [dependencies]
 serde.workspace = true
