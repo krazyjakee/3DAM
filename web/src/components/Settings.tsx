@@ -40,13 +40,23 @@ import { StorageSection } from "./settings/StorageSection";
 
 const ALL_SCOPES: Scope[] = ["read", "write", "admin", "mcp_use", "federate"];
 
+type AccessState =
+  | { kind: "checking" }
+  | { kind: "granted" }
+  | { kind: "denied"; message: string };
+
 export function Settings() {
   const [status, setStatus] = useState<AdminStatus | null>(null);
-  const [flags, setFlags] = useState<FlagInfo[]>([]);
-  const [tokens, setTokens] = useState<TokenInfo[]>([]);
-  const [audit, setAudit] = useState<AuditEntry[]>([]);
+  const [statusError, setStatusError] = useState<string | null>(null);
+  const [flags, setFlags] = useState<FlagInfo[] | null>(null);
+  const [flagsError, setFlagsError] = useState<string | null>(null);
+  const [tokens, setTokens] = useState<TokenInfo[] | null>(null);
+  const [tokensError, setTokensError] = useState<string | null>(null);
+  const [audit, setAudit] = useState<AuditEntry[] | null>(null);
+  const [auditError, setAuditError] = useState<string | null>(null);
   const [usage, setUsage] = useState<StorageUsage | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [usageError, setUsageError] = useState<string | null>(null);
+  const [access, setAccess] = useState<AccessState>({ kind: "checking" });
   // The bootstrap owner token, when enabling authentication just minted it (never locked out).
   const [bootstrap, setBootstrap] = useState<NewTokenReply | null>(null);
   // Which flag write is in flight — disables the flag controls so a slow admin round-trip can't be
@@ -64,26 +74,61 @@ export function Settings() {
    *  sections (or the whole screen) hostage. `withUsage: false` skips it for refreshes that
    *  can't change storage (flag/token writes). */
   const refresh = useCallback(async (opts?: { withUsage?: boolean }) => {
-    const settle = async <T,>(p: Promise<T>, set: (v: T) => void): Promise<string | null> => {
+    const settle = async <T,>(
+      p: Promise<T>,
+      set: (v: T) => void,
+      setSectionError: (message: string | null) => void,
+    ): Promise<void> => {
       try {
         set(await p);
-        return null;
+        setSectionError(null);
       } catch (e) {
-        // 403 = authenticated but not an admin: one clear notice beats five raw errors.
-        if (e instanceof ApiError && e.status === 403)
-          return "Your token lacks the admin scope — ask an admin for one, or sign in with an admin token.";
-        return e instanceof Error ? e.message : String(e);
+        if (e instanceof ApiError && (e.status === 401 || e.status === 403)) {
+          setAccess({
+            kind: "denied",
+            message:
+              e.status === 401
+                ? "Sign in with an admin token to manage this server."
+                : "Your credential lacks the admin scope. Ask an admin for access or sign in with an admin token.",
+          });
+          return;
+        }
+        setSectionError(errorMessage(e));
       }
     };
+
+    // Status is the access probe. Do not reveal a populated-looking admin body until this request
+    // proves the caller may administer the server; it also prevents parallel 403 responses racing
+    // successful state updates and briefly reopening the body.
+    try {
+      setStatus(await admin.status());
+      setStatusError(null);
+      setAccess({ kind: "granted" });
+    } catch (e) {
+      if (e instanceof ApiError && (e.status === 401 || e.status === 403)) {
+        setAccess({
+          kind: "denied",
+          message:
+            e.status === 401
+              ? "Sign in with an admin token to manage this server."
+              : "Your credential lacks the admin scope. Ask an admin for access or sign in with an admin token.",
+        });
+        return;
+      }
+      setStatusError(errorMessage(e));
+      // A status-specific/network failure is not evidence of denied access. Let the independently
+      // loaded sections report their own results instead of mislabelling it as a permissions issue.
+      setAccess({ kind: "granted" });
+    }
+
     const calls = [
-      settle(admin.status(), setStatus),
-      settle(admin.flags(), setFlags),
-      settle(admin.tokens(), setTokens),
-      settle(admin.audit(25), setAudit),
+      settle(admin.flags(), setFlags, setFlagsError),
+      settle(admin.tokens(), setTokens, setTokensError),
+      settle(admin.audit(25), setAudit, setAuditError),
     ];
-    if (opts?.withUsage !== false) calls.push(settle(admin.storageUsage(), setUsage));
-    const failures = (await Promise.all(calls)).filter((m): m is string => m !== null);
-    setError(failures[0] ?? null);
+    if (opts?.withUsage !== false)
+      calls.push(settle(admin.storageUsage(), setUsage, setUsageError));
+    await Promise.all(calls);
   }, []);
 
   useEffect(() => {
@@ -136,20 +181,29 @@ export function Settings() {
     [applied, confirm],
   );
 
-  const flag = (key: FlagKey) => flags.find((f) => f.key === key);
+  const flag = (key: FlagKey) => flags?.find((f) => f.key === key);
 
   return (
-    <div className="mx-auto flex min-h-dvh max-w-3xl flex-col gap-6 p-6 text-sm">
-      <header className="flex items-center justify-between">
+    <div className="mx-auto flex min-h-dvh max-w-3xl flex-col gap-6 p-4 text-sm sm:p-6">
+      <header className="flex flex-wrap items-center justify-between gap-3">
         <h1 className="text-lg font-semibold">Settings &amp; Administration</h1>
         <Link to="/" className="text-accent hover:underline">
           ← Back to library
         </Link>
       </header>
 
-      {error && (
-        <div className="flex flex-wrap items-center justify-between gap-3 rounded border border-danger/40 bg-danger/10 px-3 py-2 text-danger">
-          <span>{error}</span>
+      {access.kind === "checking" && (
+        <div className="rounded border border-border p-4 text-fg-dim" role="status">
+          Checking administration access…
+        </div>
+      )}
+
+      {access.kind === "denied" && (
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded border border-danger/40 bg-danger/10 p-4 text-danger">
+          <div>
+            <p className="font-medium">Administration access required</p>
+            <p className="mt-1 text-xs">{access.message}</p>
+          </div>
           <button
             type="button"
             className="btn shrink-0"
@@ -161,7 +215,7 @@ export function Settings() {
       )}
       {signIn && <SettingsSignIn onClose={() => setSignIn(false)} />}
 
-      {bootstrap && (
+      {access.kind === "granted" && bootstrap && (
         <div className="rounded border border-lic-permissive/40 bg-lic-permissive/10 p-3">
           <p className="text-lic-permissive">
             Authentication is on and no admin credential existed, so the owner token was created —
@@ -172,174 +226,246 @@ export function Settings() {
         </div>
       )}
 
-      {status && <StatusCard status={status} />}
+      {access.kind === "granted" && (
+        <>
+          <AdminSectionState
+            name="Server status"
+            loading={!status && !statusError}
+            error={statusError}
+          >
+            {status && <StatusCard status={status} />}
+          </AdminSectionState>
 
-      <section className="flex flex-col gap-3">
-        <h2 className="font-medium text-fg-muted">Feature flags</h2>
+          <section className="flex flex-col gap-3">
+            <h2 className="font-medium text-fg-muted">Feature flags</h2>
+            {flagsError && <SectionError name="Feature flags" message={flagsError} />}
+            {!flags && !flagsError && <SectionLoading name="Feature flags" />}
+            {flags && (
+              <div className="flex flex-col gap-4">
+                <FlagGroup title="Access">
+                  <FlagCard
+                    title="Network writes"
+                    hint="Read-only to the network by default. Enabling allows writes from beyond localhost."
+                    flag={flag("network_writes")}
+                  >
+                    <Toggle
+                      label="Network writes"
+                      checked={flag("network_writes")?.value === true}
+                      disabled={busyFlag !== null}
+                      onChange={(v) => {
+                        const f = flag("network_writes");
+                        if (f) void setFlag(f.key, v, f.version);
+                      }}
+                    />
+                  </FlagCard>
+                  <FlagCard
+                    title="Uploads"
+                    hint="Allows new files to be written into registered sources. Existing files are never replaced."
+                    flag={flag("upload")}
+                  >
+                    <Toggle
+                      label="Uploads"
+                      checked={flag("upload")?.value === true}
+                      disabled={busyFlag !== null}
+                      onChange={(v) => {
+                        const f = flag("upload");
+                        if (f) void setFlag(f.key, v, f.version);
+                      }}
+                    />
+                  </FlagCard>
+                </FlagGroup>
 
-        <FlagCard
-          title="Authentication"
-          hint="Gate the API, MCP, and admin surface. Off = the local owner has full trust."
-          flag={flag("authentication")}
-        >
-          <Choice
-            label="Authentication"
-            value={String(flag("authentication")?.value ?? "off")}
-            options={["off", "anonymous", "token"]}
-            disabled={busyFlag !== null}
-            onChange={(v) => {
-              const f = flag("authentication");
-              if (f) void setFlag(f.key, v as FlagValue, f.version);
-            }}
-          />
-        </FlagCard>
+                <FlagGroup title="Authentication">
+                  <FlagCard
+                    title="Authentication"
+                    hint="Gate the API, MCP, and admin surface. Off gives the local owner full trust."
+                    flag={flag("authentication")}
+                  >
+                    <Toggle
+                      label="Authentication"
+                      checked={flag("authentication")?.value !== "off"}
+                      disabled={busyFlag !== null || flag("user_accounts")?.value === true}
+                      onChange={(enabled) => {
+                        const f = flag("authentication");
+                        if (f) void setFlag(f.key, enabled ? "token" : "off", f.version);
+                      }}
+                    />
+                    {flag("authentication")?.value !== "off" && flag("authentication") && (
+                      <DependentOption label="Authentication mode">
+                        <Choice
+                          label="Authentication mode"
+                          value={String(flag("authentication")?.value)}
+                          options={
+                            flag("user_accounts")?.value === true
+                              ? ["token"]
+                              : ["anonymous", "token"]
+                          }
+                          disabled={busyFlag !== null}
+                          onChange={(v) => {
+                            const f = flag("authentication");
+                            if (f) void setFlag(f.key, v as FlagValue, f.version);
+                          }}
+                        />
+                      </DependentOption>
+                    )}
+                    {flag("user_accounts")?.value === true && (
+                      <DependencyNote>
+                        User accounts require token authentication. Turn accounts off before
+                        disabling this gate.
+                      </DependencyNote>
+                    )}
+                  </FlagCard>
+                  {flag("user_accounts")?.value === true ? (
+                    <FlagCard
+                      title="Single sign-on"
+                      hint="Accept logins from the configured OIDC provider alongside passwords and API tokens."
+                      flag={flag("oidc")}
+                    >
+                      <Toggle
+                        label="Single sign-on"
+                        checked={flag("oidc")?.value === true}
+                        disabled={busyFlag !== null}
+                        onChange={(v) => {
+                          const f = flag("oidc");
+                          if (f) void setFlag(f.key, v, f.version);
+                        }}
+                      />
+                    </FlagCard>
+                  ) : (
+                    flag("oidc") && (
+                      <DependencyNote>Enable User accounts to configure single sign-on.</DependencyNote>
+                    )
+                  )}
+                </FlagGroup>
 
-        <FlagCard
-          title="MCP agent server"
-          hint="Off removes the /mcp route entirely. Read-write exposes the write tools."
-          flag={flag("mcp_server")}
-        >
-          <Choice
-            label="MCP agent server"
-            value={String(flag("mcp_server")?.value ?? "off")}
-            options={["off", "read_only", "read_write"]}
-            disabled={busyFlag !== null}
-            onChange={(v) => {
-              const f = flag("mcp_server");
-              if (f) void setFlag(f.key, v as FlagValue, f.version);
-            }}
-          />
-        </FlagCard>
+                <FlagGroup title="Accounts">
+                  <FlagCard
+                    title="User accounts"
+                    hint="Full login accounts with groups and sharing; raises authentication to at least token."
+                    flag={flag("user_accounts")}
+                  >
+                    <Toggle
+                      label="User accounts"
+                      checked={flag("user_accounts")?.value === true}
+                      disabled={busyFlag !== null}
+                      onChange={(v) => {
+                        const f = flag("user_accounts");
+                        if (f) void setFlag(f.key, v, f.version);
+                      }}
+                    />
+                  </FlagCard>
+                  {flag("user_accounts")?.value !== true && flag("user_accounts") && (
+                    <DependencyNote>
+                      Enable User accounts to reveal account, group, sharing, and SSO controls.
+                    </DependencyNote>
+                  )}
+                </FlagGroup>
 
-        <FlagCard
-          title="Network writes"
-          hint="Read-only to the network by default. Enabling allows writes from beyond localhost."
-          flag={flag("network_writes")}
-        >
-          <Toggle
-            label="Network writes"
-            checked={flag("network_writes")?.value === true}
-            disabled={busyFlag !== null}
-            onChange={(v) => {
-              const f = flag("network_writes");
-              if (f) void setFlag(f.key, v, f.version);
-            }}
-          />
-        </FlagCard>
+                <FlagGroup title="Agents / MCP">
+                  <FlagCard
+                    title="MCP agent server"
+                    hint="Off removes the /mcp route entirely. Enable it to choose the tool access level."
+                    flag={flag("mcp_server")}
+                  >
+                    <Toggle
+                      label="MCP agent server"
+                      checked={flag("mcp_server")?.value !== "off"}
+                      disabled={busyFlag !== null}
+                      onChange={(enabled) => {
+                        const f = flag("mcp_server");
+                        if (f) void setFlag(f.key, enabled ? "read_only" : "off", f.version);
+                      }}
+                    />
+                    {flag("mcp_server")?.value !== "off" && flag("mcp_server") && (
+                      <DependentOption label="Tool access">
+                        <Choice
+                          label="MCP tool access"
+                          value={String(flag("mcp_server")?.value)}
+                          options={["read_only", "read_write"]}
+                          disabled={busyFlag !== null}
+                          onChange={(v) => {
+                            const f = flag("mcp_server");
+                            if (f) void setFlag(f.key, v as FlagValue, f.version);
+                          }}
+                        />
+                      </DependentOption>
+                    )}
+                  </FlagCard>
+                </FlagGroup>
 
-        <FlagCard
-          title="Uploads"
-          hint="Off by default. Allows writing new files into a registered source — the only surface that puts bytes in your project folders. Never replaces an existing file."
-          flag={flag("upload")}
-        >
-          <Toggle
-            label="Uploads"
-            checked={flag("upload")?.value === true}
-            disabled={busyFlag !== null}
-            onChange={(v) => {
-              const f = flag("upload");
-              if (f) void setFlag(f.key, v, f.version);
-            }}
-          />
-        </FlagCard>
+                <FlagGroup title="Federation">
+                  <FlagCard
+                    title="Federation peer"
+                    hint="Serve this instance's catalog to other 3DAM instances."
+                    flag={flag("federation")}
+                  >
+                    <Toggle
+                      label="Federation peer"
+                      checked={flag("federation")?.value === true}
+                      disabled={busyFlag !== null}
+                      onChange={(v) => {
+                        const f = flag("federation");
+                        if (f) void setFlag(f.key, v, f.version);
+                      }}
+                    />
+                  </FlagCard>
+                </FlagGroup>
 
-        <FlagCard
-          title="Federation peer"
-          hint="Serve this instance's catalog to other 3DAM instances (advertise endpoint)."
-          flag={flag("federation")}
-        >
-          <Toggle
-            label="Federation peer"
-            checked={flag("federation")?.value === true}
-            disabled={busyFlag !== null}
-            onChange={(v) => {
-              const f = flag("federation");
-              if (f) void setFlag(f.key, v, f.version);
-            }}
-          />
-        </FlagCard>
-
-        <FlagCard
-          title="User accounts"
-          hint="Full login accounts with groups and sharing; raises the auth gate to at least token."
-          flag={flag("user_accounts")}
-        >
-          <Toggle
-            label="User accounts"
-            checked={flag("user_accounts")?.value === true}
-            disabled={busyFlag !== null}
-            onChange={(v) => {
-              const f = flag("user_accounts");
-              if (f) void setFlag(f.key, v, f.version);
-            }}
-          />
-        </FlagCard>
-
-        <FlagCard
-          title="Single sign-on"
-          hint="Accept logins from the OIDC provider configured below. Additive — password sign-in and API tokens keep working. Needs user accounts."
-          flag={flag("oidc")}
-        >
-          <Toggle
-            label="Single sign-on"
-            checked={flag("oidc")?.value === true}
-            disabled={busyFlag !== null}
-            onChange={(v) => {
-              const f = flag("oidc");
-              if (f) void setFlag(f.key, v, f.version);
-            }}
-          />
-        </FlagCard>
-
-        <FlagCard
-          title="Auto-generate previews"
-          hint="Hosted mode: the server renders thumbnails + 3D previews on ingest so clients hit ready data. Off defers rendering to first request (lower-power hosts)."
-          flag={flag("auto_thumbnail")}
-        >
-          <Toggle
-            label="Auto-generate previews"
-            checked={flag("auto_thumbnail")?.value === true}
-            disabled={busyFlag !== null}
-            onChange={(v) => {
-              const f = flag("auto_thumbnail");
-              if (f) void setFlag(f.key, v, f.version);
-            }}
-          />
-        </FlagCard>
-
-        <FlagCard
-          title="Auto-analyze on ingest"
-          hint="Hosted mode: the server runs the analysis pass (embeddings, auto-tags, derived attributes) on ingest. Off leaves thumbnails-only."
-          flag={flag("auto_analyze")}
-        >
-          <Toggle
-            label="Auto-analyze on ingest"
-            checked={flag("auto_analyze")?.value === true}
-            disabled={busyFlag !== null}
-            onChange={(v) => {
-              const f = flag("auto_analyze");
-              if (f) void setFlag(f.key, v, f.version);
-            }}
-          />
-        </FlagCard>
-      </section>
-
-      <StorageSection usage={usage} onChange={refresh} />
+                <FlagGroup title="Analysis">
+                  <FlagCard
+                    title="Auto-generate previews"
+                    hint="Render thumbnails and 3D previews on ingest instead of on first request."
+                    flag={flag("auto_thumbnail")}
+                  >
+                    <Toggle
+                      label="Auto-generate previews"
+                      checked={flag("auto_thumbnail")?.value === true}
+                      disabled={busyFlag !== null}
+                      onChange={(v) => {
+                        const f = flag("auto_thumbnail");
+                        if (f) void setFlag(f.key, v, f.version);
+                      }}
+                    />
+                  </FlagCard>
+                  <FlagCard
+                    title="Auto-analyze on ingest"
+                    hint="Run embeddings, auto-tags, and derived-attribute analysis when assets arrive."
+                    flag={flag("auto_analyze")}
+                  >
+                    <Toggle
+                      label="Auto-analyze on ingest"
+                      checked={flag("auto_analyze")?.value === true}
+                      disabled={busyFlag !== null}
+                      onChange={(v) => {
+                        const f = flag("auto_analyze");
+                        if (f) void setFlag(f.key, v, f.version);
+                      }}
+                    />
+                  </FlagCard>
+                </FlagGroup>
+              </div>
+            )}
+          </section>
+          <StorageSection usage={usage} error={usageError} onChange={refresh} />
 
       {/* User accounts + groups (issue #42) — only while the flag is on (the routes 404 off). */}
-      {flag("user_accounts")?.value === true && (
-        <AccountsAndGroups currentAccountId={whoami.data?.account?.account_id ?? null} />
-      )}
+          {flag("user_accounts")?.value === true && (
+            <AccountsAndGroups currentAccountId={whoami.data?.account?.account_id ?? null} />
+          )}
 
-      <TokensSection
-        tokens={tokens}
-        currentIdentity={whoami.data?.identity ?? null}
-        onChange={() => void refresh({ withUsage: false })}
-      />
+          <AdminSectionState name="API tokens" loading={!tokens && !tokensError} error={tokensError}>
+            {tokens && (
+              <TokensSection
+                tokens={tokens}
+                currentIdentity={whoami.data?.identity ?? null}
+                onChange={() => void refresh({ withUsage: false })}
+              />
+            )}
+          </AdminSectionState>
 
       {/* The signed-in account's own sessions (issue #42) — self-service, not an admin surface,
           but Settings is where credential management lives today. */}
-      {whoami.data?.account && <MySessionsSection />}
+          {whoami.data?.account && <MySessionsSection />}
 
       {/* Single sign-on (issue #41). Gated on the flag's *presence*, not its value — the same
           "does this server support it" signal `FlagCard` uses. Deliberately not its value: the
@@ -349,29 +475,32 @@ export function Settings() {
           fallback — so the fetch would return `index.html` with a 200 and the section would report
           a JSON parse error. It also keeps the section (and its admin-only fetches) away from a
           non-admin, who already gets one clear notice above. */}
-      {flag("oidc") && (
-        <OidcSection
-          oidcEnabled={flag("oidc")?.value === true}
-          accountsEnabled={flag("user_accounts")?.value === true}
-        />
-      )}
+          {flag("oidc") && flag("user_accounts")?.value === true && (
+            <OidcSection oidcEnabled={flag("oidc")?.value === true} accountsEnabled />
+          )}
 
-      <section className="flex flex-col gap-2">
-        <h2 className="font-medium text-fg-muted">Audit log</h2>
-        <div className="rounded border border-border">
-          {audit.length === 0 && <div className="px-3 py-2 text-fg-dim">(no entries)</div>}
-          {audit.map((e, i) => (
-            <div key={i} className="flex gap-3 border-b border-border px-3 py-1.5 last:border-0">
-              <span className="w-40 shrink-0 text-fg-dim">
-                {new Date(e.at).toLocaleString()}
-              </span>
-              <span className="w-24 shrink-0 text-fg-muted">{e.actor}</span>
-              <span className="font-mono text-xs">{e.action}</span>
-              <span className="truncate text-fg-dim">{e.target ?? ""}</span>
-            </div>
-          ))}
-        </div>
-      </section>
+          <AdminSectionState name="Audit log" loading={!audit && !auditError} error={auditError}>
+            {audit && (
+              <section className="flex flex-col gap-2">
+                <h2 className="font-medium text-fg-muted">Audit log</h2>
+                <div className="overflow-x-auto rounded border border-border">
+                  {audit.length === 0 && <div className="px-3 py-2 text-fg-dim">(no entries)</div>}
+                  {audit.map((e, i) => (
+                    <div key={i} className="flex min-w-max gap-3 border-b border-border px-3 py-1.5 last:border-0">
+                      <span className="w-40 shrink-0 text-fg-dim">
+                        {new Date(e.at).toLocaleString()}
+                      </span>
+                      <span className="w-24 shrink-0 text-fg-muted">{e.actor}</span>
+                      <span className="font-mono text-xs">{e.action}</span>
+                      <span className="max-w-80 truncate text-fg-dim">{e.target ?? ""}</span>
+                    </div>
+                  ))}
+                </div>
+              </section>
+            )}
+          </AdminSectionState>
+        </>
+      )}
     </div>
   );
 }
@@ -398,6 +527,80 @@ function SettingsSignIn({ onClose }: { onClose: () => void }) {
         <TokenLoginForm reason={null} allowReadOnly={false} onClose={onClose} />
       </div>
     </div>
+  );
+}
+
+function SectionLoading({ name }: { name: string }) {
+  return (
+    <div className="rounded border border-border px-3 py-2 text-fg-dim" role="status">
+      Loading {name.toLowerCase()}…
+    </div>
+  );
+}
+
+function SectionError({ name, message }: { name: string; message: string }) {
+  return (
+    <div className="rounded border border-danger/40 bg-danger/10 px-3 py-2 text-danger" role="alert">
+      <span className="font-medium">{name} unavailable.</span> {message}
+    </div>
+  );
+}
+
+/** A section may keep rendering its last successful payload beneath a later refresh error. */
+function AdminSectionState({
+  name,
+  loading,
+  error,
+  children,
+}: {
+  name: string;
+  loading: boolean;
+  error: string | null;
+  children: ReactNode;
+}) {
+  return (
+    <>
+      {loading && <SectionLoading name={name} />}
+      {error && <SectionError name={name} message={error} />}
+      {children}
+    </>
+  );
+}
+
+function FlagGroup({ title, children }: { title: string; children: ReactNode }) {
+  return (
+    <section aria-labelledby={`flag-group-${title.toLowerCase().replaceAll(/[^a-z0-9]+/g, "-")}`}>
+      <h3
+        id={`flag-group-${title.toLowerCase().replaceAll(/[^a-z0-9]+/g, "-")}`}
+        className="mb-2 text-xs font-medium tracking-wide text-fg-dim uppercase"
+      >
+        {title}
+      </h3>
+      <div className="flex flex-col gap-2">{children}</div>
+    </section>
+  );
+}
+
+function DependentOption({
+  label,
+  children,
+}: {
+  label: string;
+  children: ReactNode;
+}) {
+  return (
+    <label className="flex flex-wrap items-center justify-end gap-2 border-t border-border pt-2 text-xs text-fg-dim sm:border-0 sm:pt-0">
+      <span>{label}</span>
+      {children}
+    </label>
+  );
+}
+
+function DependencyNote({ children }: { children: ReactNode }) {
+  return (
+    <p className="rounded border border-border px-3 py-2 text-xs text-fg-dim">
+      {children}
+    </p>
   );
 }
 
@@ -447,22 +650,46 @@ function FlagCard({
   // Absent from the /flags response: this build doesn't support the flag, so a toggle here would be
   // a silent no-op. Say so and drop the control (issue: never a control that does nothing).
   const unsupported = !flag;
+  const enabled = flag ? flag.value !== false && flag.value !== "off" : false;
+  const atRisk = Boolean(flag?.exposure_increasing && enabled);
   return (
-    <div className="flex items-center justify-between gap-4 rounded border border-border p-3">
+    <div
+      className={`flex flex-col gap-3 rounded border p-3 sm:flex-row sm:items-center sm:justify-between ${
+        atRisk ? "border-warn/50 bg-warn/10" : "border-border"
+      }`}
+    >
       <div className="min-w-0">
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <span className="font-medium">{title}</span>
           {flag ? (
-            <span className="text-xs text-fg-dim">
-              {flag.live ? "live" : "restart"} · v{flag.version}
-            </span>
+            <>
+              <span
+                className={`rounded px-1.5 py-0.5 text-[10px] font-medium tracking-wide uppercase ${
+                  flag.live ? "bg-accent-muted text-accent" : "bg-surface-2 text-fg-muted"
+                }`}
+              >
+                {flag.live ? "live" : "restart required"}
+              </span>
+              {flag.exposure_increasing && (
+                <span
+                  className={`rounded px-1.5 py-0.5 text-[10px] font-medium tracking-wide uppercase ${
+                    atRisk ? "bg-warn/20 text-warn" : "bg-surface-2 text-fg-dim"
+                  }`}
+                >
+                  {atRisk ? "exposure risk on" : "increases exposure"}
+                </span>
+              )}
+              <span className="text-[10px] text-fg-dim">v{flag.version}</span>
+            </>
           ) : (
             <span className="text-xs text-fg-dim italic">unsupported on this server</span>
           )}
         </div>
         <p className="text-xs text-fg-dim">{hint}</p>
       </div>
-      <div className="shrink-0">{unsupported ? null : children}</div>
+      <div className="flex shrink-0 flex-col gap-2 self-stretch sm:self-auto">
+        {unsupported ? null : children}
+      </div>
     </div>
   );
 }
@@ -518,13 +745,13 @@ function Toggle({
       aria-label={label}
       disabled={disabled}
       onClick={() => onChange(!checked)}
-      className={`h-6 w-11 rounded-full transition disabled:opacity-50 ${
+      className={`h-6 w-11 self-end rounded-full transition disabled:opacity-50 coarse:h-11 coarse:w-14 ${
         checked ? "bg-accent" : "bg-surface-2"
       }`}
     >
       <span
-        className={`block h-5 w-5 rounded-full bg-fg transition ${
-          checked ? "translate-x-5" : "translate-x-0.5"
+        className={`block h-5 w-5 rounded-full bg-fg transition coarse:h-6 coarse:w-6 ${
+          checked ? "translate-x-5 coarse:translate-x-7" : "translate-x-0.5 coarse:translate-x-1"
         }`}
       />
     </button>
@@ -708,19 +935,28 @@ const ROLES: AccountRole[] = ["admin", "editor", "viewer"];
 /** Loads accounts + groups once (they cross-reference: group membership lists accounts) and feeds
  *  both admin panes. Only mounted while the `user_accounts` flag is on — the routes 404 off. */
 function AccountsAndGroups({ currentAccountId }: { currentAccountId: string | null }) {
-  const [accounts, setAccounts] = useState<AccountInfo[]>([]);
-  const [groups, setGroups] = useState<GroupInfo[]>([]);
-  const [error, setError] = useState<string | null>(null);
+  const [accounts, setAccounts] = useState<AccountInfo[] | null>(null);
+  const [groups, setGroups] = useState<GroupInfo[] | null>(null);
+  const [accountsError, setAccountsError] = useState<string | null>(null);
+  const [groupsError, setGroupsError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
-    try {
-      const [a, g] = await Promise.all([admin.accounts(), admin.groups()]);
-      setAccounts(a);
-      setGroups(g);
-      setError(null);
-    } catch (e) {
-      setError(errorMessage(e));
-    }
+    await Promise.all([
+      admin.accounts().then(
+        (value) => {
+          setAccounts(value);
+          setAccountsError(null);
+        },
+        (error) => setAccountsError(errorMessage(error)),
+      ),
+      admin.groups().then(
+        (value) => {
+          setGroups(value);
+          setGroupsError(null);
+        },
+        (error) => setGroupsError(errorMessage(error)),
+      ),
+    ]);
   }, []);
   useEffect(() => {
     void load();
@@ -728,9 +964,28 @@ function AccountsAndGroups({ currentAccountId }: { currentAccountId: string | nu
 
   return (
     <>
-      {error && <p className="text-danger">{error}</p>}
-      <AccountsSection accounts={accounts} currentAccountId={currentAccountId} onChange={load} />
-      <GroupsSection groups={groups} accounts={accounts} onChange={load} />
+      <AdminSectionState
+        name="Accounts"
+        loading={!accounts && !accountsError}
+        error={accountsError}
+      >
+        {accounts && (
+          <AccountsSection accounts={accounts} currentAccountId={currentAccountId} onChange={load} />
+        )}
+      </AdminSectionState>
+      <AdminSectionState name="Groups" loading={!groups && !groupsError} error={groupsError}>
+        {groups && (
+          <>
+            {!accounts && accountsError && (
+              <DependencyNote>
+                Groups loaded successfully, but account details are unavailable. Membership names
+                and editing will return when the Accounts section can be loaded.
+              </DependencyNote>
+            )}
+            <GroupsSection groups={groups} accounts={accounts} onChange={load} />
+          </>
+        )}
+      </AdminSectionState>
     </>
   );
 }
@@ -977,7 +1232,7 @@ function GroupsSection({
   onChange,
 }: {
   groups: GroupInfo[];
-  accounts: AccountInfo[];
+  accounts: AccountInfo[] | null;
   onChange: () => void;
 }) {
   const { confirm, prompt } = useDialogs();
@@ -1063,7 +1318,11 @@ function GroupsSection({
               delete
             </button>
           </div>
-          {accounts.length === 0 ? (
+          {accounts === null ? (
+            <p className="text-xs text-fg-dim">
+              Account membership is unavailable while account details cannot be loaded.
+            </p>
+          ) : accounts.length === 0 ? (
             <p className="text-xs text-fg-dim">(no accounts to add)</p>
           ) : (
             <div className="flex flex-wrap gap-3">
@@ -1091,7 +1350,7 @@ function GroupsSection({
  *  (the server scopes it); it just lives on the Settings page alongside credential management. */
 function MySessionsSection() {
   const { confirm } = useDialogs();
-  const [sessions, setSessions] = useState<SessionInfo[]>([]);
+  const [sessions, setSessions] = useState<SessionInfo[] | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [revoking, setRevoking] = useState<string | null>(null);
 
@@ -1138,9 +1397,10 @@ function MySessionsSection() {
   return (
     <section className="flex flex-col gap-2">
       <h2 className="font-medium text-fg-muted">My sessions</h2>
-      {err && <p className="text-danger">{err}</p>}
-      <div className="rounded border border-border">
-        {sessions.length === 0 && !err && (
+      {!sessions && !err && <SectionLoading name="My sessions" />}
+      {err && <SectionError name="My sessions" message={err} />}
+      {sessions && <div className="rounded border border-border">
+        {sessions.length === 0 && (
           <div className="px-3 py-2 text-fg-dim">(no sessions)</div>
         )}
         {sessions.map((s) => (
@@ -1177,7 +1437,7 @@ function MySessionsSection() {
             </button>
           </div>
         ))}
-      </div>
+      </div>}
     </section>
   );
 }
@@ -1209,8 +1469,9 @@ function OidcSection({
 }) {
   const { confirm } = useDialogs();
   const [cfg, setCfg] = useState<OidcConfigInfo | null>(null);
-  const [identities, setIdentities] = useState<OidcIdentity[]>([]);
-  const [err, setErr] = useState<string | null>(null);
+  const [identities, setIdentities] = useState<OidcIdentity[] | null>(null);
+  const [configError, setConfigError] = useState<string | null>(null);
+  const [identitiesError, setIdentitiesError] = useState<string | null>(null);
   // False until the *config* read has actually answered. Without it a failed load is
   // indistinguishable from "no provider yet", and saving from that state silently replaces one.
   const [loaded, setLoaded] = useState(false);
@@ -1239,7 +1500,6 @@ function OidcSection({
    *  reason. `loaded` gates the form so nothing is offered before the truth is known. */
   const load = useCallback(async () => {
     const [c, ids] = await Promise.allSettled([admin.oidcConfig(), admin.oidcIdentities()]);
-    const failures: string[] = [];
     if (c.status === "fulfilled") {
       setCfg(c.value);
       if (c.value) {
@@ -1250,12 +1510,16 @@ function OidcSection({
         setProvisioning(c.value.provisioning);
       }
       setLoaded(true);
+      setConfigError(null);
     } else {
-      failures.push(errorMessage(c.reason));
+      setConfigError(errorMessage(c.reason));
     }
-    if (ids.status === "fulfilled") setIdentities(ids.value);
-    else failures.push(errorMessage(ids.reason));
-    setErr(failures[0] ?? null);
+    if (ids.status === "fulfilled") {
+      setIdentities(ids.value);
+      setIdentitiesError(null);
+    } else {
+      setIdentitiesError(errorMessage(ids.reason));
+    }
   }, []);
   useEffect(() => {
     void load();
@@ -1349,11 +1613,8 @@ function OidcSection({
         Let people sign in through an external identity provider. The session it mints here is an
         ordinary one, so password sign-in and API tokens keep working alongside it.
       </p>
-      {err && (
-        <p role="alert" aria-live="polite" className="text-danger">
-          {err}
-        </p>
-      )}
+      {!loaded && !configError && <SectionLoading name="OIDC provider configuration" />}
+      {configError && <SectionError name="OIDC provider configuration" message={configError} />}
 
       {/* Say what is still missing rather than hiding the controls that fix it. */}
       {!accountsEnabled && (
@@ -1369,7 +1630,7 @@ function OidcSection({
         </p>
       )}
 
-      <div className="flex flex-col gap-2 rounded border border-border p-3">
+      {loaded && <div className="flex flex-col gap-2 rounded border border-border p-3">
         <label className="flex flex-col gap-1">
           <span className="text-fg-dim">Issuer URL</span>
           <input
@@ -1444,14 +1705,16 @@ function OidcSection({
             {saving ? "Saving…" : configured ? "Save provider" : "Add provider"}
           </button>
         </div>
-      </div>
+      </div>}
 
       <h3 className="mt-1 font-medium text-fg-muted">Linked identities</h3>
       <p className="text-fg-dim">
         Which provider subject signs in as which account. Under the default policy this is required
         — without a link, an otherwise valid sign-in is still refused.
       </p>
-      <div className="rounded border border-border">
+      {!identities && !identitiesError && <SectionLoading name="Linked identities" />}
+      {identitiesError && <SectionError name="Linked identities" message={identitiesError} />}
+      {identities && <div className="rounded border border-border">
         {identities.length === 0 && <div className="px-3 py-2 text-fg-dim">(none linked)</div>}
         {identities.map((i) => (
           <div
@@ -1479,7 +1742,7 @@ function OidcSection({
             </button>
           </div>
         ))}
-      </div>
+      </div>}
       <div className="flex flex-wrap items-center gap-2 rounded border border-border p-3">
         <input
           className="field min-w-40 flex-1"

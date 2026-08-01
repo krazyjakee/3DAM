@@ -43,9 +43,11 @@ function ActionRow({
 /** Storage overview + maintenance actions (tech-spec 10 §5). */
 export function StorageSection({
   usage,
+  error,
   onChange,
 }: {
   usage: StorageUsage | null;
+  error: string | null;
   onChange: () => void;
 }) {
   const { confirm } = useDialogs();
@@ -135,6 +137,14 @@ export function StorageSection({
   return (
     <section className="flex flex-col gap-3">
       <h2 className="font-medium text-fg-muted">Storage &amp; maintenance</h2>
+      {error && (
+        <div
+          className="rounded border border-danger/40 bg-danger/10 px-3 py-2 text-danger"
+          role="alert"
+        >
+          <span className="font-medium">Storage usage unavailable.</span> {error}
+        </div>
+      )}
       <section className="rounded border border-border p-3">
         {usage ? (
           <div className="grid grid-cols-2 gap-x-6 gap-y-1 sm:grid-cols-3">
@@ -152,9 +162,9 @@ export function StorageSection({
             <AdminField label="Assets" value={String(usage.asset_count)} />
             <AdminField label="Sources" value={String(usage.source_count)} />
           </div>
-        ) : (
+        ) : !error ? (
           <p className="text-fg-dim">Loading storage usage…</p>
-        )}
+        ) : null}
       </section>
 
       <ActionRow title="Rescan all sources" hint="Full re-read of every registered source (the sidebar only runs quick, changed-file scans)." button="Rescan all (full)" busy={scan.isPending} onClick={rescanAll} />
