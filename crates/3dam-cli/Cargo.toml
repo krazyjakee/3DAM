@@ -14,6 +14,9 @@ dam-server.workspace = true
 # embedded storage-maintenance ops open the engine (`EmbeddedLibrary`) for their inherent methods.
 dam-client.workspace = true
 dam-core.workspace = true
+# Only to ask what 3D targets this build can write, so `convert --to glb` is refused up front in a
+# binary compiled without `model-convert` rather than failing per item (issue #49).
+dam-media.workspace = true
 clap.workspace = true
 tokio.workspace = true
 serde_json.workspace = true

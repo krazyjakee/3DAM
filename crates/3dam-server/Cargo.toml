@@ -10,7 +10,7 @@ dam-api.workspace = true
 # `render` pulls the wgpu renderer so `serve` can produce 3D model turntable thumbnails (ADR 0002).
 # The whole `3dam` binary links dam-server, so this turns rendering on for every role by unification
 # while dam-core itself stays GPU-free by default for pure-library consumers.
-dam-core = { workspace = true, features = ["render"] }
+dam-core = { workspace = true, features = ["render", "model-convert"] }
 axum.workspace = true
 # In-process TLS (issue #75): HTTPS from a cert/key for a hosted deployment (no `--insecure`).
 axum-server = { workspace = true }

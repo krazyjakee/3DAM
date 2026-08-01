@@ -274,6 +274,36 @@ constrained by `format` and checked at submission.
 (`meshopt`), because they are independently useful: you can optimise a mesh in-place (glTF→glTF)
 or transcode without touching geometry.
 
+> **Status (issue #49).** The **container transcode** stage is implemented, for the single target
+> `glb`, as `ConvertTarget::Model { format }`. Mesh optimisation/compression is the second stage and
+> is **not** implemented — deliberately, per the separation above; the `ModelTarget` fields below
+> (`optimise`, `quantise`, `compression`, `textures`, `flatten`) remain design, and the shipped DTO
+> carries only `format` so there is no half-wired knob.
+>
+> **The encoder is Assimp's own exporter**, reached through `russimp-ng`'s raw FFI. Assimp is
+> already linked for import (thumbnails, ADR 0011) and its exporters are compiled in, so this added
+> no native dependency. It is behind `dam-media/model-convert` because turning it on builds Assimp
+> from source; `serve` opts in, exactly as it does for `render`.
+>
+> **Why `glb` alone.** Assimp returns an export *blob chain*, and this pipeline's encode seam is a
+> single `Vec<u8>` that `atomic_write` commits (§5.2). `glb2` is one part; `gltf2` is two
+> (`.gltf` + `.bin`) and `obj` is two (`.obj` + `.mtl`). Emitting only the first part would write a
+> file referencing data nobody wrote, so both are **refused by name** with an explanation rather
+> than half-produced. Supporting them means extending the seam to multi-file outputs — a change to
+> the atomic-write discipline, not a format addition, and therefore its own slice.
+>
+> **Textures are embedded**, via `aiProcess_EmbedTextures` at *import* time. Passing it as the
+> exporter's preprocessing argument — which the name suggests — silently yields a GLB whose images
+> are `uri` references to files beside the *original*, i.e. an asset that breaks the moment it
+> leaves the output directory. Verified on a textured OBJ: the output carries
+> `{"bufferView": 0, "mimeType": "image/png"}` and no `uri`.
+>
+> **This is a delivery format, not interchange.** Assimp's exporters re-interpret: a one-material
+> textured cube comes back with two materials (a default is appended) and vertex counts move
+> (`PreTransformVertices` undoes the welding). Rigging, custom properties and non-PBR material
+> extensions degrade. That is tolerable only because §5.1 holds absolutely — the original is never
+> touched — so a lossy convert is always an *addition*, never a replacement.
+
 ```rust
 pub struct ModelTarget {
     pub container: ModelFormat,          // Gltf | Glb | Obj  (FBX is decode-in via 04, not an encode target in v1)

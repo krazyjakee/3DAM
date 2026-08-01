@@ -12,6 +12,11 @@ image.workspace = true
 dds.workspace = true
 ktx2.workspace = true
 texture2ddecoder.workspace = true
+# 3D container transcode (issue #49). Assimp's *exporters* are compiled into the same static
+# library `dam-render` already builds for import, so this adds no new native dependency — only the
+# raw FFI, which `russimp-ng` re-exports. `static-link` must match `dam-render`'s exactly, or Cargo
+# feature unification builds Assimp twice and a non-render build tries to link a system libassimp.
+russimp-ng = { workspace = true, features = ["static-link"], optional = true }
 symphonia.workspace = true
 hound.workspace = true
 rustfft.workspace = true
@@ -24,3 +29,13 @@ encoding_rs.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[features]
+# Transcode a 3D model to a self-contained GLB. Off by default: turning it on builds Assimp from
+# source (cmake/C++), which a library consumer that only wants metadata should not pay for. `serve`
+# and the CLI opt in, the same way `render` is opted into.
+model-convert = ["dep:russimp-ng"]
+# Note on test coverage: `cargo test -p dam-media` alone runs none of the model-convert tests,
+# because the feature is off. They *do* run under `cargo test --workspace` — `dam-server` enables
+# `dam-core/model-convert`, and resolver-2 unifies features across the workspace's normal graph.
+# If `dam-server` ever stops enabling it, those tests stop running silently rather than failing.

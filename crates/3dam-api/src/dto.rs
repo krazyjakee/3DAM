@@ -875,6 +875,18 @@ pub enum ConvertTarget {
         /// `wav` in v1 (lossless PCM); other codecs stage later (tech-spec 08 §3.1).
         format: String,
     },
+    /// 3D container transcode (issue #49, tech-spec 08 §3.3).
+    ///
+    /// Mesh optimise/compression is deliberately *not* a field here yet: §3.3 separates container
+    /// transcode from optimisation because they are independently useful, and a half-wired knob
+    /// would be worse than none.
+    Model {
+        /// `glb` in v1. `gltf` and `obj` are named v1 targets but emit sidecars (`.bin`, `.mtl`),
+        /// which the single-buffer encode seam cannot write as one output yet — so they are
+        /// refused by name rather than silently producing a first part that references a file
+        /// nobody wrote.
+        format: String,
+    },
 }
 
 impl ConvertTarget {
@@ -882,6 +894,7 @@ impl ConvertTarget {
         match self {
             ConvertTarget::Image { .. } => MediaType::Image,
             ConvertTarget::Audio { .. } => MediaType::Audio,
+            ConvertTarget::Model { .. } => MediaType::Model,
         }
     }
     /// The concrete output format token (drives the output extension).
@@ -889,6 +902,7 @@ impl ConvertTarget {
         match self {
             ConvertTarget::Image { format, .. } => format,
             ConvertTarget::Audio { format } => format,
+            ConvertTarget::Model { format } => format,
         }
     }
 }

@@ -16,6 +16,9 @@ mod mel;
 mod model;
 mod proc;
 mod texture;
+// 3D container transcode (issue #49) — behind `model-convert`, because enabling it builds Assimp.
+#[cfg(feature = "model-convert")]
+mod model_convert;
 mod video;
 
 pub use audio_features::{
@@ -327,6 +330,40 @@ pub fn convert_audio(
     let mut cursor = std::io::Cursor::new(Vec::new());
     audio::convert_to_wav(path, source_format, &mut cursor)?;
     Ok(cursor.into_inner())
+}
+
+/// EXPENSIVE tier: transcode a 3D model to a target container (convert pipeline, tech-spec 08 §3.3).
+///
+/// Behind the `model-convert` feature, because enabling it compiles Assimp from source. Without it
+/// the surface still exists and answers `Unsupported`, so a build that cannot do this says so
+/// rather than the format quietly vanishing from the target list.
+pub fn convert_model(path: &Path, target_format: &str) -> Result<Vec<u8>, HandlerError> {
+    #[cfg(feature = "model-convert")]
+    {
+        model_convert::convert(path, target_format)
+    }
+    #[cfg(not(feature = "model-convert"))]
+    {
+        let _ = path;
+        Err(HandlerError::Unsupported(format!(
+            "3D convert to '{target_format}' is not compiled into this build (feature \
+             `model-convert`)"
+        )))
+    }
+}
+
+/// Can this build write `target` as a 3D container? Drives the CLI's target validation so an
+/// unsupported request is refused before a job starts rather than failing per item.
+pub fn supports_model_target(target: &str) -> bool {
+    #[cfg(feature = "model-convert")]
+    {
+        model_convert::supports_target(target)
+    }
+    #[cfg(not(feature = "model-convert"))]
+    {
+        let _ = target;
+        false
+    }
 }
 
 #[cfg(test)]

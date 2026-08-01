@@ -139,7 +139,8 @@ pub(crate) enum Cmd {
         /// Asset ids to convert.
         #[arg(required = true)]
         ids: Vec<String>,
-        /// Target format: `png`|`jpg`|`webp`|`bmp`|`tga`|`tiff`|`gif` (image) or `wav` (audio).
+        /// Target format: `png`|`jpg`|`webp`|`bmp`|`tga`|`tiff`|`gif` (image), `wav` (audio),
+        /// or `glb` (3D — a self-contained glTF binary with textures embedded).
         #[arg(long)]
         to: String,
         /// Output directory (never a source tree — convert is non-destructive).

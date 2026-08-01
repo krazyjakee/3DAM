@@ -54,6 +54,9 @@ libc = "0.2"
 # 3D model thumbnails via the wgpu renderer. Pulls wgpu in transitively — enabled by `serve`, kept
 # off for lean CLI/GUI builds where the honest typed tile is the intended 3D grid affordance.
 render = ["dep:dam-render"]
+# 3D container transcode for the convert pipeline (issue #49). Separate from `render`: one is a GPU
+# thumbnail path, the other is a CPU encode, and a headless convert build should not need wgpu.
+model-convert = ["dam-media/model-convert"]
 # Model-backed semantic embeddings behind the EmbeddingSpace seam (semantic-search M4, ADR 0006).
 # Off by default: the model-free `*-stats-v1` descriptors stand in. Enabling it compiles the real
 # candle SigLIP encoder (image + text towers); it activates at runtime only when model weights are

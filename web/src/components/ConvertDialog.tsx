@@ -20,7 +20,22 @@ import { bytes } from "@/lib/format";
 
 const IMAGE_FORMATS = ["png", "jpg", "webp", "bmp", "tga", "tiff", "gif"];
 const AUDIO_FORMATS = ["wav"];
+/** 3D containers (issue #49). `glb` only: it is self-contained, where `gltf`/`obj` emit sidecar
+ *  files the convert pipeline cannot yet write as one output — the server refuses those by name. */
+const MODEL_FORMATS = ["glb"];
 const LOSSY = new Set(["jpg", "webp"]);
+
+/** The media classes `convert` can target. Not every `MediaType` — video and documents have no
+ *  encode path (PRODUCT_SPEC §9 phase 2b is deliberately shallow for both). */
+type TargetMedia = "image" | "audio" | "model";
+
+function formatsFor(m: TargetMedia): string[] {
+  return m === "image" ? IMAGE_FORMATS : m === "model" ? MODEL_FORMATS : AUDIO_FORMATS;
+}
+
+function defaultFormat(m: TargetMedia): string {
+  return formatsFor(m)[0];
+}
 const COLLISION: { value: CollisionRule; label: string }[] = [
   { value: "fail", label: "Fail on existing" },
   { value: "suffix", label: "Add -N suffix" },
@@ -49,23 +64,29 @@ export function ConvertDialog({
   const [err, setErr] = useState<string | null>(null);
 
   // Default the target media to whichever the selection mostly is.
-  const defaultMedia = useMemo<"image" | "audio">(() => {
-    const images = assets.filter((a) => a.media === "image").length;
-    const audio = assets.filter((a) => a.media === "audio").length;
-    return audio > images ? "audio" : "image";
+  const defaultMedia = useMemo<TargetMedia>(() => {
+    const counts: Record<TargetMedia, number> = {
+      image: assets.filter((a) => a.media === "image").length,
+      audio: assets.filter((a) => a.media === "audio").length,
+      model: assets.filter((a) => a.media === "model").length,
+    };
+    // Whichever the selection mostly is; ties fall to image, which is the common case.
+    return (Object.keys(counts) as TargetMedia[]).reduce((best, m) =>
+      counts[m] > counts[best] ? m : best,
+    );
   }, [assets]);
 
-  const [media, setMedia] = useState<"image" | "audio">(defaultMedia);
-  const [format, setFormat] = useState(defaultMedia === "audio" ? "wav" : "png");
+  const [media, setMedia] = useState<TargetMedia>(defaultMedia);
+  const [format, setFormat] = useState(defaultFormat(defaultMedia));
   const [maxEdge, setMaxEdge] = useState("");
   const [quality, setQuality] = useState("");
   const [outputDir, setOutputDir] = useState("");
   const [collision, setCollision] = useState<CollisionRule>("fail");
   const [dryRun, setDryRun] = useState(true);
 
-  const switchMedia = (m: "image" | "audio") => {
+  const switchMedia = (m: TargetMedia) => {
     setMedia(m);
-    setFormat(m === "audio" ? "wav" : "png");
+    setFormat(defaultFormat(m));
   };
 
   // How many inputs match the chosen target media (the rest will report `unsupported`).
@@ -82,7 +103,9 @@ export function ConvertDialog({
             max_edge: maxEdge ? Number(maxEdge) : null,
             quality: quality && LOSSY.has(format) ? Number(quality) : null,
           }
-        : { media: "audio", format };
+        : media === "model"
+          ? { media: "model", format }
+          : { media: "audio", format };
     run.mutate(
       {
         inputs: assets.map((a) => a.id),
@@ -115,7 +138,7 @@ export function ConvertDialog({
             <div>
               <label className="mb-1 block text-[11px] text-fg-muted">Target media</label>
               <div className="flex overflow-hidden rounded border border-border">
-                {(["image", "audio"] as const).map((m) => (
+                {(["image", "audio", "model"] as const).map((m) => (
                   <button
                     key={m}
                     onClick={() => switchMedia(m)}
@@ -147,7 +170,7 @@ export function ConvertDialog({
                   value={format}
                   onChange={(e) => setFormat(e.target.value)}
                 >
-                  {(media === "image" ? IMAGE_FORMATS : AUDIO_FORMATS).map((f) => (
+                  {formatsFor(media).map((f) => (
                     <option key={f} value={f}>
                       {f.toUpperCase()}
                     </option>

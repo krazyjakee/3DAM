@@ -397,7 +397,11 @@ export type CollisionRule = "fail" | "suffix" | "skip" | "overwrite";
  *  `unsupported` (fail-soft). Matches `dam-api` `ConvertTarget` (`#[serde(tag = "media")]`). */
 export type ConvertTarget =
   | { media: "image"; format: string; max_edge?: number | null; quality?: number | null }
-  | { media: "audio"; format: string };
+  | { media: "audio"; format: string }
+  /** 3D container transcode (issue #49). `glb` only for now — a self-contained glTF binary with
+   *  textures embedded. `gltf`/`obj` emit sidecar files the convert pipeline cannot yet write as
+   *  one output, so the server refuses them by name. */
+  | { media: "model"; format: string };
 
 export interface ConvertRequest {
   inputs: AssetId[];

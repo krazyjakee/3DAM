@@ -273,6 +273,11 @@ fn encode(
         ConvertTarget::Audio { format } => {
             dam_media::convert_audio(abs_input, source_format, format)
         }
+        // 3D container transcode (issue #49). `source_format` is deliberately unused: Assimp
+        // identifies the input from its own contents, and trusting the catalogued extension over
+        // the file's signature would be the wrong call for a family where mislabelled extensions
+        // are common.
+        ConvertTarget::Model { format } => dam_media::convert_model(abs_input, format),
     }
 }
 

@@ -26,7 +26,10 @@ pub(crate) fn print_dedup(groups: &[DupGroup]) {
     println!("{} group(s)", groups.len());
 }
 
-/// Pick the media-typed target from the requested `--to` format (audio = `wav`, else image).
+/// Pick the media-typed target from the requested `--to` format.
+///
+/// String dispatch, so nothing here is compiler-checked — a new [`ConvertTarget`] variant will
+/// build fine and simply be unreachable from the CLI. Keep this in step with the enum by hand.
 pub(crate) fn build_convert_target(to: &str) -> anyhow::Result<ConvertTarget> {
     let to = to.to_ascii_lowercase();
     match to.as_str() {
@@ -38,8 +41,20 @@ pub(crate) fn build_convert_target(to: &str) -> anyhow::Result<ConvertTarget> {
                 quality: None,
             })
         }
+        // 3D containers (issue #49). Checked against what this *build* can actually write rather
+        // than a hardcoded list, so a binary compiled without `model-convert` refuses the request
+        // up front instead of starting a job that fails on every item.
+        _ if dam_media::supports_model_target(&to) => Ok(ConvertTarget::Model { format: to }),
+        // `gltf`/`obj` are real v1 targets that need a multi-file output seam; name them
+        // specifically so the answer is "not yet" rather than "no such format".
+        "gltf" | "obj" => Err(anyhow::anyhow!(
+            "3D target '{to}' is not available yet: it writes sidecar files ({}) that the convert \
+             pipeline cannot emit as one output. Use `glb`, which is self-contained (issue #49)",
+            if to == "gltf" { ".bin" } else { ".mtl" }
+        )),
         other => Err(anyhow::anyhow!(
-            "unsupported target format '{other}' (image: png|jpg|webp|bmp|tga|tiff|gif; audio: wav)"
+            "unsupported target format '{other}' (image: png|jpg|webp|bmp|tga|tiff|gif; \
+             audio: wav; 3D: glb)"
         )),
     }
 }
