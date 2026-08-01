@@ -40,6 +40,7 @@ import type {
   TagRef,
 } from "@/api/types";
 import { bytes, duration, mediaLabel, originLabel, relTime } from "@/lib/format";
+import { DUPLICATE_QUERY_LIMIT } from "@/lib/limits";
 import { peerReadOnlyTitle } from "@/lib/origin";
 import { hasInteractive3D } from "@/lib/model-formats";
 import { useViewState } from "@/lib/view-state";
@@ -698,7 +699,6 @@ function CollectionsGroup({ asset }: { asset: Asset }) {
 
 /** Pull enough exact-duplicate groups to cover the library; keyed identically to the Browser's fetch
  *  so the two share one cached request under `qk.duplicates`. */
-const DUP_LIMIT = 10_000;
 
 /** The byte-identical copies of this asset. In the grid/table those copies collapse into one badged
  *  card; this is where the full set is enumerated (the request in the golden rules: "duplicates listed
@@ -707,7 +707,7 @@ const DUP_LIMIT = 10_000;
 function DuplicatesSection({ asset }: { asset: Asset }) {
   const { patch } = useViewState();
   const id = asset.summary.id;
-  const dups = useDuplicates({ kind: "exact", limit: DUP_LIMIT });
+  const dups = useDuplicates({ kind: "exact", limit: DUPLICATE_QUERY_LIMIT });
   const group = dups.data?.find(
     (g) => g.members.length > 1 && g.members.some((m) => m.id === id),
   );

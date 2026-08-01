@@ -34,6 +34,7 @@ import { useWriteGate } from "@/lib/write-gate";
 import { useViewState } from "@/lib/view-state";
 import { useDebounced } from "@/lib/use-debounced";
 import { bytes } from "@/lib/format";
+import { DUPLICATE_QUERY_LIMIT } from "@/lib/limits";
 import { requestAutoplay } from "@/lib/audio-intent";
 import { Thumbnail } from "./Thumbnail";
 import { LicenseBadge } from "./LicenseBadge";
@@ -59,7 +60,6 @@ const COARSE_POINTER =
   typeof window !== "undefined" && window.matchMedia("(pointer: coarse)").matches;
 const ROW_H = COARSE_POINTER ? 44 : 30;
 // Pull enough exact-duplicate groups to collapse the whole loaded library (default server cap is 100).
-const DUP_LIMIT = 10_000;
 
 /** Collapse byte-identical duplicates in the browse list (issue: dedup in grid/table). Each exact
  *  group renders once — the first member that appears in the current sort/filter represents it, so a
@@ -151,7 +151,7 @@ export function Browser({ onOpenNav }: { onOpenNav?: () => void }) {
   // Collapse byte-identical duplicates into one row each, badged with the hidden-copy count; the
   // full group is listed in the Inspector. Whole-library groups, cached + shared with the Inspector
   // and the Duplicates page under `qk.duplicates`.
-  const dups = useDuplicates({ kind: "exact", limit: DUP_LIMIT });
+  const dups = useDuplicates({ kind: "exact", limit: DUPLICATE_QUERY_LIMIT });
   const { visible, dupCounts } = useMemo(
     () => collapseExactDuplicates(items, dups.data),
     [items, dups.data],

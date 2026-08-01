@@ -72,21 +72,19 @@ pub fn metadata(path: &Path, format: &str) -> ModelAttributes {
 /// "this build can't" from "this file won't" and fall back to the cheap answer either way. The
 /// external-dependency byte total is carried over from the cheap tier: it is a fact about the
 /// folder the model sits in, not about the imported scene.
+#[cfg(feature = "model-convert")]
 pub fn deep_metadata(path: &Path, format: &str) -> Result<ModelAttributes, crate::HandlerError> {
-    #[cfg(feature = "model-convert")]
-    {
-        let mut attrs = probe::metadata(path)?;
-        attrs.dependency_bytes = dependency_bytes(path, format);
-        Ok(attrs)
-    }
-    #[cfg(not(feature = "model-convert"))]
-    {
-        let _ = (path, format);
-        Err(crate::HandlerError::Unsupported(
-            "exact 3D geometry counts are not compiled into this build (feature `model-convert`)"
-                .into(),
-        ))
-    }
+    let mut attrs = probe::metadata(path)?;
+    attrs.dependency_bytes = dependency_bytes(path, format);
+    Ok(attrs)
+}
+
+#[cfg(not(feature = "model-convert"))]
+pub fn deep_metadata(_path: &Path, _format: &str) -> Result<ModelAttributes, crate::HandlerError> {
+    Err(crate::HandlerError::Unsupported(
+        "exact 3D geometry counts are not compiled into this build (feature `model-convert`)"
+            .into(),
+    ))
 }
 
 // ── glTF family ────────────────────────────────────────────────────────────

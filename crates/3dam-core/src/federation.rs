@@ -484,10 +484,10 @@ pub(crate) async fn federated_query(
     if peer_target.is_some() {
         fc.l.d = true; // peer-only routing: the local stream never participates in this listing
     }
-    let answered_exhausted = pages.iter().enumerate().all(|(i, (is_local, sid, sp))| {
-        let _ = (is_local, sid);
-        consumed[i] >= sp.items.len() && sp.next.is_none()
-    });
+    let answered_exhausted = pages
+        .iter()
+        .enumerate()
+        .all(|(i, (_, _, sp))| consumed[i] >= sp.items.len() && sp.next.is_none());
     let dropped_any = !partial.complete;
     let cursor = if answered_exhausted && !dropped_any {
         None

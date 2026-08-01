@@ -1,6 +1,7 @@
-//! `cargo xtask` — dev automation. Phase 1 wires the CI aggregation; the dependency-graph guard
-//! (`check-deps`, tech-spec 01 §2) is sketched here and fleshed out with `cargo metadata` later.
+//! `cargo xtask` — dev automation, including the dependency-graph guard from tech-spec 01 §2.
 
+use serde::Deserialize;
+use std::collections::HashSet;
 use std::path::Path;
 use std::process::{Command, ExitCode};
 
@@ -11,6 +12,7 @@ fn main() -> ExitCode {
         // (tech-spec 09 §A.4, tech-spec 15 §15.5: build the web client before the native build).
         "ci" => {
             build_web()
+                && check_deps()
                 && run("cargo", &["fmt", "--all", "--check"])
                 && run(
                     "cargo",
@@ -195,14 +197,122 @@ fn gzip_man_pages(man: &Path) -> bool {
     run("gzip", &args)
 }
 
-/// Placeholder for the dependency-direction guard (tech-spec 01 §2): assert the allowed-edge
-/// whitelist over `cargo metadata` and forbid GPU/UI/HTTP in `3dam-core`'s tree.
+#[derive(Deserialize)]
+struct CargoMetadata {
+    packages: Vec<CargoPackage>,
+}
+
+#[derive(Deserialize)]
+struct CargoPackage {
+    name: String,
+    dependencies: Vec<CargoDependency>,
+}
+
+#[derive(Deserialize)]
+struct CargoDependency {
+    name: String,
+}
+
+/// Direct internal dependency edges allowed by the current architecture (tech-spec 01 §2 and
+/// `CLAUDE.md`'s crate map). External crates are deliberately outside this graph-shape check.
+const ALLOWED_DAM_EDGES: &[(&str, &str)] = &[
+    ("dam", "dam-cli"),
+    ("dam", "dam-desktop"),
+    ("dam", "dam-frontend"),
+    ("dam-cli", "dam-api"),
+    ("dam-cli", "dam-client"),
+    ("dam-cli", "dam-core"),
+    ("dam-cli", "dam-frontend"),
+    ("dam-cli", "dam-media"),
+    ("dam-cli", "dam-server"),
+    ("dam-client", "dam-api"),
+    ("dam-core", "dam-api"),
+    ("dam-core", "dam-client"),
+    ("dam-core", "dam-media"),
+    ("dam-core", "dam-render"),
+    ("dam-core", "dam-sources"),
+    ("dam-core", "dam-store"),
+    ("dam-desktop", "dam-frontend"),
+    ("dam-desktop", "dam-server"),
+    ("dam-frontend", "dam-api"),
+    ("dam-frontend", "dam-client"),
+    ("dam-frontend", "dam-core"),
+    ("dam-media", "dam-api"),
+    ("dam-server", "dam-api"),
+    ("dam-server", "dam-core"),
+    ("dam-sources", "dam-api"),
+    ("dam-store", "dam-api"),
+    ("dam-store", "dam-sources"),
+];
+
+fn product_package(name: &str) -> bool {
+    name == "dam" || name.starts_with("dam-")
+}
+
+fn unexpected_edges(metadata: &CargoMetadata) -> Vec<(String, String)> {
+    let packages: HashSet<&str> = metadata
+        .packages
+        .iter()
+        .map(|package| package.name.as_str())
+        .filter(|name| product_package(name))
+        .collect();
+    let allowed: HashSet<(&str, &str)> = ALLOWED_DAM_EDGES.iter().copied().collect();
+    let mut unexpected = metadata
+        .packages
+        .iter()
+        .filter(|package| packages.contains(package.name.as_str()))
+        .flat_map(|package| {
+            let packages = &packages;
+            let allowed = &allowed;
+            package.dependencies.iter().filter_map(move |dependency| {
+                let edge = (package.name.as_str(), dependency.name.as_str());
+                (packages.contains(dependency.name.as_str()) && !allowed.contains(&edge))
+                    .then(|| (edge.0.to_owned(), edge.1.to_owned()))
+            })
+        })
+        .collect::<Vec<_>>();
+    unexpected.sort();
+    unexpected.dedup();
+    unexpected
+}
+
+/// Assert the allowed internal-edge whitelist over `cargo metadata`. Cargo itself rejects cycles;
+/// this guard catches a new upward or cross-layer edge before it becomes accepted architecture.
 fn check_deps() -> bool {
-    eprintln!(
-        "check-deps: not yet implemented — will assert the crate-boundary rules (tech-spec 01 §2) \
-         via `cargo metadata`."
-    );
-    true
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    eprintln!("$ cargo metadata --no-deps --format-version 1");
+    let output = match Command::new("cargo")
+        .current_dir(root)
+        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        Ok(output) => {
+            eprintln!("check-deps: cargo metadata failed with {}", output.status);
+            return false;
+        }
+        Err(error) => {
+            eprintln!("check-deps: could not run cargo metadata: {error}");
+            return false;
+        }
+    };
+    let metadata: CargoMetadata = match serde_json::from_slice(&output.stdout) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            eprintln!("check-deps: invalid cargo metadata: {error}");
+            return false;
+        }
+    };
+    let unexpected = unexpected_edges(&metadata);
+    if unexpected.is_empty() {
+        eprintln!("check-deps: dependency directions are valid");
+        return true;
+    }
+    eprintln!("check-deps: unexpected internal dependency edges:");
+    for (from, to) in unexpected {
+        eprintln!("  {from} -> {to}");
+    }
+    false
 }
 
 /// Build the web client into `web/dist/` (consumed by the server's `rust-embed`, tech-spec 09 §A.4).
@@ -305,4 +415,46 @@ fn run(cmd: &str, args: &[&str]) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn package(name: &str, dependencies: &[&str]) -> CargoPackage {
+        CargoPackage {
+            name: name.to_owned(),
+            dependencies: dependencies
+                .iter()
+                .map(|name| CargoDependency {
+                    name: (*name).to_owned(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn dependency_guard_accepts_known_edges_and_ignores_external_crates() {
+        let metadata = CargoMetadata {
+            packages: vec![
+                package("dam-core", &["dam-api", "serde"]),
+                package("dam-api", &["serde"]),
+            ],
+        };
+        assert!(unexpected_edges(&metadata).is_empty());
+    }
+
+    #[test]
+    fn dependency_guard_reports_new_internal_edges() {
+        let metadata = CargoMetadata {
+            packages: vec![
+                package("dam-api", &["dam-server"]),
+                package("dam-server", &["dam-api"]),
+            ],
+        };
+        assert_eq!(
+            unexpected_edges(&metadata),
+            vec![("dam-api".to_owned(), "dam-server".to_owned())]
+        );
+    }
 }

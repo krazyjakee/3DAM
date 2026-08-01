@@ -10,7 +10,6 @@ import {
   type AccountInfo,
   type AdminStatus,
   type AuditEntry,
-  type CacheTarget,
   type FlagInfo,
   type FlagKey,
   type FlagValue,
@@ -30,12 +29,14 @@ import type {
   SessionInfo,
 } from "@/api/types";
 import { ApiError } from "@/api/client";
-import { useScan, useWhoami } from "@/api/queries";
+import { useWhoami } from "@/api/queries";
 import { getServer, setServer } from "@/lib/server";
 import { errorMessage, toast } from "@/lib/toast";
 import { useDialogs } from "@/lib/dialogs";
 import { useEscape, useFocusTrap } from "@/lib/use-focus-trap";
 import { TokenLoginForm } from "./AuthGate";
+import { AdminField } from "./settings/AdminField";
+import { StorageSection } from "./settings/StorageSection";
 
 const ALL_SCOPES: Scope[] = ["read", "write", "admin", "mcp_use", "federate"];
 
@@ -408,15 +409,15 @@ function StatusCard({ status }: { status: AdminStatus }) {
       }`}
     >
       <div className="grid grid-cols-2 gap-x-6 gap-y-1 sm:grid-cols-3">
-        <Field label="Bind" value={status.bind} />
-        <Field label="Localhost only" value={String(status.localhost_only)} />
-        <Field label="TLS" value={String(status.tls)} />
-        <Field label="Auth" value={status.auth} />
-        <Field label="MCP" value={status.mcp} />
-        <Field label="Network writes" value={String(status.network_writes)} />
-        <Field label="Tokens" value={String(status.token_count)} />
+        <AdminField label="Bind" value={status.bind} />
+        <AdminField label="Localhost only" value={String(status.localhost_only)} />
+        <AdminField label="TLS" value={String(status.tls)} />
+        <AdminField label="Auth" value={status.auth} />
+        <AdminField label="MCP" value={status.mcp} />
+        <AdminField label="Network writes" value={String(status.network_writes)} />
+        <AdminField label="Tokens" value={String(status.token_count)} />
         {status.account_count != null && (
-          <Field
+          <AdminField
             label="Accounts"
             value={status.unclaimed ? `${status.account_count} (unclaimed)` : String(status.account_count)}
           />
@@ -428,15 +429,6 @@ function StatusCard({ status }: { status: AdminStatus }) {
         </p>
       )}
     </section>
-  );
-}
-
-function Field({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="flex flex-col">
-      <span className="text-xs text-fg-dim">{label}</span>
-      <span className="font-mono">{value}</span>
-    </div>
   );
 }
 
@@ -536,234 +528,6 @@ function Toggle({
         }`}
       />
     </button>
-  );
-}
-
-/** Human-readable bytes (1024-based), e.g. `12.4 MiB`. */
-function fmtBytes(n: number): string {
-  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
-  let v = n;
-  let i = 0;
-  while (v >= 1024 && i < units.length - 1) {
-    v /= 1024;
-    i += 1;
-  }
-  return i === 0 ? `${n} B` : `${v.toFixed(1)} ${units[i]}`;
-}
-
-/** One maintenance action: a labelled row with a hint and a single button. */
-function ActionRow({
-  title,
-  hint,
-  button,
-  onClick,
-  busy,
-  danger,
-}: {
-  title: string;
-  hint: string;
-  button: string;
-  onClick: () => void;
-  busy: boolean;
-  danger?: boolean;
-}) {
-  return (
-    <div className="flex items-center justify-between gap-4 rounded border border-border p-3">
-      <div className="min-w-0">
-        <div className="font-medium">{title}</div>
-        <p className="text-xs text-fg-dim">{hint}</p>
-      </div>
-      <button
-        type="button"
-        disabled={busy}
-        onClick={onClick}
-        className={`btn shrink-0 disabled:opacity-40 ${danger ? "text-danger" : ""}`}
-      >
-        {busy ? "Working…" : button}
-      </button>
-    </div>
-  );
-}
-
-/** Storage overview + the maintenance actions (tech-spec 10 §5). Destructive ops warn-and-confirm;
- *  everything here is non-destructive to files inside registered sources. */
-function StorageSection({
-  usage,
-  onChange,
-}: {
-  usage: StorageUsage | null;
-  onChange: () => void;
-}) {
-  const { confirm } = useDialogs();
-  const scan = useScan();
-  // The key of the action currently in flight, so its button (and the destructive group) disables
-  // during the round-trip without blocking unrelated rows.
-  const [busy, setBusy] = useState<string | null>(null);
-
-  /** Run a maintenance call: mark busy, toast the result, refresh the usage numbers. */
-  const run = async (key: string, fn: () => Promise<string>) => {
-    setBusy(key);
-    try {
-      toast.success(await fn());
-      onChange();
-    } catch (e) {
-      toast.error(errorMessage(e));
-    } finally {
-      setBusy(null);
-    }
-  };
-
-  const clearCache = (target: CacheTarget, label: string) =>
-    run(`cache:${target}`, async () => {
-      const r = await admin.clearCache(target);
-      return `Cleared ${label}: ${r.files_deleted} files, ${fmtBytes(r.bytes_freed)} freed`;
-    });
-
-  const rescanAll = () => {
-    scan.mutate({ mode: "full" });
-    toast.success("Full rescan of all sources started");
-  };
-
-  const clearAnalysis = async () => {
-    if (
-      !(await confirm({
-        title: "Clear analysis?",
-        message:
-          "Drops auto-tag/dedup suggestions and derived analysis, and marks every asset for re-analysis. Your confirmed tags are kept.",
-        danger: true,
-        confirmLabel: "Clear analysis",
-      }))
-    )
-      return;
-    void run("analysis", async () => {
-      const r = await admin.clearAnalysis();
-      return `Cleared ${r.suggestions_removed} suggestions and ${r.embeddings_removed} embeddings`;
-    });
-  };
-
-  const vacuum = () =>
-    run("vacuum", async () => {
-      const r = await admin.vacuum();
-      return `Database compacted — reclaimed ${fmtBytes(r.reclaimed_bytes)}`;
-    });
-
-  const resetCatalog = async () => {
-    if (
-      !(await confirm({
-        title: "Reset the catalog?",
-        message:
-          "Removes every cataloged asset, source, collection, and tag from this library. Files on disk are NOT touched, and your tokens & settings are kept. This cannot be undone.",
-        danger: true,
-        confirmLabel: "Reset catalog",
-      }))
-    )
-      return;
-    void run("wipe", async () => {
-      const r = await admin.wipe(true);
-      return `Catalog reset — ${r.assets_removed} assets, ${r.sources_removed} sources removed`;
-    });
-  };
-
-  const factoryReset = async () => {
-    if (
-      !(await confirm({
-        title: "Factory reset everything?",
-        message:
-          "Erases the catalog AND all caches, API tokens, feature flags, and the audit log. The app returns to its first-run state and your current admin token stops working. This cannot be undone.",
-        danger: true,
-        confirmLabel: "Factory reset",
-      }))
-    )
-      return;
-    void run("factory", async () => {
-      const r = await admin.factoryReset(true);
-      return `Factory reset complete — ${r.catalog.assets_removed} assets and ${r.tokens_removed} tokens removed`;
-    });
-  };
-
-  return (
-    <section className="flex flex-col gap-3">
-      <h2 className="font-medium text-fg-muted">Storage &amp; maintenance</h2>
-
-      <section className="rounded border border-border p-3">
-        {usage ? (
-          <div className="grid grid-cols-2 gap-x-6 gap-y-1 sm:grid-cols-3">
-            <Field label="Data directory" value={usage.data_dir} />
-            <Field label="Catalog (library.db)" value={fmtBytes(usage.library_db_bytes)} />
-            <Field label="Server config (server.db)" value={fmtBytes(usage.server_db_bytes)} />
-            <Field
-              label="Thumbnail cache"
-              value={`${fmtBytes(usage.thumbnails.bytes)} · ${usage.thumbnails.files} files`}
-            />
-            <Field
-              label="3D preview cache"
-              value={`${fmtBytes(usage.previews.bytes)} · ${usage.previews.files} files`}
-            />
-            <Field label="Assets" value={String(usage.asset_count)} />
-            <Field label="Sources" value={String(usage.source_count)} />
-          </div>
-        ) : (
-          <p className="text-fg-dim">Loading storage usage…</p>
-        )}
-      </section>
-
-      <ActionRow
-        title="Rescan all sources"
-        hint="Full re-read of every registered source (the sidebar only runs quick, changed-file scans)."
-        button="Rescan all (full)"
-        busy={scan.isPending}
-        onClick={rescanAll}
-      />
-      <ActionRow
-        title="Clear thumbnail cache"
-        hint="Delete cached image thumbnails. They regenerate on next view."
-        button="Clear thumbnails"
-        busy={busy === "cache:thumbnails"}
-        onClick={() => void clearCache("thumbnails", "thumbnails")}
-      />
-      <ActionRow
-        title="Clear 3D preview cache"
-        hint="Delete cached 3D preview meshes. They regenerate on next view."
-        button="Clear 3D previews"
-        busy={busy === "cache:previews"}
-        onClick={() => void clearCache("previews", "3D previews")}
-      />
-      <ActionRow
-        title="Clear analysis"
-        hint="Drop auto-tag/dedup suggestions and embeddings; keeps confirmed tags."
-        button="Clear analysis"
-        busy={busy === "analysis"}
-        onClick={() => void clearAnalysis()}
-        danger
-      />
-      <ActionRow
-        title="Compact database"
-        hint="Reclaim disk space freed by deletions (VACUUM)."
-        button="Compact"
-        busy={busy === "vacuum"}
-        onClick={vacuum}
-      />
-
-      <div className="mt-2 flex flex-col gap-3 rounded border border-danger/40 bg-danger/5 p-3">
-        <div className="text-xs font-medium uppercase tracking-wide text-danger">Danger zone</div>
-        <ActionRow
-          title="Reset catalog"
-          hint="Wipe all cataloged assets/sources/collections. Files on disk are untouched; tokens & settings are kept."
-          button="Reset catalog"
-          busy={busy === "wipe"}
-          onClick={() => void resetCatalog()}
-          danger
-        />
-        <ActionRow
-          title="Factory reset"
-          hint="Erase everything: catalog, caches, tokens, feature flags, and audit log. Returns to first-run."
-          button="Factory reset"
-          busy={busy === "factory"}
-          onClick={() => void factoryReset()}
-          danger
-        />
-      </div>
-    </section>
   );
 }
 

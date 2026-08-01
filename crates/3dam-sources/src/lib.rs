@@ -254,6 +254,7 @@ pub fn open_source(
     conn: &SourceConnection,
     scratch: &Path,
 ) -> Result<Box<dyn FileSource>, LibError> {
+    #[cfg(not(any(feature = "sftp", feature = "smb")))]
     let _ = scratch; // only the remote backends materialise bytes
     match conn {
         SourceConnection::LocalFs { root } => Ok(Box::new(LocalFsSource::new(root))),

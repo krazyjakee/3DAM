@@ -2,16 +2,24 @@
 
 import type { LicenseStatus, MediaType, Origin, SourceState } from "@/api/types";
 
-export function bytes(n: number): string {
+function formatBytes(n: number, units: readonly string[], fixed: boolean): string {
   if (n < 1024) return `${n} B`;
-  const u = ["KB", "MB", "GB", "TB"];
   let v = n / 1024;
   let i = 0;
-  while (v >= 1024 && i < u.length - 1) {
+  while (v >= 1024 && i < units.length - 1) {
     v /= 1024;
     i += 1;
   }
-  return `${v < 10 ? v.toFixed(1) : Math.round(v)} ${u[i]}`;
+  return `${fixed || v < 10 ? v.toFixed(1) : Math.round(v)} ${units[i]}`;
+}
+
+export function bytes(n: number): string {
+  return formatBytes(n, ["KB", "MB", "GB", "TB"], false);
+}
+
+/** Human-readable IEC bytes for storage administration, e.g. `12.4 MiB`. */
+export function binaryBytes(n: number): string {
+  return formatBytes(n, ["KiB", "MiB", "GiB", "TiB"], true);
 }
 
 export function relTime(epochSecs: number | null | undefined): string {

@@ -149,12 +149,16 @@ fn render_thumbnail_bytes(
 
 /// Cache-key suffix distinguishing thumbnail variants that can change independently of the source
 /// bytes. Only 3D renders carry one (keyed to the renderer version); images return an empty suffix.
-#[cfg_attr(not(feature = "render"), allow(unused_variables))]
+#[cfg(feature = "render")]
 fn thumbnail_variant(media: MediaType) -> String {
-    #[cfg(feature = "render")]
     if media == MediaType::Model {
         return format!("-r{}", dam_render::RENDER_VERSION);
     }
+    String::new()
+}
+
+#[cfg(not(feature = "render"))]
+fn thumbnail_variant(_media: MediaType) -> String {
     String::new()
 }
 

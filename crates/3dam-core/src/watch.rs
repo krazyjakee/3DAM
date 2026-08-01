@@ -32,7 +32,9 @@ const POLL_INTERVAL: Duration = Duration::from_secs(60);
 enum WatchEntry {
     /// The live OS watcher. Never read — held purely so its `Drop` (which stops notifications)
     /// doesn't run until the source is unwatched or the engine closes.
-    Local(#[allow(dead_code)] notify::RecommendedWatcher),
+    Local {
+        _watcher: notify::RecommendedWatcher,
+    },
     /// A detached poll task marks its source watched here (nothing to keep alive).
     Poll,
     /// Slot reserved while a local watcher is being registered off-thread. Reserving synchronously
@@ -163,7 +165,9 @@ impl WatchManager {
                 }
             });
             // Publish the live watcher, replacing the `Pending` reservation.
-            live.lock().unwrap().insert(id, WatchEntry::Local(watcher));
+            live.lock()
+                .unwrap()
+                .insert(id, WatchEntry::Local { _watcher: watcher });
         });
     }
 
