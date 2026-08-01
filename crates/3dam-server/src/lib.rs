@@ -15,6 +15,7 @@ mod authn;
 mod comments;
 mod config;
 mod mcp;
+mod oidc;
 mod store;
 mod upload;
 
@@ -277,6 +278,9 @@ pub(crate) fn build_router(state: AppState) -> Router {
         // absent (404) until an operator turns uploads on. Past that gate the `Writer` extractor
         // still answers the per-*caller* question with a 401/403 that says why.
         .merge(upload::routes(state.clone()))
+        // OIDC/OAuth2 login (issue #41) — behind the `Oidc` flag *and* `UserAccounts`, since a
+        // verified subject resolves to an account or to nothing. Absent (404) until both are on.
+        .merge(oidc::routes(state.clone()))
         // The admin API (tech-spec 10 §5), guarded by the AdminAuth extractor.
         .merge(admin::routes(state.clone()))
         // SPA fallback: any non-API GET serves the embedded web client (tech-spec 09 §A.4).
@@ -806,6 +810,14 @@ async fn version(State(st): State<AppState>) -> Json<serde_json::Value> {
         // its Upload view rather than offering one whose every request 404s. Reported here for the
         // same reason `accounts` is — a capability the build has but this deployment may not run.
         "upload": st.store.upload(),
+        // OIDC posture (issue #41): whether this deployment offers a "sign in with…" button. True
+        // only when the login surface would actually answer — the flag *and* accounts *and* a
+        // configured provider — because a button that leads to a 404 or a "no provider configured"
+        // error is worse than no button. Deliberately says nothing about *which* provider: this
+        // endpoint is unauthenticated, and the issuer can name an organisation.
+        "oidc": st.store.oidc()
+            && st.store.user_accounts()
+            && st.store.oidc_config_info().ok().flatten().is_some(),
         "unclaimed": st.store.unclaimed(),
         // How many accounts exist. `unclaimed` alone can't distinguish "brand new instance" from
         // "the operator re-opened the claim window to recover a lost admin" — and in the second

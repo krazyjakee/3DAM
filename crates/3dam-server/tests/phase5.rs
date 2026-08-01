@@ -107,22 +107,26 @@ async fn defaults_are_safe_and_admin_reachable_under_off() {
     assert_eq!(body["network_writes"], false);
     assert_eq!(body["exposed_without_auth"], false);
 
-    // Eight live flags, all at version 0 (unset → defaults): the three exposure flags, the two
+    // Nine live flags, all at version 0 (unset → defaults): the three exposure flags, the two
     // hosted-mode pipeline toggles (issue #71) which default *on*, the federation peer flag
     // (phase 6, issue #39) which defaults *off* — off means the advertise surface is absent —
     // user accounts (phase 6, issue #42), also off, which keeps the whole accounts/groups/shares
-    // surface absent, and uploads (issue #80), off, which keeps the one write-into-source route
-    // absent.
+    // surface absent, uploads (issue #80), off, which keeps the one write-into-source route
+    // absent, and OIDC login (issue #41), off, which keeps `/api/v1/auth/oidc` absent.
     let (st, flags) = call(&app, "GET", "/admin/api/flags", None, None).await;
     assert_eq!(st, StatusCode::OK);
     let flags = flags.as_array().unwrap();
-    assert_eq!(flags.len(), 8);
+    assert_eq!(flags.len(), 9);
     let flag = |key: &str| flags.iter().find(|f| f["key"] == key).unwrap();
     assert_eq!(flag("auto_thumbnail")["value"], true);
     assert_eq!(flag("auto_analyze")["value"], true);
     assert_eq!(flag("federation")["value"], false);
     assert_eq!(flag("user_accounts")["value"], false);
     assert_eq!(flag("upload")["value"], false);
+    assert_eq!(flag("oidc")["value"], false);
+    // Admitting identities minted by a third party is exposure, so it needs the same explicit
+    // confirm as opening network writes or uploads.
+    assert_eq!(flag("oidc")["exposure_increasing"], true);
     // Workload toggles never raise exposure, so they need no confirm.
     assert_eq!(flag("auto_thumbnail")["exposure_increasing"], false);
     // Uploads do: on is the only way bytes enter a source over the network.

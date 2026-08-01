@@ -138,10 +138,13 @@ function LoginScreen({
 
   if (claiming) return <ClaimScreen onSignIn={() => setClaiming(false)} />;
 
-  // Account sign-in only works same-origin. The session is an HttpOnly, host-only,
-  // `SameSite=Strict` cookie and the server sends `Access-Control-Allow-Origin: *`, which can never
-  // carry credentials — so a cross-origin POST would 200, the browser would discard the Set-Cookie,
-  // and the reloaded app would land right back on this form with no error. Better to say so.
+  // Account sign-in only works same-origin. The session is an HttpOnly, host-only cookie and the
+  // server sends `Access-Control-Allow-Origin: *`, which can never carry credentials — so a
+  // cross-origin POST would 200, the browser would discard the Set-Cookie, and the reloaded app
+  // would land right back on this form with no error. Better to say so.
+  // (The cookie is `SameSite=Lax` since issue #41 — the OIDC callback is a cross-site navigation
+  // and `Strict` would withhold it there. That does not change this: the blocker here is the CORS
+  // wildcard, and cross-site *POSTs* carry no cookie under `Lax` either.)
   const remote = isRemote();
   return (
     <div className="fixed inset-0 flex items-center justify-center bg-bg p-4">

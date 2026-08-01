@@ -118,6 +118,10 @@ pub struct FlagsBlock {
     /// off means `POST /api/v1/upload` is absent. Sized by `[upload] max_file_mb`, which is a
     /// deployment property rather than a posture, hence the separate block.
     pub upload: Option<bool>,
+    /// Accept OIDC/OAuth2 logins (phase 6, issue #41). Off by default; off means the
+    /// `/api/v1/auth/oidc` surface is absent. The provider itself is configured in `[oidc]` — this
+    /// is only the switch, so a deployment can carry the config while the door stays shut.
+    pub oidc: Option<bool>,
 }
 
 /// `[accounts]` — the config-plane recovery hatch (ADR 0009 §3, issue #42). Not a flag: it acts
@@ -170,6 +174,9 @@ impl ServeFile {
         }
         if let Some(a) = self.flags.auto_analyze {
             out.push((FlagKey::AutoAnalyze, FlagValue::Bool(a)));
+        }
+        if let Some(o) = self.flags.oidc {
+            out.push((FlagKey::Oidc, FlagValue::Bool(o)));
         }
         if let Some(f) = self.flags.federation {
             out.push((FlagKey::Federation, FlagValue::Bool(f)));

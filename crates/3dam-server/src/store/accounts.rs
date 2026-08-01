@@ -450,11 +450,7 @@ impl ServerStore {
             params![username],
         )
         .map_err(internal)?;
-        conn.execute(
-            "UPDATE account SET last_login = ?2 WHERE account_id = ?1",
-            params![account_id, now],
-        )
-        .map_err(internal)?;
+        // `last_login` is stamped by `insert_session`, which every login path goes through.
         let session = Self::insert_session(&conn, &account_id, user_agent, now)?;
         Self::audit_row(
             &conn,
@@ -505,6 +501,16 @@ impl ServerStore {
                 now + SESSION_ABS_MS,
                 user_agent
             ],
+        )
+        .map_err(internal)?;
+        // Stamping `last_login` here rather than in each caller is the point: minting a session
+        // *is* signing in, and this is the one place all three ways of doing that meet (password
+        // login, the first-run claim, and OIDC). It was previously done only by `login`, so a
+        // claimed admin showed "never signed in" until their second visit — and every future login
+        // path would have had the same trap waiting.
+        conn.execute(
+            "UPDATE account SET last_login = ?2 WHERE account_id = ?1",
+            params![account_id, now],
         )
         .map_err(internal)?;
         Ok(NewSession {
@@ -1030,7 +1036,9 @@ impl ServerStore {
         self.visibility_gen.load(Ordering::Relaxed)
     }
 
-    fn bump_visibility_gen(&self) {
+    /// `pub(super)` so the sibling `store::oidc` can call it too: provisioning an account from a
+    /// verified subject changes who can see what, exactly as `create_account` does.
+    pub(super) fn bump_visibility_gen(&self) {
         self.visibility_gen.fetch_add(1, Ordering::Relaxed);
     }
 }

@@ -27,6 +27,20 @@ pub fn routes(st: AppState) -> Router<AppState> {
             axum::routing::delete(revoke_token),
         )
         .route("/admin/api/audit", get(list_audit))
+        // OIDC provider config (issue #41). Not under the accounts block: an operator configures
+        // the provider *before* switching the flag on, and the accounts gate would hide it.
+        .route("/admin/api/oidc", get(get_oidc).put(set_oidc))
+        // Identity links. Load-bearing rather than a convenience: `OidcProvisioning::Linked` is the
+        // default, so without a way to create a link a default-configured provider is one no one
+        // can ever sign in through.
+        .route(
+            "/admin/api/oidc/identities",
+            get(list_oidc_identities).post(link_oidc_identity),
+        )
+        .route(
+            "/admin/api/oidc/identities/{subject}",
+            axum::routing::delete(unlink_oidc_identity),
+        )
         .route("/admin/api/maintenance/usage", get(maintenance_usage))
         .route(
             "/admin/api/maintenance/clear-cache",
@@ -430,4 +444,78 @@ async fn factory_reset(
         cache,
         tokens_removed,
     }))
+}
+
+// ── OIDC provider configuration (issue #41) ─────────────────────────────────
+
+/// `GET /admin/api/oidc` — the configured provider, or `null` when none is set.
+///
+/// Returns [`OidcConfigInfo`], which has no field for the client secret: the "never returned by a
+/// GET" rule (tech-spec 10 §5) is enforced by the type, not by remembering to strip it.
+async fn get_oidc(
+    AdminAuth(_ctx): AdminAuth,
+    State(st): State<AppState>,
+) -> Result<Json<Option<OidcConfigInfo>>, ApiError> {
+    Ok(Json(st.store.oidc_config_info()?))
+}
+
+/// `PUT /admin/api/oidc` — set the provider config. The secret is write-only, and omitting it keeps
+/// whatever is stored (see `ServerStore::set_oidc_config`).
+async fn set_oidc(
+    AdminAuth(ctx): AdminAuth,
+    State(st): State<AppState>,
+    Json(req): Json<SetOidcConfig>,
+) -> Result<Json<Option<OidcConfigInfo>>, ApiError> {
+    st.store.set_oidc_config(&req, &actor_of(&ctx))?;
+    Ok(Json(st.store.oidc_config_info()?))
+}
+
+/// `GET /admin/api/oidc/identities` — every provider subject linked to a local account.
+async fn list_oidc_identities(
+    AdminAuth(_ctx): AdminAuth,
+    State(st): State<AppState>,
+) -> Result<Json<Vec<OidcIdentity>>, ApiError> {
+    Ok(Json(st.store.list_oidc_identities()?))
+}
+
+/// `POST /admin/api/oidc/identities` — link a provider subject to an existing account.
+///
+/// The issuer comes from the configured provider rather than the request, so a link can only ever
+/// name an issuer this instance actually accepts tokens from.
+async fn link_oidc_identity(
+    AdminAuth(ctx): AdminAuth,
+    State(st): State<AppState>,
+    Json(req): Json<LinkOidcIdentity>,
+) -> Result<Json<Vec<OidcIdentity>>, ApiError> {
+    let cfg = st.store.oidc_config_info()?.ok_or_else(|| {
+        ApiError(LibError::BadRequest(
+            "configure the OIDC provider before linking identities to it".into(),
+        ))
+    })?;
+    // Resolve the account first so a bad id is a clean 404 rather than a foreign-key error.
+    let account = st.store.get_account(&req.account_id)?;
+    st.store.link_oidc_identity(
+        &cfg.config.issuer,
+        req.subject.trim(),
+        &account.account_id,
+        &actor_of(&ctx),
+    )?;
+    Ok(Json(st.store.list_oidc_identities()?))
+}
+
+/// `DELETE /admin/api/oidc/identities/{subject}` — revoke the provider's ability to sign in as the
+/// linked account. The account itself is untouched.
+async fn unlink_oidc_identity(
+    AdminAuth(ctx): AdminAuth,
+    State(st): State<AppState>,
+    Path(subject): Path<String>,
+) -> Result<Json<Vec<OidcIdentity>>, ApiError> {
+    let cfg = st.store.oidc_config_info()?.ok_or_else(|| {
+        ApiError(LibError::BadRequest(
+            "no OIDC provider is configured".into(),
+        ))
+    })?;
+    st.store
+        .unlink_oidc_identity(&cfg.config.issuer, &subject, &actor_of(&ctx))?;
+    Ok(Json(st.store.list_oidc_identities()?))
 }

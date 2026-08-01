@@ -80,6 +80,12 @@ tower-http = { version = "0.6", features = ["cors", "trace", "set-header"] }
 # `stream` is what lets an upload body be a file handle rather than a `Vec<u8>` (issue #80): the
 # connected backend must not have to hold a multi-gigabyte asset in memory to forward it.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+# OIDC/OAuth2 login (phase 6, issue #41). Deliberately a library, not hand-rolled: the security of
+# this flow is entirely in the details it owns — ID-token signature verification against a rotating
+# JWKS, `iss`/`aud`/`exp` checks, and the nonce/PKCE bindings that stop code interception and
+# replay. Its default features are `reqwest` + `rustls-tls`, which is already this workspace's HTTP
+# and TLS posture, so it adds a dependency tree rather than a second one.
+openidconnect = "4"
 url = "2"
 # web-client embedding (tech-spec 09 §A.4): bake web/dist into the binary, MIME by extension.
 rust-embed = { version = "8", features = ["mime-guess"] }

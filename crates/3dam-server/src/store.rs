@@ -40,6 +40,10 @@ pub struct FlagState {
     /// `POST /api/v1/upload` 404s. Squarely an exposure flag, not a workload one: it is the only
     /// surface in 3DAM that puts bytes in the user's project folders (tech-spec 08 §5.1).
     pub upload: bool,
+    /// Accept OIDC/OAuth2 logins (phase 6, issue #41). Off ⇒ the `/api/v1/auth/oidc` surface 404s.
+    /// An exposure flag: it admits identities minted by a third party, so turning it on needs the
+    /// same explicit confirm as opening any other door.
+    pub oidc: bool,
     versions: HashMap<FlagKey, u64>,
 }
 
@@ -57,6 +61,7 @@ impl FlagState {
             federation: false,
             user_accounts: false,
             upload: false,
+            oidc: false,
             versions: HashMap::new(),
         }
     }
@@ -70,6 +75,7 @@ impl FlagState {
             FlagKey::Federation => FlagValue::Bool(self.federation),
             FlagKey::UserAccounts => FlagValue::Bool(self.user_accounts),
             FlagKey::Upload => FlagValue::Bool(self.upload),
+            FlagKey::Oidc => FlagValue::Bool(self.oidc),
         }
     }
     /// Apply a typed value under its key. The key disambiguates the `bool` flags, which the value
@@ -84,6 +90,7 @@ impl FlagState {
             (FlagKey::Federation, FlagValue::Bool(b)) => self.federation = b,
             (FlagKey::UserAccounts, FlagValue::Bool(b)) => self.user_accounts = b,
             (FlagKey::Upload, FlagValue::Bool(b)) => self.upload = b,
+            (FlagKey::Oidc, FlagValue::Bool(b)) => self.oidc = b,
             // Type-mismatched pairs are rejected before this point (`FlagValue::matches`).
             _ => {}
         }
@@ -123,6 +130,11 @@ pub fn is_exposure_increasing(
         // project folders (issue #80). Confirmed like network writes, and for a stronger reason:
         // the blast radius is files on disk rather than rows in the catalog.
         (FlagKey::Upload, FlagValue::Bool(true), FlagValue::Bool(false)) => true,
+        // OIDC *on* delegates part of "who may sign in here" to a third party (issue #41). Even
+        // configured correctly it is exposure: for a public issuer the audience is the whole
+        // internet, and the answer to that is `provisioning`, which an operator has to have chosen
+        // deliberately. Confirm-on-enable is how they are made to.
+        (FlagKey::Oidc, FlagValue::Bool(true), FlagValue::Bool(false)) => true,
         // Accounts *off* is the exposure-increasing direction, and only while the raise is
         // load-bearing (raw auth `Off`). With auth already at `Anonymous`/`Token` the gate survives
         // the flip, so it stays an ordinary toggle.
@@ -134,17 +146,25 @@ pub fn is_exposure_increasing(
 }
 
 /// Does flipping this flag ever increase exposure? A UI hint (`FlagInfo::exposure_increasing`) — true
-/// for the auth/MCP/network flags and for `UserAccounts` (whose *off* direction can remove the only
-/// gate on the instance), false for the hosted-mode workload toggles.
+/// for the auth/MCP/network flags, for `UserAccounts` (whose *off* direction can remove the only
+/// gate on the instance), for `Upload`, and for `Oidc`; false for the hosted-mode workload toggles.
+///
+/// Exhaustive on purpose, like [`FlagValue::matches`]. As a `matches!` list this silently answered
+/// `false` for any newly-added key, which does not fail a build and does not fail a `set` — the
+/// *enforcement* in [`is_exposure_increasing`] would still demand `confirm` while this hint told
+/// the UI there was nothing to warn about. Two answers to one question, disagreeing quietly.
 fn flag_can_increase_exposure(key: FlagKey) -> bool {
-    matches!(
-        key,
+    match key {
         FlagKey::Authentication
-            | FlagKey::McpServer
-            | FlagKey::NetworkWrites
-            | FlagKey::UserAccounts
-            | FlagKey::Upload
-    )
+        | FlagKey::McpServer
+        | FlagKey::NetworkWrites
+        | FlagKey::UserAccounts
+        | FlagKey::Upload
+        | FlagKey::Oidc => true,
+        FlagKey::AutoThumbnail | FlagKey::AutoAnalyze => false,
+        // Discovery, not exposure: the reads a peer performs still ride the ordinary auth gate.
+        FlagKey::Federation => false,
+    }
 }
 
 pub struct ServerStore {
@@ -252,6 +272,30 @@ impl ServerStore {
     /// Accept uploads (issue #80): mount `POST /api/v1/upload`.
     pub fn upload(&self) -> bool {
         self.flags.read().unwrap().upload
+    }
+
+    /// Accept OIDC logins (issue #41): mount the `/api/v1/auth/oidc` surface.
+    pub fn oidc(&self) -> bool {
+        self.flags.read().unwrap().oidc
+    }
+
+    /// The single `Oidc` guard, behind the router's `route_layer` on `/api/v1/auth/oidc`.
+    ///
+    /// Requires **both** flags. `UserAccounts` is not implied by turning `oidc` on, and an OIDC
+    /// login has nowhere to land without accounts — a verified subject resolves to an account or to
+    /// nothing. Checking only `oidc` would leave a login flow that authenticates successfully and
+    /// then fails at the last step, which reads as a broken provider rather than a missing switch.
+    /// `NotFound` for the same reason as every other gate: off ⇒ the surface is absent (ADR 0004).
+    pub fn require_oidc(&self) -> Result<(), LibError> {
+        if !self.user_accounts() {
+            return Err(LibError::NotFound(
+                "OIDC login needs user accounts, which are disabled".into(),
+            ));
+        }
+        if !self.oidc() {
+            return Err(LibError::NotFound("OIDC login is disabled".into()));
+        }
+        Ok(())
     }
 
     /// The single `Upload` guard, behind the router's `route_layer` on `/api/v1/upload`.
@@ -782,8 +826,60 @@ CREATE TABLE IF NOT EXISTS share (
   CHECK ((account_id IS NULL) != (group_id IS NULL))
 );
 CREATE INDEX IF NOT EXISTS share_resource ON share(resource, resource_id);
+
+-- OIDC / OAuth2 login (phase 6, issue #41).
+--
+-- Single-row provider config. `rowid = 1` is enforced by the CHECK, so a write is an upsert and
+-- there is no way to end up with two providers disagreeing about who may sign in.
+CREATE TABLE IF NOT EXISTS oidc_provider (
+  id            INTEGER PRIMARY KEY CHECK (id = 1),
+  issuer        TEXT NOT NULL,
+  client_id     TEXT NOT NULL,
+  client_secret TEXT,               -- write-only; never returned by the admin API (tech-spec 10 §5)
+  redirect_url  TEXT NOT NULL,
+  scopes        TEXT NOT NULL,      -- JSON array of extra scopes; `openid` is always requested
+  provisioning  TEXT NOT NULL,      -- 'linked' | 'auto_viewer' | 'auto_editor'
+  updated_at    INTEGER NOT NULL,
+  updated_by    TEXT
+);
+
+-- Which external identity is which local account.
+--
+-- Keyed on (issuer, subject), not subject alone: `sub` is only unique *within* an issuer, so a bare
+-- subject key would let a second configured provider hand out a `sub` that collides with a linked
+-- one and inherit that account. Kept in its own table rather than as a column on `account` partly
+-- for that composite key, and partly because `server.db` has no migration mechanism — the schema is
+-- one `CREATE TABLE IF NOT EXISTS` batch, so adding a table is free where `ALTER TABLE` is not.
+CREATE TABLE IF NOT EXISTS oidc_identity (
+  issuer     TEXT NOT NULL,
+  subject    TEXT NOT NULL,
+  account_id TEXT NOT NULL REFERENCES account(account_id) ON DELETE CASCADE,
+  linked_at  INTEGER NOT NULL,
+  PRIMARY KEY (issuer, subject)
+);
+CREATE INDEX IF NOT EXISTS oidc_identity_account ON oidc_identity(account_id);
+
+-- In-flight authorization requests: the CSRF `state`, the replay-binding `nonce`, and the PKCE
+-- verifier, held between the redirect out and the callback back.
+--
+-- Server-side rather than in a cookie because the verifier is the one secret that must never reach
+-- the browser — PKCE exists precisely so that a stolen authorization code is useless without it.
+-- Rows are single-use (deleted when redeemed) and swept by age, so a login the user abandons
+-- expires rather than accumulating.
+CREATE TABLE IF NOT EXISTS oidc_login (
+  state         TEXT PRIMARY KEY,
+  nonce         TEXT NOT NULL,
+  pkce_verifier TEXT NOT NULL,
+  return_to     TEXT,               -- validated same-origin path to land on after login
+  browser_hash  TEXT NOT NULL,      -- blake3 of the `dam_oidc` cookie that started this login
+  created       INTEGER NOT NULL
+);
 ";
 
 // The accounts/sessions/groups/shares surface (issue #42) — a child module so it can reach the
 // private `conn`/`flags` fields while keeping this file to flags/tokens/audit.
 pub(crate) mod accounts;
+
+// The OIDC/OAuth2 login surface (issue #41) — provider config, in-flight authorization requests,
+// and identity links. Same child-module reasoning as `accounts`.
+pub(crate) mod oidc;

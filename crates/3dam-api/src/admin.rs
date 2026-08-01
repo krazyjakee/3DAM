@@ -4,16 +4,22 @@
 //! store + semantics) and every admin client (the CLI over `--connect`, later the web Settings
 //! surface). Kept in `dam-api` — the dependency-free seam — so both sides agree on one definition.
 //!
-//! Phase-5 scope: the flags with a real served surface (**authentication**, **MCP server**,
-//! **network writes**) plus the read-only exposure/status view. User accounts, sessions, OIDC, and
-//! inbound federation are their own capability phases (spec §9 phases 5→6) and are **not** modelled
-//! here — "off removes the surface" (ADR 0004) means we do not advertise flags for absent surfaces.
+//! Scope grows with the served surface: the phase-5 flags (**authentication**, **MCP server**,
+//! **network writes**) plus the read-only exposure/status view, and then one flag per capability
+//! phase as it lands — user accounts (#42), uploads (#80), inbound federation (#39), OIDC login
+//! (#41). "Off removes the surface" (ADR 0004), so a flag appears here only once there is a real
+//! surface for it to unmount.
 
 use crate::service::Scopes;
 use serde::{Deserialize, Serialize};
 
-/// The authentication mode — one gate over the whole shared surface (tech-spec 10 §1.1). `Oidc` is
-/// the phase-6 extension path (feature-gated) and is intentionally absent from the v1 enum.
+/// The authentication mode — one gate over the whole shared surface (tech-spec 10 §1.1).
+///
+/// There is deliberately no `Oidc` variant. Tech-spec 10 §1.1 sketched one, but OIDC turned out to
+/// belong beside this enum rather than inside it: §1.5 has an OIDC login mint an ordinary server
+/// session, so it composes with password login and bearer tokens instead of displacing them. It is
+/// therefore [`FlagKey::Oidc`] — a capability you switch on — while this stays the single answer to
+/// "what does this instance demand of an unauthenticated caller?".
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthMode {
@@ -72,10 +78,22 @@ pub enum FlagKey {
     /// A token minted for tagging should not silently also be able to do that, and an operator who
     /// wants tagging-without-uploading had no way to say so while the two shared one scope.
     Upload,
+    /// `bool` — accept logins from a configured OIDC/OAuth2 provider (phase 6, issue #41). Off by
+    /// default; off means the whole `/api/v1/auth/oidc` surface 404s and the client shows no
+    /// "sign in with…" button.
+    ///
+    /// A **flag**, not a fourth `AuthMode`. The mode answers "what does this instance demand of a
+    /// caller?", and OIDC does not replace that: tech-spec 10 §1.5 has OIDC issuing an ordinary
+    /// server session, so an instance can accept passwords *and* OIDC at once, and every bearer
+    /// token keeps working. Modelling it as a mode would have made those mutually exclusive.
+    ///
+    /// Implies `UserAccounts`: an OIDC login resolves to an account, so with accounts off there is
+    /// nothing for a verified subject to become.
+    Oidc,
 }
 
 impl FlagKey {
-    pub const ALL: [FlagKey; 8] = [
+    pub const ALL: [FlagKey; 9] = [
         FlagKey::Authentication,
         FlagKey::McpServer,
         FlagKey::NetworkWrites,
@@ -84,6 +102,7 @@ impl FlagKey {
         FlagKey::Federation,
         FlagKey::UserAccounts,
         FlagKey::Upload,
+        FlagKey::Oidc,
     ];
     /// The stable string used in the URL, the store, and the config file.
     pub fn as_str(self) -> &'static str {
@@ -96,6 +115,7 @@ impl FlagKey {
             FlagKey::Federation => "federation",
             FlagKey::UserAccounts => "user_accounts",
             FlagKey::Upload => "upload",
+            FlagKey::Oidc => "oidc",
         }
     }
     pub fn parse(s: &str) -> Option<FlagKey> {
@@ -120,18 +140,23 @@ pub enum FlagValue {
 
 impl FlagValue {
     /// Reject a value that does not match its key's type (a `bool` for `authentication`, etc.).
+    ///
+    /// Written as an exhaustive `match` on the key rather than a `matches!` list. `matches!` is
+    /// closed over the arms it names, so a newly-added [`FlagKey`] compiles clean and silently
+    /// answers `false` — i.e. the new flag is un-settable, with no error pointing here. The
+    /// exhaustive form makes the compiler demand an arm for every future key instead.
     pub fn matches(self, key: FlagKey) -> bool {
-        matches!(
-            (key, self),
-            (FlagKey::Authentication, FlagValue::Auth(_))
-                | (FlagKey::McpServer, FlagValue::Mcp(_))
-                | (FlagKey::NetworkWrites, FlagValue::Bool(_))
-                | (FlagKey::AutoThumbnail, FlagValue::Bool(_))
-                | (FlagKey::AutoAnalyze, FlagValue::Bool(_))
-                | (FlagKey::Federation, FlagValue::Bool(_))
-                | (FlagKey::UserAccounts, FlagValue::Bool(_))
-                | (FlagKey::Upload, FlagValue::Bool(_))
-        )
+        match key {
+            FlagKey::Authentication => matches!(self, FlagValue::Auth(_)),
+            FlagKey::McpServer => matches!(self, FlagValue::Mcp(_)),
+            FlagKey::NetworkWrites
+            | FlagKey::AutoThumbnail
+            | FlagKey::AutoAnalyze
+            | FlagKey::Federation
+            | FlagKey::UserAccounts
+            | FlagKey::Upload
+            | FlagKey::Oidc => matches!(self, FlagValue::Bool(_)),
+        }
     }
 }
 
@@ -337,4 +362,88 @@ pub struct FactoryResetReport {
     pub catalog: WipeReport,
     pub cache: ClearCacheReport,
     pub tokens_removed: u64,
+}
+
+// ── OIDC provider configuration (phase 6, issue #41) ────────────────────────
+//
+// Split into a read shape and a write shape on purpose. Tech-spec 10 §5 requires that OIDC client
+// secrets are never returned by a `GET`, and the cheapest way to guarantee that is for the type the
+// read path can construct to have nowhere to put one.
+
+/// What an operator may configure about the OIDC provider (tech-spec 10 §1.5).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OidcConfig {
+    /// Issuer URL. The discovery document at `{issuer}/.well-known/openid-configuration` supplies
+    /// the authorization/token endpoints and the JWKS URI, so this is the only endpoint an operator
+    /// gives us.
+    pub issuer: String,
+    pub client_id: String,
+    /// Where the issuer sends the browser back. Must be registered with the provider, and is echoed
+    /// in the token exchange, so it has to match exactly on both sides.
+    pub redirect_url: String,
+    /// Extra scopes beyond `openid`, which is always requested. `email`/`profile` are the usual
+    /// additions and are what make a useful username available.
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    /// What to do with a verified subject that no local account is linked to.
+    #[serde(default)]
+    pub provisioning: OidcProvisioning,
+}
+
+/// Policy for a verified-but-unknown subject. Tech-spec 10 §1.5 fixes the v1 default as
+/// reject-unless-linked: a correctly-configured provider is not by itself authority to create
+/// accounts on this instance, because for most providers *anyone* can hold a valid account.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OidcProvisioning {
+    /// Refuse the login. An admin must link the subject to an account first.
+    #[default]
+    Linked,
+    /// Create an account on first login, with [`OidcConfig::default_role`]-equivalent rights.
+    /// Only sane when the issuer's audience *is* the intended user set (a corporate tenant).
+    AutoViewer,
+    AutoEditor,
+}
+
+/// The provider config as read back: identical to [`OidcConfig`] minus any secret, plus whether a
+/// secret is on file at all — an operator needs to see "configured" without seeing the value.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OidcConfigInfo {
+    #[serde(flatten)]
+    pub config: OidcConfig,
+    /// True when a client secret is stored. Never the secret itself (tech-spec 10 §5).
+    pub client_secret_set: bool,
+}
+
+/// Body of `PUT /admin/api/oidc`. The secret is write-only and *optional on update*: omitting it
+/// keeps the stored one, so an operator can edit the issuer or scopes without re-entering it (and
+/// without the UI having to round-trip a value it is never allowed to read).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SetOidcConfig {
+    #[serde(flatten)]
+    pub config: OidcConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<String>,
+}
+
+/// A link between a provider subject and a local account (`GET /admin/api/oidc/identities`).
+/// `username` is denormalised in so an admin screen can show who a link points at without a join.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OidcIdentity {
+    pub issuer: String,
+    pub subject: String,
+    pub account_id: String,
+    pub username: String,
+    pub linked_at: i64,
+}
+
+/// Body of `POST /admin/api/oidc/identities`.
+///
+/// The issuer is not a field: it is taken from the configured provider, so an admin cannot
+/// accidentally link a subject under an issuer this instance does not actually accept tokens from.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LinkOidcIdentity {
+    /// The provider's stable subject claim (`sub`) for the user being linked.
+    pub subject: String,
+    pub account_id: String,
 }

@@ -86,33 +86,45 @@ fn looks_proxied(headers: &HeaderMap) -> bool {
 /// `secure` is `tls || [server] secure_cookies`: this process's own TLS posture, *or* the
 /// operator's declaration that a TLS-terminating proxy sits in front. Without the second term a
 /// proxied deployment would ship a 90-day session cookie with no `Secure` attribute.
-fn session_cookies(sess: &NewSession, secure: bool) -> [String; 2] {
+///
+/// **`SameSite=Lax`, not `Strict`** *(amended for issue #41)*. There is one session cookie, so
+/// there can only be one answer, and OIDC forces it: the callback arrives as a cross-site
+/// navigation from the identity provider, and `Strict` withholds the cookie on exactly that class
+/// of request — a user would finish a correct login and land looking signed out. `Lax` is not a
+/// meaningful loss here, because `SameSite` was never what protected writes on this surface: `Lax`
+/// still withholds the cookie from cross-site POST/PUT/DELETE, and every cookie-authenticated
+/// mutation is additionally gated on the double-submit `x-dam-csrf` token (`auth::enforce_csrf`),
+/// which an attacker cannot read cross-origin. Shared with `crate::oidc` so the two login paths
+/// cannot drift into issuing the same cookie with different attributes.
+pub(crate) fn session_cookies(sess: &NewSession, secure: bool) -> [String; 2] {
     let secure = if secure { "; Secure" } else { "" };
     let max_age = 90 * 24 * 60 * 60;
     [
         format!(
-            "{SESSION_COOKIE}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}{secure}",
+            "{SESSION_COOKIE}={}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}{secure}",
             sess.cookie_value
         ),
         format!(
-            "{CSRF_COOKIE}={}; Path=/; SameSite=Strict; Max-Age={max_age}{secure}",
+            "{CSRF_COOKIE}={}; Path=/; SameSite=Lax; Max-Age={max_age}{secure}",
             sess.csrf
         ),
     ]
 }
 
-/// Expire both cookies (logout).
+/// Expire both cookies (logout). `SameSite` matches [`session_cookies`] — a browser matches the
+/// cookie to overwrite on name/path/domain, and keeping the attributes aligned avoids leaving a
+/// stale twin behind under a different `SameSite`.
 fn clear_cookies() -> [String; 2] {
     [
-        format!("{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"),
-        format!("{CSRF_COOKIE}=; Path=/; SameSite=Strict; Max-Age=0"),
+        format!("{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"),
+        format!("{CSRF_COOKIE}=; Path=/; SameSite=Lax; Max-Age=0"),
     ]
 }
 
 /// Attach cookies to a response by **appending** each `Set-Cookie` line. A response carries two of
 /// them (session + CSRF), and the tuple/array `IntoResponse` impls *insert* by header name — which
 /// would silently drop the first cookie — so the two are appended explicitly here.
-fn with_cookies(body: impl IntoResponse, cookies: [String; 2]) -> Response {
+pub(crate) fn with_cookies(body: impl IntoResponse, cookies: [String; 2]) -> Response {
     let mut resp = body.into_response();
     for c in cookies {
         // Cookie values are hex/uuid-safe by construction, so this never fails in practice.

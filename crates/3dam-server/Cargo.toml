@@ -32,6 +32,12 @@ uuid.workspace = true
 argon2.workspace = true
 # serve config file (tech-spec 09 §A.1).
 toml.workspace = true
+# OIDC/OAuth2 login (issue #41): discovery, PKCE, and ID-token validation against the issuer's JWKS.
+openidconnect.workspace = true
+# Outbound HTTP for the OIDC discovery/token/JWKS calls (the same client dam-client already uses).
+reqwest.workspace = true
+# Validating the issuer/redirect URLs an operator configures, before a user meets the failure.
+url.workspace = true
 # Stages an upload body on real disk before it is written into a source (issue #80). The temp file
 # is removed on drop, so a client that disconnects mid-transfer leaves nothing behind.
 tempfile.workspace = true
@@ -43,3 +49,9 @@ tower = { workspace = true, features = ["util"] }
 image.workspace = true
 # `StreamExt::next` for draining a `subscribe` stream (the restricted-subscriber test, issue #42).
 futures.workspace = true
+# The in-process OIDC issuer (tests/support/oidc_issuer.rs) needs two things `openidconnect` uses
+# internally but does not re-export: `chrono` to stamp `exp`/`iat` on an ID token, and `base64` to
+# read back the HTTP Basic client credential the token exchange authenticates with. Both versions
+# are already in the tree via openidconnect itself, so this adds no packages.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+base64 = "0.22"

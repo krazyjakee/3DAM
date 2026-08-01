@@ -18,7 +18,9 @@ This file is the low-level design for the security and administration layer that
 - [11](11-mcp-server.md) sits behind this auth layer; its `POST /mcp` route is mounted or unmounted by the MCP flag, and its tools read the same `AuthContext` and scopes.
 - [13](13-cli.md) drives the same admin API as the web UI (one source of truth) for headless administration.
 
-Compile-time note: the runtime flags here presuppose the capability was **compiled in** — the `auth-oidc` Cargo feature gates `oauth2`/`openidconnect`, the `server`/`mcp` features gate the surfaces ([01](01-architecture-and-crates.md) §6). A runtime flag can only enable what the build carries.
+Compile-time note: the runtime flags here presuppose the capability was **compiled in** — the `server`/`mcp` features gate those surfaces ([01](01-architecture-and-crates.md) §6). A runtime flag can only enable what the build carries.
+
+> **The `auth-oidc` Cargo feature was not adopted** *(decided 2026-08-01, issue #41)*. This file previously gated `oauth2`/`openidconnect` behind a build feature. In implementation that lost to CLAUDE.md golden rule 4, which names *auth* among the capabilities that are runtime flags in `server.db` **and not Cargo features** (ADR 0004), and to the shipping reality that 3DAM is one binary: a build-time gate means the released artifact either carries OIDC or cannot be given it, which is the situation [ADR 0015](../adr/0015-video-decode-backend.md) deliberately avoided for video decode. `openidconnect` is therefore an unconditional dependency of `3dam-server`, and [`FlagKey::Oidc`](#) is the only switch. The cost is a larger dependency tree for deployments that never enable it; the benefit is that enabling it is a runtime decision an operator can actually make.
 
 ---
 
@@ -39,11 +41,16 @@ pub enum AuthMode {
     Anonymous,
     /// Bearer token / API key. The simple default for a private instance.
     Token,
-    /// OIDC / OAuth2 bearer (JWT) validated against a configured issuer.
-    /// Requires the `auth-oidc` build feature. The open-standard extension path.
-    Oidc(OidcConfig),
 }
 ```
+
+> **No `Oidc` variant** *(amended 2026-08-01, issue #41)*. This enum originally carried
+> `Oidc(OidcConfig)`. Implementing §1.5 showed that to be the wrong shape: an OIDC login mints an
+> **ordinary server session** (§4.4), so it composes with password login and bearer tokens rather
+> than displacing them — and a mode is by definition the one answer to "what does this instance
+> demand of an unauthenticated caller?". As a variant, turning OIDC on would have switched password
+> login *off*. It is therefore `FlagKey::Oidc`, a capability alongside the mode, gated exactly like
+> uploads and accounts: off ⇒ the `/api/v1/auth/oidc` surface 404s.
 
 `Off` and `Anonymous` differ only in intent and labelling of the resulting identity; both admit unauthenticated requests. The distinction is load-bearing for the admin UI's "exposed without auth" warning (§3.4, DESIGN_GUIDELINES §3.6) and for what an anonymous caller is *granted* (§4.2). When accounts are on (§4), `Off` is disallowed — you cannot require login and also accept no credential — so enabling accounts forces the mode to at least `Token`.
 
@@ -75,7 +82,7 @@ Resolution order in the middleware:
 1. **Mode `Off`** → `AuthContext { identity: Anonymous, scopes: anon_scopes(), .. }` with no credential inspected.
 2. A credential is presented (`Authorization: Bearer …`, an API-key header, or a session cookie for the web client):
    - **Token mode** → look the token up in the server token store (§1.4); a hit yields its recorded scopes/visibility, a miss is `401`.
-   - **OIDC mode** → validate the JWT against the issuer's JWKS (signature, `iss`, `aud`, `exp`); map the verified subject to an account (§4) or to a default scope set for known-but-account-less subjects.
+   - **An issuer-minted bearer JWT** (the stateless API/agent leg of §1.5) → validate against the issuer's JWKS (signature, `iss`, `aud`, `exp`) and map the verified subject to an account (§4). **Not yet implemented** (issue #41 landed the browser login leg only): today an OIDC identity reaches the server as an ordinary session cookie, minted at the callback, so it resolves through the `Session` arm below.
    - **Session** (web client, post-login) → validate the session token against the session store (§4.4) and load the account.
 3. **No credential, mode `Anonymous`** → the anonymous identity with `anon_scopes()`.
 4. **No credential, mode requires one** (accounts on, or a scope beyond anon requested) → `401`.
@@ -120,12 +127,19 @@ Tokens are managed through the admin API (§5) and are independent of accounts: 
 
 ### 1.5 OIDC / OAuth2 (the extension path, design level)
 
-OIDC is the open-standard extension over the token default, gated by the `auth-oidc` build feature and the `authentication = Oidc` runtime mode. Design-level flow (via `openidconnect`/`oauth2`):
+OIDC is the open-standard extension over the token default, gated by the **`oidc` runtime flag**
+(which additionally requires `user_accounts` — a verified subject resolves to an account or to
+nothing). Implemented in `3dam-server`'s `oidc` module via `openidconnect`; the web-client login leg
+is live, the stateless bearer-JWT leg is not yet. Flow:
 
 - **Config (`OidcConfig`):** issuer URL (discovery document fetched for endpoints + JWKS), client id, client secret (server store), redirect URL, requested scopes, and a claim→account mapping rule (which claim is the stable subject, optional group→role mapping).
 - **Web-client login:** Authorization Code + PKCE. The browser is redirected to the issuer; on callback the server exchanges the code, validates the ID token, resolves/creates the account link, and issues a **server session** (§4.4) — the browser thereafter carries the session cookie, not the raw JWT.
 - **API/agent callers:** present an issuer-minted **bearer JWT** directly; the middleware validates it against the cached JWKS each request (with key rotation handled by JWKS refresh). No session is created for stateless callers.
-- **Account mapping:** a verified `sub` maps to an `Account` (§4). Whether an unknown-but-valid subject is auto-provisioned (with a default role) or rejected is a configured policy on `OidcConfig`; v1 default is reject-unless-linked (see Open questions).
+- **Account mapping:** a verified subject maps to an `Account` (§4). Because `Linked` is the default, the **link routes are load-bearing, not a convenience** — without them a default-configured provider is one nobody can ever sign in through. Whether an unknown-but-valid subject is auto-provisioned (with a default role) or rejected is a configured policy on `OidcConfig`; v1 default is reject-unless-linked. Provisioning **refuses** rather than merges when the derived username collides with an existing local account — otherwise anyone who can get a chosen `preferred_username` out of the issuer could take over a local one.
+- **The identity key is `(issuer, subject)`, not `subject`.** `sub` is only unique *within* an issuer, so a bare-subject key would let a second configured provider mint a subject that collides with a linked one and inherit that account. Stored in its own `oidc_identity` table (`server.db` has no migration mechanism — the schema is one `CREATE TABLE IF NOT EXISTS` batch — so adding a table is free where `ALTER TABLE` is not).
+- **In-flight state is server-side.** `state`, `nonce` and the PKCE verifier live in an `oidc_login` row, deleted as it is read (`DELETE … RETURNING`), so a captured callback URL cannot be replayed; rows expire after ten minutes. The verifier in particular must never reach the browser — PKCE's whole value is that a stolen code is useless without a secret the browser never saw. The row count is capped, because `/start` is necessarily unauthenticated and therefore an unauthenticated write.
+- **`state` is bound to the browser that started the login.** Single-use is *not* sufficient on its own: it does not stop **login CSRF**, where an attacker completes an honest login as themselves and hands the victim the resulting callback URL — valid in every respect, never redeemed — so the victim is silently signed in *as the attacker* and works inside the attacker's library. `/start` therefore sets a short-lived `HttpOnly` `dam_oidc` cookie and stores only its blake3 hash; the callback is refused (and audited) unless the browser presents a cookie matching it, compared in constant time. An attacker cannot set that cookie on this origin.
+- **`return_to` is a rooted local path, never a URL.** A login link a stranger sends must not choose where you land; `//host` is refused along with schemes, backslashes and control characters.
 
 The seam is deliberately the same `AuthContext` regardless of mode, so adding OIDC changes only *how* the context is populated, not who consumes it (DESIGN_GUIDELINES §2: "keep the seam clean so open-standard identity slots in without a rewrite").
 
@@ -344,7 +358,7 @@ For v1 scoping **bottoms out at source and collection level** (not per-asset —
   secondary path. Turning `UserAccounts` on raises the **effective** auth mode to at least `Token`
   (accounts and unauthenticated owner trust never coexist); `Anonymous` is preserved as
   public-read + login-to-elevate.
-- **Sessions** (web-client login) are server-side records (§2.2 `sessions`) with an absolute expiry and a sliding `last_seen`; the browser holds an opaque session cookie (`HttpOnly`, `SameSite=Strict`), not credentials, plus a double-submit CSRF token echoed in `x-dam-csrf` on cookie-authenticated writes (ADR 0009 §4). Logout and admin-initiated revocation delete the row. Account lockout: 10 failed logins / 15-minute window per username.
+- **Sessions** (web-client login) are server-side records (§2.2 `sessions`) with an absolute expiry and a sliding `last_seen`; the browser holds an opaque session cookie (`HttpOnly`, **`SameSite=Lax`** — amended 2026-08-01 for issue #41: the OIDC callback is a cross-site navigation and `Strict` withholds the cookie on exactly that, so a correct login would land looking signed out; `Lax` still withholds it from cross-site POST/PUT/DELETE, and writes are gated on the CSRF token regardless), not credentials, plus a double-submit CSRF token echoed in `x-dam-csrf` on cookie-authenticated writes (ADR 0009 §4). Logout and admin-initiated revocation delete the row. Account lockout: 10 failed logins / 15-minute window per username.
 - **Token/session lifetime** (resolved, ADR 0009 §3): sessions expire after **14 days of inactivity** with a **90-day absolute ceiling**; API tokens are long-lived with an optional `expires`. Tokens remain independent credentials at or below their issuing authority's ceiling — never above.
 
 ### 4.5 Audit log
@@ -396,7 +410,9 @@ POST   /admin/tokens                → issue (label, scopes⊆ceiling, visibili
 DELETE /admin/tokens/{id}           → revoke
 
 # Auth mode config (subset of flags, surfaced for the mode picker)
-GET/PUT /admin/auth                 → read/set AuthMode incl. OidcConfig (secret write-only)
+GET/PUT /admin/api/oidc             → read/set the OIDC provider config (secret write-only)
+GET/POST /admin/api/oidc/identities → list / link a provider subject to a local account
+DELETE  /admin/api/oidc/identities/{subject} → unlink (the account itself is untouched)
 
 # Audit
 GET    /admin/audit?since=…&action=…&target=… → paged audit entries
