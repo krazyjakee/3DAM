@@ -3,6 +3,9 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
+  "engines": {
+    "node": ">=22.22.0"
+  },
   "description": "3DAM web client — the browser front-end served by `3dam serve`.",
   "scripts": {
     "dev": "vite",
@@ -17,9 +20,9 @@
     "@tanstack/react-query": "^5.62.0",
     "@tanstack/react-virtual": "^3.11.0",
     "lucide-react": "^0.469.0",
-    "react": "^19.0.0",
-    "react-dom": "^19.0.0",
-    "react-router-dom": "^7.1.0"
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
+    "react-router": "^8.3.0"
   },
   "devDependencies": {
     "@eslint/js": "^9.0.0",
@@ -34,6 +37,6 @@
     "tailwindcss": "^4.0.0",
     "typescript": "^5.7.2",
     "typescript-eslint": "^8.0.0",
-    "vite": "^6.0.0"
+    "vite": "^7.0.0"
   }
 }

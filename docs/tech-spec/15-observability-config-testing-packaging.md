@@ -376,7 +376,8 @@ The client is platform-independent, so it is built in **one** `web` job and cons
 build leg as an artifact — four identical builds would be four chances to diverge, and this
 keeps pnpm/Node/wasm-pack off the macOS and Windows runners entirely.
 
-1. Set up **pnpm** + **Node 20**, and a Rust toolchain with the `wasm32-unknown-unknown` target.
+1. Set up **pnpm** + **Node 22.22.0**, and a Rust toolchain with the
+   `wasm32-unknown-unknown` target.
 2. Install **`wasm-pack`** and run `cargo xtask web`. The task builds the viewer islands into
    `web/src/wasm/`, then installs the locked pnpm dependencies and builds `web/dist`.
 3. The task verifies the exact WASM inputs Vite needs (`dam_viewer.js` and

@@ -3,7 +3,7 @@
 // read this and derive the file-03 `QueryRequest`; nothing view-related lives in a global store.
 
 import { useCallback, useMemo } from "react";
-import { useSearchParams } from "react-router-dom";
+import { useSearchParams } from "react-router";
 import type {
   Filter,
   MediaType,

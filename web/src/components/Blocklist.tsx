@@ -3,7 +3,7 @@
 // here lets the next scan pick the content back up. Read-mostly: the only action is Unblock; the
 // blocking itself happens from the Browser/Inspector context menu on a live asset.
 
-import { Link } from "react-router-dom";
+import { Link } from "react-router";
 import { Ban, RotateCcw } from "lucide-react";
 import { useBlocklist, useCan, useUnblock } from "@/api/queries";
 import { AUTH_COPY } from "@/lib/auth";
@@ -105,4 +105,3 @@ function Row({
     </li>
   );
 }
-

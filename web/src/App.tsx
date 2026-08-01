@@ -1,5 +1,5 @@
 import { MutationCache, QueryCache, QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { BrowserRouter, Route, Routes } from "react-router-dom";
+import { BrowserRouter, Route, Routes } from "react-router";
 import { Workspace } from "./components/Workspace";
 import { Settings } from "./components/Settings";
 import { Duplicates } from "./components/Duplicates";

@@ -4,7 +4,7 @@
 // is exactly why this is cheap to build well (DESIGN_GUIDELINES §3.6).
 
 import { useCallback, useEffect, useState, type ReactNode } from "react";
-import { Link } from "react-router-dom";
+import { Link } from "react-router";
 import {
   admin,
   type AccountInfo,

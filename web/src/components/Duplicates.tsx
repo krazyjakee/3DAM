@@ -6,7 +6,7 @@
 // collection, copy path, remove / remove + block). Blocked hashes are managed on the /blocklist surface.
 
 import { useCallback, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link } from "react-router";
 import { Copy } from "lucide-react";
 import { useDuplicates } from "@/api/queries";
 import type { AssetSummary, DupGroup, DupKind, MediaType } from "@/api/types";
@@ -201,4 +201,3 @@ function MemberTile({
     </Link>
   );
 }
-
