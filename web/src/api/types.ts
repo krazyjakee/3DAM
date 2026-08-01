@@ -400,8 +400,12 @@ export type ConvertTarget =
   | { media: "audio"; format: string }
   /** 3D container transcode (issue #49). `glb` only for now — a self-contained glTF binary with
    *  textures embedded. `gltf`/`obj` emit sidecar files the convert pipeline cannot yet write as
-   *  one output, so the server refuses them by name. */
-  | { media: "model"; format: string };
+   *  one output, so the server refuses them by name.
+   *
+   *  `optimize` opts into mesh optimisation: redundant materials and meshes merge, degenerate faces
+   *  go, and the vertices a merge duplicates are re-joined — fewer draw calls for the same picture.
+   *  It collapses the node graph, so it is opt-in rather than the default. */
+  | { media: "model"; format: string; optimize?: boolean };
 
 export interface ConvertRequest {
   inputs: AssetId[];

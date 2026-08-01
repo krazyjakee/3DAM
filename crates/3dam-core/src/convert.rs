@@ -277,7 +277,9 @@ fn encode(
         // identifies the input from its own contents, and trusting the catalogued extension over
         // the file's signature would be the wrong call for a family where mislabelled extensions
         // are common.
-        ConvertTarget::Model { format } => dam_media::convert_model(abs_input, format),
+        ConvertTarget::Model { format, optimize } => {
+            dam_media::convert_model(abs_input, format, *optimize)
+        }
     }
 }
 

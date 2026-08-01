@@ -398,6 +398,27 @@ fn analyze_model(
     let MediaAttributes::Model(m) = dam_media::extract_metadata(abs, det) else {
         return Err("model metadata unavailable".into());
     };
+    // Refine the scan's cheap counts with exact ones where this build can (issue #49). The cheap
+    // tier reads FBX/Collada/3DS structurally, which is right for a scan but has to assume
+    // triangles for a compressed FBX index array or a `<vcount>`-less Collada polygon list, and has
+    // nothing to say about `.blend`. A full Assimp import settles all of that — and *this* is the
+    // tier allowed to pay for a decode, which is why it lives here and not in the scan.
+    //
+    // Fail-soft in both directions: a build without `model-convert`, or a file Assimp cannot read,
+    // simply leaves the cheap answer in place. The refined attributes are written back before the
+    // embedding is computed so the stored row and the vector agree.
+    let m = match dam_media::extract_model_metadata_deep(abs, &det.format) {
+        Ok(exact) => {
+            if let Err(e) = store.set_media_attrs(&t.id, &MediaAttributes::Model(exact.clone())) {
+                tracing::warn!(asset = %t.id, error = %e, "storing exact model counts failed");
+            }
+            exact
+        }
+        Err(e) => {
+            tracing::debug!(asset = %t.id, error = %e, "exact model counts unavailable");
+            m
+        }
+    };
     // Model-free stats embedding from geometry counts + rig/anim/uv flags (§2.3, §4.2 corroboration).
     let vec = normalise(vec![
         (1.0 + m.vertex_count.unwrap_or(0) as f32).log10(),

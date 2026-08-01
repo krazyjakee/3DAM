@@ -34,6 +34,19 @@
 //! non-PBR material extensions are lost. That is acceptable only because the pipeline is
 //! non-destructive by construction — the original is never touched (tech-spec 08 §5.1) — so a
 //! lossy convert is always an addition, never a replacement.
+//!
+//! ## Optimisation, and what it is not
+//!
+//! `optimize` adds [`OPTIMISE_FLAGS`] to the import: redundant materials go, meshes and nodes are
+//! merged, degenerate faces are deleted, and the vertices a merge duplicates are re-joined. That is
+//! *topological* optimisation — fewer draw calls and fewer vertices for the same picture.
+//!
+//! It is **not** mesh compression. `KHR_draco_mesh_compression` is the obvious next step and is not
+//! reachable from here: this tree force-enables Assimp's bundled Draco (see
+//! `crates/3dam-render/assimp-draco.cmake` and ADR 0011), but only Assimp's glTF2 *reader* consults
+//! it — `glTF2Exporter.cpp` contains no Draco path at all, so there is nothing to switch on. Adding
+//! Draco or meshopt encoding means a new encoder dependency and a decision about who is expected to
+//! read the output; that is its own slice, deliberately not this one.
 
 use std::ffi::CString;
 use std::path::Path;
@@ -57,10 +70,48 @@ const IMPORT_FLAGS: u32 = AI_PROCESS_TRIANGULATE
     | AI_PROCESS_GEN_SMOOTH_NORMALS
     | AI_PROCESS_EMBED_TEXTURES;
 
+/// The curated optimisation set, added to [`IMPORT_FLAGS`] when a request opts in.
+///
+/// All of it is *import*-time work, and that is not a stylistic choice: Assimp's post-process chain
+/// runs `OptimizeGraph` → `OptimizeMeshes` → … → `JoinIdenticalVertices` in that fixed order
+/// (`PostStepRegistry.cpp`), so the join that recovers the vertices a merge duplicated only happens
+/// if the merge ran first, in the same pass. Handing these to the exporter instead would be too
+/// late — and the exporter's own preprocessing is subtracted against what the importer already did,
+/// which is the trap documented on `aiCopyScene` below.
+///
+/// Why each one:
+/// - **`RemoveRedundantMaterials`** — identical materials collapse to one, which is what lets
+///   `OptimizeMeshes` merge the meshes that referenced them. On its own it is nearly free.
+/// - **`OptimizeGraph`** — collapses nodes that carry nothing (no animation, bone, light or
+///   camera). This is the step that makes optimisation structurally lossy: node names and hierarchy
+///   are how some downstream tools address parts of a model, so it is opt-in rather than default.
+///   Assimp explicitly preserves animated/bone/light/camera nodes, so animation survives.
+/// - **`OptimizeMeshes`** — merges meshes sharing a material into one, i.e. fewer draw calls, which
+///   is the headline win for a web/preview handoff.
+/// - **`FindDegenerates` + `SortByPType`** — delete zero-area triangles rather than render them.
+///   Both need configuration to behave; see [`optimise_props`].
+/// - **`ImproveCacheLocality`** — reorders triangles for vertex-cache hit rate. Pure win, invisible
+///   in the file's shape, measurable on the GPU.
+const OPTIMISE_FLAGS: u32 = AI_PROCESS_REMOVE_REDUNDANT_MATERIALS
+    | AI_PROCESS_OPTIMIZE_GRAPH
+    | AI_PROCESS_OPTIMIZE_MESHES
+    | AI_PROCESS_FIND_DEGENERATES
+    | AI_PROCESS_SORT_BY_PTYPE
+    | AI_PROCESS_IMPROVE_CACHE_LOCALITY;
+
 const AI_PROCESS_JOIN_IDENTICAL_VERTICES: u32 = 0x2;
 const AI_PROCESS_TRIANGULATE: u32 = 0x8;
 const AI_PROCESS_GEN_SMOOTH_NORMALS: u32 = 0x40;
+const AI_PROCESS_IMPROVE_CACHE_LOCALITY: u32 = 0x800;
+const AI_PROCESS_REMOVE_REDUNDANT_MATERIALS: u32 = 0x1000;
+const AI_PROCESS_SORT_BY_PTYPE: u32 = 0x8000;
+const AI_PROCESS_FIND_DEGENERATES: u32 = 0x1_0000;
+const AI_PROCESS_OPTIMIZE_MESHES: u32 = 0x20_0000;
+const AI_PROCESS_OPTIMIZE_GRAPH: u32 = 0x40_0000;
 const AI_PROCESS_EMBED_TEXTURES: u32 = 0x1000_0000;
+
+/// `aiPrimitiveType_POINT | aiPrimitiveType_LINE` — what `SortByPType` is told to throw away.
+const AI_PRIMITIVE_TYPE_POINT_AND_LINE: i32 = 0x1 | 0x2;
 
 /// Target formats this module accepts, mapped to Assimp's exporter ids.
 ///
@@ -82,7 +133,8 @@ struct Scene(*const russimp_ng::sys::aiScene);
 
 impl Drop for Scene {
     fn drop(&mut self) {
-        // SAFETY: the pointer came from `aiImportFile` and is released exactly once, here.
+        // SAFETY: the pointer came from one of the `aiImportFile*` entry points (both release the
+        // same way) and is released exactly once, here.
         unsafe { russimp_ng::sys::aiReleaseImport(self.0) }
     }
 }
@@ -98,6 +150,46 @@ impl Drop for SceneCopy {
     }
 }
 
+/// Owns an import property store so it outlives the import call and is freed on every exit path.
+struct Props(*mut russimp_ng::sys::aiPropertyStore);
+
+impl Drop for Props {
+    fn drop(&mut self) {
+        // SAFETY: the pointer came from `aiCreatePropertyStore` and is released exactly once, here.
+        unsafe { russimp_ng::sys::aiReleasePropertyStore(self.0) }
+    }
+}
+
+/// Configure the two optimisation steps whose *defaults* are wrong for an export target.
+///
+/// `FindDegenerates` does not remove a degenerate triangle by default — it rewrites it as a line or
+/// a point, and `SortByPType` then splits those into primitives of their own. Left alone, the naive
+/// flag set would therefore trade a handful of invisible triangles for **extra draw calls**, which
+/// is the opposite of the request. `PP_FD_REMOVE` deletes them instead, and `PP_SBP_REMOVE` drops
+/// any point/line primitive that reaches the sort anyway (some importers produce them directly).
+///
+/// The keys are spelled out rather than taken from a binding because `config.h` is not in
+/// `russimp-sys-ng`'s `wrapper.h`, so its `AI_CONFIG_*` string macros are not generated.
+fn optimise_props() -> Result<Props, HandlerError> {
+    // SAFETY: allocates a store; null means the allocation failed and is handled below.
+    let store = unsafe { russimp_ng::sys::aiCreatePropertyStore() };
+    if store.is_null() {
+        return Err(HandlerError::Encode(
+            "Assimp could not allocate an import property store".into(),
+        ));
+    }
+    let props = Props(store);
+    for (key, value) in [
+        ("PP_FD_REMOVE", 1),
+        ("PP_SBP_REMOVE", AI_PRIMITIVE_TYPE_POINT_AND_LINE),
+    ] {
+        let key_c = CString::new(key).expect("config keys are NUL-free literals");
+        // SAFETY: `props.0` is a live store and `key_c` outlives the call, which copies the name.
+        unsafe { russimp_ng::sys::aiSetImportPropertyInteger(props.0, key_c.as_ptr(), value) };
+    }
+    Ok(props)
+}
+
 /// Owns an export blob chain so it is released even if we bail while copying it out.
 struct Blob(*const russimp_ng::sys::aiExportDataBlob);
 
@@ -110,8 +202,11 @@ impl Drop for Blob {
 
 /// Transcode `path` to `target_format`, returning the encoded bytes.
 ///
+/// `optimize` opts into the mesh optimisation described in the module docs — off means a plain
+/// container transcode.
+///
 /// EXPENSIVE tier — the convert pipeline only, never at ingest.
-pub fn convert(path: &Path, target_format: &str) -> Result<Vec<u8>, HandlerError> {
+pub fn convert(path: &Path, target_format: &str, optimize: bool) -> Result<Vec<u8>, HandlerError> {
     let id = exporter_id(target_format).ok_or_else(|| {
         HandlerError::Unsupported(format!(
             "3D target '{target_format}' is not supported (this build writes: glb)"
@@ -123,9 +218,30 @@ pub fn convert(path: &Path, target_format: &str) -> Result<Vec<u8>, HandlerError
     // `id` is one of this module's own string literals, so this cannot fail.
     let id_c = CString::new(id).expect("exporter ids are NUL-free literals");
 
-    // SAFETY: `path_c` outlives the call; Assimp copies what it needs. A null return means the
-    // import failed, and the reason is fetched immediately (see `last_error`).
-    let scene = unsafe { russimp_ng::sys::aiImportFile(path_c.as_ptr(), IMPORT_FLAGS) };
+    // The optimisation steps need a configured property store (see `optimise_props`), which the
+    // plain `aiImportFile` shorthand has nowhere to take — hence the two import calls rather than
+    // one with a conditional flag word. The store must stay alive across the import.
+    let flags = if optimize {
+        IMPORT_FLAGS | OPTIMISE_FLAGS
+    } else {
+        IMPORT_FLAGS
+    };
+    let props = optimize.then(optimise_props).transpose()?;
+
+    // SAFETY: `path_c` (and `props`) outlive the call; Assimp copies what it needs. A null return
+    // means the import failed, and the reason is deliberately not fetched (see below). The null
+    // `aiFileIO` asks for Assimp's own default filesystem, which is what `aiImportFile` uses too.
+    let scene = match &props {
+        Some(p) => unsafe {
+            russimp_ng::sys::aiImportFileExWithProperties(
+                path_c.as_ptr(),
+                flags,
+                std::ptr::null_mut(),
+                p.0,
+            )
+        },
+        None => unsafe { russimp_ng::sys::aiImportFile(path_c.as_ptr(), flags) },
+    };
     if scene.is_null() {
         // Deliberately no Assimp error detail. `aiGetErrorString()` reads `gLastErrorString`, a
         // plain `static std::string` that the C API assigns with **no lock** — and this crate is
@@ -247,7 +363,7 @@ mod tests {
     #[test]
     fn a_model_transcodes_to_a_valid_glb() {
         let (_d, p) = write("tri.obj", TRIANGLE_OBJ.as_bytes());
-        let bytes = convert(&p, "glb").expect("OBJ → GLB must convert");
+        let bytes = convert(&p, "glb", false).expect("OBJ → GLB must convert");
 
         // The GLB container header: magic `glTF`, version 2, then the total length. Checking all
         // three rather than just the magic means a truncated or misreported blob fails here.
@@ -267,7 +383,7 @@ mod tests {
     #[test]
     fn the_exported_glb_can_be_read_back_as_a_model() {
         let (_d, p) = write("tri.obj", TRIANGLE_OBJ.as_bytes());
-        let bytes = convert(&p, "glb").unwrap();
+        let bytes = convert(&p, "glb", false).unwrap();
 
         let (_d2, out) = write("out.glb", &bytes);
         let out_c = CString::new(out.as_os_str().as_encoded_bytes()).unwrap();
@@ -311,8 +427,8 @@ mod tests {
         o
     }
 
-    /// Pull `(position_count, triangle_count)` out of a GLB's JSON chunk.
-    fn glb_counts(glb: &[u8]) -> (u64, u64) {
+    /// Parse a GLB's JSON chunk — the only part of the container these assertions read.
+    fn glb_json(glb: &[u8]) -> serde_json::Value {
         let mut off = 12usize;
         let mut doc = None;
         while off + 8 <= glb.len() {
@@ -325,7 +441,12 @@ mod tests {
             }
             off += 8 + clen;
         }
-        let doc = doc.expect("GLB has a JSON chunk");
+        doc.expect("GLB has a JSON chunk")
+    }
+
+    /// Pull `(position_count, triangle_count)` out of a GLB's first mesh primitive.
+    fn glb_counts(glb: &[u8]) -> (u64, u64) {
+        let doc = glb_json(glb);
         let prim = &doc["meshes"][0]["primitives"][0];
         let acc = |i: &serde_json::Value| {
             doc["accessors"][i.as_u64().unwrap() as usize]["count"]
@@ -335,6 +456,28 @@ mod tests {
         let pos = acc(&prim["attributes"]["POSITION"]);
         let tris = acc(&prim["indices"]) / 3;
         (pos, tris)
+    }
+
+    /// `(total positions, total triangles, primitive count)` across every mesh in the GLB.
+    ///
+    /// The primitive count is the interesting one: in glTF a primitive is one draw call, so it is
+    /// the direct measure of what `OptimizeMeshes` is for.
+    fn glb_totals(glb: &[u8]) -> (u64, u64, usize) {
+        let doc = glb_json(glb);
+        let acc = |i: &serde_json::Value| {
+            doc["accessors"][i.as_u64().unwrap() as usize]["count"]
+                .as_u64()
+                .unwrap()
+        };
+        let (mut pos, mut tris, mut prims) = (0, 0, 0);
+        for mesh in doc["meshes"].as_array().expect("GLB has meshes") {
+            for prim in mesh["primitives"].as_array().unwrap() {
+                prims += 1;
+                pos += acc(&prim["attributes"]["POSITION"]);
+                tris += acc(&prim["indices"]) / 3;
+            }
+        }
+        (pos, tris, prims)
     }
 
     /// The output must be **indexed**, and this is not a nicety — it is a 3.5x difference in file
@@ -354,7 +497,7 @@ mod tests {
     #[test]
     fn the_exported_glb_is_indexed_not_expanded_to_three_verts_per_triangle() {
         let (_d, p) = write("grid.obj", grid_obj().as_bytes());
-        let bytes = convert(&p, "glb").expect("grid must convert");
+        let bytes = convert(&p, "glb", false).expect("grid must convert");
         let (pos, tris) = glb_counts(&bytes);
         assert_eq!(tris, 18, "the fixture is 18 triangles");
         assert!(
@@ -366,6 +509,120 @@ mod tests {
         assert!(pos <= 20, "expected ~16 shared vertices, got {pos}");
     }
 
+    /// Two quads that meet along an edge, split into two OBJ groups so Assimp imports them as two
+    /// meshes with the same (default) material.
+    ///
+    /// Shaped for exactly what optimisation should do to it: the groups can merge because their
+    /// material is identical, and vertices 2 and 3 exist twice — once per mesh — until the merge
+    /// puts them in the same buffer for `JoinIdenticalVertices` to collapse. So a plain transcode
+    /// gives 2 primitives / 8 positions and an optimised one gives 1 / 6, from the same 4 triangles.
+    fn two_group_obj() -> &'static str {
+        "v 0.0 0.0 0.0\nv 1.0 0.0 0.0\nv 1.0 1.0 0.0\nv 0.0 1.0 0.0\n\
+         v 2.0 0.0 0.0\nv 2.0 1.0 0.0\n\
+         g left\nf 1 2 3\nf 1 3 4\n\
+         g right\nf 2 5 6\nf 2 6 3\n"
+    }
+
+    /// Mesh optimisation as an encode option (issue #49): opting in must cost draw calls and
+    /// vertices, not geometry.
+    ///
+    /// Both halves matter. Fewer primitives is `OptimizeMeshes` doing its job — a primitive is a
+    /// draw call, and merging them is the headline win for a web/preview handoff. Fewer positions
+    /// is the subtler one: `JoinIdenticalVertices` already runs on *both* paths, so a smaller
+    /// vertex count can only come from the merge having happened first, which is only true because
+    /// these are import-time steps ordered by Assimp's post-process chain. Wire them to the
+    /// exporter instead and the primitive count still drops while this assertion goes red.
+    ///
+    /// The triangle count is asserted unchanged on purpose: "optimised" here means topology, not
+    /// simplification. Anything that starts deleting faces is a different feature and should have
+    /// to change this test to land.
+    #[test]
+    fn optimising_merges_draw_calls_and_the_vertices_they_shared() {
+        let (_d, p) = write("two-groups.obj", two_group_obj().as_bytes());
+
+        let plain = convert(&p, "glb", false).expect("plain transcode");
+        let optimised = convert(&p, "glb", true).expect("optimised transcode");
+
+        // Still a GLB, and still one whose header agrees with its own length — an optimisation that
+        // produces a subtly malformed container would otherwise pass the count assertions below.
+        assert_eq!(&optimised[0..4], b"glTF");
+        assert_eq!(u32::from_le_bytes(optimised[4..8].try_into().unwrap()), 2);
+        assert_eq!(
+            u32::from_le_bytes(optimised[8..12].try_into().unwrap()) as usize,
+            optimised.len()
+        );
+
+        let (plain_pos, plain_tris, plain_prims) = glb_totals(&plain);
+        let (opt_pos, opt_tris, opt_prims) = glb_totals(&optimised);
+
+        assert_eq!(
+            (plain_tris, opt_tris),
+            (4, 4),
+            "the fixture is 4 triangles and optimisation must not remove geometry"
+        );
+        assert!(
+            opt_prims < plain_prims,
+            "optimising did not merge draw calls: {plain_prims} → {opt_prims} primitives"
+        );
+        assert_eq!(
+            opt_prims, 1,
+            "the two groups share a material, so they merge"
+        );
+        assert!(
+            opt_pos < plain_pos,
+            "optimising did not re-join the vertices the two meshes shared: {plain_pos} → \
+             {opt_pos} positions"
+        );
+        assert_eq!(
+            opt_pos, 6,
+            "6 distinct positions in the fixture; {plain_pos} unoptimised because the shared edge \
+             is duplicated per mesh"
+        );
+    }
+
+    /// The optimised output has to be readable *as a model*, not merely well-formed — the same bar
+    /// the plain path is held to, because a merged scene is where a bad node/mesh index would show.
+    #[test]
+    fn an_optimised_glb_can_be_read_back_as_a_model() {
+        let (_d, p) = write("two-groups.obj", two_group_obj().as_bytes());
+        let bytes = convert(&p, "glb", true).unwrap();
+
+        let (_d2, out) = write("out.glb", &bytes);
+        let out_c = CString::new(out.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: same import/release discipline as `convert`; released before the assertions so a
+        // failure cannot leak the scene.
+        let (meshes, ok) = unsafe {
+            let s = russimp_ng::sys::aiImportFile(out_c.as_ptr(), AI_PROCESS_TRIANGULATE);
+            if s.is_null() {
+                (0, false)
+            } else {
+                let n = (*s).mNumMeshes;
+                russimp_ng::sys::aiReleaseImport(s);
+                (n, true)
+            }
+        };
+        assert!(ok, "the optimised GLB did not re-import");
+        assert_eq!(meshes, 1, "one merged mesh survives the round trip");
+    }
+
+    /// Optimisation must not turn a refusal into a success (or a panic) — the property-store import
+    /// path is a second FFI entry point, so every guard in `convert` has to hold on it too.
+    #[test]
+    fn the_optimised_path_refuses_the_same_inputs_as_the_plain_one() {
+        let (_d, prose) = write("notamodel.obj", b"this is not geometry, it is prose");
+        let err = convert(&prose, "glb", true).expect_err("must refuse");
+        assert!(matches!(err, HandlerError::Corrupt(_)), "{err:?}");
+
+        let (_d2, broken) = write("broken.fbx", b"\x00\x01\x02 not an fbx");
+        assert!(convert(&broken, "glb", true).is_err());
+
+        let (_d3, tri) = write("tri.obj", TRIANGLE_OBJ.as_bytes());
+        assert!(matches!(
+            convert(&tri, "gltf", true),
+            Err(HandlerError::Unsupported(_))
+        ));
+    }
+
     #[test]
     fn an_unsupported_target_is_refused_by_name() {
         let (_d, p) = write("tri.obj", TRIANGLE_OBJ.as_bytes());
@@ -373,7 +630,7 @@ mod tests {
         // convert seam cannot write — so they must be refused *here*, clearly, rather than
         // producing a first part that silently references a file nobody wrote.
         for target in ["gltf", "obj", "fbx", "png"] {
-            let err = match convert(&p, target) {
+            let err = match convert(&p, target, false) {
                 Err(e) => e,
                 Ok(_) => panic!("{target} must be refused, but it converted"),
             };
@@ -396,7 +653,7 @@ mod tests {
     #[test]
     fn a_file_with_no_geometry_is_refused_rather_than_exported_empty() {
         let (_d, p) = write("notamodel.obj", b"this is not geometry, it is prose");
-        let err = convert(&p, "glb").expect_err("must refuse");
+        let err = convert(&p, "glb", false).expect_err("must refuse");
         assert!(matches!(err, HandlerError::Corrupt(_)), "{err:?}");
         assert!(
             err.to_string().contains("no geometry"),
@@ -408,6 +665,6 @@ mod tests {
     #[test]
     fn an_unreadable_file_is_refused_not_fatal() {
         let (_d, p) = write("broken.fbx", b"\x00\x01\x02 not an fbx");
-        assert!(convert(&p, "glb").is_err());
+        assert!(convert(&p, "glb", false).is_err());
     }
 }
