@@ -49,6 +49,11 @@ export interface ViewState {
   selected: string | null;
 }
 
+export interface ViewStatePatchOptions {
+  /** Replace transient/repair updates. User-committed navigation pushes by default. */
+  replace?: boolean;
+}
+
 /** Decode the `adv` URL param (a JSON `Filter[]`). Malformed input degrades to no advanced filters
  *  rather than throwing — a hand-edited URL never breaks the browse. */
 function parseAdv(raw: string | null): Filter[] {
@@ -86,35 +91,35 @@ export function useViewState() {
   );
 
   const patch = useCallback(
-    (next: Partial<ViewState>) => {
-      setParams(
-        (prev) => {
-          const p = new URLSearchParams(prev);
-          const set = (k: string, v: string | null | undefined) => {
-            if (v === null || v === undefined || v === "") p.delete(k);
-            else p.set(k, v);
-          };
-          if ("q" in next) set("q", next.q);
-          if ("media" in next) set("media", next.media);
-          if ("source" in next) set("source", next.source);
-          if ("license" in next) set("license", next.license);
-          if ("tag" in next) set("tag", next.tag);
-          if ("collection" in next) set("col", next.collection);
-          if ("fav" in next) set("fav", next.fav ? "1" : null);
-          if ("path" in next) set("path", next.path);
-          if ("subfolders" in next) set("sub", next.subfolders ? null : "0");
-          if ("adv" in next) set("adv", next.adv && next.adv.length ? JSON.stringify(next.adv) : null);
-          if ("sort" in next) set("sort", next.sort);
-          if ("dir" in next) set("dir", next.dir);
-          if ("mode" in next) set("mode", next.mode === "lexical" ? null : next.mode);
-          if ("view" in next) set("view", next.view);
-          if ("selected" in next) set("sel", next.selected);
-          return p;
-        },
-        { replace: true },
-      );
+    (next: Partial<ViewState>, options: ViewStatePatchOptions = {}) => {
+      const updated = new URLSearchParams(params);
+      const set = (k: string, v: string | null | undefined) => {
+        if (v === null || v === undefined || v === "") updated.delete(k);
+        else updated.set(k, v);
+      };
+      if ("q" in next) set("q", next.q);
+      if ("media" in next) set("media", next.media);
+      if ("source" in next) set("source", next.source);
+      if ("license" in next) set("license", next.license);
+      if ("tag" in next) set("tag", next.tag);
+      if ("collection" in next) set("col", next.collection);
+      if ("fav" in next) set("fav", next.fav ? "1" : null);
+      if ("path" in next) set("path", next.path);
+      if ("subfolders" in next) set("sub", next.subfolders ? null : "0");
+      if ("adv" in next)
+        set("adv", next.adv && next.adv.length ? JSON.stringify(next.adv) : null);
+      if ("sort" in next) set("sort", next.sort);
+      if ("dir" in next) set("dir", next.dir);
+      if ("mode" in next) set("mode", next.mode === "lexical" ? null : next.mode);
+      if ("view" in next) set("view", next.view);
+      if ("selected" in next) set("sel", next.selected);
+
+      // React Router will navigate even when given the current search string. Avoid duplicate
+      // history entries for repeated clicks on the already-active source/folder/asset/view.
+      if (updated.toString() === params.toString()) return;
+      setParams(updated, { replace: options.replace ?? false });
     },
-    [setParams],
+    [params, setParams],
   );
 
   const request: QueryRequest = useMemo(() => {

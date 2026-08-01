@@ -508,7 +508,9 @@ function Toolbar({
           value={state.q}
           // Searching is a faceted query — it can't compose with a collection view, so typing
           // exits collection mode (mirrors the sidebar's mutual-exclusion).
-          onChange={(e) => patch({ q: e.target.value, collection: null })}
+          onChange={(e) =>
+            patch({ q: e.target.value, collection: null }, { replace: true })
+          }
         />
         {searching ? (
           <Loader2

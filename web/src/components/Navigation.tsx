@@ -420,7 +420,10 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
                 onSuccess: () => {
                   // Don't leave the browser filtered on a source that no longer exists (issue #29),
                   // and drop any folder scope under it (issue #66).
-                  if (state.source === s.id) patch({ source: null, path: null });
+                  // The source no longer exists, so repair the current URL instead of leaving an
+                  // invalid history entry that Back could revisit and clean up repeatedly.
+                  if (state.source === s.id)
+                    patch({ source: null, path: null }, { replace: true });
                 },
               });
             }

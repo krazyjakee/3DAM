@@ -133,7 +133,9 @@ function InspectorPanel({
   // This is independent of the close button, which on the rail collapses rather than deselects (#65).
   useEffect(() => {
     if (asset.isError && asset.error instanceof ApiError && asset.error.status === 404) {
-      patch({ selected: null });
+      // Repair the current entry in place. Pushing here would let Back return to the same dangling
+      // asset and trigger this cleanup again, creating a navigation loop.
+      patch({ selected: null }, { replace: true });
     }
   }, [asset.isError, asset.error, patch]);
 
