@@ -389,11 +389,13 @@ impl Store {
             }
             MediaAttributes::Image(i) => {
                 conn.execute(
-                    "INSERT INTO image_attr (asset_id, width, height, color_depth, has_alpha, color_space)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                    "INSERT INTO image_attr (asset_id, width, height, color_depth, has_alpha,
+                                             color_space, texture_format, mip_levels)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                      ON CONFLICT(asset_id) DO UPDATE SET
                         width=excluded.width, height=excluded.height, color_depth=excluded.color_depth,
-                        has_alpha=excluded.has_alpha, color_space=excluded.color_space",
+                        has_alpha=excluded.has_alpha, color_space=excluded.color_space,
+                        texture_format=excluded.texture_format, mip_levels=excluded.mip_levels",
                     params![
                         key,
                         i.width,
@@ -401,6 +403,8 @@ impl Store {
                         i.color_depth,
                         i.has_alpha.map(|b| b as i64),
                         i.color_space,
+                        i.texture_format,
+                        i.mip_levels,
                     ],
                 )
                 .map_err(internal)?;
@@ -515,7 +519,8 @@ impl Store {
             MediaType::Image => conn
                 .query_row(
                     "SELECT width, height, color_depth, has_alpha, color_space,
-                            phash, tileability, repeat_period, tile_class, dominant_colors, class
+                            phash, tileability, repeat_period, tile_class, dominant_colors, class,
+                            texture_format, mip_levels
                      FROM image_attr WHERE asset_id = ?1",
                     params![id_blob],
                     |r| {
@@ -536,6 +541,8 @@ impl Store {
                                 .and_then(|s| serde_json::from_str(&s).ok())
                                 .unwrap_or_default(),
                             class: r.get(10)?,
+                            texture_format: r.get(11)?,
+                            mip_levels: r.get(12)?,
                         })
                     },
                 )

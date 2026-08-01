@@ -10,7 +10,7 @@
 //! for game textures today; when the SigLIP path lands it is a `model_version` bump behind the same
 //! `Embedder` seam (tech-spec 05 §2.1, §7), not a rewrite.
 
-use image::{DynamicImage, GenericImageView, ImageReader};
+use image::{DynamicImage, GenericImageView};
 use std::path::Path;
 
 use crate::HandlerError;
@@ -48,11 +48,10 @@ const REPEAT_TAU: f32 = 0.55;
 /// never at ingest scale. Fail-soft is the caller's job: a decode error returns `Corrupt` and the
 /// asset simply keeps its cheap-tier metadata with no embedding (tech-spec 05 §2.3).
 pub fn extract_image_features(path: &Path) -> Result<ImageFeatures, HandlerError> {
-    let img = ImageReader::open(path)
-        .and_then(|r| r.with_guessed_format())
-        .map_err(HandlerError::Io)?
-        .decode()
-        .map_err(|e| HandlerError::Corrupt(e.to_string()))?;
+    // Routed, not raw `ImageReader`: GPU texture containers decode through their own path, so a
+    // DDS/KTX2 gets a phash, dominant colours, tileability and an embedding like any other image.
+    // Without this they would be previewable but invisible to similarity, dedup and auto-tagging.
+    let img = crate::image::decode_any(path)?;
 
     let phash = dhash(&img);
     let embedding = embed(&img);

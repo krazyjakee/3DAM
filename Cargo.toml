@@ -145,6 +145,18 @@ log = "0.4"
 # media decode / encode (tech-spec 04 handlers + 08 convert). Pure-Rust where possible.
 # `image` covers the v1 raster matrix (ADR 0009 §8); DDS/KTX2/EXR/HDR stage later.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "tga", "tiff", "webp"] }
+# GPU texture containers (issue #49). Deliberately NOT `image`'s own `dds` feature: that decoder
+# handles only DXT1/3/5 and returns Unsupported for BC4/BC5/BC6H/BC7 — i.e. exactly the formats a
+# real game-asset folder is full of (BC5 normal maps, BC7 albedo). The `dds` crate (image-rs org,
+# safe Rust) decodes 81 formats including all of BCn, and reads the header without touching pixels,
+# which is what the cheap tier needs. `rayon` is encode-only, so it is off.
+dds = { version = "0.2", default-features = false }
+# KTX2 container only — header, level index, DFD. It deliberately does not decompress payloads, so
+# it is always safe to run at the cheap tier whatever the file carries.
+ktx2 = "0.5"
+# Block-compressed payload → pixels, for the KTX2 levels that are plain BCn/ASTC rather than
+# Basis-supercompressed. Note its output is BGRA-packed u32, not RGBA.
+texture2ddecoder = "0.1"
 # `symphonia` is the audio decode/probe path (tech-spec 04 §7.1); curated to the v1 codec set.
 symphonia = { version = "0.5", default-features = false, features = ["mp3", "flac", "vorbis", "ogg", "wav", "pcm", "adpcm", "isomp4", "aac", "aiff"] }
 # WAV/PCM encode for the convert pipeline (tech-spec 08 §3.1).

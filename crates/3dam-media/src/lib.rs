@@ -15,6 +15,7 @@ mod image;
 mod mel;
 mod model;
 mod proc;
+mod texture;
 mod video;
 
 pub use audio_features::{
@@ -269,7 +270,9 @@ pub fn render_thumbnail(
 ) -> Result<ThumbPng, HandlerError> {
     match det.media {
         MediaType::Image => {
-            let (bytes, width, height) = image::thumbnail(path, max_edge)?;
+            // The format is what routes a DDS/KTX2 to the texture decoder (issue #49); the raster
+            // path ignores it.
+            let (bytes, width, height) = image::thumbnail(path, max_edge, &det.format)?;
             Ok(ThumbPng {
                 bytes,
                 width,
@@ -345,6 +348,32 @@ mod tests {
             media,
             format: format.to_string(),
         }
+    }
+
+    /// A 4x4 BC1 DDS whose single block is solid red — the raster equivalent of a 4x4 red PNG,
+    /// which is what makes the two analysable side by side. `c0 = 0xF800` is red in RGB565; note
+    /// `0xFFFF` there would be *white*, which is an easy fixture mistake to make.
+    fn red_bc1_dds() -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(b"DDS ");
+        let mut h = [0u32; 31];
+        h[0] = 124;
+        h[1] = 0x1 | 0x2 | 0x4 | 0x1000 | 0x80000;
+        h[2] = 4;
+        h[3] = 4;
+        h[4] = 8;
+        h[6] = 1;
+        h[18] = 32;
+        h[19] = 0x4;
+        h[20] = u32::from_le_bytes(*b"DXT1");
+        h[26] = 0x1000;
+        for w in h {
+            v.extend_from_slice(&w.to_le_bytes());
+        }
+        v.extend_from_slice(&0xF800u16.to_le_bytes());
+        v.extend_from_slice(&0x001Fu16.to_le_bytes());
+        v.extend_from_slice(&0u32.to_le_bytes());
+        v
     }
 
     fn write_png(path: &Path, w: u32, h: u32) {
@@ -515,6 +544,83 @@ mod tests {
         assert_eq!(i.has_alpha, Some(true)); // RGBA PNG → colour type 6
         assert_eq!(i.color_space.as_deref(), Some("srgb"));
         std::fs::remove_file(&p).ok();
+    }
+
+    /// A GPU texture must reach the texture decoder through the *dispatch*, not just in isolation.
+    /// The routing key is `det.format`; before issue #49 this call handed a DDS to the raster
+    /// decoder, which cannot open one, so the preview came back as an error.
+    #[test]
+    fn a_dds_thumbnail_routes_to_the_texture_decoder() {
+        let p = tmp("dispatch.dds");
+        std::fs::write(&p, red_bc1_dds()).unwrap();
+
+        let thumb = render_thumbnail(&p, &det(MediaType::Image, "dds"), 64).unwrap();
+        assert!(thumb.bytes.starts_with(b"\x89PNG"), "PNG-encoded");
+        // Not an exact size assertion: `thumbnail` fits the long edge to the box, and this
+        // deliberately tiny 4x4 fixture is scaled *up* to it — same as any small raster.
+        assert!(thumb.width <= 64 && thumb.height <= 64);
+        // The point of the test: real decoded pixels came back, not a blank surface. The block is
+        // solid red, so a thumbnail that routed to the raster decoder (or produced nothing) fails.
+        let decoded = ::image::load_from_memory(&thumb.bytes).unwrap().to_rgba8();
+        let px = decoded
+            .get_pixel(decoded.width() / 2, decoded.height() / 2)
+            .0;
+        assert!(
+            px[0] > 200 && px[1] < 60 && px[2] < 60,
+            "expected the texture's red, got {px:?}"
+        );
+
+        // …and the cheap tier answers through the same dispatch.
+        let attrs = extract_metadata(&p, &det(MediaType::Image, "dds"));
+        match attrs {
+            MediaAttributes::Image(i) => {
+                assert_eq!(i.texture_format.as_deref(), Some("BC1_UNORM"));
+                assert_eq!((i.width, i.height), (Some(4), Some(4)));
+            }
+            other => panic!("expected image attributes, got {other:?}"),
+        }
+        // …and the expensive tier reaches them everywhere, not just for thumbnails. Analysis and
+        // convert both decode through the same routed entry point, so a texture participates in
+        // similarity/dedup/auto-tag rather than being a preview-only catalog row.
+        let feats = extract_image_features(&p).expect("a texture must be analysable");
+        // Not `phash != 0`: a dHash of a *uniform* image is legitimately all-zero (no gradients),
+        // and this fixture is solid red. The embedding is the signal that matters — without one a
+        // texture can never appear as a similarity or dedup result.
+        assert!(
+            !feats.embedding.is_empty(),
+            "a texture must get an embedding, or it can never be a similarity result"
+        );
+        assert!(
+            !feats.dominant_colors.is_empty(),
+            "a texture must get dominant colours, or auto-tagging cannot see it"
+        );
+        let png = convert_image(&p, "png", None, None).expect("dds → png must convert");
+        assert!(png.starts_with(b"\x89PNG"));
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A texture and an ordinary raster of the same content must analyse to the same answer.
+    ///
+    /// This is the assertion that a routed decode is *equivalent*, not merely non-empty — the
+    /// analysis pass feeds similarity, dedup and auto-tagging, so a texture that decodes to
+    /// different pixels than its PNG twin would quietly sort into different neighbourhoods.
+    #[test]
+    fn a_texture_and_an_equivalent_png_analyse_alike() {
+        let png = tmp("solid.png");
+        ::image::RgbaImage::from_pixel(4, 4, ::image::Rgba([255, 0, 0, 255]))
+            .save_with_format(&png, ::image::ImageFormat::Png)
+            .unwrap();
+        let from_png = extract_image_features(&png).unwrap();
+        let _ = std::fs::remove_file(&png);
+
+        let dds = tmp("solid_equiv.dds");
+        std::fs::write(&dds, red_bc1_dds()).unwrap();
+        let from_dds = extract_image_features(&dds).unwrap();
+        let _ = std::fs::remove_file(&dds);
+
+        assert_eq!(from_dds.dominant_colors, from_png.dominant_colors);
+        assert_eq!(from_dds.phash, from_png.phash);
     }
 
     #[test]

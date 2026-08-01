@@ -311,6 +311,15 @@ pub struct ImageAttributes {
     pub color_depth: Option<i64>,
     pub has_alpha: Option<bool>,
     pub color_space: Option<String>,
+    // ── GPU texture containers (issue #49); None for ordinary rasters ──
+    /// The container's own pixel format — `BC7_UNORM`, `R8G8B8A8_SRGB`, … For a DDS or KTX2 this
+    /// is the field that actually distinguishes one texture from another: dimensions alone say
+    /// nothing about whether a 4 MB file is a BC5 normal map or a BC7 albedo.
+    #[serde(default)]
+    pub texture_format: Option<String>,
+    /// Mip levels stored in the file (1 = just the base image).
+    #[serde(default)]
+    pub mip_levels: Option<i64>,
     // ── derived by analysis (tech-spec 05 §5, §6); None until the analyze pass runs ──
     /// Perceptual (dHash) hash, hex-encoded — the near-dup signal (§4.2).
     #[serde(default)]

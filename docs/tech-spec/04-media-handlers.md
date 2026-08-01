@@ -372,13 +372,25 @@ it is a plan, not a frozen list.
 | TGA | ✅ | ✅ | common in game texture packs |
 | BMP | ✅ | ✅ | |
 | GIF | ✅ | ✅ | first-frame thumbnail |
-| DDS | ✅ | Later | header (dims, format, mip count) cheap in v1; block-compressed decode staged |
-| KTX2 | ✅ (header) | Later | KTX2 is a convert *target* (§6.5, PNG↔KTX2 in 08); full decode/transcode staged |
+| DDS | ✅ | ✅ | header (dims, format, mip count) cheap; BC1–BC7 + ASTC + uncompressed decode via the `dds` crate (issue #49) |
+| KTX2 | ✅ | ✅ / partial | header always (the container parses without touching payload); decode for uncompressed RGBA/BGRA + **BC1–BC7**. **ASTC, ETC2/EAC, and any supercompressed payload (Basis/ETC1S/UASTC, Zstd, ZLIB) get metadata only** |
+| KTX (v1) | ✅ (recognised) | — | different container/magic; reported as undecoded rather than as a corrupt KTX2 |
 | TIFF / EXR / HDR | Later | Later | HDR/linear handling staged; EXR matters for VFX-adjacent packs |
 | SVG | — | — | out of scope v1 (vector, not raster asset) |
 
 Colour space / linear handling matters for the tileability test and normal maps (PRODUCT_SPEC §5);
 the header-level colour-space flag is cheap-tier, the linear-space analysis is 05.
+
+Two notes on the texture containers (issue #49), because both are easy to get subtly wrong:
+
+- **Not `image`'s own `dds` feature.** It decodes DXT1/DXT3/DXT5 and returns `Unsupported` for
+  everything else — which excludes **BC5** (how normal maps are stored) and **BC7** (the modern
+  albedo default), i.e. most of a current texture set. Enabling it would have read as support while
+  failing on the common cases.
+- **Colour space is reported only when the file states it.** A KTX2 spells it into the `VkFormat`
+  (`..._SRGB`), and a DX10 DDS carries it in the DXGI format — those are answered. A **DX9** DDS
+  header has no such field, so the answer is `None` rather than a guess: defaulting it to linear
+  would mislabel every legacy albedo, and defaulting to sRGB would mislabel every normal map.
 
 ### 7.3 3D model (`gltf` decode · `fbxcel` for FBX · custom OBJ/STL/PLY readers)
 

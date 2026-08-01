@@ -541,6 +541,18 @@ pub const MIGRATIONS: &[&str] = &[
     ) STRICT;
     CREATE INDEX idx_comment_asset ON asset_comment(asset_id, comment_id);
     "#,
+    // ── V15: GPU texture container attributes (issue #49) ────────────────────────────────────────
+    // DDS and KTX2 were catalogued as images with dimensions and nothing else, which makes a BC5
+    // normal map and a BC7 albedo the same row. These two columns are what distinguish them, and
+    // they come from the container header at the cheap tier — no pixel decode.
+    //
+    // Additive `ALTER TABLE`, so existing rows keep working and simply read NULL until their next
+    // scan fills them in. Ordinary rasters leave both NULL for good: PNG has no mip chain and its
+    // "format" is the file extension the row already carries.
+    r#"
+    ALTER TABLE image_attr ADD COLUMN texture_format TEXT;
+    ALTER TABLE image_attr ADD COLUMN mip_levels INTEGER;
+    "#,
 ];
 
 #[cfg(test)]

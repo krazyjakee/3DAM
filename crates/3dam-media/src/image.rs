@@ -16,6 +16,16 @@ use crate::HandlerError;
 /// Cheap header read: dimensions always; alpha/bit-depth/colour-space where the container gives
 /// them without a pixel decode.
 pub fn metadata(path: &Path, format: &str) -> ImageAttributes {
+    // GPU texture containers are read by their own header parsers (issue #49): `ImageReader`
+    // cannot open a DDS or KTX2 at all, so without this they land here and produce nothing.
+    if crate::texture::is_texture(format) {
+        // Returns unconditionally, including on failure. Falling through would run the raster
+        // path — which cannot open these containers anyway — and then reach the blanket
+        // `color_space = "srgb"` below, stamping sRGB onto a texture that deliberately declined to
+        // state one. An unreadable container is better recorded as "nothing known".
+        return crate::texture::metadata(path, format).unwrap_or_default();
+    }
+
     let mut attrs = ImageAttributes::default();
 
     if let Ok(reader) = ImageReader::open(path).and_then(|r| r.with_guessed_format()) {
@@ -35,7 +45,8 @@ pub fn metadata(path: &Path, format: &str) -> ImageAttributes {
     }
 
     // The v1 raster matrix (PNG/JPEG/WebP/TGA/BMP/GIF/TIFF) is sRGB-encoded by default; the linear
-    // analysis that matters for normal maps is phase-3 (05), not a cheap header field.
+    // analysis that matters for normal maps is phase-3 (05), not a cheap header field. GPU texture
+    // containers never reach this line — they state their own colour space and are answered above.
     attrs.color_space = Some("srgb".to_string());
     attrs
 }
@@ -59,13 +70,50 @@ fn png_ihdr(path: &Path) -> Option<(u8, bool)> {
 
 /// Fully decode and downscale to a PNG no larger than `max_edge` on its long side (aspect
 /// preserved). EXPENSIVE tier — only called on preview/thumbnail request, never at ingest.
-pub fn thumbnail(path: &Path, max_edge: u32) -> Result<(Vec<u8>, u32, u32), HandlerError> {
-    let reader = ImageReader::open(path)
+pub fn thumbnail(
+    path: &Path,
+    max_edge: u32,
+    format: &str,
+) -> Result<(Vec<u8>, u32, u32), HandlerError> {
+    encode_thumb(decode_for(path, format)?, max_edge)
+}
+
+/// Decode any supported still image to pixels, routing GPU texture containers to their own decoder.
+///
+/// The one place a still image becomes pixels, so every expensive-tier consumer — thumbnails,
+/// convert, and the analysis pass — gets the same format coverage. Without this the texture support
+/// would be thumbnail-only: a DDS would show a preview but stay invisible to similarity, dedup and
+/// auto-tagging, which is most of what the catalog is *for*.
+pub fn decode_for(path: &Path, format: &str) -> Result<image::DynamicImage, HandlerError> {
+    if crate::texture::is_texture(format) {
+        return Ok(image::DynamicImage::ImageRgba8(
+            crate::texture::decode_rgba(path, format)?,
+        ));
+    }
+    ImageReader::open(path)
         .and_then(|r| r.with_guessed_format())
-        .map_err(HandlerError::Io)?;
-    let img = reader
+        .map_err(HandlerError::Io)?
         .decode()
-        .map_err(|e| HandlerError::Corrupt(e.to_string()))?;
+        .map_err(|e| HandlerError::Corrupt(e.to_string()))
+}
+
+/// As [`decode_for`], for callers that hold only a path. The extension is the same signal
+/// `detect()` uses, so this agrees with how the asset was classified in the first place.
+pub fn decode_any(path: &Path) -> Result<image::DynamicImage, HandlerError> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    decode_for(path, &ext)
+}
+
+/// Downscale and PNG-encode a decoded image. Shared by the raster and texture paths so both
+/// produce the same thumbnail shape.
+fn encode_thumb(
+    img: image::DynamicImage,
+    max_edge: u32,
+) -> Result<(Vec<u8>, u32, u32), HandlerError> {
     // `thumbnail` uses a fast box filter for big reductions; `resize` with Lanczos when close.
     let thumb = img.thumbnail(max_edge, max_edge);
     let (w, h) = (thumb.width(), thumb.height());
@@ -84,12 +132,7 @@ pub fn convert(
     max_edge: Option<u32>,
     quality: Option<u8>,
 ) -> Result<Vec<u8>, HandlerError> {
-    let reader = ImageReader::open(path)
-        .and_then(|r| r.with_guessed_format())
-        .map_err(HandlerError::Io)?;
-    let mut img = reader
-        .decode()
-        .map_err(|e| HandlerError::Corrupt(e.to_string()))?;
+    let mut img = decode_any(path).map_err(|e| HandlerError::Corrupt(e.to_string()))?;
     if let Some(edge) = max_edge {
         if img.width() > edge || img.height() > edge {
             img = img.resize(edge, edge, FilterType::Lanczos3);

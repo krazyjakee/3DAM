@@ -95,6 +95,13 @@ export interface ImageAttributes {
   color_depth?: number | null;
   has_alpha: boolean | null;
   color_space: string | null;
+  // ── GPU texture containers (DDS/KTX2, issue #49); null for ordinary rasters ──
+  /** The container's own pixel format — `BC7_UNORM`, `R8G8B8A8_SRGB`, … For a texture this is what
+   *  distinguishes one file from another: dimensions alone don't say whether a 4 MB `.dds` is a BC5
+   *  normal map or a BC7 albedo. */
+  texture_format?: string | null;
+  /** Mip levels stored in the file (1 = just the base image). */
+  mip_levels?: number | null;
   // ── derived by the analysis pass (null until `analyze` runs) ──
   /** Perceptual (dHash) hash, hex-encoded. */
   phash?: string | null;
