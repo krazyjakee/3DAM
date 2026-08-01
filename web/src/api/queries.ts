@@ -11,7 +11,13 @@ import {
 import { api } from "./client";
 import type { Scope } from "./admin";
 import { bustThumbnails } from "@/lib/thumbnail-cache";
-import { getServer } from "@/lib/server";
+import { getServer, hasBearerCredential } from "@/lib/server";
+import {
+  BROWSE_MAX_PAGES,
+  BROWSE_PAGE_SIZE,
+  browseCursorDirectory,
+  type BrowsePageParam,
+} from "@/lib/browse-window";
 import type {
   AddSource,
   AnalyzeRequest,
@@ -50,20 +56,20 @@ export const qk = {
   folders: (source: string, prefix: string) => ["folders", source, prefix] as const,
 };
 
-const PAGE_LIMIT = 60;
+const PAGE_LIMIT = BROWSE_PAGE_SIZE;
 
 export function useVersion() {
   return useQuery({ queryKey: qk.version, queryFn: api.version, staleTime: Infinity });
 }
 
-/** Who the current credential is + what it can do (front-door auth). Keyed on the stored token so a
+/** Who the current credential is + what it can do (front-door auth). Keyed on non-secret connection state so a
  *  sign-in / sign-out / token swap refetches automatically (the AuthGate reloads the app on those,
  *  but keying it makes the hook correct even without a reload). A 401 flips the AuthGate via the
  *  shared QueryCache handler; we don't retry it. Every server posture reports scopes, so the whole
  *  UI can gate consistently — an auth-off server grants full trust (all scopes). */
 export function useWhoami() {
   return useQuery({
-    queryKey: [...qk.whoami, getServer().token],
+    queryKey: [...qk.whoami, getServer().base, hasBearerCredential() ? "bearer" : "session"],
     queryFn: api.whoami,
     staleTime: Infinity,
     retry: false,
@@ -95,14 +101,28 @@ export function useCan(scope: Scope): boolean {
  *  resolved live) instead of the faceted search. Keyed under `qk.assets` either way, so the same WS
  *  asset events keep both views live. */
 export function useAssets(req: QueryRequest, collection?: CollectionId | null) {
+  // The query key owns the directory's lifetime. Page payloads are capped below, while this sparse
+  // cursor chain is enough to recreate an evicted page when the user scrolls backwards.
+  const cursorDirectoryKey = JSON.stringify([collection ?? null, req]);
+  const cursorDirectory = browseCursorDirectory(cursorDirectoryKey);
   return useInfiniteQuery({
     queryKey: collection ? [...qk.assets, "collection", collection] : [...qk.assets, req],
-    initialPageParam: null as string | null,
-    queryFn: ({ pageParam }) =>
-      collection
-        ? api.collectionAssets(collection, { after: pageParam, limit: PAGE_LIMIT })
-        : api.query({ ...req, page: { after: pageParam, limit: PAGE_LIMIT } }),
-    getNextPageParam: (last) => last.cursor ?? undefined,
+    initialPageParam: { after: null, index: 0 } as BrowsePageParam,
+    queryFn: async ({ pageParam }) => {
+      const page = collection
+        ? api.collectionAssets(collection, { after: pageParam.after, limit: PAGE_LIMIT })
+        : api.query({ ...req, page: { after: pageParam.after, limit: PAGE_LIMIT } });
+      const resolved = await page;
+      cursorDirectory.remember(pageParam, resolved.cursor);
+      return resolved;
+    },
+    getNextPageParam: (last, _pages, lastParam) =>
+      last.cursor === null
+        ? undefined
+        : { after: last.cursor, index: lastParam.index + 1 },
+    getPreviousPageParam: (_first, _pages, firstParam) =>
+      cursorDirectory.previous(firstParam),
+    maxPages: BROWSE_MAX_PAGES,
   });
 }
 

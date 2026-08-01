@@ -55,6 +55,11 @@ import { ConvertDialog } from "./ConvertDialog";
 import { AdvancedSearch } from "./AdvancedSearch";
 import { ActiveFilters } from "./ActiveFilters";
 import { Centered } from "@/lib/ui";
+import {
+  browseWindowMetrics,
+  flattenBrowsePages,
+  type BrowsePageParam,
+} from "@/lib/browse-window";
 
 /** Modifier keys that change what a click does to the multi-selection (issue #10/#22). */
 export interface ClickMods {
@@ -69,7 +74,7 @@ const CELL_H = 132;
 const COARSE_POINTER =
   typeof window !== "undefined" && window.matchMedia("(pointer: coarse)").matches;
 const ROW_H = COARSE_POINTER ? 44 : 30;
-// Pull enough exact-duplicate groups to collapse the whole loaded library (default server cap is 100).
+// Pull enough exact-duplicate groups to collapse the retained browse window (server cap is 100).
 
 /** Collapse byte-identical duplicates in the browse list (issue: dedup in grid/table). Each exact
  *  group renders once — the first member that appears in the current sort/filter represents it, so a
@@ -129,11 +134,10 @@ export function Browser({
   const [anchor, setAnchor] = useState<string | null>(null);
   const selectedAsset = useAsset(state.selected);
 
-  const items = useMemo(
-    () => assets.data?.pages.flatMap((p) => p.items) ?? [],
-    [assets.data],
-  );
-  const total = assets.data?.pages[0]?.total ?? null;
+  // `useAssets` retains only a small page LRU. Everything derived here is consequently bounded by
+  // that window instead of growing with the lifetime scroll history.
+  const items = useMemo(() => flattenBrowsePages(assets.data?.pages), [assets.data?.pages]);
+  const total = assets.data?.pages.find((page) => page.total !== null)?.total ?? null;
   const byId = useMemo(() => new Map(items.map((a) => [a.id, a])), [items]);
 
   // Federation fan-out (issue #39): a query page comes back `partial.complete === false` when a
@@ -155,15 +159,22 @@ export function Browser({
 
   // Prefetch hint (issue #72): as each page loads, ask the server to warm that page's thumbnails +
   // preview meshes so the grid's HTTP fetches hit cache. Fire-and-forget — bytes still come over
-  // HTTP/2 (ADR 0012); this only moves generation ahead of render. Keyed on page count so it fires
-  // once per fetched page, not on every cache invalidation.
-  const pageCount = assets.data?.pages.length ?? 0;
+  // HTTP/2 (ADR 0012); this only moves generation ahead of render. The remembered key set is itself
+  // bounded to the current LRU; returning to an evicted page may harmlessly warm it again.
+  const prefetchedPages = useRef<Set<string>>(new Set());
   useEffect(() => {
-    const page = assets.data?.pages[pageCount - 1];
-    if (!page || page.items.length === 0) return;
-    void api.prefetch({ assets: page.items.map((a) => a.id) }).catch(() => {});
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pageCount]);
+    const pages = assets.data?.pages ?? [];
+    const params = (assets.data?.pageParams ?? []) as BrowsePageParam[];
+    const current = new Set<string>();
+    pages.forEach((page, index) => {
+      if (page.items.length === 0) return;
+      const key = `${params[index]?.index ?? index}:${page.items[0]?.id ?? "empty"}`;
+      current.add(key);
+      if (!prefetchedPages.current.has(key))
+        void api.prefetch({ assets: page.items.map((a) => a.id) }).catch(() => {});
+    });
+    prefetchedPages.current = current;
+  }, [assets.data]);
 
   // Collapse byte-identical duplicates into one row each, badged with the hidden-copy count; the
   // full group is listed in the Inspector. Whole-library groups, cached + shared with the Inspector
@@ -174,13 +185,30 @@ export function Browser({
     [items, dups.data],
   );
 
+  const firstPageParam = assets.data?.pageParams[0] as BrowsePageParam | undefined;
+  const windowMetrics = browseWindowMetrics(
+    firstPageParam,
+    visible.length,
+    assets.hasNextPage,
+  );
+
+  // Selected summaries outlive page eviction so batch actions and the selection bar do not blink
+  // out while their rows are off-screen. This cache is bounded by the explicit selection itself.
+  const selectedCache = useRef<Map<string, AssetSummary>>(new Map());
   const clearSelection = useCallback(() => {
     setSelection(new Set());
     setAnchor(null);
+    selectedCache.current.clear();
   }, []);
-  const selectAll = useCallback(() => setSelection(new Set(visible.map((a) => a.id))), [visible]);
+  const selectAll = useCallback(() => {
+    selectedCache.current = new Map(visible.map((asset) => [asset.id, asset]));
+    setSelection(new Set(visible.map((a) => a.id)));
+  }, [visible]);
   const selectedAssets = useMemo(
-    () => [...selection].map((id) => byId.get(id)).filter((a): a is AssetSummary => !!a),
+    () =>
+      [...selection]
+        .map((id) => byId.get(id) ?? selectedCache.current.get(id))
+        .filter((a): a is AssetSummary => !!a),
     [selection, byId],
   );
   // Convert targets set from the context menu (single/multi); rendered as a dialog at Browser root.
@@ -191,6 +219,7 @@ export function Browser({
   const onItemClick = useCallback(
     (asset: AssetSummary, mods: ClickMods) => {
       const id = asset.id;
+      selectedCache.current.set(id, asset);
       patch({ selected: id });
       if (mods.shift && anchor) {
         const ids = visible.map((a) => a.id);
@@ -199,16 +228,24 @@ export function Browser({
         if (a >= 0 && b >= 0) {
           const [lo, hi] = a < b ? [a, b] : [b, a];
           const range = ids.slice(lo, hi + 1);
+          for (const item of visible.slice(lo, hi + 1))
+            selectedCache.current.set(item.id, item);
           setSelection((prev) => new Set([...prev, ...range]));
         }
       } else if (mods.meta) {
         setSelection((prev) => {
           const next = new Set(prev);
-          next.has(id) ? next.delete(id) : next.add(id);
+          if (next.has(id)) {
+            next.delete(id);
+            selectedCache.current.delete(id);
+          } else {
+            next.add(id);
+          }
           return next;
         });
         setAnchor(id);
       } else {
+        selectedCache.current = new Map([[id, asset]]);
         setSelection(new Set([id]));
         setAnchor(id);
       }
@@ -232,7 +269,9 @@ export function Browser({
     (asset: AssetSummary, x: number, y: number) => {
       const targetIds =
         selection.has(asset.id) && selection.size > 1 ? [...selection] : [asset.id];
-      const targets = targetIds.map((id) => byId.get(id)).filter((a): a is AssetSummary => !!a);
+      const targets = targetIds
+        .map((id) => byId.get(id) ?? selectedCache.current.get(id))
+        .filter((a): a is AssetSummary => !!a);
       setMenu({ assets: targets.length ? targets : [asset], x, y });
     },
     [selection, byId],
@@ -323,6 +362,11 @@ export function Browser({
     hasMore: assets.hasNextPage,
     loadMore: () => assets.fetchNextPage(),
     loading: assets.isFetchingNextPage,
+    hasPrevious: assets.hasPreviousPage,
+    loadPrevious: () => assets.fetchPreviousPage(),
+    loadingPrevious: assets.isFetchingPreviousPage,
+    windowStart: windowMetrics.start,
+    virtualCount: windowMetrics.virtualCount,
   };
 
   return (
@@ -334,7 +378,7 @@ export function Browser({
       tabIndex={-1}
     >
       <Toolbar
-        count={visible.length}
+        count={windowMetrics.start + items.length}
         total={total}
         onOpenNav={onOpenNav}
         onShowShortcuts={onShowShortcuts}
@@ -791,6 +835,13 @@ interface ListProps {
   hasMore: boolean;
   loadMore: () => void;
   loading: boolean;
+  hasPrevious: boolean;
+  loadPrevious: () => void;
+  loadingPrevious: boolean;
+  /** Absolute logical slot of `items[0]`; earlier slots are evicted page height. */
+  windowStart: number;
+  /** Absolute virtual length, including the next-page loading runway. */
+  virtualCount: number;
 }
 
 /** Normalise a mouse click into our modifier model (cmd on macOS, ctrl elsewhere). */
@@ -892,23 +943,43 @@ function Grid({
   hasMore,
   loadMore,
   loading,
+  hasPrevious,
+  loadPrevious,
+  loadingPrevious,
+  windowStart,
+  virtualCount,
 }: ListProps) {
   const parentRef = useRef<HTMLDivElement>(null);
   const cols = useColumns(parentRef, CELL_W);
-  const rowCount = Math.ceil(items.length / cols);
+  const rowCount = Math.ceil(virtualCount / cols);
 
   const virt = useVirtualizer({
     count: rowCount,
     getScrollElement: () => parentRef.current,
     estimateSize: () => CELL_H,
+    // Grid/table switches remount the virtualizer. Resume at the retained window instead of
+    // starting in its evicted leading spacer and accidentally refetching the entire history.
+    initialOffset: Math.floor(windowStart / cols) * CELL_H,
     overscan: 4,
   });
 
-  useInfinite(virt.getVirtualItems(), rowCount, hasMore, loading, loadMore);
+  const virtualRows = virt.getVirtualItems();
+  useBrowseWindowLoading(
+    (virtualRows[0]?.index ?? 0) * cols,
+    ((virtualRows.at(-1)?.index ?? 0) + 1) * cols - 1,
+    windowStart,
+    windowStart + items.length,
+    hasPrevious,
+    loadingPrevious,
+    loadPrevious,
+    hasMore,
+    loading,
+    loadMore,
+  );
 
   const scrollToItem = useCallback(
-    (index: number) => virt.scrollToIndex(Math.floor(index / cols)),
-    [virt, cols],
+    (index: number) => virt.scrollToIndex(Math.floor((windowStart + index) / cols)),
+    [virt, cols, windowStart],
   );
   const { focusIndex, setFocusIndex, onKeyDown } = useRovingFocus(
     items.length,
@@ -926,9 +997,14 @@ function Grid({
       onKeyDown={onKeyDown}
     >
       <div style={{ height: virt.getTotalSize(), position: "relative" }}>
-        {virt.getVirtualItems().map((vr) => {
+        {virtualRows.map((vr) => {
           const start = vr.index * cols;
-          const row = items.slice(start, start + cols);
+          const row = Array.from({ length: cols }, (_, column) => {
+            const absoluteIndex = start + column;
+            const localIndex = absoluteIndex - windowStart;
+            return { absoluteIndex, localIndex, asset: items[localIndex] };
+          });
+          if (row.every(({ asset }) => !asset)) return null;
           return (
             <div
               key={vr.key}
@@ -938,15 +1014,15 @@ function Grid({
                 gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))`,
               }}
             >
-              {row.map((a, ci) => {
-                const index = start + ci;
+              {row.map(({ asset: a, absoluteIndex, localIndex }) => {
+                if (!a) return <div key={`empty-${absoluteIndex}`} aria-hidden="true" />;
                 return (
                   <GridCell
                     key={a.id}
                     asset={a}
-                    index={index}
+                    index={localIndex}
                     active={selection.has(a.id)}
-                    focusable={index === focusIndex}
+                    focusable={localIndex === focusIndex}
                     onFocusIndex={setFocusIndex}
                     dupCount={dupCounts.get(a.id)}
                     onClick={onItemClick}
@@ -959,6 +1035,11 @@ function Grid({
           );
         })}
       </div>
+      {loadingPrevious && (
+        <div className="sticky top-0 z-20 py-1 text-center text-[11px] text-fg-dim">
+          Loading earlier…
+        </div>
+      )}
       {loading && <div className="py-2 text-center text-[11px] text-fg-dim">Loading more…</div>}
     </div>
   );
@@ -1142,17 +1223,38 @@ function Table({
   hasMore,
   loadMore,
   loading,
+  hasPrevious,
+  loadPrevious,
+  loadingPrevious,
+  windowStart,
+  virtualCount,
 }: ListProps) {
   const parentRef = useRef<HTMLDivElement>(null);
   const virt = useVirtualizer({
-    count: items.length,
+    count: virtualCount,
     getScrollElement: () => parentRef.current,
     estimateSize: () => ROW_H,
+    initialOffset: windowStart * ROW_H,
     overscan: 12,
   });
-  useInfinite(virt.getVirtualItems(), items.length, hasMore, loading, loadMore);
+  const virtualRows = virt.getVirtualItems();
+  useBrowseWindowLoading(
+    virtualRows[0]?.index ?? 0,
+    virtualRows.at(-1)?.index ?? 0,
+    windowStart,
+    windowStart + items.length,
+    hasPrevious,
+    loadingPrevious,
+    loadPrevious,
+    hasMore,
+    loading,
+    loadMore,
+  );
 
-  const scrollToItem = useCallback((index: number) => virt.scrollToIndex(index), [virt]);
+  const scrollToItem = useCallback(
+    (index: number) => virt.scrollToIndex(windowStart + index),
+    [virt, windowStart],
+  );
   const { focusIndex, setFocusIndex, onKeyDown } = useRovingFocus(
     items.length,
     1,
@@ -1182,15 +1284,17 @@ function Table({
         <span className="text-right">Size</span>
       </div>
       <div style={{ height: virt.getTotalSize(), position: "relative" }}>
-        {virt.getVirtualItems().map((vr) => {
-          const a = items[vr.index];
+        {virtualRows.map((vr) => {
+          const localIndex = vr.index - windowStart;
+          const a = items[localIndex];
+          if (!a) return null;
           return (
             <TableRow
-              key={vr.key}
+              key={a.id}
               asset={a}
-              index={vr.index}
+              index={localIndex}
               active={selection.has(a.id)}
-              focusable={vr.index === focusIndex}
+              focusable={localIndex === focusIndex}
               onFocusIndex={setFocusIndex}
               dupCount={dupCounts.get(a.id)}
               top={vr.start}
@@ -1201,6 +1305,11 @@ function Table({
           );
         })}
       </div>
+      {loadingPrevious && (
+        <div className="sticky top-6 z-20 py-1 text-center text-[11px] text-fg-dim">
+          Loading earlier…
+        </div>
+      )}
       {loading && <div className="py-2 text-center text-[11px] text-fg-dim">Loading more…</div>}
     </div>
   );
@@ -1348,16 +1457,23 @@ function useColumns(ref: React.RefObject<HTMLDivElement | null>, target: number)
   return cols;
 }
 
-/** Trigger the next page when the last window row nears the end. */
-function useInfinite(
-  visible: { index: number }[],
-  count: number,
+/** Refill either edge of the retained page LRU as its loading runway enters the viewport. */
+function useBrowseWindowLoading(
+  firstVisible: number,
+  lastVisible: number,
+  windowStart: number,
+  windowEnd: number,
+  hasPrevious: boolean,
+  loadingPrevious: boolean,
+  loadPrevious: () => void,
   hasMore: boolean,
   loading: boolean,
   loadMore: () => void,
 ) {
-  const last = visible.at(-1)?.index ?? 0;
   useEffect(() => {
-    if (hasMore && !loading && last >= count - 8) loadMore();
-  }, [last, count, hasMore, loading, loadMore]);
+    if (hasPrevious && !loadingPrevious && firstVisible <= windowStart + 8) loadPrevious();
+  }, [firstVisible, windowStart, hasPrevious, loadingPrevious, loadPrevious]);
+  useEffect(() => {
+    if (hasMore && !loading && lastVisible >= windowEnd - 8) loadMore();
+  }, [lastVisible, windowEnd, hasMore, loading, loadMore]);
 }
