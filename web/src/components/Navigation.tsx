@@ -297,7 +297,7 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
         onClick={() => go({ media: null, collection: null })}
         right={<Count n={total} loading={stats.isLoading} />}
       >
-        <Layers size={14} /> All assets
+        <Layers size={14} /> All media types
       </Row>
       {/* Favorites (issue #63): a boolean facet — star an asset from the Inspector — that composes
           with the media/source facets. Toggling it on clears any active collection view. */}

@@ -44,6 +44,7 @@ import { ContextMenu, useLongPress, type MenuState } from "./ContextMenu";
 import { ExportDialog } from "./ExportDialog";
 import { ConvertDialog } from "./ConvertDialog";
 import { AdvancedSearch } from "./AdvancedSearch";
+import { ActiveFilters } from "./ActiveFilters";
 import { Centered } from "@/lib/ui";
 
 /** Modifier keys that change what a click does to the multi-selection (issue #10/#22). */
@@ -157,7 +158,10 @@ export function Browser({ onOpenNav }: { onOpenNav?: () => void }) {
     [items, dups.data],
   );
 
-  const clearSelection = useCallback(() => setSelection(new Set()), []);
+  const clearSelection = useCallback(() => {
+    setSelection(new Set());
+    setAnchor(null);
+  }, []);
   const selectAll = useCallback(() => setSelection(new Set(visible.map((a) => a.id))), [visible]);
   const selectedAssets = useMemo(
     () => [...selection].map((id) => byId.get(id)).filter((a): a is AssetSummary => !!a),
@@ -250,6 +254,27 @@ export function Browser({ onOpenNav }: { onOpenNav?: () => void }) {
     // The centre browse region is the page's main landmark (a11y hardening, issue #44).
     <main className="flex h-full min-w-0 flex-1 flex-col bg-bg" aria-label="Asset browser">
       <Toolbar count={visible.length} total={total} onOpenNav={onOpenNav} searching={searching} />
+      <ActiveFilters
+        onClearAll={() => {
+          clearSelection();
+          patch({
+            q: "",
+            media: null,
+            source: null,
+            license: null,
+            tag: null,
+            collection: null,
+            fav: false,
+            path: null,
+            subfolders: true,
+            adv: [],
+            sort: "name",
+            dir: "asc",
+            mode: "lexical",
+            selected: null,
+          });
+        }}
+      />
       {/* Folder breadcrumb (issue #66) — the current source + path segments, each clickable to jump
           up the tree. Only shown when browsing a source (not a collection view). */}
       <Breadcrumb />

@@ -419,7 +419,7 @@ export function AdvancedSearch() {
                   className="text-[11px] text-fg-dim hover:text-accent"
                   onClick={() => setAdv([])}
                 >
-                  Clear all
+                  Clear advanced
                 </button>
               )}
             </div>
