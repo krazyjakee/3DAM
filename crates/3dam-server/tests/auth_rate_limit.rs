@@ -2,11 +2,11 @@
 
 use axum::body::Body;
 use axum::extract::ConnectInfo;
-use axum::http::{Request, StatusCode, header};
+use axum::http::{header, Request, StatusCode};
 use dam_api::admin::{FlagKey, FlagValue, SetFlag};
 use dam_core::EmbeddedLibrary;
-use dam_server::{ServerStore, router};
-use serde_json::{Value, json};
+use dam_server::{router, ServerStore};
+use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -46,8 +46,7 @@ async fn rotating_usernames_and_forwarded_headers_end_in_429_with_retry_after() 
         .unwrap();
 
     let peer: SocketAddr = "203.0.113.9:54321".parse().unwrap();
-    let app = router(lib, store, "0.0.0.0:7878", false)
-        .layer(axum::Extension(ConnectInfo(peer)));
+    let app = router(lib, store, "0.0.0.0:7878", false).layer(axum::Extension(ConnectInfo(peer)));
 
     for attempt in 0..20 {
         let request = Request::builder()

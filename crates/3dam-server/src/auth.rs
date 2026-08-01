@@ -71,10 +71,7 @@ fn bearer(parts: &Parts) -> Option<String> {
 /// Resolve auth for a live-event WebSocket ticket mint, which needs `Read`. The mint is an ordinary
 /// fetch and therefore uses the Authorization header or same-origin session cookie. The long-lived
 /// credential is never accepted from a URI (issue #128).
-pub fn resolve_ws(
-    store: &ServerStore,
-    headers: &HeaderMap,
-) -> Result<Resolved, LibError> {
+pub fn resolve_ws(store: &ServerStore, headers: &HeaderMap) -> Result<Resolved, LibError> {
     let token = bearer_header(headers);
     let resolved = resolve(store, token, cookie_value(headers, SESSION_COOKIE))?;
     resolved.ctx.require(Scope::Read)?;

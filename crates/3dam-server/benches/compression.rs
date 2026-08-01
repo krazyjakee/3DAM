@@ -22,7 +22,11 @@ fn largest_asset(extension: &str) -> Option<Vec<u8>> {
         .map(|entry| entry.path())
         .filter(|path| path.extension().and_then(|value| value.to_str()) == Some(extension))
         .collect();
-    candidates.sort_by_key(|path| fs::metadata(path).map(|metadata| metadata.len()).unwrap_or(0));
+    candidates.sort_by_key(|path| {
+        fs::metadata(path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0)
+    });
     fs::read(candidates.pop()?).ok()
 }
 

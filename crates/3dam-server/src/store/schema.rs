@@ -6,7 +6,7 @@
 //! migration once released.
 
 use dam_api::LibError;
-use rusqlite::{Connection, DatabaseName, OpenFlags, TransactionBehavior};
+use rusqlite::{Connection, OpenFlags, TransactionBehavior, MAIN_DB};
 use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
@@ -193,8 +193,12 @@ fn migrate_with(
                 )
             })?;
     }
-    tx.commit()
-        .map_err(|error| migration_error("could not commit server.db migration; upgrade rolled back", error))?;
+    tx.commit().map_err(|error| {
+        migration_error(
+            "could not commit server.db migration; upgrade rolled back",
+            error,
+        )
+    })?;
     tracing::info!(from = current, to = target, backup = ?backup, "migrated server.db");
     Ok(())
 }
@@ -239,7 +243,7 @@ fn create_backup(
             ))
         })?;
         source
-            .backup(DatabaseName::Main, &backup_path, None)
+            .backup(MAIN_DB, &backup_path, None)
             .map_err(|error| {
                 LibError::Internal(format!(
                     "could not create server.db migration backup {}: {error}",
@@ -323,12 +327,14 @@ fn secure_and_sync_backup(path: &Path) -> Result<(), LibError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|error| {
-            LibError::Internal(format!(
-                "could not restrict server.db backup {} to mode 0600: {error}",
-                path.display()
-            ))
-        })?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(
+            |error| {
+                LibError::Internal(format!(
+                    "could not restrict server.db backup {} to mode 0600: {error}",
+                    path.display()
+                ))
+            },
+        )?;
     }
 
     let file = OpenOptions::new()
@@ -363,7 +369,10 @@ fn secure_and_sync_backup(path: &Path) -> Result<(), LibError> {
     // Persist the directory entry as well as the file contents on Unix. Some other platforms do
     // not permit opening/syncing directories; their inherited ACL/durability rules apply instead.
     #[cfg(unix)]
-    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         let sync_result = std::fs::File::open(parent).and_then(|directory| directory.sync_all());
         match sync_result {
             Ok(()) => {}
@@ -424,7 +433,8 @@ mod tests {
             .unwrap();
         assert_eq!(version, 2);
         assert_eq!(
-            conn.query_row("SELECT secret FROM first", [], |row| row.get::<_, String>(0))
+            conn.query_row("SELECT secret FROM first", [], |row| row
+                .get::<_, String>(0))
                 .unwrap(),
             "kept"
         );

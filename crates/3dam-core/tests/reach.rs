@@ -125,18 +125,18 @@ async fn delta_scan_skips_unchanged_and_marks_missing() {
     let delta = scan(&lib, &ctx, ScanMode::Delta).await;
     assert_eq!(all_names(&lib, &ctx).await, vec!["a.png", "b.png"]);
     assert!(
-        delta.error.as_deref().unwrap_or("").contains("unchanged"),
-        "delta note should mention unchanged files: {:?}",
-        delta.error
+        delta.summary.as_deref().unwrap_or("").contains("unchanged"),
+        "delta summary should mention unchanged files: {:?}",
+        delta.summary
     );
 
     // Remove a file; a delta re-scan marks it missing (non-destructive — the row persists).
     std::fs::remove_file(src.join("a.png")).unwrap();
     let delta2 = scan(&lib, &ctx, ScanMode::Delta).await;
     assert!(
-        delta2.error.as_deref().unwrap_or("").contains("missing"),
-        "delta note should mention missing files: {:?}",
-        delta2.error
+        delta2.summary.as_deref().unwrap_or("").contains("missing"),
+        "delta summary should mention missing files: {:?}",
+        delta2.summary
     );
     // Grouping only — the catalog row is kept (still listed), never deleted (§2.2).
     assert_eq!(all_names(&lib, &ctx).await, vec!["a.png", "b.png"]);

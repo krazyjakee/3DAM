@@ -10,8 +10,8 @@
 
 use wgpu::util::DeviceExt;
 
-use crate::camera::OrbitCamera;
 use crate::batching::{self, BatchItem};
+use crate::camera::OrbitCamera;
 use crate::gpu::{GpuContext, VIEWER_DEPTH_FORMAT};
 use crate::preview_mesh::{CpuMaterial, CpuModel, CpuTexture};
 
@@ -409,7 +409,12 @@ impl ModelRenderer {
                 let source = &model.submeshes[source_index];
                 let base = vertices.len() as u32;
                 vertices.extend_from_slice(&source.vertices);
-                indices.extend(source.indices.iter().map(|index| index.saturating_add(base)));
+                indices.extend(
+                    source
+                        .indices
+                        .iter()
+                        .map(|index| index.saturating_add(base)),
+                );
             }
             meshes.push(upload_mesh(device, &vertices, &indices, material, false));
         }

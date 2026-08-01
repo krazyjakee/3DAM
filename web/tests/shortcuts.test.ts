@@ -52,7 +52,12 @@ test("suppresses shortcuts in editable fields and modified plain-key collisions"
   );
   assert.equal(
     shortcutForEvent(
-      key(" ", { target: { tagName: "BUTTON", closest: () => ({}) } as never }),
+      key(" ", {
+        target: {
+          tagName: "BUTTON",
+          closest: (selector: string) => (selector === "[data-asset-id]" ? {} : null),
+        } as never,
+      }),
     ),
     "play-pause",
   );

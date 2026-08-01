@@ -447,21 +447,15 @@ fn resolve_sibling(base: &str, rel: &str) -> Result<String, LibError> {
     }
     // Absolute paths (POSIX or Windows-drive) and URLs are never source-relative siblings.
     let bytes = rel.as_bytes();
-    let windows_drive = bytes.len() >= 2
-        && bytes[1] == b':'
-        && (bytes[0] as char).is_ascii_alphabetic();
+    let windows_drive =
+        bytes.len() >= 2 && bytes[1] == b':' && (bytes[0] as char).is_ascii_alphabetic();
     let uri_scheme = rel.split_once(':').is_some_and(|(scheme, _)| {
         !scheme.is_empty()
             && scheme.chars().enumerate().all(|(i, c)| {
-                c.is_ascii_alphabetic()
-                    || (i > 0 && (c.is_ascii_digit() || "+-.".contains(c)))
+                c.is_ascii_alphabetic() || (i > 0 && (c.is_ascii_digit() || "+-.".contains(c)))
             })
     });
-    if rel.starts_with('/')
-        || rel.starts_with('\\')
-        || windows_drive
-        || uri_scheme
-    {
+    if rel.starts_with('/') || rel.starts_with('\\') || windows_drive || uri_scheme {
         return Err(LibError::BadRequest(
             "related path must be source-relative".into(),
         ));
@@ -595,8 +589,8 @@ impl EmbeddedLibrary {
             credentials::cleanup_pending_credentials(&store, &secrets)?;
             Ok::<_, LibError>((store, secrets))
         })
-            .await
-            .map_err(|e| LibError::Internal(e.to_string()))??;
+        .await
+        .map_err(|e| LibError::Internal(e.to_string()))??;
         let store = Arc::new(store);
         let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         // Built before the watch manager: watch-triggered delta scans are bulk readers too and
@@ -715,9 +709,7 @@ impl EmbeddedLibrary {
                         let result = s
                             .get_source_connection(&id)
                             .and_then(|connection| secrets.resolve(connection))
-                            .map(|connection| {
-                                dam_sources::writable_without_handshake(&connection)
-                            });
+                            .map(|connection| dam_sources::writable_without_handshake(&connection));
                         (id, result)
                     })
                     .collect::<Vec<_>>())
@@ -754,14 +746,9 @@ impl EmbeddedLibrary {
     /// Attach the authenticated transport actor to a newly-created background job. This remains
     /// inherent (rather than part of `LibraryService`) because attribution is server-boundary
     /// metadata, not a caller-controlled library operation.
-    pub async fn set_job_initiator(
-        &self,
-        id: &JobId,
-        initiator: String,
-    ) -> Result<(), LibError> {
+    pub async fn set_job_initiator(&self, id: &JobId, initiator: String) -> Result<(), LibError> {
         let id = *id;
-        self.db(move |s| s.set_job_initiator(&id, &initiator))
-            .await
+        self.db(move |s| s.set_job_initiator(&id, &initiator)).await
     }
 
     // ── visibility enforcement (tech-spec 10 §4.3, issue #42) ────────────────
@@ -1576,14 +1563,9 @@ impl LibraryService for EmbeddedLibrary {
             // Commit the redacted row + deterministic opaque ref first. If the secret write then
             // fails, the row still tracks any provider-side partial success; cleanup deletes the
             // credential before the row, so no failure ordering can create an untracked secret.
-            s.add_source_with_auth(
-                id,
-                &conn,
-                &name,
-                watch,
-                stored_ref.as_deref(),
-            )?;
-            if let (Some(reference), Some(material)) = (stored_ref.as_deref(), credential.as_ref()) {
+            s.add_source_with_auth(id, &conn, &name, watch, stored_ref.as_deref())?;
+            if let (Some(reference), Some(material)) = (stored_ref.as_deref(), credential.as_ref())
+            {
                 if let Err(error) = secrets.put(reference, material) {
                     // If deletion itself cannot be confirmed, retain the row/reference. It will
                     // list as locked/unavailable and remains recoverable; removing the row here

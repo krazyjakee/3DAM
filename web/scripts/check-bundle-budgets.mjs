@@ -36,10 +36,20 @@ async function filesBelow(directory) {
 
 async function sizedArtifact(file) {
   const brotli = `${file}.br`;
+  const bytes = (await stat(file)).size;
+  // The production compressor deliberately skips bodies below 256 bytes because a sidecar and an
+  // extra cache variant cost more than they save. Those assets are transferred raw, so their raw
+  // size is also the effective compressed-transfer size for budget accounting.
+  const brotliBytes = await stat(brotli)
+    .then((metadata) => metadata.size)
+    .catch((error) => {
+      if (error?.code === "ENOENT" && bytes < 256) return bytes;
+      throw error;
+    });
   return {
     file: posix(relative(distRoot, file)),
-    bytes: (await stat(file)).size,
-    brotliBytes: (await stat(brotli)).size,
+    bytes,
+    brotliBytes,
   };
 }
 

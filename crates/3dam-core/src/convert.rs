@@ -32,7 +32,7 @@ pub(crate) fn run_convert(
     // Source-safety (§5.1): outputs may not land inside any registered source tree. All per-item
     // paths live under `output_dir`, so validating the root once is sufficient and cheap.
     let source_roots = source_roots(store)?;
-    let out_check = canonical_or_self(&output_dir);
+    let out_check = canonical_for_containment(&output_dir);
     if source_roots.iter().any(|r| path_within(&out_check, r)) {
         return Err(LibError::BadRequest(format!(
             "output_dir {} lies inside a registered source; convert is non-destructive and refuses to write there",
@@ -387,16 +387,37 @@ fn source_roots(store: &Store) -> Result<Vec<PathBuf>, LibError> {
         .list_sources()?
         .into_iter()
         .filter(|s| s.kind == SourceKind::LocalFs)
-        .map(|s| canonical_or_self(Path::new(&s.uri)))
+        .map(|s| canonical_for_containment(Path::new(&s.uri)))
         .collect())
 }
 
-fn canonical_or_self(p: &Path) -> PathBuf {
-    p.canonicalize().unwrap_or_else(|_| normalise(p))
+/// Resolve the deepest existing ancestor and append the still-missing suffix. Canonicalising only
+/// the full path is insufficient for a new output directory: on macOS, for example, `/var` and
+/// `/private/var` name the same tree, but a lexical fallback would treat them as unrelated.
+fn canonical_for_containment(p: &Path) -> PathBuf {
+    let absolute = if p.is_absolute() {
+        normalise(p)
+    } else {
+        std::env::current_dir()
+            .map(|cwd| normalise(&cwd.join(p)))
+            .unwrap_or_else(|_| normalise(p))
+    };
+    let mut ancestor = absolute.as_path();
+    loop {
+        if let Ok(canonical) = ancestor.canonicalize() {
+            let suffix = absolute
+                .strip_prefix(ancestor)
+                .unwrap_or_else(|_| Path::new(""));
+            return normalise(&canonical.join(suffix));
+        }
+        let Some(parent) = ancestor.parent() else {
+            return absolute;
+        };
+        ancestor = parent;
+    }
 }
 
-/// Lexically normalise a path (drop `.`, resolve `..`) when it cannot be canonicalised (e.g. it
-/// does not exist yet). Enough to make the within-source check meaningful for a fresh output dir.
+/// Lexically normalise a path (drop `.`, resolve `..`) before containment comparison.
 fn normalise(p: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for c in p.components() {

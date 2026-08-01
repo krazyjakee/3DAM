@@ -123,11 +123,14 @@ pub(crate) fn run_upload(
     let (asset, uncatalogued_reason) = ingest_one(
         store,
         events,
-        &req.source,
-        &written,
-        read_from,
-        size,
-        modified_ms,
+        fs.as_ref(),
+        IngestFile {
+            source: &req.source,
+            rel_path: &written,
+            bytes: read_from,
+            size,
+            modified_ms,
+        },
     );
 
     Ok(UploadOutcome {
@@ -221,15 +224,27 @@ fn put_once(fs: &dyn FileSource, rel: &str, staged: &Path) -> Result<(), LibErro
 ///
 /// Idempotent by `(source_id, path)` through `upsert_asset`, so a watch event racing this call for
 /// the same path updates the row rather than duplicating it.
+struct IngestFile<'a> {
+    source: &'a SourceId,
+    rel_path: &'a str,
+    bytes: &'a Path,
+    size: u64,
+    modified_ms: Option<i64>,
+}
+
 fn ingest_one(
     store: &Store,
     events: &broadcast::Sender<LibraryEvent>,
-    source: &SourceId,
-    rel_path: &str,
-    bytes: &Path,
-    size: u64,
-    modified_ms: Option<i64>,
+    source_fs: &dyn FileSource,
+    file: IngestFile<'_>,
 ) -> (Option<AssetId>, Option<String>) {
+    let IngestFile {
+        source,
+        rel_path,
+        bytes,
+        size,
+        modified_ms,
+    } = file;
     // `detect_for_ingest`, not `detect`: it answers "should the catalog hold this?", and using the
     // looser check here would create rows the next scan of the same tree would decline to make.
     let Some(det) = dam_media::detect_for_ingest(Path::new(rel_path)) else {
@@ -276,7 +291,15 @@ fn ingest_one(
 
     match store.upsert_asset(&na) {
         Ok((id, inserted)) => {
-            let attrs = dam_media::extract_metadata(bytes, &det);
+            let mut attrs = dam_media::extract_metadata(bytes, &det);
+            // A local fetch is deliberately an isolated scratch copy, so path-based metadata
+            // cannot see siblings beside the destination. Resolve loose-glTF dependencies through
+            // the same confined source capability instead of ambiently reopening the source tree.
+            if let MediaAttributes::Model(model) = &mut attrs {
+                if det.format == "gltf" {
+                    model.dependency_bytes = gltf_dependency_bytes(source_fs, rel_path, bytes);
+                }
+            }
             if let Err(e) = store.set_media_attrs(&id, &attrs) {
                 tracing::warn!(path = %rel_path, error = %e, "attr persist failed");
             }
@@ -306,6 +329,36 @@ fn ingest_one(
             (None, Some(format!("stored, but not catalogued: {e}")))
         }
     }
+}
+
+fn gltf_dependency_bytes(source: &dyn FileSource, model_path: &str, bytes: &Path) -> Option<i64> {
+    let json = std::fs::read(bytes).ok()?;
+    let root: serde_json::Value = serde_json::from_slice(&json).ok()?;
+    let mut seen = std::collections::HashSet::new();
+    let mut total = 0_u64;
+    for key in ["buffers", "images"] {
+        let Some(items) = root.get(key).and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        for item in items {
+            let Some(uri) = item.get("uri").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            if uri.starts_with("data:") {
+                continue;
+            }
+            let Ok(relative) = crate::resolve_sibling(model_path, &uri.replace("%20", " ")) else {
+                continue;
+            };
+            if !seen.insert(relative.clone()) {
+                continue;
+            }
+            if let Ok(stat) = source.content_stat(&relative) {
+                total = total.saturating_add(stat.len);
+            }
+        }
+    }
+    (total > 0).then_some(total.min(i64::MAX as u64) as i64)
 }
 
 #[cfg(test)]

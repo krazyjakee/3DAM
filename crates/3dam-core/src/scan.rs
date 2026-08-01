@@ -295,7 +295,9 @@ pub(crate) fn run_scan(
                 record_warning(
                     &mut warnings,
                     &mut warning_details,
-                    format!("Source “{source_label}” could not be fully walked; inspect source status"),
+                    format!(
+                        "Source “{source_label}” could not be fully walked; inspect source status"
+                    ),
                 );
                 tracing::warn!(source = %sid, error = %e, "source scan failed");
             }
@@ -307,7 +309,10 @@ pub(crate) fn run_scan(
     } else {
         let _ = store.update_job_progress(
             &job,
-            JobState::Done,
+            // Keep the job non-terminal until `complete_job` atomically installs its summary and
+            // warnings. Publishing `Done` here lets a polling client observe a terminal row before
+            // the report fields are written.
+            JobState::Running,
             examined,
             total.or(Some(examined)),
             None,
@@ -325,9 +330,11 @@ pub(crate) fn run_scan(
                 "{omitted} additional warning(s) omitted; inspect source status and server logs"
             ));
         }
-        let suffix = (!notes.is_empty())
-            .then(|| format!(" ({})", notes.join(", ")))
-            .unwrap_or_default();
+        let suffix = if notes.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", notes.join(", "))
+        };
         let summary = format!("Scanned {examined} item(s){suffix}");
         let _ = store.complete_job(&job, &summary, &warning_details);
     }

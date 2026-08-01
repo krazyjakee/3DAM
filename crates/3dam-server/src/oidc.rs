@@ -39,8 +39,8 @@
 //! — it can never serve a stale signing key after a rotation — and caching it is a contained
 //! optimisation for when it matters.
 
-use crate::authn::{session_cookies, with_cookies};
 use crate::auth_rate::{self, Endpoint, PeerAddr};
+use crate::authn::{session_cookies, with_cookies};
 use crate::store::oidc::{StoredOidc, TakeLogin};
 use crate::{ApiError, AppState};
 use axum::extract::{Query, State};

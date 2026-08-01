@@ -253,7 +253,11 @@ async fn token_mode_gates_reads_and_scopes_gate_writes() {
         None,
     )
     .await;
-    assert_eq!(st, StatusCode::UNAUTHORIZED, "WS ticket cannot call JSON APIs");
+    assert_eq!(
+        st,
+        StatusCode::UNAUTHORIZED,
+        "WS ticket cannot call JSON APIs"
+    );
 
     let asset = uuid::Uuid::now_v7();
     let other = uuid::Uuid::now_v7();
@@ -276,7 +280,11 @@ async fn token_mode_gates_reads_and_scopes_gate_writes() {
         None,
     )
     .await;
-    assert_eq!(st, StatusCode::UNAUTHORIZED, "media ticket is exact-asset bound");
+    assert_eq!(
+        st,
+        StatusCode::UNAUTHORIZED,
+        "media ticket is exact-asset bound"
+    );
 
     // Read token on a write route → 403 (missing Write scope). Localhost, so the network ceiling
     // is not the blocker — the identity scope is.

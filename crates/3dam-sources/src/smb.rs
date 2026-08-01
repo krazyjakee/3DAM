@@ -16,8 +16,8 @@ use futures::StreamExt;
 use smb::create::CreateDisposition;
 use smb::resource::{Directory, Resource};
 use smb::{
-    Client, ClientConfig, CreateOptions, FileAccessMask, FileAttributes, FileCreateArgs, GetLen,
-    FileDirectoryInformation, UncPath,
+    Client, ClientConfig, CreateOptions, FileAccessMask, FileAttributes, FileCreateArgs,
+    FileDirectoryInformation, GetLen, UncPath,
 };
 use std::str::FromStr;
 use std::sync::Arc;
@@ -145,12 +145,12 @@ impl FileSource for SmbSource {
         let rel_path = guard_rel_path(rel_path)?;
         let unc = self.unc_for(&rel_path);
         self.rt.block_on(async {
-            let args = FileCreateArgs::make_open_existing(
-                FileAccessMask::new().with_generic_read(true),
-            );
-            let resource = self.client.create_file(&unc, &args).await.map_err(|e| {
-                LibError::SourceUnavailable(format!("smb stat {rel_path}: {e}"))
-            })?;
+            let args =
+                FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_read(true));
+            let resource =
+                self.client.create_file(&unc, &args).await.map_err(|e| {
+                    LibError::SourceUnavailable(format!("smb stat {rel_path}: {e}"))
+                })?;
             let file = match resource {
                 Resource::File(file) => file,
                 other => {
@@ -158,9 +158,10 @@ impl FileSource for SmbSource {
                     return Err(LibError::NotFound(format!("source file {rel_path}")));
                 }
             };
-            let len = file.get_len().await.map_err(|e| {
-                LibError::SourceUnavailable(format!("smb stat {rel_path}: {e}"))
-            });
+            let len = file
+                .get_len()
+                .await
+                .map_err(|e| LibError::SourceUnavailable(format!("smb stat {rel_path}: {e}")));
             let _ = file.close().await;
             Ok(ContentStat {
                 len: len?,
@@ -179,12 +180,12 @@ impl FileSource for SmbSource {
         let rel_path = guard_rel_path(rel_path)?;
         let unc = self.unc_for(&rel_path);
         self.rt.block_on(async {
-            let args = FileCreateArgs::make_open_existing(
-                FileAccessMask::new().with_generic_read(true),
-            );
-            let resource = self.client.create_file(&unc, &args).await.map_err(|e| {
-                LibError::SourceUnavailable(format!("smb open {rel_path}: {e}"))
-            })?;
+            let args =
+                FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_read(true));
+            let resource =
+                self.client.create_file(&unc, &args).await.map_err(|e| {
+                    LibError::SourceUnavailable(format!("smb open {rel_path}: {e}"))
+                })?;
             let file = match resource {
                 Resource::File(file) => file,
                 other => {
@@ -201,9 +202,7 @@ impl FileSource for SmbSource {
                         .read_block(&mut chunk, position, None, false)
                         .await
                         .map_err(|e| {
-                            LibError::SourceUnavailable(format!(
-                                "smb range read {rel_path}: {e}"
-                            ))
+                            LibError::SourceUnavailable(format!("smb range read {rel_path}: {e}"))
                         })?;
                     if read == 0 {
                         return Err(LibError::SourceUnavailable(

@@ -112,11 +112,7 @@ impl Store {
     /// Attach opaque in-app report/artifact links to a job. Routes are validated here before they
     /// become durable API data; future async convert/export manifests cannot persist a filesystem
     /// path, external URL, or traversal and have the web client turn it into a link.
-    pub fn set_job_artifacts(
-        &self,
-        id: &JobId,
-        artifacts: &[JobArtifact],
-    ) -> Result<(), LibError> {
+    pub fn set_job_artifacts(&self, id: &JobId, artifacts: &[JobArtifact]) -> Result<(), LibError> {
         if artifacts
             .iter()
             .filter_map(|artifact| artifact.route.as_deref())
@@ -276,10 +272,7 @@ fn decode_job_artifacts(raw: Option<&str>) -> Vec<JobArtifact> {
 /// Only a single-slash application route is linkable. Percent escapes are rejected rather than
 /// decoded here so encoded separators/traversal cannot disagree with the browser/router decoder.
 fn valid_artifact_route(route: &str) -> bool {
-    let path = route
-        .split(['?', '#'])
-        .next()
-        .unwrap_or_default();
+    let path = route.split(['?', '#']).next().unwrap_or_default();
     let known_surface = path == "/jobs"
         || path.starts_with("/jobs/")
         || path == "/reports"
@@ -456,7 +449,10 @@ mod tests {
             r"\server\share\report.json",
             "/jobs/%2e%2e/secret",
         ] {
-            assert!(!valid_artifact_route(unsafe_route), "accepted {unsafe_route}");
+            assert!(
+                !valid_artifact_route(unsafe_route),
+                "accepted {unsafe_route}"
+            );
         }
     }
 }

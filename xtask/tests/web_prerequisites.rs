@@ -51,10 +51,7 @@ fn wasm_rejects_an_unpinned_optimizer_toolchain() {
 fn web_fails_before_install_when_wasm_pack_is_missing() {
     use std::os::unix::fs::PermissionsExt;
 
-    let bin_dir = std::env::temp_dir().join(format!(
-        "3dam-xtask-test-pnpm-{}",
-        std::process::id()
-    ));
+    let bin_dir = std::env::temp_dir().join(format!("3dam-xtask-test-pnpm-{}", std::process::id()));
     std::fs::create_dir_all(&bin_dir).unwrap();
     let pnpm = bin_dir.join("pnpm");
     std::fs::write(&pnpm, "#!/bin/sh\nexit 0\n").unwrap();

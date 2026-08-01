@@ -678,13 +678,13 @@ impl LibraryService for ApiClient {
             .split_once('-')
             .ok_or_else(|| LibError::Upstream("range response has invalid Content-Range".into()))?;
         let first = first
-            .parse()
+            .parse::<u64>()
             .map_err(|_| LibError::Upstream("range response has invalid Content-Range".into()))?;
         let last = last
-            .parse()
+            .parse::<u64>()
             .map_err(|_| LibError::Upstream("range response has invalid Content-Range".into()))?;
         let total_len = total_len
-            .parse()
+            .parse::<u64>()
             .map_err(|_| LibError::Upstream("range response has invalid Content-Range".into()))?;
         if first != range.first() || last != range.last() {
             return Err(LibError::Upstream(
@@ -1327,7 +1327,9 @@ mod tests {
         }
         assert_eq!(received, b"abcdef");
         let request = request.await.unwrap();
-        assert!(request.to_ascii_lowercase().contains("range: bytes=10-15\r\n"));
+        assert!(request
+            .to_ascii_lowercase()
+            .contains("range: bytes=10-15\r\n"));
 
         let (endpoint, request) = range_server(
             "Content-Type: video/mp4\r\nContent-Length: 5\r\nContent-Range: bytes 10-15/300000000\r\nConnection: close\r\n",
@@ -1335,11 +1337,13 @@ mod tests {
         )
         .await;
         let client = ApiClient::connect(endpoint).await.unwrap();
-        let error = client
+        let error = match client
             .stream_content(&AuthContext::embedded(), &AssetId::new(), range)
             .await
-            .err()
-            .expect("mismatched Content-Length must fail before exposing a stream");
+        {
+            Ok(_) => panic!("mismatched Content-Length must fail before exposing a stream"),
+            Err(error) => error,
+        };
         assert!(matches!(error, LibError::Upstream(_)));
         request.await.unwrap();
 
@@ -1351,8 +1355,7 @@ mod tests {
         let error = client
             .fetch_bytes_bounded(client.http.get(client.url("content").unwrap()), 4)
             .await
-            .err()
-            .expect("actual streamed bytes must enforce the materialisation cap");
+            .expect_err("actual streamed bytes must enforce the materialisation cap");
         assert!(matches!(error, LibError::Unsupported(_)));
     }
 }

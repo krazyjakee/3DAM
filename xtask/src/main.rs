@@ -252,9 +252,10 @@ fn product_package(name: &str) -> bool {
     name == "dam" || name.starts_with("dam-")
 }
 
-fn dependency_drift(
-    metadata: &CargoMetadata,
-) -> (Vec<(String, String, bool)>, Vec<(String, String, bool)>) {
+type OwnedDependencyEdge = (String, String, bool);
+type DependencyDrift = (Vec<OwnedDependencyEdge>, Vec<OwnedDependencyEdge>);
+
+fn dependency_drift(metadata: &CargoMetadata) -> DependencyDrift {
     let packages: HashSet<&str> = metadata
         .packages
         .iter()

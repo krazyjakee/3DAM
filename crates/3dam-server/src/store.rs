@@ -199,7 +199,8 @@ impl ServerStore {
     fn from_conn(mut conn: Connection, path: Option<&Path>) -> Result<ServerStore, LibError> {
         // A second process opening the same data directory should wait for the short, serialized
         // migration transaction and then observe its version, not fail spuriously with SQLITE_BUSY.
-        conn.busy_timeout(Duration::from_secs(30)).map_err(internal)?;
+        conn.busy_timeout(Duration::from_secs(30))
+            .map_err(internal)?;
         // The accounts tables lean on cascading deletes (sessions/memberships/shares follow their
         // account or group); rusqlite leaves foreign keys off per SQLite default, so opt in.
         conn.pragma_update(None, "foreign_keys", "ON")

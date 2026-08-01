@@ -116,12 +116,7 @@ pub fn run(args: Vec<OsString>) -> u8 {
         )
         .menu(app_menu)
         .on_menu_event(move |app, event| {
-            handle_menu_event(
-                app,
-                event.id().as_ref(),
-                &zoom,
-                keychain_account.as_deref(),
-            )
+            handle_menu_event(app, event.id().as_ref(), &zoom, keychain_account.as_deref())
         })
         .setup(move |app| {
             let mut win = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url))
@@ -296,14 +291,20 @@ fn credential_account(url: &url::Url) -> String {
         "{}://{}{}{}",
         url.scheme(),
         url.host_str().unwrap_or_default(),
-        url.port().map(|port| format!(":{port}")).unwrap_or_default(),
+        url.port()
+            .map(|port| format!(":{port}"))
+            .unwrap_or_default(),
         url.path().trim_end_matches('/'),
     )
 }
 
 fn native_credential_script(url: &url::Url, secret: &str, forgettable: bool) -> String {
     let origin = url.origin().ascii_serialization();
-    let path = if url.path().is_empty() { "/" } else { url.path() };
+    let path = if url.path().is_empty() {
+        "/"
+    } else {
+        url.path()
+    };
     let base = path.trim_end_matches('/');
     include_str!("native-credential.js")
         .replace(
@@ -322,7 +323,10 @@ fn native_credential_script(url: &url::Url, secret: &str, forgettable: bool) -> 
             "__3DAM_BASE_JSON__",
             &serde_json::to_string(base).expect("string JSON"),
         )
-        .replace("__3DAM_FORGETTABLE_JSON__", if forgettable { "true" } else { "false" })
+        .replace(
+            "__3DAM_FORGETTABLE_JSON__",
+            if forgettable { "true" } else { "false" },
+        )
 }
 
 /// Boot the in-process server on a background thread — its own Tokio runtime, since the main thread

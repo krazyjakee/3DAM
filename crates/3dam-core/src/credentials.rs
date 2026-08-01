@@ -244,7 +244,9 @@ fn secure_directory_permissions(path: &Path, metadata: &std::fs::Metadata) -> Re
     let mut permissions = metadata.permissions();
     permissions.set_mode(0o700);
     std::fs::set_permissions(path, permissions).map_err(|_| {
-        secret_configuration_error("could not restrict the source credential directory to mode 0700")
+        secret_configuration_error(
+            "could not restrict the source credential directory to mode 0700",
+        )
     })?;
     let mode = std::fs::metadata(path)
         .map_err(|_| secret_configuration_error("could not verify source credential permissions"))?
@@ -259,7 +261,10 @@ fn secure_directory_permissions(path: &Path, metadata: &std::fs::Metadata) -> Re
 }
 
 #[cfg(not(unix))]
-fn secure_directory_permissions(_path: &Path, _metadata: &std::fs::Metadata) -> Result<(), LibError> {
+fn secure_directory_permissions(
+    _path: &Path,
+    _metadata: &std::fs::Metadata,
+) -> Result<(), LibError> {
     Err(secret_configuration_error(
         "the file credential backend is supported only on Unix; use the Windows credential store",
     ))
@@ -313,9 +318,9 @@ impl SecretVault {
         }
         #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
         {
-            return Ok(Self {
+            Ok(Self {
                 backend: Arc::new(KeyringBackend::new()),
-            });
+            })
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
         Err(secret_configuration_error(
@@ -354,7 +359,10 @@ impl SecretVault {
             .map_err(secret_operation_error)
     }
 
-    pub(crate) fn resolve(&self, mut connection: SourceConnection) -> Result<SourceConnection, LibError> {
+    pub(crate) fn resolve(
+        &self,
+        mut connection: SourceConnection,
+    ) -> Result<SourceConnection, LibError> {
         let Some(credential_ref) = connection.credential_ref().map(str::to_owned) else {
             return Ok(connection);
         };
@@ -379,8 +387,12 @@ fn secret_operation_error(error: SecretError) -> LibError {
     let message = match error {
         SecretError::Missing => "source credentials are missing; re-enter them",
         SecretError::Locked => "source credential store is locked; unlock it and retry",
-        SecretError::Unavailable => "source credential store is unavailable; retry or configure the headless backend",
-        SecretError::Invalid => "source credential entry is invalid; re-enter the source credentials",
+        SecretError::Unavailable => {
+            "source credential store is unavailable; retry or configure the headless backend"
+        }
+        SecretError::Invalid => {
+            "source credential entry is invalid; re-enter the source credentials"
+        }
     };
     LibError::SourceUnavailable(message.into())
 }
@@ -389,7 +401,10 @@ fn secret_operation_error(error: SecretError) -> LibError {
 /// all SQLite rows are then redacted in one transaction. Any pre-commit failure leaves the old rows
 /// untouched and open fails explicitly, so retrying after unlocking/fixing the backend cannot lose
 /// source availability.
-pub(crate) fn migrate_legacy_credentials(store: &Store, vault: &SecretVault) -> Result<(), LibError> {
+pub(crate) fn migrate_legacy_credentials(
+    store: &Store,
+    vault: &SecretVault,
+) -> Result<(), LibError> {
     if store.source_credentials_migrated()? {
         return Ok(());
     }
@@ -406,7 +421,10 @@ pub(crate) fn migrate_legacy_credentials(store: &Store, vault: &SecretVault) -> 
     }
     if !updates.is_empty() {
         store.rewrite_source_credentials(&updates)?;
-        tracing::info!(sources = updates.len(), "migrated source credentials out of library.db");
+        tracing::info!(
+            sources = updates.len(),
+            "migrated source credentials out of library.db"
+        );
     } else if !rows.is_empty() {
         // Retry path: a prior process may have committed the redacted rows but failed during the
         // physical free-page/WAL scrub before it could set the completion marker.
@@ -419,7 +437,10 @@ pub(crate) fn migrate_legacy_credentials(store: &Store, vault: &SecretVault) -> 
 /// Drain durable opaque-ref tombstones created by source removal/catalog reset. Deleting the host
 /// secret first and acknowledging the row second is retry-safe: a crash in between repeats an
 /// idempotent delete, while a locked backend leaves the reference queued for the next open.
-pub(crate) fn cleanup_pending_credentials(store: &Store, vault: &SecretVault) -> Result<(), LibError> {
+pub(crate) fn cleanup_pending_credentials(
+    store: &Store,
+    vault: &SecretVault,
+) -> Result<(), LibError> {
     for credential_ref in store.pending_source_credential_cleanup()? {
         vault.delete(&credential_ref)?;
         store.complete_source_credential_cleanup(&credential_ref)?;
@@ -498,14 +519,15 @@ mod tests {
         let vault = SecretVault::memory();
         migrate_legacy_credentials(&store, &vault).unwrap();
 
-        let (connection_json, auth_ref): (String, String) = Connection::open(data.path().join("library.db"))
-            .unwrap()
-            .query_row(
-                "SELECT connection, auth_ref FROM source WHERE id = ?1",
-                rusqlite::params![source.as_bytes().to_vec()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
+        let (connection_json, auth_ref): (String, String) =
+            Connection::open(data.path().join("library.db"))
+                .unwrap()
+                .query_row(
+                    "SELECT connection, auth_ref FROM source WHERE id = ?1",
+                    rusqlite::params![source.as_bytes().to_vec()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
         assert_eq!(auth_ref, SecretVault::reference(&source));
         assert!(!connection_json.contains(SENTINEL));
         assert!(!connection_json.contains("password"));
@@ -515,15 +537,20 @@ mod tests {
                 let path = data.path().join(format!("library.db{suffix}"));
                 if let Ok(raw) = std::fs::read(&path) {
                     assert!(
-                        !raw.windows(forbidden.len()).any(|window| window == forbidden.as_bytes()),
+                        !raw.windows(forbidden.len())
+                            .any(|window| window == forbidden.as_bytes()),
                         "SQLite artifact {} leaked {forbidden}",
                         path.display()
                     );
                 }
             }
         }
-        let hydrated = vault.resolve(store.get_source_connection(&source).unwrap()).unwrap();
-        let SourceConnection::Sftp(config) = hydrated else { panic!() };
+        let hydrated = vault
+            .resolve(store.get_source_connection(&source).unwrap())
+            .unwrap();
+        let SourceConnection::Sftp(config) = hydrated else {
+            panic!()
+        };
         assert_eq!(config.password.as_deref(), Some(SENTINEL));
         assert_eq!(config.passphrase.as_deref(), Some("legacy-passphrase"));
 
@@ -556,7 +583,9 @@ mod tests {
         )
         .unwrap();
         let artifact = std::fs::read(manifest).unwrap();
-        assert!(!artifact.windows(SENTINEL.len()).any(|window| window == SENTINEL.as_bytes()));
+        assert!(!artifact
+            .windows(SENTINEL.len())
+            .any(|window| window == SENTINEL.as_bytes()));
     }
 
     #[cfg(unix)]
@@ -567,14 +596,27 @@ mod tests {
         let root = parent.path().join("source-secrets");
         let vault = SecretVault::file(&root, data.path()).unwrap();
         let reference = SecretVault::reference(&SourceId::new());
-        vault.put(&reference, &SourceCredentials::Federated { token: "sentinel".into() }).unwrap();
+        vault
+            .put(
+                &reference,
+                &SourceCredentials::Federated {
+                    token: "sentinel".into(),
+                },
+            )
+            .unwrap();
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(std::fs::metadata(&root).unwrap().permissions().mode() & 0o777, 0o700);
+            assert_eq!(
+                std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
             let entry = std::fs::read_dir(&root).unwrap().next().unwrap().unwrap();
-            assert_eq!(entry.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                entry.metadata().unwrap().permissions().mode() & 0o777,
+                0o600
+            );
         }
         assert!(SecretVault::file(&data.path().join("secrets"), data.path()).is_err());
     }
@@ -603,9 +645,15 @@ mod tests {
             .unwrap();
 
         store.wipe_catalog().unwrap();
-        assert_eq!(store.pending_source_credential_cleanup().unwrap(), vec![reference.clone()]);
+        assert_eq!(
+            store.pending_source_credential_cleanup().unwrap(),
+            vec![reference.clone()]
+        );
         cleanup_pending_credentials(&store, &vault).unwrap();
-        assert!(store.pending_source_credential_cleanup().unwrap().is_empty());
+        assert!(store
+            .pending_source_credential_cleanup()
+            .unwrap()
+            .is_empty());
         assert_eq!(vault.backend.get(&reference), Err(SecretError::Missing));
     }
 

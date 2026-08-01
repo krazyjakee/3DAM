@@ -131,6 +131,7 @@ impl WatchManager {
         let scratch = self.scratch.clone();
         self.rt.spawn_blocking(move || {
             let (tx, mut rx) = mpsc::unbounded_channel::<()>();
+            let initial_scan = tx.clone();
             let mut watcher =
                 match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
                     // Only a genuine content mutation may trigger a re-scan. The inotify backend also
@@ -156,6 +157,11 @@ impl WatchManager {
                 return;
             }
 
+            // Reconcile once after registration. A file can be created after `add_source` returns
+            // but before the off-thread OS watch is live; that event cannot be replayed by notify.
+            // The initial delta is idempotent and closes that otherwise permanent missed-event gap.
+            let _ = initial_scan.send(());
+
             rt.spawn(async move {
                 while rx.recv().await.is_some() {
                     // Coalesce the burst: keep resetting the quiet timer until it elapses.
@@ -165,7 +171,9 @@ impl WatchManager {
                             more = rx.recv() => if more.is_none() { return },
                         }
                     }
-                    trigger_delta(&store, &secrets, &events, &in_flight, &governor, &scratch, id);
+                    trigger_delta(
+                        &store, &secrets, &events, &in_flight, &governor, &scratch, id,
+                    );
                 }
             });
             // Publish the live watcher, replacing the `Pending` reservation.
@@ -185,7 +193,9 @@ impl WatchManager {
         self.rt.spawn(async move {
             loop {
                 tokio::time::sleep(POLL_INTERVAL).await;
-                trigger_delta(&store, &secrets, &events, &in_flight, &governor, &scratch, id);
+                trigger_delta(
+                    &store, &secrets, &events, &in_flight, &governor, &scratch, id,
+                );
             }
         });
     }

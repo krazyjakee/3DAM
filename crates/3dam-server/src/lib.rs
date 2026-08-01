@@ -35,9 +35,9 @@ use dam_api::LibError;
 use dam_core::EmbeddedLibrary;
 use futures::StreamExt;
 use rust_embed::RustEmbed;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
@@ -344,16 +344,16 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .fallback(static_handler)
         // Record only the path, never the query. A WebSocket ticket is short-lived and one-use,
         // but defense in depth still keeps it out of debug spans and downstream diagnostics.
-        .layer(TraceLayer::new_for_http().make_span_with(
-            |request: &axum::http::Request<Body>| {
+        .layer(
+            TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<Body>| {
                 tracing::debug_span!(
                     "request",
                     method = %request.method(),
                     uri = %trace_path(request.uri()),
                     version = ?request.version(),
                 )
-            },
-        ))
+            }),
+        )
         .layer(CorsLayer::permissive())
         // Media has no URL credential and WebSockets carry only a derived one-use ticket. Keep the
         // no-referrer policy as another boundary against future sensitive URL material.
@@ -898,10 +898,13 @@ fn available_static_encoding(
     has_brotli: bool,
     has_gzip: bool,
 ) -> Option<StaticEncoding> {
-    candidates.iter().copied().find(|candidate| match candidate {
-        StaticEncoding::Brotli => has_brotli,
-        StaticEncoding::Gzip => has_gzip,
-    })
+    candidates
+        .iter()
+        .copied()
+        .find(|candidate| match candidate {
+            StaticEncoding::Brotli => has_brotli,
+            StaticEncoding::Gzip => has_gzip,
+        })
 }
 
 #[derive(Default)]
@@ -953,9 +956,7 @@ fn accepted_encodings(headers: &HeaderMap) -> AcceptedEncodings {
             let quality = encoding_qvalue(parts.next());
             let slot = if coding.eq_ignore_ascii_case("br") {
                 &mut accepted.brotli
-            } else if coding.eq_ignore_ascii_case("gzip")
-                || coding.eq_ignore_ascii_case("x-gzip")
-            {
+            } else if coding.eq_ignore_ascii_case("gzip") || coding.eq_ignore_ascii_case("x-gzip") {
                 &mut accepted.gzip
             } else if coding == "*" {
                 &mut accepted.wildcard
@@ -1002,7 +1003,11 @@ fn static_encoding_candidates(headers: &HeaderMap) -> Result<Vec<StaticEncoding>
     }
     let identity = accepted
         .identity
-        .unwrap_or(if accepted.wildcard == Some(0) { 0 } else { 1000 });
+        .unwrap_or(if accepted.wildcard == Some(0) {
+            0
+        } else {
+            1000
+        });
     if identity == 0 {
         Err(())
     } else {
@@ -1025,15 +1030,14 @@ fn serve_embedded(path: &str, request_headers: &HeaderMap) -> Option<Response> {
     let brotli = WebAssets::get(&format!("{path}.br"));
     let gzip = WebAssets::get(&format!("{path}.gz"));
     let has_encoded_variants = brotli.is_some() || gzip.is_some();
-    let encoded = available_static_encoding(&candidates, brotli.is_some(), gzip.is_some()).map(
-        |encoding| {
+    let encoded =
+        available_static_encoding(&candidates, brotli.is_some(), gzip.is_some()).map(|encoding| {
             let file = match encoding {
                 StaticEncoding::Brotli => brotli.unwrap(),
                 StaticEncoding::Gzip => gzip.unwrap(),
             };
             (encoding, file)
-        },
-    );
+        });
     let mut response = (
         [
             (header::CONTENT_TYPE, mime),
@@ -1278,9 +1282,11 @@ fn streamed_content_response(
     let headers = response.headers_mut();
     headers.insert(
         header::CONTENT_TYPE,
-        content.metadata.content_type.parse().unwrap_or_else(|_| {
-            header::HeaderValue::from_static("application/octet-stream")
-        }),
+        content
+            .metadata
+            .content_type
+            .parse()
+            .unwrap_or_else(|_| header::HeaderValue::from_static("application/octet-stream")),
     );
     headers.insert(
         header::CACHE_CONTROL,
@@ -1299,7 +1305,9 @@ fn streamed_content_response(
             header::CONTENT_RANGE,
             header::HeaderValue::from_str(&format!(
                 "bytes {}-{}/{}",
-                content.range.first(), content.range.last(), content.metadata.len
+                content.range.first(),
+                content.range.last(),
+                content.metadata.len
             ))
             .unwrap(),
         );
@@ -1323,9 +1331,10 @@ fn metadata_only_response(
     let headers = response.headers_mut();
     headers.insert(
         header::CONTENT_TYPE,
-        metadata.content_type.parse().unwrap_or_else(|_| {
-            header::HeaderValue::from_static("application/octet-stream")
-        }),
+        metadata
+            .content_type
+            .parse()
+            .unwrap_or_else(|_| header::HeaderValue::from_static("application/octet-stream")),
     );
     headers.insert(
         header::CACHE_CONTROL,
@@ -1401,12 +1410,10 @@ async fn asset_content(
         .and_then(|value| value.to_str().ok())
         .filter(|_| if_range_matches(&headers, &metadata));
     let (status, range) = match range.map(|value| parse_range(value, metadata.len)) {
-        Some(RangeSpec::Satisfiable(first, last)) => {
-            (
-                StatusCode::PARTIAL_CONTENT,
-                ContentRange::new(first, last).expect("a satisfiable range is ordered"),
-            )
-        }
+        Some(RangeSpec::Satisfiable(first, last)) => (
+            StatusCode::PARTIAL_CONTENT,
+            ContentRange::new(first, last).expect("a satisfiable range is ordered"),
+        ),
         Some(RangeSpec::Unsatisfiable) => {
             return Ok(metadata_only_response(
                 &metadata,
@@ -1892,7 +1899,10 @@ async fn mint_ws_ticket(headers: HeaderMap, State(st): State<AppState>) -> Respo
     let now = Instant::now();
     let mut tickets = match st.ws_tickets.lock() {
         Ok(tickets) => tickets,
-        Err(_) => return ApiError(LibError::Internal("ticket service unavailable".into())).into_response(),
+        Err(_) => {
+            return ApiError(LibError::Internal("ticket service unavailable".into()))
+                .into_response()
+        }
     };
     tickets.retain(|_, value| value.expires > now);
     if tickets.len() >= MAX_ACTIVE_TICKETS {
@@ -1929,16 +1939,22 @@ fn allowed_media_target(target: &str) -> bool {
     if uri.scheme().is_some() || uri.authority().is_some() {
         return false;
     }
-    let segments: Vec<_> = uri.path().split('/').filter(|part| !part.is_empty()).collect();
+    let segments: Vec<_> = uri
+        .path()
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
     if segments.len() != 5
         || segments[..3] != ["api", "v1", "assets"]
         || segments[3].parse::<AssetId>().is_err()
-        || !matches!(segments[4], "content" | "related" | "preview-mesh" | "thumbnail")
+        || !matches!(
+            segments[4],
+            "content" | "related" | "preview-mesh" | "thumbnail"
+        )
     {
         return false;
     }
-    !uri
-        .query()
+    !uri.query()
         .unwrap_or_default()
         .split('&')
         .any(|pair| pair.starts_with("ticket=") || pair.starts_with("token="))
@@ -1964,7 +1980,10 @@ async fn mint_media_ticket(
     let now = Instant::now();
     let mut tickets = match st.media_tickets.lock() {
         Ok(tickets) => tickets,
-        Err(_) => return ApiError(LibError::Internal("ticket service unavailable".into())).into_response(),
+        Err(_) => {
+            return ApiError(LibError::Internal("ticket service unavailable".into()))
+                .into_response()
+        }
     };
     tickets.retain(|_, value| value.expires > now);
     if tickets.len() >= MAX_ACTIVE_TICKETS {
@@ -2051,7 +2070,10 @@ async fn ws_handler(
 ) -> Response {
     let ticket = match st.ws_tickets.lock() {
         Ok(mut tickets) => tickets.remove(&ticket_key(&q.ticket)),
-        Err(_) => return ApiError(LibError::Internal("ticket service unavailable".into())).into_response(),
+        Err(_) => {
+            return ApiError(LibError::Internal("ticket service unavailable".into()))
+                .into_response()
+        }
     };
     let Some(ticket) = ticket.filter(|ticket| ticket.expires > Instant::now()) else {
         return ApiError(LibError::Unauthorized).into_response();
@@ -2215,11 +2237,10 @@ mod tests {
     #[test]
     fn credential_material_is_absent_from_traced_targets() {
         let sentinel = "dam_XSS_SENTINEL_DO_NOT_LOG";
-        let uri: axum::http::Uri = format!(
-            "/api/v1/ws?ticket=dam_ws_short&token={sentinel}&diagnostic={sentinel}"
-        )
-        .parse()
-        .unwrap();
+        let uri: axum::http::Uri =
+            format!("/api/v1/ws?ticket=dam_ws_short&token={sentinel}&diagnostic={sentinel}")
+                .parse()
+                .unwrap();
         assert_eq!(trace_path(&uri), "/api/v1/ws");
         assert!(!trace_path(&uri).contains(sentinel));
     }
@@ -2242,7 +2263,9 @@ mod tests {
         assert!(!allowed_media_target(&format!(
             "/api/v1/assets/{id}/content?token=dam_secret"
         )));
-        assert!(!allowed_media_target("https://other.test/api/v1/assets/x/content"));
+        assert!(!allowed_media_target(
+            "https://other.test/api/v1/assets/x/content"
+        ));
     }
 
     fn accepted(value: &'static str) -> HeaderMap {
@@ -2283,12 +2306,16 @@ mod tests {
         }
         let response = serve_embedded("index.html", &accepted("identity")).unwrap();
         assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
-        assert!(response.headers().get_all(header::VARY).iter().any(|value| {
-            value
-                .to_str()
-                .unwrap_or_default()
-                .eq_ignore_ascii_case("accept-encoding")
-        }));
+        assert!(response
+            .headers()
+            .get_all(header::VARY)
+            .iter()
+            .any(|value| {
+                value
+                    .to_str()
+                    .unwrap_or_default()
+                    .eq_ignore_ascii_case("accept-encoding")
+            }));
     }
 
     #[tokio::test]
@@ -2320,7 +2347,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.headers().get(header::CONTENT_ENCODING).unwrap(), "gzip");
+        assert_eq!(
+            response.headers().get(header::CONTENT_ENCODING).unwrap(),
+            "gzip"
+        );
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();

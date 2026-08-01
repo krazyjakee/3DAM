@@ -98,7 +98,7 @@ pub trait FileSource: Send + Sync {
         length: u64,
         sink: &mut dyn FnMut(Vec<u8>) -> bool,
     ) -> Result<(), LibError> {
-        use std::io::{Read, Seek};
+        use std::io::Seek;
 
         let fetched = self.fetch(rel_path)?;
         let mut file = std::fs::File::open(fetched.path())
@@ -238,8 +238,12 @@ pub enum SourceCredentials {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         passphrase: Option<String>,
     },
-    Smb { password: String },
-    Federated { token: String },
+    Smb {
+        password: String,
+    },
+    Federated {
+        token: String,
+    },
 }
 
 impl std::fmt::Debug for SourceCredentials {
@@ -616,9 +620,7 @@ fn parse_connection_url(uri: &str, scheme: &str) -> Result<Url, LibError> {
     let parsed = Url::parse(uri)
         .map_err(|_| LibError::BadRequest(format!("invalid {scheme} source uri")))?;
     if parsed.scheme() != scheme || parsed.query().is_some() || parsed.fragment().is_some() {
-        return Err(LibError::BadRequest(format!(
-            "invalid {scheme} source uri"
-        )));
+        return Err(LibError::BadRequest(format!("invalid {scheme} source uri")));
     }
     Ok(parsed)
 }
@@ -659,7 +661,8 @@ fn decode_component(value: &str, scheme: &str) -> Result<String, LibError> {
     while i < bytes.len() {
         if bytes[i] == b'%' {
             let hex = &value[i + 1..i + 3];
-            decoded.push(u8::from_str_radix(hex, 16).expect("escapes validated before URL parsing"));
+            decoded
+                .push(u8::from_str_radix(hex, 16).expect("escapes validated before URL parsing"));
             i += 3;
         } else {
             decoded.push(bytes[i]);
@@ -729,19 +732,6 @@ fn parse_federated(uri: &str, opts: &ConnOptions) -> Result<SourceConnection, Li
     }))
 }
 
-fn split_once_or<'a>(s: &'a str, sep: char, default: (&'a str, &'a str)) -> (&'a str, &'a str) {
-    match s.split_once(sep) {
-        Some((a, b)) => (a, b),
-        None => {
-            if default.0.is_empty() && default.1.is_empty() {
-                (s, "")
-            } else {
-                default
-            }
-        }
-    }
-}
-
 /// Validate and normalise a source-relative path before any backend sees it.
 ///
 /// This is deliberately a path-*geometry* check, not the stricter upload naming policy: an existing
@@ -767,10 +757,9 @@ pub(crate) fn guard_rel_path(rel_path: &str) -> Result<String, LibError> {
     // Reject every URI-scheme shape, not only `://`: `file:/x` and `file:x` are URLs too.
     if let Some((scheme, _)) = rel_path.split_once(':') {
         if !scheme.is_empty()
-            && scheme
-                .chars()
-                .enumerate()
-                .all(|(i, c)| c.is_ascii_alphabetic() || (i > 0 && (c.is_ascii_digit() || "+-.".contains(c))))
+            && scheme.chars().enumerate().all(|(i, c)| {
+                c.is_ascii_alphabetic() || (i > 0 && (c.is_ascii_digit() || "+-.".contains(c)))
+            })
         {
             return Err(reject());
         }
@@ -930,6 +919,7 @@ pub struct LocalFsSource {
 impl LocalFsSource {
     /// Construct only for metadata/writability operations which cannot fetch. Byte-bearing callers
     /// must come through [`open_source`], where configured scratch is mandatory.
+    #[cfg(test)]
     fn without_scratch(root: impl Into<PathBuf>) -> LocalFsSource {
         let supplied = root.into();
         let root = supplied.canonicalize().unwrap_or(supplied);
@@ -971,7 +961,10 @@ fn open_registered_root(root: &Path) -> Option<cap_std::fs::Dir> {
 
     let mut components = root.components().peekable();
     let mut anchor = PathBuf::new();
-    while matches!(components.peek(), Some(Component::Prefix(_) | Component::RootDir)) {
+    while matches!(
+        components.peek(),
+        Some(Component::Prefix(_) | Component::RootDir)
+    ) {
         anchor.push(components.next()?.as_os_str());
     }
     if anchor.as_os_str().is_empty() {
@@ -996,7 +989,14 @@ impl FileSource for LocalFsSource {
         let root = self.cap_root()?;
         let mut stack = vec![PathBuf::new()];
         while let Some(rel_dir) = stack.pop() {
-            let entries = root.read_dir(&rel_dir).map_err(|_| {
+            // `cap_std` treats an empty relative path as ENOENT; `.` names the already-pinned root
+            // without changing the catalog paths yielded below.
+            let read_dir = if rel_dir.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                &rel_dir
+            };
+            let entries = root.read_dir(read_dir).map_err(|_| {
                 LibError::SourceUnavailable("registered local source root is unavailable".into())
             })?;
             for entry in entries {
@@ -1024,7 +1024,12 @@ impl FileSource for LocalFsSource {
                     // metadata call after `file_type` would be another swap window (and could
                     // disclose an external target's size/mtime even though fetch later refused it).
                     let (size, modified_ms) = match entry.open().and_then(|file| file.metadata()) {
-                        Ok(meta) => (meta.len(), meta.modified().ok().and_then(system_time_ms)),
+                        Ok(meta) => (
+                            meta.len(),
+                            meta.modified()
+                                .ok()
+                                .and_then(|time| system_time_ms(time.into_std())),
+                        ),
                         Err(_) => (0, None),
                     };
                     if !sink(Ok(FileEntry {
@@ -1053,7 +1058,10 @@ impl FileSource for LocalFsSource {
             .map_err(|_| LibError::NotFound("source file is unavailable".into()))?;
         Ok(ContentStat {
             len: metadata.len(),
-            modified_ms: metadata.modified().ok().and_then(system_time_ms),
+            modified_ms: metadata
+                .modified()
+                .ok()
+                .and_then(|time| system_time_ms(time.into_std())),
         })
     }
 
@@ -1148,7 +1156,10 @@ impl LocalFsSource {
         use std::io::Write;
         let root = self.cap_root()?;
         before_create();
-        if let Some(parent) = Path::new(rel).parent().filter(|p| !p.as_os_str().is_empty()) {
+        if let Some(parent) = Path::new(rel)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+        {
             root.create_dir_all(parent).map_err(|_| {
                 LibError::BadRequest("destination must stay within its source root".into())
             })?;
@@ -1158,7 +1169,10 @@ impl LocalFsSource {
         // cap-std performs component resolution beneath the root handle on Unix and Windows and
         // refuses a link which would leave it.
         let temp_name = format!(".3dam-upload-{}", uuid::Uuid::now_v7());
-        let temp_rel = match Path::new(rel).parent().filter(|p| !p.as_os_str().is_empty()) {
+        let temp_rel = match Path::new(rel)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+        {
             Some(parent) => parent.join(temp_name),
             None => PathBuf::from(temp_name),
         };
@@ -1175,20 +1189,20 @@ impl LocalFsSource {
             file.sync_all()
                 .map_err(|e| LibError::Internal(format!("fsync {rel}: {e}")))?;
 
-        // Widen the mode *before* the rename, so the file is never visible at its real name with
-        // the wrong permissions.
-        //
-        // `tempfile` creates at 0600 — correct for a temp file, wrong for the asset it becomes. A
-        // source is a shared project folder whose other files are 0644; an uploaded texture only
-        // the server's uid can read is one nobody else on the machine, and no DCC tool running as
-        // another user, can open. Applying the umask (0666 &! umask) would be more faithful still,
-        // but reading the umask means temporarily setting it, which races every other thread in the
-        // process — so this takes the conventional default rather than a racy approximation of it.
-        //
-        // Through the open descriptor, not the path: the destination is a user-chosen directory
-        // that may be group- or world-writable, and a path-based `set_permissions` there could be
-        // redirected by someone swapping the temp name for a symlink between creation and this
-        // call. The fd already refers to the file we made, so there is nothing to redirect.
+            // Widen the mode *before* the rename, so the file is never visible at its real name with
+            // the wrong permissions.
+            //
+            // `tempfile` creates at 0600 — correct for a temp file, wrong for the asset it becomes. A
+            // source is a shared project folder whose other files are 0644; an uploaded texture only
+            // the server's uid can read is one nobody else on the machine, and no DCC tool running as
+            // another user, can open. Applying the umask (0666 &! umask) would be more faithful still,
+            // but reading the umask means temporarily setting it, which races every other thread in the
+            // process — so this takes the conventional default rather than a racy approximation of it.
+            //
+            // Through the open descriptor, not the path: the destination is a user-chosen directory
+            // that may be group- or world-writable, and a path-based `set_permissions` there could be
+            // redirected by someone swapping the temp name for a symlink between creation and this
+            // call. The fd already refers to the file we made, so there is nothing to redirect.
             #[cfg(unix)]
             {
                 use cap_std::fs::PermissionsExt;
@@ -1206,7 +1220,7 @@ impl LocalFsSource {
         // Publishing is an atomic, no-clobber hard link: if the destination exists, the kernel
         // refuses the link; if it does not, readers see the fully written and synced inode in one
         // step. Both names are resolved relative to the same capability, closing symlink swaps.
-        let published = root.hard_link(&temp_rel, root, &rel).map_err(|e| {
+        let published = root.hard_link(&temp_rel, root, rel).map_err(|e| {
             if e.kind() == std::io::ErrorKind::AlreadyExists {
                 LibError::Conflict(format!("{rel} already exists"))
             } else {
@@ -1391,10 +1405,7 @@ mod tests {
         assert_eq!(cfg.password.as_deref(), Some("p@ss"));
         assert_eq!(cfg.share, "team share");
         assert_eq!(cfg.base_path, "art work");
-        assert_eq!(
-            c.display_uri(),
-            "smb://[::1]:1445/team%20share/art%20work"
-        );
+        assert_eq!(c.display_uri(), "smb://[::1]:1445/team%20share/art%20work");
 
         let reparsed = SourceConnection::parse("smb", &c.display_uri(), &ConnOptions::default())
             .expect("sanitized SMB display URI must remain parseable");
@@ -1433,9 +1444,21 @@ mod tests {
     fn malformed_remote_authorities_are_secret_free_bad_requests() {
         for (kind, uri, secret) in [
             ("sftp", "sftp://user:top-secret@[::1/assets", "top-secret"),
-            ("sftp", "sftp://user:top-secret@host:nope/assets", "top-secret"),
-            ("sftp", "sftp://user:top-secret@host:70000/assets", "top-secret"),
-            ("sftp", "sftp://user:top%ZZsecret@host/assets", "top%ZZsecret"),
+            (
+                "sftp",
+                "sftp://user:top-secret@host:nope/assets",
+                "top-secret",
+            ),
+            (
+                "sftp",
+                "sftp://user:top-secret@host:70000/assets",
+                "top-secret",
+            ),
+            (
+                "sftp",
+                "sftp://user:top%ZZsecret@host/assets",
+                "top%ZZsecret",
+            ),
             ("smb", "smb://[::1/share", ""),
             ("smb", "smb://host:not-a-port/share", ""),
         ] {
@@ -1484,7 +1507,10 @@ mod tests {
         let json = serde_json::to_string(&connection).unwrap();
         let debug = format!("{connection:?}");
         for forbidden in [SENTINEL, "/private/sentinel", "sentinel-passphrase"] {
-            assert!(!json.contains(forbidden), "portable JSON leaked {forbidden}");
+            assert!(
+                !json.contains(forbidden),
+                "portable JSON leaked {forbidden}"
+            );
             assert!(!debug.contains(forbidden), "Debug leaked {forbidden}");
         }
         assert!(!json.contains("password"));
@@ -1509,22 +1535,27 @@ mod tests {
             ".",
         ] {
             let error = guard_rel_path(bad).unwrap_err();
-            assert!(matches!(error, LibError::BadRequest(_)), "{bad:?}: {error}");
-            assert!(!error.to_string().contains(bad), "escape was echoed: {error}");
+            let LibError::BadRequest(message) = error else {
+                panic!("{bad:?} produced the wrong error category: {error}");
+            };
+            assert_eq!(
+                message, "asset path must stay within its source root",
+                "the generic refusal must not echo {bad:?}"
+            );
         }
         assert_eq!(guard_rel_path("a/./b//c.png").unwrap(), "a/b/c.png");
 
         // Existing-file reads do not inherit upload's cross-platform *creation* policy.
         for valid_posix_name in ["CON", "report.", "photo\u{202e}gnp.exe"] {
-            assert!(guard_rel_path(valid_posix_name).is_ok(), "{valid_posix_name:?}");
+            assert!(
+                guard_rel_path(valid_posix_name).is_ok(),
+                "{valid_posix_name:?}"
+            );
         }
     }
 
     fn fetched_local(root: &Path, scratch: &Path) -> LocalFsSource {
-        LocalFsSource::registered(
-            root.canonicalize().unwrap(),
-            Some(scratch.to_path_buf()),
-        )
+        LocalFsSource::registered(root.canonicalize().unwrap(), Some(scratch.to_path_buf()))
     }
 
     #[test]
@@ -1536,6 +1567,25 @@ mod tests {
         let fetched = source.fetch("asset.bin").unwrap();
         assert_eq!(std::fs::read(fetched.path()).unwrap(), b"inside");
         assert_eq!(fetched.path().parent(), Some(scratch.path()));
+    }
+
+    #[test]
+    fn local_walk_reads_the_pinned_root_and_yields_root_relative_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("nested")).unwrap();
+        std::fs::write(root.path().join("asset.bin"), b"root").unwrap();
+        std::fs::write(root.path().join("nested/asset.bin"), b"nested").unwrap();
+        let source = fetched_local(root.path(), scratch.path());
+        let mut paths = Vec::new();
+        source
+            .walk(&mut |entry| {
+                paths.push(entry.unwrap().rel_path);
+                true
+            })
+            .unwrap();
+        paths.sort();
+        assert_eq!(paths, ["asset.bin", "nested/asset.bin"]);
     }
 
     #[test]
@@ -1572,15 +1622,10 @@ mod tests {
 
         let mut yielded = 0;
         source
-            .read_range(
-                "large-video.mp4",
-                0,
-                (FETCH_CHUNK * 3) as u64,
-                &mut |_| {
-                    yielded += 1;
-                    false
-                },
-            )
+            .read_range("large-video.mp4", 0, (FETCH_CHUNK * 3) as u64, &mut |_| {
+                yielded += 1;
+                false
+            })
             .unwrap();
         assert_eq!(yielded, 1, "receiver drop must stop the source loop");
     }
@@ -1650,11 +1695,11 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), &root).unwrap();
 
         // Rebuilding a backend from the persisted canonical connection refuses the replacement.
-        let source = LocalFsSource::registered(
-            registered_root,
-            Some(scratch.path().to_path_buf()),
-        );
-        assert!(matches!(source.fetch("asset.bin"), Err(LibError::SourceUnavailable(_))));
+        let source = LocalFsSource::registered(registered_root, Some(scratch.path().to_path_buf()));
+        assert!(matches!(
+            source.fetch("asset.bin"),
+            Err(LibError::SourceUnavailable(_))
+        ));
         assert!(source.put("stolen.bin", &mut &b"x"[..]).is_err());
         assert!(!outside.path().join("stolen.bin").exists());
 
@@ -1848,7 +1893,10 @@ mod tests {
         let err = src.put("escape/stolen.png", &mut &b"x"[..]).unwrap_err();
         assert!(matches!(err, LibError::BadRequest(_)), "got {err:?}");
         let mkdir_err = src.mkdir("escape/stolen-folder").unwrap_err();
-        assert!(matches!(mkdir_err, LibError::BadRequest(_)), "got {mkdir_err:?}");
+        assert!(
+            matches!(mkdir_err, LibError::BadRequest(_)),
+            "got {mkdir_err:?}"
+        );
         assert!(
             !outside.path().join("stolen.png").exists()
                 && !outside.path().join("stolen-folder").exists(),

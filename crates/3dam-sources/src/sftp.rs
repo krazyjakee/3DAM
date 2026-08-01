@@ -210,9 +210,10 @@ impl FileSource for SftpSource {
         let abs = self.remote_path(&rel_path);
         self.rt.block_on(async {
             let session = self.session.lock().await;
-            let metadata = session.metadata(abs.clone()).await.map_err(|e| {
-                LibError::SourceUnavailable(format!("sftp stat {abs}: {e}"))
-            })?;
+            let metadata = session
+                .metadata(abs.clone())
+                .await
+                .map_err(|e| LibError::SourceUnavailable(format!("sftp stat {abs}: {e}")))?;
             Ok(ContentStat {
                 len: metadata.len(),
                 modified_ms: metadata.modified().ok().and_then(crate::system_time_ms),
@@ -233,9 +234,10 @@ impl FileSource for SftpSource {
             use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
             let session = self.session.lock().await;
-            let mut remote = session.open(abs.clone()).await.map_err(|e| {
-                LibError::SourceUnavailable(format!("sftp open {abs}: {e}"))
-            })?;
+            let mut remote = session
+                .open(abs.clone())
+                .await
+                .map_err(|e| LibError::SourceUnavailable(format!("sftp open {abs}: {e}")))?;
             remote
                 .seek(std::io::SeekFrom::Start(offset))
                 .await

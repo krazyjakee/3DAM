@@ -76,6 +76,9 @@ fn visual_fixture_manifest_covers_both_browser_backends_and_material_modes() {
         "alpha-blend",
         "material-batching",
     ] {
-        assert!(manifest.contains(token), "visual fixture manifest lost `{token}`");
+        assert!(
+            manifest.contains(token),
+            "visual fixture manifest lost `{token}`"
+        );
     }
 }

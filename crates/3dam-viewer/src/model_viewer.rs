@@ -115,18 +115,9 @@ impl ModelViewer {
     /// Full DOM-driven camera pose. Pan is expressed in viewport fractions, so the same two-finger
     /// or keyboard movement feels consistent across canvas sizes and authored model scales.
     #[wasm_bindgen(js_name = setCameraPose)]
-    pub fn set_camera_pose(
-        &self,
-        yaw: f32,
-        pitch: f32,
-        zoom: f32,
-        pan_x: f32,
-        pan_y: f32,
-    ) {
+    pub fn set_camera_pose(&self, yaw: f32, pitch: f32, zoom: f32, pan_x: f32, pan_y: f32) {
         let mut inner = self.inner.borrow_mut();
-        inner
-            .camera
-            .update_pose(yaw, pitch, zoom, pan_x, pan_y);
+        inner.camera.update_pose(yaw, pitch, zoom, pan_x, pan_y);
         inner.dirty = true;
     }
 

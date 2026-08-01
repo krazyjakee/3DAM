@@ -178,8 +178,8 @@ async fn claim(
         let _permit = permit;
         store.claim(&req, "claim")
     })
-        .await
-        .map_err(|e| ApiError(LibError::Internal(e.to_string())))??;
+    .await
+    .map_err(|e| ApiError(LibError::Internal(e.to_string())))??;
     let ident = AccountIdentity {
         account_id: account.account_id.clone(),
         username: account.username.clone(),

@@ -14,6 +14,7 @@ pub fn orbit_direction(yaw: f32, pitch: f32) -> [f32; 3] {
     ]
 }
 
+#[cfg(test)]
 pub fn canonical_direction() -> [f32; 3] {
     orbit_direction(DEFAULT_YAW, DEFAULT_PITCH)
 }

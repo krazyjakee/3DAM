@@ -65,7 +65,10 @@ mod tests {
         let result = plan(&items);
         assert_eq!(result.opaque_groups.len(), 4);
         assert_eq!(result.blended.len(), 6);
-        assert_eq!(result.opaque_groups.iter().map(Vec::len).sum::<usize>(), 120);
+        assert_eq!(
+            result.opaque_groups.iter().map(Vec::len).sum::<usize>(),
+            120
+        );
         assert_eq!(result.opaque_groups.len() + result.blended.len(), 10);
     }
 }

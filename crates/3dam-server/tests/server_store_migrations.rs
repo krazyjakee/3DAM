@@ -96,9 +96,11 @@ fn every_unversioned_historical_shape_upgrades_without_losing_secrets() {
             .unwrap();
         assert_eq!(flag, ("\"token\"".into(), 7, "fixture-admin".into()));
         assert_eq!(
-            conn.query_row("SELECT secret_hash FROM token WHERE token_id='token-1'", [], |row| {
-                row.get::<_, String>(0)
-            })
+            conn.query_row(
+                "SELECT secret_hash FROM token WHERE token_id='token-1'",
+                [],
+                |row| { row.get::<_, String>(0) }
+            )
             .unwrap(),
             "token-secret-hash"
         );
@@ -190,7 +192,8 @@ fn every_unversioned_historical_shape_upgrades_without_losing_secrets() {
         }
         assert_eq!(
             backup
-                .query_row("SELECT secret_hash FROM token", [], |row| row.get::<_, String>(0))
+                .query_row("SELECT secret_hash FROM token", [], |row| row
+                    .get::<_, String>(0))
                 .unwrap(),
             "token-secret-hash"
         );
@@ -252,7 +255,8 @@ fn schema_from_a_newer_binary_is_refused_without_partial_open() {
 
     let conn = Connection::open(path).unwrap();
     assert_eq!(
-        conn.query_row("SELECT value FROM future_secret", [], |row| row.get::<_, String>(0))
+        conn.query_row("SELECT value FROM future_secret", [], |row| row
+            .get::<_, String>(0))
             .unwrap(),
         "keep-me"
     );

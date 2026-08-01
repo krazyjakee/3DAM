@@ -132,9 +132,18 @@ async fn large_content_supports_head_validators_ranges_and_fail_soft_fallbacks()
         fixture.total.to_string().as_str()
     );
     assert_eq!(head.headers().get(header::ACCEPT_RANGES).unwrap(), "bytes");
-    let etag = head.headers().get(header::ETAG).unwrap().to_str().unwrap().to_string();
+    let etag = head
+        .headers()
+        .get(header::ETAG)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
     assert!(
-        axum::body::to_bytes(head.into_body(), 1).await.unwrap().is_empty(),
+        axum::body::to_bytes(head.into_body(), 1)
+            .await
+            .unwrap()
+            .is_empty(),
         "HEAD must not open or emit content bytes"
     );
 
@@ -185,7 +194,10 @@ async fn large_content_supports_head_validators_ranges_and_fail_soft_fallbacks()
         )
         .as_str()
     );
-    assert_eq!(partial.headers().get(header::CONTENT_LENGTH).unwrap(), "4096");
+    assert_eq!(
+        partial.headers().get(header::CONTENT_LENGTH).unwrap(),
+        "4096"
+    );
     let bytes = axum::body::to_bytes(partial.into_body(), 4096)
         .await
         .unwrap();
@@ -230,7 +242,10 @@ async fn large_content_supports_head_validators_ranges_and_fail_soft_fallbacks()
             let range = format!("bytes={first}-{}", first + 1023);
             let response = request(&app, Method::GET, &uri, &[("range", &range)]).await;
             assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
-            assert_eq!(response.headers().get(header::CONTENT_LENGTH).unwrap(), "1024");
+            assert_eq!(
+                response.headers().get(header::CONTENT_LENGTH).unwrap(),
+                "1024"
+            );
             axum::body::to_bytes(response.into_body(), 1024)
                 .await
                 .unwrap()

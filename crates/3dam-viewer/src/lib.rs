@@ -6,6 +6,7 @@
 //!
 //! - [`ModelViewer`] — the interactive 3D viewer (server-decoded `DMSH` mesh → textured PBR orbit
 //!   view; every Assimp format, with materials).
+//!
 //! Audio waveforms use the web client's lightweight Canvas2D path, so audio does not pay the wgpu
 //! download/initialisation cost. Thumbnails stay *server-rendered* previews.
 //!
@@ -46,12 +47,10 @@ pub use native_stub::NOT_ON_NATIVE;
 
 #[cfg(any(target_arch = "wasm32", test))]
 mod batching;
-#[cfg(any(target_arch = "wasm32", test))]
-mod framing;
-#[cfg(any(target_arch = "wasm32", test))]
-mod render_quality;
 #[cfg(target_arch = "wasm32")]
 mod camera;
+#[cfg(target_arch = "wasm32")]
+mod framing;
 #[cfg(target_arch = "wasm32")]
 mod gpu;
 #[cfg(target_arch = "wasm32")]
@@ -60,6 +59,8 @@ mod model_viewer;
 mod preview_mesh;
 #[cfg(target_arch = "wasm32")]
 mod raf;
+#[cfg(any(target_arch = "wasm32", test))]
+mod render_quality;
 #[cfg(target_arch = "wasm32")]
 mod scene;
 

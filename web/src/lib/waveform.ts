@@ -45,7 +45,7 @@ export function expandSymmetricPeaks(peaks: readonly number[]): Float32Array {
   const samples = new Float32Array(peaks.length * 2);
   for (let index = 0; index < peaks.length; index++) {
     const peak = Math.max(0, Math.min(1, Number(peaks[index]) || 0));
-    samples[index * 2] = -peak;
+    samples[index * 2] = peak === 0 ? 0 : -peak;
     samples[index * 2 + 1] = peak;
   }
   return samples;

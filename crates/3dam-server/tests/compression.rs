@@ -5,7 +5,9 @@
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use axum::response::Response;
-use dam_api::dto::{AddSource, JobState, QueryRequest, ScanMode, ScanRequest, SourceKind, SourceOptions};
+use dam_api::dto::{
+    AddSource, JobState, QueryRequest, ScanMode, ScanRequest, SourceKind, SourceOptions,
+};
 use dam_api::service::{AuthContext, LibraryService};
 use dam_core::EmbeddedLibrary;
 use dam_server::{router, ServerStore};
@@ -72,13 +74,17 @@ fn decode_gzip(input: &[u8]) -> Vec<u8> {
 }
 
 fn varies_on_accept_encoding(response: &Response) -> bool {
-    response.headers().get_all(header::VARY).iter().any(|value| {
-        value
-            .to_str()
-            .unwrap_or_default()
-            .split(',')
-            .any(|name| name.trim().eq_ignore_ascii_case("accept-encoding"))
-    })
+    response
+        .headers()
+        .get_all(header::VARY)
+        .iter()
+        .any(|value| {
+            value
+                .to_str()
+                .unwrap_or_default()
+                .split(',')
+                .any(|name| name.trim().eq_ignore_ascii_case("accept-encoding"))
+        })
 }
 
 #[tokio::test]
@@ -135,12 +141,9 @@ async fn range_body_is_never_recompressed() {
     std::fs::write(source.join("large.txt"), &original).unwrap();
 
     let library = Arc::new(
-        EmbeddedLibrary::open_with(
-            &root.join("data"),
-            dam_core::ResourceOptions::ungoverned(),
-        )
-        .await
-        .unwrap(),
+        EmbeddedLibrary::open_with(&root.join("data"), dam_core::ResourceOptions::ungoverned())
+            .await
+            .unwrap(),
     );
     let context = AuthContext::embedded();
     let source_id = library
@@ -204,7 +207,10 @@ async fn range_body_is_never_recompressed() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
-    assert_eq!(response.headers().get(header::CONTENT_RANGE).unwrap(), "bytes 10-109/1000");
+    assert_eq!(
+        response.headers().get(header::CONTENT_RANGE).unwrap(),
+        "bytes 10-109/1000"
+    );
     assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
     assert!(!varies_on_accept_encoding(&response));
     assert_eq!(response_bytes(response).await, original[10..110]);

@@ -54,22 +54,20 @@ impl Store {
                 let hash: Option<Vec<u8>> = r.get(5)?;
                 let source_id = blob_to_source_id(&r.get::<_, Vec<u8>>(6)?);
                 let auth_ref: Option<String> = r.get(7)?;
-                Ok(parse_connection(&connection)
-                    .ok()
-                    .map(|mut connection| {
-                        connection.set_credential_ref(auth_ref);
-                        AnalysisTarget {
-                            id,
-                            source_id,
-                            connection,
-                            path,
-                            media: MediaType::parse(&media_s).unwrap_or(MediaType::Image),
-                            format,
-                            content_hash: hash
-                                .and_then(|h| <[u8; 32]>::try_from(h.as_slice()).ok())
-                                .map(ContentHash),
-                        }
-                    }))
+                Ok(parse_connection(&connection).ok().map(|mut connection| {
+                    connection.set_credential_ref(auth_ref);
+                    AnalysisTarget {
+                        id,
+                        source_id,
+                        connection,
+                        path,
+                        media: MediaType::parse(&media_s).unwrap_or(MediaType::Image),
+                        format,
+                        content_hash: hash
+                            .and_then(|h| <[u8; 32]>::try_from(h.as_slice()).ok())
+                            .map(ContentHash),
+                    }
+                }))
             })
             .map_err(internal)?;
         Ok(rows

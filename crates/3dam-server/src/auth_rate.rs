@@ -8,7 +8,7 @@
 
 use crate::{ApiError, AppState};
 use axum::extract::{ConnectInfo, FromRequestParts};
-use axum::http::{HeaderMap, request::Parts};
+use axum::http::{request::Parts, HeaderMap};
 use dam_api::LibError;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
@@ -186,10 +186,7 @@ impl AuthProtection {
     pub(crate) fn new(trusted_proxies: impl IntoIterator<Item = IpAddr>) -> Self {
         Self {
             buckets: TokenBuckets::default(),
-            trusted_proxies: trusted_proxies
-                .into_iter()
-                .map(canonical_ip)
-                .collect(),
+            trusted_proxies: trusted_proxies.into_iter().map(canonical_ip).collect(),
             password_hashes: Arc::new(Semaphore::new(PASSWORD_HASH_SLOTS)),
             oidc_discovery: Arc::new(Semaphore::new(OIDC_DISCOVERY_SLOTS)),
         }
@@ -301,7 +298,10 @@ impl AuthProtection {
 
 fn canonical_ip(ip: IpAddr) -> IpAddr {
     match ip {
-        IpAddr::V6(ip) => ip.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(ip)),
+        IpAddr::V6(ip) => ip
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(ip)),
         ip => ip,
     }
 }
@@ -377,12 +377,21 @@ mod tests {
         let now = Instant::now();
         for n in 0..20 {
             assert!(protection
-                .check_at(Endpoint::Login, peer, &headers, Some(&format!("user-{n}")), now)
+                .check_at(
+                    Endpoint::Login,
+                    peer,
+                    &headers,
+                    Some(&format!("user-{n}")),
+                    now
+                )
                 .is_ok());
         }
         assert!(matches!(
             protection.check_at(Endpoint::Login, peer, &headers, Some("new-user"), now),
-            Err(Limited { reason: "client", .. })
+            Err(Limited {
+                reason: "client",
+                ..
+            })
         ));
     }
 
@@ -410,7 +419,10 @@ mod tests {
                 None,
                 now,
             ),
-            Err(Limited { reason: "global", .. })
+            Err(Limited {
+                reason: "global",
+                ..
+            })
         ));
     }
 
@@ -439,7 +451,10 @@ mod tests {
                 Some("alice"),
                 now,
             ),
-            Err(Limited { reason: "identity", .. })
+            Err(Limited {
+                reason: "identity",
+                ..
+            })
         ));
     }
 

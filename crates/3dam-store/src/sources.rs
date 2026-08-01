@@ -141,7 +141,11 @@ impl Store {
                         "credential migration produced a non-canonical source reference".into(),
                     ));
                 }
-                Ok((*id, serde_json::to_string(connection).map_err(internal)?, auth_ref.clone()))
+                Ok((
+                    *id,
+                    serde_json::to_string(connection).map_err(internal)?,
+                    auth_ref.clone(),
+                ))
             })
             .collect::<Result<Vec<_>, LibError>>()?;
         let mut conn = self.conn.lock().unwrap();
@@ -350,7 +354,10 @@ impl Store {
             .map_err(internal)?;
             // ON DELETE CASCADE clears its assets.
             let n = tx
-                .execute("DELETE FROM source WHERE id = ?1", params![id.as_bytes().to_vec()])
+                .execute(
+                    "DELETE FROM source WHERE id = ?1",
+                    params![id.as_bytes().to_vec()],
+                )
                 .map_err(internal)?;
             if n == 0 {
                 return Err(LibError::NotFound(format!("source {id}")));

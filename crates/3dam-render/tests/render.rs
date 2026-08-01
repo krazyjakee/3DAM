@@ -302,6 +302,12 @@ fn multi_material_visual_fixture_reaches_the_browser_contract() {
     let blob = dam_render::model_preview_blob(&fixture("multi_material_grid.obj"), "obj")
         .expect("decode the material-grid parity fixture to DMSH");
     let (_textures, materials, submeshes) = parse_dmsh(&blob);
-    assert!(materials >= 4, "fixture must preserve four distinct materials");
-    assert!(submeshes >= 4, "fixture must preserve material-separated geometry");
+    assert!(
+        materials >= 4,
+        "fixture must preserve four distinct materials"
+    );
+    assert!(
+        submeshes >= 4,
+        "fixture must preserve material-separated geometry"
+    );
 }

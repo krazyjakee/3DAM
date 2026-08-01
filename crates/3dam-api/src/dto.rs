@@ -89,6 +89,11 @@ impl ContentRange {
     pub fn len(self) -> u64 {
         self.last - self.first + 1
     }
+
+    /// A constructed inclusive range always contains at least one byte.
+    pub const fn is_empty(self) -> bool {
+        false
+    }
 }
 
 /// A content representation opened for bounded streaming. `metadata.len` is the complete

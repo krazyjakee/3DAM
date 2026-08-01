@@ -124,7 +124,11 @@ impl OrbitCamera {
 
     pub fn update_pose(&mut self, yaw: f32, pitch: f32, zoom: f32, pan_x: f32, pan_y: f32) {
         const LIMIT: f32 = std::f32::consts::FRAC_PI_2 - 0.05;
-        self.yaw = if yaw.is_finite() { yaw } else { self.framing.yaw };
+        self.yaw = if yaw.is_finite() {
+            yaw
+        } else {
+            self.framing.yaw
+        };
         self.pitch = if pitch.is_finite() {
             pitch.clamp(-LIMIT, LIMIT)
         } else {
