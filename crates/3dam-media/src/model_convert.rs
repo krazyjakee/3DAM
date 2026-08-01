@@ -26,7 +26,9 @@
 //!
 //! ## What this is, and is not
 //!
-//! It is "give me a self-contained GLB of this model" — for preview, web delivery, or handoff.
+//! It is "give me a self-contained GLB of this model" — for preview, web delivery, or handoff. The
+//! output is **indexed**, which is not automatic here: see the `aiCopyScene` comment in `convert`
+//! for the flag interaction that otherwise triples the vertex count.
 //! It is **not** lossless interchange. Assimp's exporters re-interpret: a one-material textured
 //! cube comes back with two materials, because a default is appended. Custom properties and
 //! non-PBR material extensions are lost. That is acceptable only because the pipeline is
@@ -85,6 +87,17 @@ impl Drop for Scene {
     }
 }
 
+/// Owns a scene produced by `aiCopyScene`, which is freed with `aiFreeScene` rather than
+/// `aiReleaseImport` — different allocator bookkeeping, and mixing them is a double-free.
+struct SceneCopy(*mut russimp_ng::sys::aiScene);
+
+impl Drop for SceneCopy {
+    fn drop(&mut self) {
+        // SAFETY: the pointer came from `aiCopyScene` and is freed exactly once, here.
+        unsafe { russimp_ng::sys::aiFreeScene(self.0) }
+    }
+}
+
 /// Owns an export blob chain so it is released even if we bail while copying it out.
 struct Blob(*const russimp_ng::sys::aiExportDataBlob);
 
@@ -139,10 +152,35 @@ pub fn convert(path: &Path, target_format: &str) -> Result<Vec<u8>, HandlerError
         ));
     }
 
-    // SAFETY: `scene.0` is a live scene from the import above; `id_c` outlives the call. The `0`
-    // is the exporter's preprocessing flags — deliberately empty, because the processing that
-    // matters (texture embedding) has to happen at *import*, not here.
-    let blob = unsafe { russimp_ng::sys::aiExportSceneToBlob(scene.0, id_c.as_ptr(), 0) };
+    // Export a *copy*, not the imported scene — this is worth 3.8x on output size and is entirely
+    // non-obvious.
+    //
+    // `Exporter::Export` computes `pp = (enforced | requested) & ~already_applied_by_the_importer`,
+    // and skips that subtraction when the scene is flagged as a copy. `glb2` enforces
+    // `JoinIdenticalVertices`, which our import flags also request — so on the *imported* scene the
+    // join is subtracted out as "already done". But the exporter then runs `MakeVerboseFormat`
+    // unconditionally, which de-indexes the mesh to three vertices per triangle, and only re-joins
+    // when the enforced set *lacks* `JoinIdenticalVertices`. The result is a fully de-indexed GLB:
+    // a 65k-triangle sphere exported at 196,608 positions / 7.1 MB instead of 33,153 / 1.8 MB.
+    //
+    // `aiCopyScene` sets the copy flag, so nothing is subtracted, the join runs, and the output is
+    // indexed. Fixing it from the other end — dropping `JoinIdenticalVertices` at import — works
+    // too, but the import-side join is what mesh simplification will need, so the copy is the
+    // version that leaves both doors open.
+    let mut copy_ptr: *mut russimp_ng::sys::aiScene = std::ptr::null_mut();
+    // SAFETY: `scene.0` is a live imported scene; `aiCopyScene` writes a new scene pointer out.
+    unsafe { russimp_ng::sys::aiCopyScene(scene.0, &mut copy_ptr) };
+    if copy_ptr.is_null() {
+        return Err(HandlerError::Encode(
+            "Assimp could not copy the scene for export".into(),
+        ));
+    }
+    let copy = SceneCopy(copy_ptr);
+
+    // SAFETY: `copy.0` is a live scene; `id_c` outlives the call. The `0` is the exporter's
+    // preprocessing flags — deliberately empty, because the processing that matters (texture
+    // embedding) has to happen at *import*, not here.
+    let blob = unsafe { russimp_ng::sys::aiExportSceneToBlob(copy.0, id_c.as_ptr(), 0) };
     if blob.is_null() {
         // No detail here for a second reason on top of the race: `aiExportSceneToBlob` builds a
         // local `Exporter` and discards its error string, so `aiGetErrorString()` would return the
@@ -247,6 +285,85 @@ mod tests {
         };
         assert!(ok, "the exported GLB did not re-import");
         assert!(meshes > 0, "the exported GLB has no meshes");
+    }
+
+    /// A 4x4 vertex grid — 16 vertices, 18 triangles, every interior vertex shared by several.
+    /// Chosen so indexed (16 positions) and de-indexed (54) are unmistakably different.
+    fn grid_obj() -> String {
+        let mut o = String::new();
+        for y in 0..4 {
+            for x in 0..4 {
+                o.push_str(&format!("v {x}.0 {y}.0 0.0\n"));
+            }
+        }
+        for y in 0..3 {
+            for x in 0..3 {
+                let (a, b, c, d) = (
+                    y * 4 + x + 1,
+                    y * 4 + x + 2,
+                    (y + 1) * 4 + x + 2,
+                    (y + 1) * 4 + x + 1,
+                );
+                o.push_str(&format!("f {a} {b} {c}\n"));
+                o.push_str(&format!("f {a} {c} {d}\n"));
+            }
+        }
+        o
+    }
+
+    /// Pull `(position_count, triangle_count)` out of a GLB's JSON chunk.
+    fn glb_counts(glb: &[u8]) -> (u64, u64) {
+        let mut off = 12usize;
+        let mut doc = None;
+        while off + 8 <= glb.len() {
+            let clen = u32::from_le_bytes(glb[off..off + 4].try_into().unwrap()) as usize;
+            let ctype = &glb[off + 4..off + 8];
+            if ctype == b"JSON" {
+                doc =
+                    serde_json::from_slice::<serde_json::Value>(&glb[off + 8..off + 8 + clen]).ok();
+                break;
+            }
+            off += 8 + clen;
+        }
+        let doc = doc.expect("GLB has a JSON chunk");
+        let prim = &doc["meshes"][0]["primitives"][0];
+        let acc = |i: &serde_json::Value| {
+            doc["accessors"][i.as_u64().unwrap() as usize]["count"]
+                .as_u64()
+                .unwrap()
+        };
+        let pos = acc(&prim["attributes"]["POSITION"]);
+        let tris = acc(&prim["indices"]) / 3;
+        (pos, tris)
+    }
+
+    /// The output must be **indexed**, and this is not a nicety — it is a 3.5x difference in file
+    /// size, measured.
+    ///
+    /// Assimp's exporter computes its post-processing as
+    /// `(enforced | requested) & ~already_applied_by_the_importer`, and skips that subtraction only
+    /// when the scene is a *copy*. Because `glb2` enforces `JoinIdenticalVertices` and our import
+    /// flags also request it, exporting the imported scene directly subtracts the join away — while
+    /// `MakeVerboseFormat` still de-indexes to three vertices per triangle, with nothing re-joining
+    /// them. A 16k-triangle sphere came out at 1,377,636 bytes with 49,152 positions instead of
+    /// 391,564 bytes with 8,066.
+    ///
+    /// This assertion catches both an accidental revert of the `aiCopyScene` hop and an Assimp
+    /// upgrade that changes the `mIsCopy` behaviour it relies on — which is undocumented internals,
+    /// so it is exactly the kind of thing that needs a guard rather than a comment.
+    #[test]
+    fn the_exported_glb_is_indexed_not_expanded_to_three_verts_per_triangle() {
+        let (_d, p) = write("grid.obj", grid_obj().as_bytes());
+        let bytes = convert(&p, "glb").expect("grid must convert");
+        let (pos, tris) = glb_counts(&bytes);
+        assert_eq!(tris, 18, "the fixture is 18 triangles");
+        assert!(
+            pos < tris * 3,
+            "the GLB is de-indexed: {pos} positions for {tris} triangles (3x means every triangle \
+             got its own copy of every vertex — see this test's docs)"
+        );
+        // Tighter: the grid's 16 shared vertices should survive as roughly that.
+        assert!(pos <= 20, "expected ~16 shared vertices, got {pos}");
     }
 
     #[test]

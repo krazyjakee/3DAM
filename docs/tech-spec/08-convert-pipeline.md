@@ -292,6 +292,16 @@ or transcode without touching geometry.
 > than half-produced. Supporting them means extending the seam to multi-file outputs — a change to
 > the atomic-write discipline, not a format addition, and therefore its own slice.
 >
+> **The export goes through `aiCopyScene`**, and that is load-bearing rather than tidiness. Assimp's
+> exporter computes its post-processing as `(enforced | requested) & ~already_applied_by_the_importer`
+> and skips that subtraction only for a scene flagged as a *copy*. `glb2` enforces
+> `JoinIdenticalVertices`, which the import flags also request — so exporting the imported scene
+> subtracts the join away, while `MakeVerboseFormat` still de-indexes to three vertices per
+> triangle and nothing re-joins them. Measured on a 16k-triangle sphere: **1,377,636 bytes with
+> 49,152 positions, against 391,564 bytes with 8,066** — a 3.5× difference from one flag interaction.
+> Guarded by a test asserting the output's POSITION count is below 3× its triangle count, because
+> the `mIsCopy` behaviour it relies on is Assimp internals rather than a documented contract.
+>
 > **Textures are embedded**, via `aiProcess_EmbedTextures` at *import* time. Passing it as the
 > exporter's preprocessing argument — which the name suggests — silently yields a GLB whose images
 > are `uri` references to files beside the *original*, i.e. an asset that breaks the moment it
