@@ -1326,6 +1326,7 @@ async fn submit_analyze(
     Json(req): Json<AnalyzeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let job_id = st.lib.submit_analyze(&ctx, req).await?;
+    let _ = st.lib.set_job_initiator(&job_id, actor_of(&ctx)).await;
     Ok(Json(serde_json::json!({ "job_id": job_id })))
 }
 
@@ -1609,6 +1610,11 @@ async fn submit_scan(
     Json(req): Json<ScanRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let job_id = st.lib.submit_scan(&ctx, req).await?;
+    // The engine/store seam intentionally knows nothing about accounts or token labels. Attribute
+    // the durable history row here, where the authenticated actor is available (best-effort: a
+    // completed submission must not be reported as failed solely because attribution could not be
+    // attached).
+    let _ = st.lib.set_job_initiator(&job_id, actor_of(&ctx)).await;
     Ok(Json(serde_json::json!({ "job_id": job_id })))
 }
 

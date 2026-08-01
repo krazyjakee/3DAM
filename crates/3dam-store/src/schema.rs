@@ -553,6 +553,17 @@ pub const MIGRATIONS: &[&str] = &[
     ALTER TABLE image_attr ADD COLUMN texture_format TEXT;
     ALTER TABLE image_attr ADD COLUMN mip_levels INTEGER;
     "#,
+    // ── V16: durable, differentiated terminal job outcomes (issue #117) ────────────────────────
+    // `error` remains reserved for a hard job failure. A successful run's description and its
+    // recoverable degradation are separate so clients cannot accidentally call a partial result a
+    // success. Timestamps already lived on the row; initiator is additive and nullable because old
+    // jobs and embedded/automatic callers do not always have an authenticated identity.
+    r#"
+    ALTER TABLE job ADD COLUMN summary TEXT;
+    ALTER TABLE job ADD COLUMN warnings TEXT;
+    ALTER TABLE job ADD COLUMN initiator TEXT;
+    ALTER TABLE job ADD COLUMN result_artifacts TEXT;
+    "#,
 ];
 
 #[cfg(test)]

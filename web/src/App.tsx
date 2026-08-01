@@ -5,6 +5,8 @@ import { Settings } from "./components/Settings";
 import { Duplicates } from "./components/Duplicates";
 import { Blocklist } from "./components/Blocklist";
 import { Upload } from "./components/Upload";
+import { JobHistory } from "./components/JobHistory";
+import { JobNotifications } from "./components/StatusBar";
 import { Toaster } from "./components/Toaster";
 import { AuthGate } from "./components/AuthGate";
 import { ApiError, type VersionInfo } from "./api/client";
@@ -80,6 +82,7 @@ export function App() {
       {/* Front-door auth: in token mode nothing below renders until a credential validates. */}
       <AuthGate>
         <BrowserRouter>
+          <JobNotifications />
           <Routes>
             {/* The admin / Settings surface (tech-spec 09 §B.4, 10). */}
             <Route path="/settings" element={<Settings />} />
@@ -89,6 +92,8 @@ export function App() {
             <Route path="/blocklist" element={<Blocklist />} />
             {/* Writing files into a source — the one write-into-source path (issue #80). */}
             <Route path="/upload" element={<Upload />} />
+            {/* Durable background operation outcomes and reports (issue #117). */}
+            <Route path="/jobs" element={<JobHistory />} />
             {/* URL owns view state via ?query params (lib/view-state.ts); one workspace route. */}
             <Route path="*" element={<Workspace />} />
           </Routes>

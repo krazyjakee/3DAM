@@ -19,7 +19,7 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
 /// The current analysis pipeline version. Bump when any extractor's algorithm/output changes so the
@@ -29,6 +29,7 @@ use tokio::sync::broadcast;
 /// V3: the analyze pass also extracts continuous acoustic features (loudness/brightness/harmonicity,
 /// issue #61), so audio re-analyses once more to populate them.
 pub const PIPELINE_VERSION: i64 = 3;
+const MAX_JOB_WARNING_DETAILS: u64 = 20;
 
 /// Embedding-space ids (§2.1). Model-free descriptors in v1 — see module docs. One logical index per
 /// media type; vectors from different spaces are never cross-ranked (§3.1).
@@ -83,6 +84,7 @@ pub(crate) fn run_analyze(
     // Shared across the rayon workers: a monotonic completion counter and a skip counter.
     let done = AtomicU64::new(0);
     let warnings = AtomicU64::new(0);
+    let warning_details = Mutex::new(Vec::new());
 
     // Rebuild each distinct source's backend **once**, before the fan-out. Opening per asset would
     // mean an SSH handshake or an SMB session setup per file, which for a remote pass is most of the
@@ -122,7 +124,13 @@ pub(crate) fn run_analyze(
                 });
             }
             Err(e) => {
-                warnings.fetch_add(1, Ordering::Relaxed);
+                let prior = warnings.fetch_add(1, Ordering::Relaxed);
+                if prior < MAX_JOB_WARNING_DETAILS {
+                    warning_details.lock().unwrap().push(format!(
+                        "“{}” could not be analysed; inspect its source status and retry",
+                        t.path
+                    ));
+                }
                 tracing::warn!(asset = %t.id, path = %t.path, error = %e, "analysis skipped asset");
             }
         }
@@ -139,12 +147,22 @@ pub(crate) fn run_analyze(
 
     let done = done.load(Ordering::Relaxed);
     let warnings = warnings.load(Ordering::Relaxed);
+    let mut warning_details = warning_details
+        .into_inner()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let omitted = warnings.saturating_sub(warning_details.len() as u64);
+    if omitted > 0 {
+        warning_details.push(format!(
+            "{omitted} additional warning(s) omitted; inspect source status and server logs"
+        ));
+    }
     if cancel.load(Ordering::Relaxed) {
         let _ = store.set_job_state(&job, JobState::Cancelled, None);
     } else {
         let _ = store.update_job_progress(&job, JobState::Done, done, Some(total), None);
-        let note = (warnings > 0).then(|| format!("{warnings} item(s) skipped"));
-        let _ = store.set_job_state(&job, JobState::Done, note.as_deref());
+        let analysed = done.saturating_sub(warnings);
+        let summary = format!("Analysed {analysed} of {total} item(s)");
+        let _ = store.complete_job(&job, &summary, &warning_details);
     }
     emit_progress(&store, &events, &job);
     tracing::info!(%job, done, warnings, "analysis finished");

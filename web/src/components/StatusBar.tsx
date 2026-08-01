@@ -1,5 +1,6 @@
-import { useEffect, useRef, useState } from "react";
-import { ChevronUp, EyeOff, Loader2, LogIn, LogOut, Server, ShieldCheck, X } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { ChevronUp, EyeOff, History, Loader2, LogIn, LogOut, Server, ShieldCheck, X } from "lucide-react";
+import { useNavigate } from "react-router";
 import { useCancelJob, useJobs, useScopes, useStats, useVersion, useWhoami } from "@/api/queries";
 import { authApi } from "@/api/auth";
 import { useConnection, type ConnState } from "@/api/connection";
@@ -19,6 +20,7 @@ export function StatusBar() {
   const jobs = useJobs({});
   const cancel = useCancelJob();
   const conn = useConnection();
+  const navigate = useNavigate();
   const [cancelling, setCancelling] = useState<Set<string>>(() => new Set());
 
   const active = (jobs.data?.items ?? []).filter(
@@ -49,7 +51,6 @@ export function StatusBar() {
 
   return (
     <footer className="flex h-7 shrink-0 items-center gap-3 border-t border-border bg-surface px-3 text-[11px] text-fg-dim coarse:h-auto coarse:min-h-11">
-      <JobAnnouncer jobs={jobs.data?.items ?? []} />
       {active.length === 0 ? (
         <span className="flex-1">Idle</span>
       ) : active.length === 1 ? (
@@ -63,6 +64,15 @@ export function StatusBar() {
       ) : (
         <AggregateJobs jobs={active} cancelling={cancelling} onCancel={cancelJob} />
       )}
+      <button
+        type="button"
+        className="flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 hover:text-fg coarse:min-h-11"
+        onClick={() => navigate("/jobs")}
+        title="Open background job history"
+      >
+        <History size={11} aria-hidden="true" />
+        <span className="hidden sm:inline">History</span>
+      </button>
       <MediaBreakdown />
       <ConnectionPill state={conn.state} />
       <IdentityChip auth={version.data?.auth} accounts={version.data?.accounts === true} />
@@ -70,6 +80,18 @@ export function StatusBar() {
       <span className="tabular-nums">{version.data?.server ?? ""}</span>
     </footer>
   );
+}
+
+/** App-level lifecycle observer. It stays mounted across routes so a job that finishes while the
+ * user is in Settings or another report still produces a durable, linked notification. */
+export function JobNotifications() {
+  const jobs = useJobs({});
+  const navigate = useNavigate();
+  const openJob = useCallback(
+    (id: string) => navigate(`/jobs?job=${encodeURIComponent(id)}`),
+    [navigate],
+  );
+  return <JobAnnouncer jobs={jobs.data?.items ?? []} onOpenJob={openJob} />;
 }
 
 /** Sign-in / identity / sign-out chip (front-door auth). On a gated server (token or anonymous):
@@ -250,7 +272,13 @@ function MediaBreakdown() {
 /** Screen-reader announcements for background jobs (a11y hardening, issue #44). A polite, visually
  *  hidden live region speaks only lifecycle transitions rather than every progress tick. Cancelled
  *  jobs also raise a visible toast, so cancellation feedback isn't available only to AT users. */
-function JobAnnouncer({ jobs }: { jobs: JobStatus[] }) {
+function JobAnnouncer({
+  jobs,
+  onOpenJob,
+}: {
+  jobs: JobStatus[];
+  onOpenJob: (id: string) => void;
+}) {
   const [msg, setMsg] = useState("");
   const previous = useRef<Map<string, JobStatus["state"]> | null>(null);
   useEffect(() => {
@@ -263,11 +291,25 @@ function JobAnnouncer({ jobs }: { jobs: JobStatus[] }) {
       }
       const oldState = previous.current?.get(job.id);
       if (oldState === job.state) return [];
-      if (job.state === "done") return [`${job.kind} job complete`];
-      if (job.state === "failed") return [`${job.kind} job failed`];
+      const action = { label: "View details", onClick: () => onOpenJob(job.id) };
+      if (job.state === "done") {
+        if ((job.warnings?.length ?? 0) > 0) {
+          toast.warning(`${job.kind} job completed with warnings`, { action });
+          return [`${job.kind} job completed with warnings`];
+        }
+        toast.success(`${job.kind} job completed`, { action });
+        return [`${job.kind} job completed successfully`];
+      }
+      if (job.state === "failed") {
+        toast.error(
+          `${job.kind} job failed${job.error ? `: ${job.error}` : ""}`,
+          { action },
+        );
+        return [`${job.kind} job failed`];
+      }
       if (job.state === "cancelled") {
-        toast.info(`${job.kind} job cancelled`);
-        return [];
+        toast.info(`${job.kind} job cancelled`, { action });
+        return [`${job.kind} job cancelled`];
       }
       if (!oldState && (job.state === "queued" || job.state === "running")) {
         return [`${job.kind} job started`];
@@ -277,7 +319,7 @@ function JobAnnouncer({ jobs }: { jobs: JobStatus[] }) {
     if (transitions.length) setMsg(transitions.join(". "));
     previous.current = next;
     // Keyed on states only: progress updates re-render the component but never change the message.
-  }, [jobs]);
+  }, [jobs, onOpenJob]);
   return (
     <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">
       {msg}

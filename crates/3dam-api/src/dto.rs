@@ -808,6 +808,16 @@ pub struct Progress {
     pub current: Option<String>,
 }
 
+/// A durable, safe-to-render result of a background job. `route` is an application-relative report
+/// or asset route, never a filesystem path; convert/export can populate these when their async job
+/// manifests land without changing the history contract.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct JobArtifact {
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct JobStatus {
     pub id: JobId,
@@ -816,6 +826,24 @@ pub struct JobStatus {
     pub progress: Progress,
     #[serde(default)]
     pub error: Option<String>,
+    /// Human-readable terminal summary. Unlike `error`, this describes completed work and remains
+    /// available in job history after the live progress event has passed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// Recoverable, per-item degradation. A done job with warnings is a partial success, not an
+    /// unqualified success and not a hard failure.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub result_artifacts: Vec<JobArtifact>,
+    /// Millisecond Unix timestamps persisted with the job row.
+    #[serde(default)]
+    pub created_at: i64,
+    #[serde(default)]
+    pub updated_at: i64,
+    /// The account/token/automation identity which started the job, when it can be attributed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initiator: Option<String>,
     /// Every source this job touches, recorded when the job is created (issue #42). `Progress.current`
     /// names a live file path, so a restricted identity may only observe a job whose sources are
     /// *all* within its ceiling — see

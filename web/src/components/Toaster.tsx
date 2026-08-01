@@ -3,13 +3,14 @@
 // as `alert`) so the feedback reaches assistive tech, not just sighted users. Uses the design tokens
 // (DESIGN_GUIDELINES §4), no hardcoded palette.
 
-import { CheckCircle2, Info, X, XCircle } from "lucide-react";
+import { AlertTriangle, CheckCircle2, Info, X, XCircle } from "lucide-react";
 import { dismiss, useToasts, type ToastKind } from "@/lib/toast";
 
-const ICON = { success: CheckCircle2, error: XCircle, info: Info } as const;
+const ICON = { success: CheckCircle2, warning: AlertTriangle, error: XCircle, info: Info } as const;
 
 const ACCENT: Record<ToastKind, string> = {
   success: "var(--color-lic-permissive)",
+  warning: "var(--color-warn)",
   error: "var(--color-danger)",
   info: "var(--color-accent)",
 };
@@ -47,6 +48,18 @@ export function Toaster() {
                   onFocus={(e) => e.currentTarget.select()}
                   className="field mt-2 resize-none font-mono text-[10px]"
                 />
+              )}
+              {t.action && (
+                <button
+                  type="button"
+                  className="mt-1.5 text-accent hover:underline"
+                  onClick={() => {
+                    t.action?.onClick();
+                    dismiss(t.id);
+                  }}
+                >
+                  {t.action.label}
+                </button>
               )}
             </div>
             <button

@@ -21,6 +21,14 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 
 const PROGRESS_EVERY: u64 = 16;
+const MAX_JOB_WARNING_DETAILS: usize = 20;
+
+fn record_warning(total: &mut u64, details: &mut Vec<String>, message: String) {
+    *total += 1;
+    if details.len() < MAX_JOB_WARNING_DETAILS {
+        details.push(message);
+    }
+}
 
 #[allow(clippy::too_many_arguments)] // the job runner's full context; a struct would just rename it
 pub(crate) fn run_scan(
@@ -53,6 +61,7 @@ pub(crate) fn run_scan(
     let mut examined: u64 = 0;
     let mut skipped: u64 = 0;
     let mut warnings: u64 = 0;
+    let mut warning_details = Vec::new();
     let mut removed_total: u64 = 0;
 
     for src in sources {
@@ -60,6 +69,7 @@ pub(crate) fn run_scan(
             continue; // federated peers yield catalog rows, not bytes — not scanned here (phase 6)
         }
         let sid = src.id;
+        let source_label = src.name.clone();
 
         // Rebuild the backend from the persisted connection (incl. secret). An unreachable host or
         // bad credentials mark the source offline and move on — degrade one edge, not the job.
@@ -67,7 +77,11 @@ pub(crate) fn run_scan(
             Ok(c) => c,
             Err(e) => {
                 let _ = store.set_source_error(&sid, &e.to_string());
-                warnings += 1;
+                record_warning(
+                    &mut warnings,
+                    &mut warning_details,
+                    format!("Source “{source_label}” could not be opened; inspect its connection settings"),
+                );
                 continue;
             }
         };
@@ -76,7 +90,11 @@ pub(crate) fn run_scan(
             Err(e) => {
                 let _ = store.set_source_error(&sid, &e.to_string());
                 tracing::warn!(source = %sid, error = %e, "source unavailable");
-                warnings += 1;
+                record_warning(
+                    &mut warnings,
+                    &mut warning_details,
+                    format!("Source “{source_label}” is unavailable; inspect source status and credentials"),
+                );
                 continue;
             }
         };
@@ -124,11 +142,18 @@ pub(crate) fn run_scan(
                     if cancel.load(Ordering::Relaxed) {
                         return false;
                     }
-                    // Materialise bytes locally (in place for local, downloaded for remote).
+                    // Materialise bytes locally from the backend's pinned/opened source handle.
                     let fetched = match fs.fetch(&fe.rel_path) {
                         Ok(f) => f,
                         Err(e) => {
-                            warnings += 1;
+                            record_warning(
+                                &mut warnings,
+                                &mut warning_details,
+                                format!(
+                                    "“{}” could not be read from source “{source_label}”",
+                                    fe.rel_path
+                                ),
+                            );
                             tracing::warn!(path = %fe.rel_path, error = %e, "fetch failed");
                             return true;
                         }
@@ -142,7 +167,11 @@ pub(crate) fn run_scan(
                     let hash = match hash_file(abs) {
                         Some(h) => Some(h),
                         None => {
-                            warnings += 1;
+                            record_warning(
+                                &mut warnings,
+                                &mut warning_details,
+                                format!("“{}” could not be hashed; check file readability", fe.rel_path),
+                            );
                             return true;
                         }
                     };
@@ -171,6 +200,14 @@ pub(crate) fn run_scan(
                             // CHEAP tier (tech-spec 04 §4): header-only media attributes.
                             let attrs = dam_media::extract_metadata(abs, &det);
                             if let Err(e) = store.set_media_attrs(&id, &attrs) {
+                                record_warning(
+                                    &mut warnings,
+                                    &mut warning_details,
+                                    format!(
+                                        "“{}” was catalogued but its media metadata could not be saved",
+                                        fe.rel_path
+                                    ),
+                                );
                                 tracing::warn!(path = %fe.rel_path, error = %e, "attr persist failed");
                             }
                             if inserted {
@@ -202,14 +239,23 @@ pub(crate) fn run_scan(
                             }
                         }
                         Err(e) => {
-                            warnings += 1;
+                            record_warning(
+                                &mut warnings,
+                                &mut warning_details,
+                                format!("“{}” could not be added to the catalog", fe.rel_path),
+                            );
                             tracing::warn!(path = %fe.rel_path, error = %e, "skipped asset");
                         }
                     }
                     true
                 }
-                Err(_) => {
-                    warnings += 1;
+                Err(e) => {
+                    record_warning(
+                        &mut warnings,
+                        &mut warning_details,
+                        format!("An entry in source “{source_label}” could not be listed"),
+                    );
+                    tracing::warn!(source = %sid, error = %e, "source entry unavailable");
                     true
                 }
             }
@@ -226,13 +272,27 @@ pub(crate) fn run_scan(
                         .collect();
                     match store.mark_paths_missing(&sid, &removed) {
                         Ok(n) => removed_total += n,
-                        Err(e) => tracing::warn!(source = %sid, error = %e, "mark-missing failed"),
+                        Err(e) => {
+                            record_warning(
+                                &mut warnings,
+                                &mut warning_details,
+                                format!(
+                                    "Source “{source_label}” was scanned but missing-file status could not be updated"
+                                ),
+                            );
+                            tracing::warn!(source = %sid, error = %e, "mark-missing failed");
+                        }
                     }
                 }
                 let _ = store.set_source_scanned(&sid, dam_store::now_ms());
             }
             Err(e) => {
                 let _ = store.set_source_error(&sid, &e.to_string());
+                record_warning(
+                    &mut warnings,
+                    &mut warning_details,
+                    format!("Source “{source_label}” could not be fully walked; inspect source status"),
+                );
                 tracing::warn!(source = %sid, error = %e, "source scan failed");
             }
         }
@@ -255,11 +315,17 @@ pub(crate) fn run_scan(
         if removed_total > 0 {
             notes.push(format!("{removed_total} missing"));
         }
-        if warnings > 0 {
-            notes.push(format!("{warnings} skipped"));
+        let omitted = warnings.saturating_sub(warning_details.len() as u64);
+        if omitted > 0 {
+            warning_details.push(format!(
+                "{omitted} additional warning(s) omitted; inspect source status and server logs"
+            ));
         }
-        let note = (!notes.is_empty()).then(|| notes.join(", "));
-        let _ = store.set_job_state(&job, JobState::Done, note.as_deref());
+        let suffix = (!notes.is_empty())
+            .then(|| format!(" ({})", notes.join(", ")))
+            .unwrap_or_default();
+        let summary = format!("Scanned {examined} item(s){suffix}");
+        let _ = store.complete_job(&job, &summary, &warning_details);
     }
     emit_progress(&store, &events, &job);
     tracing::info!(%job, done, skipped, removed = removed_total, warnings, "scan finished");

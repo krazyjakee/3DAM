@@ -116,6 +116,12 @@ mod tests {
             state: JobState::Running,
             progress: Progress::default(),
             error: None,
+            summary: None,
+            warnings: Vec::new(),
+            result_artifacts: Vec::new(),
+            created_at: 0,
+            updated_at: 0,
+            initiator: None,
             sources: vec![SourceId::new()],
         }
     }

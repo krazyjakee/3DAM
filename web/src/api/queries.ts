@@ -161,6 +161,18 @@ export function useJobs(req: JobListRequest = {}) {
   });
 }
 
+/** Durable newest-first history. Each page cursor is supplied by the server after applying the
+ * caller's visibility ceiling, so restricted sessions never fetch or render hidden job details. */
+export function useJobHistory() {
+  return useInfiniteQuery({
+    queryKey: [...qk.jobs, "history"],
+    queryFn: ({ pageParam }) =>
+      api.listJobs({ page: { limit: 50, after: pageParam } }),
+    initialPageParam: null as string | null,
+    getNextPageParam: (last) => last.cursor ?? undefined,
+  });
+}
+
 export function useAddSource() {
   const qc = useQueryClient();
   return useMutation({

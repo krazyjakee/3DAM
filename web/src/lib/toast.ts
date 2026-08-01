@@ -4,7 +4,7 @@
 
 import { useSyncExternalStore } from "react";
 
-export type ToastKind = "success" | "error" | "info";
+export type ToastKind = "success" | "warning" | "error" | "info";
 
 export interface Toast {
   id: number;
@@ -15,10 +15,16 @@ export interface Toast {
     label: string;
     value: string;
   };
+  /** Optional in-app destination/action associated with this outcome. */
+  action?: {
+    label: string;
+    onClick: () => void;
+  };
 }
 
 export interface ToastOptions {
   manualCopy?: Toast["manualCopy"];
+  action?: Toast["action"];
 }
 
 let toasts: Toast[] = [];
@@ -37,7 +43,7 @@ function push(kind: ToastKind, message: string, options?: ToastOptions): number 
   // A manual-copy fallback stays until explicitly dismissed: the user may need time to select the
   // complete value and switch to the destination. Ordinary errors still clear after seven seconds.
   if (!options?.manualCopy) {
-    const ttl = kind === "error" ? 7000 : 3500;
+    const ttl = kind === "error" || kind === "warning" ? 7000 : 3500;
     setTimeout(() => dismiss(id), ttl);
   }
   return id;
@@ -49,9 +55,10 @@ export function dismiss(id: number) {
 }
 
 export const toast = {
-  success: (m: string) => push("success", m),
+  success: (m: string, options?: ToastOptions) => push("success", m, options),
+  warning: (m: string, options?: ToastOptions) => push("warning", m, options),
   error: (m: string, options?: ToastOptions) => push("error", m, options),
-  info: (m: string) => push("info", m),
+  info: (m: string, options?: ToastOptions) => push("info", m, options),
 };
 
 /** Normalise anything thrown (ApiError, Error, string) into a human message for a toast. */

@@ -19,10 +19,20 @@ impl Store {
         let id = JobId::new();
         let now = now_ms();
         let sources_json = encode_job_sources(sources);
+        // Automated callers are attributable from their stable internal request marker. Manual
+        // callers currently have no identity at this storage seam, so remain honestly unknown.
+        let initiator = if params_json.contains("\"watch\":true") {
+            Some("Source watcher")
+        } else if params_json.contains("\"auto\":true") {
+            Some("Automation")
+        } else {
+            None
+        };
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO job (id, kind, state, params, progress, done, total, created_at, updated_at, sources)
-             VALUES (?1, ?2, 'queued', ?3, 0, 0, ?4, ?5, ?5, ?6)",
+            "INSERT INTO job (id, kind, state, params, progress, done, total, created_at, updated_at,
+                              sources, initiator)
+             VALUES (?1, ?2, 'queued', ?3, 0, 0, ?4, ?5, ?5, ?6, ?7)",
             params![
                 id.as_bytes().to_vec(),
                 job_kind_str(kind),
@@ -30,6 +40,7 @@ impl Store {
                 total.map(|t| t as i64),
                 now,
                 sources_json,
+                initiator,
             ],
         )
         .map_err(internal)?;
@@ -86,10 +97,69 @@ impl Store {
         Ok(())
     }
 
+    /// Attach request attribution after submission. The server learns the authenticated actor at
+    /// its boundary, while automatic/watch jobs are attributed at creation time.
+    pub fn set_job_initiator(&self, id: &JobId, initiator: &str) -> Result<(), LibError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE job SET initiator = ?2 WHERE id = ?1",
+            params![id.as_bytes().to_vec(), initiator],
+        )
+        .map_err(internal)?;
+        Ok(())
+    }
+
+    /// Attach opaque in-app report/artifact links to a job. Routes are validated here before they
+    /// become durable API data; future async convert/export manifests cannot persist a filesystem
+    /// path, external URL, or traversal and have the web client turn it into a link.
+    pub fn set_job_artifacts(
+        &self,
+        id: &JobId,
+        artifacts: &[JobArtifact],
+    ) -> Result<(), LibError> {
+        if artifacts
+            .iter()
+            .filter_map(|artifact| artifact.route.as_deref())
+            .any(|route| !valid_artifact_route(route))
+        {
+            return Err(LibError::BadRequest(
+                "job artifact routes must be safe application-relative paths".into(),
+            ));
+        }
+        let encoded = serde_json::to_string(artifacts).map_err(internal)?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE job SET result_artifacts = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id.as_bytes().to_vec(), encoded, now_ms()],
+        )
+        .map_err(internal)?;
+        Ok(())
+    }
+
+    /// Persist a successful terminal report. Warnings deliberately live outside `error`: their
+    /// presence means partial success, while `Failed` remains reserved for a whole-job failure.
+    pub fn complete_job(
+        &self,
+        id: &JobId,
+        summary: &str,
+        warnings: &[String],
+    ) -> Result<(), LibError> {
+        let warnings_json = serde_json::to_string(warnings).map_err(internal)?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE job SET state = 'done', summary = ?2, warnings = ?3, error = NULL,
+                            updated_at = ?4 WHERE id = ?1",
+            params![id.as_bytes().to_vec(), summary, warnings_json, now_ms()],
+        )
+        .map_err(internal)?;
+        Ok(())
+    }
+
     pub fn get_job(&self, id: &JobId) -> Result<JobStatus, LibError> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT id, kind, state, done, total, current, error, sources FROM job WHERE id = ?1",
+            "SELECT id, kind, state, done, total, current, error, sources, created_at, updated_at,
+                    summary, warnings, initiator, result_artifacts FROM job WHERE id = ?1",
             params![id.as_bytes().to_vec()],
             Self::row_to_job,
         )
@@ -110,24 +180,37 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT id, kind, state, done, total, current, error, sources FROM job
-                 ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                "SELECT id, kind, state, done, total, current, error, sources, created_at, updated_at,
+                        summary, warnings, initiator, result_artifacts FROM job
+                 ORDER BY created_at DESC, rowid DESC",
             )
             .map_err(internal)?;
-        let rows = stmt
-            .query_map(params![limit as i64, offset as i64], Self::row_to_job)
-            .map_err(internal)?;
+        let rows = stmt.query_map([], Self::row_to_job).map_err(internal)?;
         let mut items = Vec::new();
+        let mut raw_index = 0usize;
+        let mut has_more = false;
         for r in rows {
             let job = r.map_err(internal)?;
+            if raw_index < offset {
+                raw_index += 1;
+                continue;
+            }
             let keep_kind = req.kinds.is_empty() || req.kinds.contains(&job.kind);
             let keep_state = req.state.map(|s| s == job.state).unwrap_or(true);
             if keep_kind && keep_state && vis.allows_job(&job) {
-                items.push(job);
+                if items.len() < limit as usize {
+                    items.push(job);
+                } else {
+                    has_more = true;
+                    break;
+                }
             }
+            raw_index += 1;
         }
-        let next = if items.len() == limit as usize {
-            Some(Cursor((offset + items.len()).to_string()))
+        let next = if has_more {
+            // The cursor is a physical row offset, not a visible-item count: inaccessible rows can
+            // be interleaved, and counting only returned jobs would repeat/skip data on the next page.
+            Some(Cursor(raw_index.to_string()))
         } else {
             None
         };
@@ -143,6 +226,22 @@ impl Store {
         let current: Option<String> = r.get(5)?;
         let error: Option<String> = r.get(6)?;
         let sources: Option<String> = r.get(7)?;
+        let created_at: i64 = r.get(8)?;
+        let updated_at: i64 = r.get(9)?;
+        let mut summary: Option<String> = r.get(10)?;
+        let warnings: Option<String> = r.get(11)?;
+        let initiator: Option<String> = r.get(12)?;
+        let result_artifacts: Option<String> = r.get(13)?;
+        let mut decoded_warnings = decode_job_warnings(warnings.as_deref());
+        let mut hard_error = error;
+        // Before V16 completed scan/analyse notes occupied `error`. Preserve those reports while
+        // keeping actual failed-job errors differentiated in the new API.
+        if parse_job_state(&state_s) == JobState::Done && summary.is_none() {
+            summary = hard_error.take();
+            if summary.as_deref().is_some_and(|s| s.contains("skipped")) {
+                decoded_warnings.push(summary.clone().unwrap_or_default());
+            }
+        }
         Ok(JobStatus {
             id,
             kind: parse_job_kind(&kind_s),
@@ -152,10 +251,50 @@ impl Store {
                 total: total.map(|t| t as u64),
                 current,
             },
-            error,
+            error: hard_error,
+            summary,
+            warnings: decoded_warnings,
+            result_artifacts: decode_job_artifacts(result_artifacts.as_deref()),
+            created_at,
+            updated_at,
+            initiator,
             sources: decode_job_sources(sources.as_deref()),
         })
     }
+}
+
+fn decode_job_warnings(raw: Option<&str>) -> Vec<String> {
+    raw.and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default()
+}
+
+fn decode_job_artifacts(raw: Option<&str>) -> Vec<JobArtifact> {
+    raw.and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default()
+}
+
+/// Only a single-slash application route is linkable. Percent escapes are rejected rather than
+/// decoded here so encoded separators/traversal cannot disagree with the browser/router decoder.
+fn valid_artifact_route(route: &str) -> bool {
+    let path = route
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default();
+    let known_surface = path == "/jobs"
+        || path.starts_with("/jobs/")
+        || path == "/reports"
+        || path.starts_with("/reports/")
+        || path == "/assets"
+        || path.starts_with("/assets/");
+    known_surface
+        && route.starts_with('/')
+        && !route.starts_with("//")
+        && !route.contains('\\')
+        && !route.contains('%')
+        && !route.contains("://")
+        && !path
+            .split('/')
+            .any(|segment| segment == "." || segment == "..")
 }
 
 /// Job source attribution ↔ the `job.sources` TEXT column: a JSON array of canonical uuid strings.
@@ -213,5 +352,111 @@ fn parse_job_state(s: &str) -> JobState {
         "failed" => JobState::Failed,
         "cancelled" => JobState::Cancelled,
         _ => JobState::Queued,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dam_api::page::PageParams;
+    use dam_api::service::VisibilityScope;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn terminal_report_round_trips_separately_from_hard_errors() {
+        let store = Store::open_in_memory().unwrap();
+        let source = SourceId::new();
+        let job = store
+            .create_job(JobKind::Analyze, r#"{"auto":true}"#, Some(3), &[source])
+            .unwrap();
+        store
+            .update_job_progress(&job, JobState::Done, 3, Some(3), None)
+            .unwrap();
+        store
+            .complete_job(
+                &job,
+                "Analysed 2 of 3 item(s)",
+                &["1 item could not be analysed; inspect source status".into()],
+            )
+            .unwrap();
+
+        let status = store.get_job(&job).unwrap();
+        assert_eq!(status.state, JobState::Done);
+        assert_eq!(status.summary.as_deref(), Some("Analysed 2 of 3 item(s)"));
+        assert_eq!(status.warnings.len(), 1);
+        assert!(status.error.is_none());
+        assert_eq!(status.initiator.as_deref(), Some("Automation"));
+        assert!(status.updated_at >= status.created_at);
+    }
+
+    #[test]
+    fn history_paging_counts_hidden_rows_without_skipping_visible_jobs() {
+        let store = Store::open_in_memory().unwrap();
+        let visible = SourceId::new();
+        let hidden = SourceId::new();
+        let oldest = store
+            .create_job(JobKind::Scan, "{}", None, &[visible])
+            .unwrap();
+        let middle = store
+            .create_job(JobKind::Scan, "{}", None, &[hidden])
+            .unwrap();
+        let newest = store
+            .create_job(JobKind::Scan, "{}", None, &[visible])
+            .unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            for (id, at) in [(&oldest, 1_i64), (&middle, 2), (&newest, 3)] {
+                conn.execute(
+                    "UPDATE job SET created_at = ?2, updated_at = ?2 WHERE id = ?1",
+                    params![id.as_bytes().to_vec(), at],
+                )
+                .unwrap();
+            }
+        }
+        let vis = Visibility::Restricted(VisibilityScope {
+            sources: BTreeSet::from([visible]),
+            ..VisibilityScope::default()
+        });
+        let first = store
+            .list_jobs(
+                &JobListRequest {
+                    page: PageParams {
+                        after: None,
+                        limit: 1,
+                    },
+                    ..JobListRequest::default()
+                },
+                &vis,
+            )
+            .unwrap();
+        assert_eq!(first.items[0].id, newest);
+        let second = store
+            .list_jobs(
+                &JobListRequest {
+                    page: PageParams {
+                        after: first.cursor,
+                        limit: 1,
+                    },
+                    ..JobListRequest::default()
+                },
+                &vis,
+            )
+            .unwrap();
+        assert_eq!(second.items[0].id, oldest);
+    }
+
+    #[test]
+    fn artifact_routes_reject_external_and_filesystem_targets() {
+        assert!(valid_artifact_route("/jobs?job=018f"));
+        for unsafe_route in [
+            "https://example.test/report",
+            "//example.test/report",
+            "/jobs/../secret",
+            "/Users/operator/report.json",
+            r"\server\share\report.json",
+            "/jobs/%2e%2e/secret",
+        ] {
+            assert!(!valid_artifact_route(unsafe_route), "accepted {unsafe_route}");
+        }
     }
 }

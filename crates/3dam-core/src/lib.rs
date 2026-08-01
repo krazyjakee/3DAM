@@ -665,6 +665,19 @@ impl EmbeddedLibrary {
             .map_err(|e| LibError::Internal(e.to_string()))?
     }
 
+    /// Attach the authenticated transport actor to a newly-created background job. This remains
+    /// inherent (rather than part of `LibraryService`) because attribution is server-boundary
+    /// metadata, not a caller-controlled library operation.
+    pub async fn set_job_initiator(
+        &self,
+        id: &JobId,
+        initiator: String,
+    ) -> Result<(), LibError> {
+        let id = *id;
+        self.db(move |s| s.set_job_initiator(&id, &initiator))
+            .await
+    }
+
     // ── visibility enforcement (tech-spec 10 §4.3, issue #42) ────────────────
     //
     // The ceiling is resolved once at auth time (server) and enforced here, in the engine, as a

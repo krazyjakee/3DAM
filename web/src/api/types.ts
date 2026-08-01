@@ -667,12 +667,23 @@ export interface Progress {
   total: number | null;
   current: string | null;
 }
+export interface JobArtifact {
+  label: string;
+  /** Application-relative report or asset route; never a filesystem path. */
+  route?: string | null;
+}
 export interface JobStatus {
   id: JobId;
   kind: JobKind;
   state: JobState;
   progress: Progress;
   error: string | null;
+  summary?: string | null;
+  warnings?: string[];
+  result_artifacts?: JobArtifact[];
+  created_at?: number;
+  updated_at?: number;
+  initiator?: string | null;
   /** Every source this job touches. `progress.current` names a live file path, so a
    *  visibility-restricted session is shown a job only when all of these are within its ceiling —
    *  jobs outside it are simply absent from `/jobs` and from the event stream (issue #42). */
