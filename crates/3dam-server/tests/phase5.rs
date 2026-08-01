@@ -152,6 +152,27 @@ async fn defaults_are_safe_and_admin_reachable_under_off() {
     assert_eq!(st, StatusCode::OK);
 }
 
+#[tokio::test]
+async fn responses_deny_worker_and_service_worker_creation() {
+    let (app, _store, _lib) = harness(true).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/version")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response
+            .headers()
+            .get("content-security-policy")
+            .and_then(|value| value.to_str().ok()),
+        Some("worker-src 'none'")
+    );
+}
+
 // ── ops health probes (issue #75) ────────────────────────────────────────────
 
 #[tokio::test]
@@ -219,6 +240,44 @@ async fn token_mode_gates_reads_and_scopes_gate_writes() {
     let (st, _) = call(&app, "GET", "/api/v1/stats", Some(&secret), None).await;
     assert_eq!(st, StatusCode::OK);
 
+    // Derived credentials never echo the parent and cannot cross their transport/path boundary.
+    let (st, ws_ticket) = call(&app, "POST", "/api/v1/ws-ticket", Some(&secret), None).await;
+    assert_eq!(st, StatusCode::OK);
+    let ws_ticket = ws_ticket["ticket"].as_str().unwrap();
+    assert!(!ws_ticket.contains(&secret));
+    let (st, _) = call(
+        &app,
+        "GET",
+        &format!("/api/v1/stats?ticket={ws_ticket}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "WS ticket cannot call JSON APIs");
+
+    let asset = uuid::Uuid::now_v7();
+    let other = uuid::Uuid::now_v7();
+    let (st, media_ticket) = call(
+        &app,
+        "POST",
+        "/api/v1/media-ticket",
+        Some(&secret),
+        Some(json!({"target": format!("/api/v1/assets/{asset}/content")})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let media_ticket = media_ticket["ticket"].as_str().unwrap();
+    assert!(!media_ticket.contains(&secret));
+    let (st, _) = call(
+        &app,
+        "GET",
+        &format!("/api/v1/assets/{other}/content?ticket={media_ticket}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "media ticket is exact-asset bound");
+
     // Read token on a write route → 403 (missing Write scope). Localhost, so the network ceiling
     // is not the blocker — the identity scope is.
     let (st, _) = call(
@@ -235,8 +294,8 @@ async fn token_mode_gates_reads_and_scopes_gate_writes() {
     let (st, _) = call(&app, "GET", "/api/v1/stats", Some("dam_nope"), None).await;
     assert_eq!(st, StatusCode::UNAUTHORIZED);
 
-    // Browser media path (issue #74): a read GET authenticates via `?token=` when the header can't
-    // be set (`<img>`/`<audio>` loads). Valid → 200, bogus → 401.
+    // Long-lived bearers are never URI credentials (issue #128). Even a valid sentinel in the
+    // query is ignored; browser media/WS use narrow derived tickets minted via a header request.
     let (st, _) = call(
         &app,
         "GET",
@@ -245,7 +304,7 @@ async fn token_mode_gates_reads_and_scopes_gate_writes() {
         None,
     )
     .await;
-    assert_eq!(st, StatusCode::OK, "query-param token authenticates a read");
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
     let (st, _) = call(&app, "GET", "/api/v1/stats?token=dam_nope", None, None).await;
     assert_eq!(st, StatusCode::UNAUTHORIZED);
 }

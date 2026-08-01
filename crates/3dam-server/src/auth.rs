@@ -68,31 +68,14 @@ fn bearer(parts: &Parts) -> Option<String> {
     bearer_header(&parts.headers)
 }
 
-/// Pull a bearer secret from a `?token=` query param. Browsers can't set the `Authorization` header
-/// on `<img>`/`<audio>` element loads (thumbnails, content, previews), so a cross-origin token-gated
-/// web client (issue #74) carries the token in the URL for **read** GETs. Token secrets are
-/// `dam_`+hex (no reserved chars), so no percent-decoding is needed. (Same-origin session cookies
-/// ride along on element loads automatically, so accounts need no query credential.)
-fn query_bearer(parts: &Parts) -> Option<String> {
-    let q = parts.uri.query()?;
-    q.split('&')
-        .find_map(|pair| pair.strip_prefix("token="))
-        .filter(|t| !t.is_empty())
-        .map(|t| t.to_string())
-}
-
-/// Resolve auth for the live-event WebSocket (issue #74), which needs `Read`. A browser cannot set
-/// the `Authorization` header on a WebSocket, so the bearer secret is also accepted as a `?token=`
-/// query param; the header wins when both are present. Session cookies ride the WS handshake
-/// headers (same-origin), so an accounts login needs no query credential. (Tokens in a URL can
-/// reach access logs — the tradeoff of browser WS auth; keep `RUST_LOG` at info, which does not log
-/// query strings.)
+/// Resolve auth for a live-event WebSocket ticket mint, which needs `Read`. The mint is an ordinary
+/// fetch and therefore uses the Authorization header or same-origin session cookie. The long-lived
+/// credential is never accepted from a URI (issue #128).
 pub fn resolve_ws(
     store: &ServerStore,
     headers: &HeaderMap,
-    query_token: Option<String>,
 ) -> Result<Resolved, LibError> {
-    let token = bearer_header(headers).or(query_token);
+    let token = bearer_header(headers);
     let resolved = resolve(store, token, cookie_value(headers, SESSION_COOKIE))?;
     resolved.ctx.require(Scope::Read)?;
     Ok(resolved)
@@ -198,12 +181,14 @@ pub struct Reader(pub AuthContext);
 impl FromRequestParts<AppState> for Reader {
     type Rejection = ApiError;
     async fn from_request_parts(parts: &mut Parts, st: &AppState) -> Result<Self, ApiError> {
-        // Reads (incl. browser `<img>`/`<audio>` GETs) accept the token from the header *or* a
-        // `?token=` query param (issue #74), or the session cookie; the header wins. GETs are
-        // side-effect-free, so no CSRF gate here.
+        if let Some(ticket) = crate::resolve_media_ticket(st, parts) {
+            return Ok(Reader(ticket?));
+        }
+        // Browser media is fetched with this same header and converted to a local blob URL; raw
+        // bearer query credentials are deliberately not supported (issue #128).
         let resolved = resolve(
             &st.store,
-            bearer(parts).or_else(|| query_bearer(parts)),
+            bearer(parts),
             cookie_value(&parts.headers, SESSION_COOKIE),
         )?;
         resolved.ctx.require(Scope::Read)?;

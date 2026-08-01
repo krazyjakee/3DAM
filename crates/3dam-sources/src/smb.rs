@@ -5,7 +5,8 @@
 //! poll-only upstream (§3.3) — this backend provides enumerate + fetch. The share connection is
 //! established once at construction and reused.
 //!
-//! v1 secret handling matches SFTP: credentials come from the source record's connection blob.
+//! Credentials are hydrated from the host secret store immediately before construction; the
+//! portable source connection contains no password material (issue #103).
 //! Only the default SMB port is supported in v1 (share_connect resolves the server from the UNC);
 //! a non-default port is rejected up front rather than silently ignored.
 

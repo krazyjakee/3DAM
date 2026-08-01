@@ -112,11 +112,12 @@ pub trait FileSource: Send + Sync {
 
 // ── connection model (persisted per source, tech-spec 02 §3 `source.connection`) ────────────────
 
-/// Everything needed to (re)build a file source, including its secret. Serialised into the source
-/// record's `connection` column; **never** returned to a client (the sanitised [`display_uri`] is).
+/// Everything needed to (re)build a file source. Only the non-secret fields are serialised into the
+/// portable source record; credential material is populated at runtime from `credential_ref`, an
+/// opaque host-secret-store key held in the source table's separate `auth_ref` column.
 ///
 /// [`display_uri`]: SourceConnection::display_uri
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SourceConnection {
     LocalFs { root: String },
@@ -125,7 +126,7 @@ pub enum SourceConnection {
     Federated(FederatedConfig),
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SftpConfig {
     pub host: String,
     #[serde(default = "default_sftp_port")]
@@ -134,16 +135,21 @@ pub struct SftpConfig {
     /// Source-root-relative base directory on the remote host (absolute or `~`-relative per server).
     #[serde(default = "default_remote_root")]
     pub base_path: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing)]
     pub password: Option<String>,
-    /// Path to a private key file on *this* host (v1 secret handling; tech-spec 10 owns a keyring later).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Path to a private key file on *this* host. It is host-private configuration: copying the
+    /// portable catalog must not disclose either the path or the key's location.
+    #[serde(default, skip_serializing)]
     pub private_key: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing)]
     pub passphrase: Option<String>,
+    /// Opaque secret-store key. The store injects this from `source.auth_ref`; serde deliberately
+    /// ignores it so connection JSON cannot become a second credential-reference authority.
+    #[serde(skip)]
+    pub credential_ref: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SmbConfig {
     pub host: String,
     #[serde(default = "default_smb_port")]
@@ -153,24 +159,73 @@ pub struct SmbConfig {
     pub base_path: String,
     #[serde(default)]
     pub username: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing)]
     pub password: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub domain: Option<String>,
+    #[serde(skip)]
+    pub credential_ref: Option<String>,
 }
 
 /// A peer 3DAM server (phase 6, issue #39). Yields **catalog rows, not bytes** — it satisfies the
 /// source *record* model (persisted connection + secret) but is deliberately not a [`FileSource`]:
 /// the query fan-out in `dam-core` talks to it over the peer's HTTP read API, and the only byte
 /// transfer it ever does is fetching remote-owned previews (tech-spec 07 §4).
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct FederatedConfig {
     /// Peer base endpoint, `http(s)://host:port` (no trailing slash, no path).
     pub endpoint: String,
-    /// Bearer token for the peer, when its auth mode requires one. Held server-side in the
-    /// connection blob like every other source secret; never returned to clients.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Bearer token for the peer, when its auth mode requires one. Runtime-only: the serialised
+    /// connection always omits it, including while migrating a legacy row that still contains it.
+    #[serde(default, skip_serializing)]
     pub token: Option<String>,
+    #[serde(skip)]
+    pub credential_ref: Option<String>,
+}
+
+/// Credential payload stored behind one opaque reference. This type is intentionally separate
+/// from the portable connection model, and its `Debug` implementation never reveals values.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SourceCredentials {
+    Sftp {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        password: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        private_key: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        passphrase: Option<String>,
+    },
+    Smb { password: String },
+    Federated { token: String },
+}
+
+impl std::fmt::Debug for SourceCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = match self {
+            SourceCredentials::Sftp { .. } => "sftp",
+            SourceCredentials::Smb { .. } => "smb",
+            SourceCredentials::Federated { .. } => "federated",
+        };
+        f.debug_struct("SourceCredentials")
+            .field("kind", &kind)
+            .field("material", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for SourceConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SourceConnection")
+            .field("kind", &self.kind())
+            .field("uri", &self.display_uri())
+            .field("credential_ref", &self.credential_ref().map(|_| "[OPAQUE]"))
+            .field(
+                "credential_material",
+                &self.has_inline_credentials().then_some("[REDACTED]"),
+            )
+            .finish()
+    }
 }
 
 fn default_sftp_port() -> u16 {
@@ -203,6 +258,100 @@ impl SourceConnection {
             SourceConnection::Sftp(_) => "sftp",
             SourceConnection::Smb(_) => "smb",
             SourceConnection::Federated(_) => "federated",
+        }
+    }
+
+    /// Opaque key for resolving this connection's host-local credential, when one exists.
+    pub fn credential_ref(&self) -> Option<&str> {
+        match self {
+            SourceConnection::LocalFs { .. } => None,
+            SourceConnection::Sftp(c) => c.credential_ref.as_deref(),
+            SourceConnection::Smb(c) => c.credential_ref.as_deref(),
+            SourceConnection::Federated(c) => c.credential_ref.as_deref(),
+        }
+    }
+
+    /// Inject the reference stored in `source.auth_ref`. It is never serialised into connection
+    /// JSON, so there is one canonical reference field in the database.
+    pub fn set_credential_ref(&mut self, credential_ref: Option<String>) {
+        match self {
+            SourceConnection::LocalFs { .. } => {}
+            SourceConnection::Sftp(c) => c.credential_ref = credential_ref,
+            SourceConnection::Smb(c) => c.credential_ref = credential_ref,
+            SourceConnection::Federated(c) => c.credential_ref = credential_ref,
+        }
+    }
+
+    /// Remove runtime/legacy inline credential fields and return their secure-store payload.
+    /// Calling this before every catalog write is defence in depth on top of serde's unconditional
+    /// `skip_serializing` annotations.
+    pub fn take_credentials(&mut self) -> Option<SourceCredentials> {
+        match self {
+            SourceConnection::LocalFs { .. } => None,
+            SourceConnection::Sftp(c) => {
+                let password = c.password.take();
+                let private_key = c.private_key.take();
+                let passphrase = c.passphrase.take();
+                (password.is_some() || private_key.is_some() || passphrase.is_some()).then_some(
+                    SourceCredentials::Sftp {
+                        password,
+                        private_key,
+                        passphrase,
+                    },
+                )
+            }
+            SourceConnection::Smb(c) => c
+                .password
+                .take()
+                .map(|password| SourceCredentials::Smb { password }),
+            SourceConnection::Federated(c) => c
+                .token
+                .take()
+                .map(|token| SourceCredentials::Federated { token }),
+        }
+    }
+
+    /// Whether runtime or legacy inline credential material is present. Persistence layers use
+    /// this to reject an unsafe call site instead of silently dropping credentials during serde.
+    pub fn has_inline_credentials(&self) -> bool {
+        match self {
+            SourceConnection::LocalFs { .. } => false,
+            SourceConnection::Sftp(c) => {
+                c.password.is_some() || c.private_key.is_some() || c.passphrase.is_some()
+            }
+            SourceConnection::Smb(c) => c.password.is_some(),
+            SourceConnection::Federated(c) => c.token.is_some(),
+        }
+    }
+
+    /// Hydrate a persisted connection from a resolved credential payload. A kind mismatch means
+    /// the host secret entry is corrupt or was replaced; fail closed without exposing either value.
+    pub fn apply_credentials(&mut self, credentials: SourceCredentials) -> Result<(), LibError> {
+        match (self, credentials) {
+            (
+                SourceConnection::Sftp(c),
+                SourceCredentials::Sftp {
+                    password,
+                    private_key,
+                    passphrase,
+                },
+            ) => {
+                c.password = password;
+                c.private_key = private_key;
+                c.passphrase = passphrase;
+                Ok(())
+            }
+            (SourceConnection::Smb(c), SourceCredentials::Smb { password }) => {
+                c.password = Some(password);
+                Ok(())
+            }
+            (SourceConnection::Federated(c), SourceCredentials::Federated { token }) => {
+                c.token = Some(token);
+                Ok(())
+            }
+            _ => Err(LibError::SourceUnavailable(
+                "source credential entry is invalid; re-enter the source credentials".into(),
+            )),
         }
     }
 
@@ -378,6 +527,7 @@ fn parse_sftp(uri: &str, opts: &ConnOptions) -> Result<SourceConnection, LibErro
         password: opts.password.clone().or(uri_pass),
         private_key: opts.private_key.clone(),
         passphrase: opts.passphrase.clone(),
+        credential_ref: None,
     }))
 }
 
@@ -415,6 +565,7 @@ fn parse_smb(uri: &str, opts: &ConnOptions) -> Result<SourceConnection, LibError
         username: opts.username.clone().or(uri_user).unwrap_or_default(),
         password: opts.password.clone().or(uri_pass),
         domain: opts.domain.clone(),
+        credential_ref: None,
     }))
 }
 
@@ -532,6 +683,7 @@ fn parse_federated(uri: &str, opts: &ConnOptions) -> Result<SourceConnection, Li
     Ok(SourceConnection::Federated(FederatedConfig {
         endpoint,
         token: opts.password.clone(),
+        credential_ref: None,
     }))
 }
 
@@ -1206,6 +1358,31 @@ mod tests {
         assert_eq!(cfg.username, "legacy");
         assert_eq!(cfg.base_path, "/assets");
         assert_eq!(cfg.password.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn portable_connection_serialization_and_debug_never_expose_credentials() {
+        const SENTINEL: &str = "issue-103-sentinel-password";
+        let connection = SourceConnection::parse(
+            "sftp",
+            "sftp://legacy@example.invalid/assets",
+            &ConnOptions {
+                password: Some(SENTINEL.into()),
+                private_key: Some("/private/sentinel/id_ed25519".into()),
+                passphrase: Some("sentinel-passphrase".into()),
+                ..ConnOptions::default()
+            },
+        )
+        .unwrap();
+        let json = serde_json::to_string(&connection).unwrap();
+        let debug = format!("{connection:?}");
+        for forbidden in [SENTINEL, "/private/sentinel", "sentinel-passphrase"] {
+            assert!(!json.contains(forbidden), "portable JSON leaked {forbidden}");
+            assert!(!debug.contains(forbidden), "Debug leaked {forbidden}");
+        }
+        assert!(!json.contains("password"));
+        assert!(!json.contains("private_key"));
+        assert!(!json.contains("passphrase"));
     }
 
     #[test]

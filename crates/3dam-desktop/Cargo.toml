@@ -24,7 +24,7 @@ dam-frontend = { workspace = true }
 tokio = { workspace = true }
 # Validate the `--connect` endpoint into the URL the webview navigates to (hosted mode, issue #70).
 url = { workspace = true }
-# JSON-encode the shell token into the localStorage init script without hand-escaping.
+# JSON-encode native fetch-closure inputs without hand-escaping.
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 
@@ -38,6 +38,15 @@ tauri-plugin-dialog = "2"
 # restores runtime-created windows too, so the window built in `.setup()` is covered without an
 # explicit `restore_state` call.
 tauri-plugin-window-state = "2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { workspace = true, features = ["linux-native-async-persistent", "async-io", "crypto-rust"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { workspace = true, features = ["apple-native"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { workspace = true, features = ["windows-native"] }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

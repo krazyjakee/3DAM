@@ -109,7 +109,8 @@ function IdentityChip({ auth, accounts }: { auth?: string; accounts: boolean }) 
 
   const account = whoami.data?.account ?? null;
   const restricted = whoami.data?.restricted === true;
-  const signedIn = !!getServer().token || !!account;
+  const nativeCredential = getServer().nativeCredential;
+  const signedIn = !!getServer().token || nativeCredential || !!account;
   const canWrite = scopes.includes("write");
   const identity = account?.username ?? whoami.data?.identity ?? null;
 
@@ -167,18 +168,31 @@ function IdentityChip({ auth, accounts }: { auth?: string; accounts: boolean }) 
           <EyeOff size={11} />
         </span>
       )}
-      <button
-        className="flex items-center gap-1 rounded px-1.5 py-0.5 hover:text-fg"
-        onClick={() => void signOut()}
-        title={
-          account
-            ? "Sign out — end this session (stays connected to this server)"
-            : "Sign out — drop the token (stays connected to this server)"
-        }
-      >
-        <LogOut size={11} />
-        <span>Sign out</span>
-      </button>
+      {nativeCredential ? (
+        <span
+          className="text-fg-dim"
+          title={
+            getServer().nativeCredentialForgettable
+              ? "Use File → Forget Server Credential, then relaunch"
+              : "This credential lasts only for the current desktop session"
+          }
+        >
+          {getServer().nativeCredentialForgettable ? "File → Forget credential" : "Desktop session"}
+        </span>
+      ) : (
+        <button
+          className="flex items-center gap-1 rounded px-1.5 py-0.5 hover:text-fg"
+          onClick={() => void signOut()}
+          title={
+            account
+              ? "Sign out — end this session (stays connected to this server)"
+              : "Sign out — forget the tab token (stays connected to this server)"
+          }
+        >
+          <LogOut size={11} />
+          <span>Sign out</span>
+        </button>
+      )}
     </span>
   );
 }

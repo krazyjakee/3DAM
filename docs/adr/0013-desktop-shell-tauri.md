@@ -31,8 +31,11 @@ dedup, admin. The desktop app was the only surface not reusing it.
 - **Auth** rides the front-door design (tech-spec 10) unchanged: with the `Authentication` flag Off
   the local anonymous caller already resolves to owner trust; when it is on, the shell mints a
   per-launch owner-scoped "desktop shell" token in-process (revoking the previous launch's by
-  label) and seeds it into the web client's own credential store
-  (`localStorage["3dam.server"]`) via a webview initialization script.
+  label). Hosted `--connect` credentials are stored under an origin-and-mount key in the platform
+  OS keychain. A pre-page initialization closure attaches the native credential only to fetches for
+  that exact server boundary; application/page JavaScript sees only a boolean credential hint,
+  never the bearer value. **File → Forget Server Credential** deletes the keychain entry and exits
+  so no already-initialized page retains authority.
 
 Consequences for the architecture rules:
 
@@ -61,6 +64,14 @@ Consequences for the architecture rules:
   `http://127.0.0.1` origin where Tauri IPC is deliberately unavailable (a security posture, not a
   limitation). Native affordances (folder pickers, tray, deep OS integration) can be added later
   behind Tauri capabilities without changing this decision.
+
+The credential wrapper is not a general IPC secret-read command. A compromised page can exercise
+the API authority already represented by its signed-in UI, but cannot ask Tauri/keyring for the
+bearer, attach it to another origin or reverse-proxy mount, or serialize it into web storage.
+The wrapper binds pristine Fetch/Headers/Request accessors before page code, so prototype
+monkeypatching cannot observe the attached header. Server responses set `worker-src 'none'`, and
+the desktop window uses an incognito renderer partition, closing both new and persisted service
+worker interception paths below that wrapper.
 - **wry/tao directly (no Tauri)** — viable and lighter, but Tauri buys the packaging/bundling,
   updater, and capability story we want for distribution (tech-spec 15), for one extra config file.
 

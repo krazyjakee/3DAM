@@ -5,6 +5,7 @@
 mod analysis;
 mod background;
 mod convert;
+mod credentials;
 mod export;
 mod federation;
 mod paths;
@@ -110,6 +111,7 @@ fn thumb_cache_lookup(data_dir: &Path, asset: &Asset, max_edge: u32) -> Option<A
 fn gen_thumbnail(
     data_dir: &Path,
     store: &Store,
+    secrets: &credentials::SecretVault,
     asset: &Asset,
     max_edge: u32,
 ) -> Result<AssetContent, LibError> {
@@ -120,7 +122,7 @@ fn gen_thumbnail(
 
     // Cache miss: resolve the source file (in place for local, downloaded for remote). `fetch`
     // guards `..` traversal out of the source root.
-    let fetched = fetch_asset(store, asset, &paths::scratch_dir(data_dir))?;
+    let fetched = fetch_asset(store, secrets, asset, &paths::scratch_dir(data_dir))?;
     let det = dam_media::Detected {
         media: asset.summary.media,
         format: asset.summary.format.clone(),
@@ -205,6 +207,7 @@ fn render_model_thumbnail(
 fn gen_model_preview(
     data_dir: &Path,
     store: &Store,
+    secrets: &credentials::SecretVault,
     asset: &Asset,
 ) -> Result<AssetContent, LibError> {
     if asset.summary.media != MediaType::Model {
@@ -212,7 +215,7 @@ fn gen_model_preview(
             "3D preview is only available for model assets".to_string(),
         ));
     }
-    gen_model_preview_impl(data_dir, store, asset)
+    gen_model_preview_impl(data_dir, store, secrets, asset)
 }
 
 #[cfg(feature = "render")]
@@ -231,6 +234,7 @@ fn preview_content(bytes: Vec<u8>) -> AssetContent {
 fn gen_model_preview_impl(
     data_dir: &Path,
     store: &Store,
+    secrets: &credentials::SecretVault,
     asset: &Asset,
 ) -> Result<AssetContent, LibError> {
     let key = asset
@@ -244,7 +248,7 @@ fn gen_model_preview_impl(
         return Ok(preview_content(bytes)); // cache hit → no source access at all
     }
 
-    let fetched = fetch_asset(store, asset, &paths::scratch_dir(data_dir))?;
+    let fetched = fetch_asset(store, secrets, asset, &paths::scratch_dir(data_dir))?;
     let bytes =
         dam_render::model_preview_blob(fetched.path(), &asset.summary.format).map_err(|e| {
             if matches!(e, dam_render::RenderError::Decode(_)) {
@@ -261,6 +265,7 @@ fn gen_model_preview_impl(
 fn gen_model_preview_impl(
     _data_dir: &Path,
     _store: &Store,
+    _secrets: &credentials::SecretVault,
     _asset: &Asset,
 ) -> Result<AssetContent, LibError> {
     Err(LibError::Unsupported(
@@ -347,10 +352,11 @@ fn map_handler_err(e: dam_media::HandlerError) -> LibError {
 /// bytes are copied from an already-open root capability; remote bytes are downloaded. Pure/blocking.
 fn fetch_asset(
     store: &Store,
+    secrets: &credentials::SecretVault,
     asset: &Asset,
     scratch: &Path,
 ) -> Result<dam_sources::Fetched, LibError> {
-    let conn = store.get_source_connection(&asset.source_id)?;
+    let conn = secrets.resolve(store.get_source_connection(&asset.source_id)?)?;
     let fs = dam_sources::open_source(&conn, scratch)?;
     fs.fetch(&asset.path)
 }
@@ -360,6 +366,7 @@ fn fetch_asset(
 /// triggers a download. Pure/blocking — called inside a `spawn_blocking` closure.
 fn read_asset_content(
     store: &Store,
+    secrets: &credentials::SecretVault,
     asset: &Asset,
     scratch: &Path,
 ) -> Result<AssetContent, LibError> {
@@ -369,7 +376,7 @@ fn read_asset_content(
             "asset is {size} bytes; preview content is capped at {MAX_CONTENT_BYTES} bytes"
         )));
     }
-    let fetched = fetch_asset(store, asset, scratch)?;
+    let fetched = fetch_asset(store, secrets, asset, scratch)?;
     let abs = fetched.path();
     let bytes = std::fs::read(abs)
         .map_err(|e| LibError::Internal(format!("read {}: {e}", abs.display())))?;
@@ -437,12 +444,13 @@ fn resolve_sibling(base: &str, rel: &str) -> Result<String, LibError> {
 /// Pure/blocking — called inside a `spawn_blocking` closure. Powers loose-glTF external buffers (#56).
 fn read_related_content(
     store: &Store,
+    secrets: &credentials::SecretVault,
     asset: &Asset,
     rel: &str,
     scratch: &Path,
 ) -> Result<AssetContent, LibError> {
     let target = resolve_sibling(&asset.path, rel)?;
-    let conn = store.get_source_connection(&asset.source_id)?;
+    let conn = secrets.resolve(store.get_source_connection(&asset.source_id)?)?;
     let fs = dam_sources::open_source(&conn, scratch)?;
     let fetched = fs.fetch(&target)?;
     let abs = fetched.path();
@@ -467,6 +475,8 @@ fn read_related_content(
 /// The in-process engine. Cheap to clone the handle by wrapping in `Arc`.
 pub struct EmbeddedLibrary {
     store: Arc<Store>,
+    /// Host-local resolver for the opaque `source.auth_ref` values in the portable catalog.
+    secrets: credentials::SecretVault,
     events: broadcast::Sender<LibraryEvent>,
     data_dir: PathBuf,
     cancels: Mutex<HashMap<JobId, Arc<AtomicBool>>>,
@@ -526,7 +536,13 @@ impl EmbeddedLibrary {
             dam_sources::clean_scratch(&scratch);
         }
         let dir = data_dir.to_path_buf();
-        let store = tokio::task::spawn_blocking(move || Store::open(&dir))
+        let (store, secrets) = tokio::task::spawn_blocking(move || {
+            let store = Store::open(&dir)?;
+            let secrets = credentials::SecretVault::for_host(&dir)?;
+            credentials::migrate_legacy_credentials(&store, &secrets)?;
+            credentials::cleanup_pending_credentials(&store, &secrets)?;
+            Ok::<_, LibError>((store, secrets))
+        })
             .await
             .map_err(|e| LibError::Internal(e.to_string()))??;
         let store = Arc::new(store);
@@ -539,6 +555,7 @@ impl EmbeddedLibrary {
         ));
         let watchers = watch::WatchManager::new(
             store.clone(),
+            secrets.clone(),
             events.clone(),
             tokio::runtime::Handle::current(),
             governor.clone(),
@@ -569,6 +586,7 @@ impl EmbeddedLibrary {
             .map_err(|e| LibError::Internal(e.to_string()))?;
         Ok(EmbeddedLibrary {
             store,
+            secrets,
             events,
             data_dir: data_dir.to_path_buf(),
             cancels: Mutex::new(HashMap::new()),
@@ -636,20 +654,36 @@ impl EmbeddedLibrary {
     /// `LocalFs` source can perfectly well be a mounted network share underneath.
     async fn mark_writable(&self, sources: &mut [SourceInfo]) {
         let ids: Vec<SourceId> = sources.iter().map(|s| s.id).collect();
+        let secrets = self.secrets.clone();
         let probed = self
             .db(move |s| {
                 Ok(ids
                     .into_iter()
-                    .filter(|id| {
-                        s.get_source_connection(id)
-                            .is_ok_and(|c| dam_sources::writable_without_handshake(&c))
+                    .map(|id| {
+                        let result = s
+                            .get_source_connection(&id)
+                            .and_then(|connection| secrets.resolve(connection))
+                            .map(|connection| {
+                                dam_sources::writable_without_handshake(&connection)
+                            });
+                        (id, result)
                     })
-                    .collect::<std::collections::HashSet<_>>())
+                    .collect::<Vec<_>>())
             })
             .await
             .unwrap_or_default();
         for s in sources.iter_mut() {
-            s.writable = probed.contains(&s.id);
+            match probed.iter().find(|(id, _)| *id == s.id).map(|(_, r)| r) {
+                Some(Ok(writable)) => s.writable = *writable,
+                Some(Err(error)) => {
+                    s.writable = false;
+                    // Credential errors are deliberately generic and contain no ref, secret, host
+                    // path, or platform-provider detail. Listing therefore makes a locked/missing
+                    // store explicit without turning it into a disclosure surface.
+                    s.state = SourceState::Error(error.to_string());
+                }
+                None => s.writable = false,
+            }
         }
     }
 
@@ -945,7 +979,14 @@ impl EmbeddedLibrary {
     /// blocklist — without touching files in sources or `server.db`. Emits `CatalogReset` so live
     /// clients empty their grids.
     pub async fn wipe_catalog(&self) -> Result<WipeReport, LibError> {
-        let report = self.db(|s| s.wipe_catalog()).await?;
+        let secrets = self.secrets.clone();
+        let report = self
+            .db(move |s| {
+                let report = s.wipe_catalog()?;
+                credentials::cleanup_pending_credentials(s, &secrets)?;
+                Ok(report)
+            })
+            .await?;
         let _ = self.events.send(LibraryEvent::CatalogReset);
         Ok(report)
     }
@@ -1055,10 +1096,11 @@ impl LibraryService for EmbeddedLibrary {
         self.require_asset_visible(ctx, id).await?;
         let id = *id;
         let scratch = self.scratch();
+        let secrets = self.secrets.clone();
         let local = self
             .db(move |s| {
                 let asset = s.get_asset(&id)?;
-                read_asset_content(s, &asset, &scratch)
+                read_asset_content(s, &secrets, &asset, &scratch)
             })
             .await;
         match local {
@@ -1082,10 +1124,11 @@ impl LibraryService for EmbeddedLibrary {
         let rel = rel.to_string();
         let rel2 = rel.clone();
         let scratch = self.scratch();
+        let secrets = self.secrets.clone();
         let local = self
             .db(move |s| {
                 let asset = s.get_asset(&id)?;
-                read_related_content(s, &asset, &rel2, &scratch)
+                read_related_content(s, &secrets, &asset, &rel2, &scratch)
             })
             .await;
         match local {
@@ -1108,6 +1151,7 @@ impl LibraryService for EmbeddedLibrary {
         let id = *id;
         let edge = max_edge.clamp(THUMB_MIN_EDGE, THUMB_MAX_EDGE);
         let data_dir = self.data_dir.clone();
+        let secrets = self.secrets.clone();
         // Fast path: a cheap cache probe on the unbounded pool, so an already-rendered thumbnail is
         // never stuck behind background generation.
         let probe_dir = data_dir.clone();
@@ -1133,7 +1177,7 @@ impl LibraryService for EmbeddedLibrary {
         // burst can't starve an interactive inspector read (preview / waveform / detail).
         self.run_bg(move |s| {
             let asset = s.get_asset(&id)?;
-            gen_thumbnail(&data_dir, s, &asset, edge)
+            gen_thumbnail(&data_dir, s, &secrets, &asset, edge)
         })
         .await
     }
@@ -1146,10 +1190,11 @@ impl LibraryService for EmbeddedLibrary {
         self.require_asset_visible(ctx, id).await?;
         let id = *id;
         let data_dir = self.data_dir.clone();
+        let secrets = self.secrets.clone();
         let local = self
             .db(move |s| {
                 let asset = s.get_asset(&id)?;
-                gen_model_preview(&data_dir, s, &asset)
+                gen_model_preview(&data_dir, s, &secrets, &asset)
             })
             .await;
         match local {
@@ -1176,6 +1221,7 @@ impl LibraryService for EmbeddedLibrary {
             .unwrap_or(background::PREGEN_THUMB_EDGE)
             .clamp(THUMB_MIN_EDGE, THUMB_MAX_EDGE);
         let store = self.store.clone();
+        let secrets = self.secrets.clone();
         let data_dir = self.data_dir.clone();
         let assets = req.assets.clone();
         tokio::task::spawn_blocking(move || {
@@ -1183,9 +1229,9 @@ impl LibraryService for EmbeddedLibrary {
                 let Ok(asset) = store.get_asset(&id) else {
                     continue; // vanished (or peer-owned) — fail-soft
                 };
-                let _ = gen_thumbnail(&data_dir, &store, &asset, edge);
+                let _ = gen_thumbnail(&data_dir, &store, &secrets, &asset, edge);
                 if asset.summary.media == MediaType::Model {
-                    let _ = gen_model_preview(&data_dir, &store, &asset);
+                    let _ = gen_model_preview(&data_dir, &store, &secrets, &asset);
                 }
             }
         });
@@ -1250,7 +1296,8 @@ impl LibraryService for EmbeddedLibrary {
             }
         }
         let scratch = self.scratch();
-        self.db(move |s| convert::run_convert(s, req, &scratch))
+        let secrets = self.secrets.clone();
+        self.db(move |s| convert::run_convert(s, &secrets, req, &scratch))
             .await
     }
 
@@ -1269,8 +1316,9 @@ impl LibraryService for EmbeddedLibrary {
         let scratch = self.scratch();
         let staged = staged.to_path_buf();
         let events = self.events.clone();
+        let secrets = self.secrets.clone();
         let outcome = self
-            .db(move |s| upload::run_upload(s, &events, req, &staged, &scratch))
+            .db(move |s| upload::run_upload(s, &secrets, &events, req, &staged, &scratch))
             .await?;
 
         // Ask the background pipeline for a drain. `ingest_one` writes only the cheap tier, and the
@@ -1399,7 +1447,38 @@ impl LibraryService for EmbeddedLibrary {
         let name = req.name.clone().unwrap_or(default_name);
         let watch = req.options.watch;
         let is_federated = matches!(conn, dam_sources::SourceConnection::Federated(_));
-        let id = self.db(move |s| s.add_source(&conn, &name, watch)).await?;
+        let id = SourceId::new();
+        let credential = conn.take_credentials();
+        let credential_ref = credential
+            .as_ref()
+            .map(|_| credentials::SecretVault::reference(&id));
+        let secrets = self.secrets.clone();
+        let stored_ref = credential_ref.clone();
+        self.db(move |s| {
+            // Commit the redacted row + deterministic opaque ref first. If the secret write then
+            // fails, the row still tracks any provider-side partial success; cleanup deletes the
+            // credential before the row, so no failure ordering can create an untracked secret.
+            s.add_source_with_auth(
+                id,
+                &conn,
+                &name,
+                watch,
+                stored_ref.as_deref(),
+            )?;
+            if let (Some(reference), Some(material)) = (stored_ref.as_deref(), credential.as_ref()) {
+                if let Err(error) = secrets.put(reference, material) {
+                    // If deletion itself cannot be confirmed, retain the row/reference. It will
+                    // list as locked/unavailable and remains recoverable; removing the row here
+                    // would turn a possibly committed provider entry into an orphan.
+                    if secrets.delete(reference).is_ok() {
+                        let _ = s.remove_source(&id, false);
+                    }
+                    return Err(error);
+                }
+            }
+            Ok(())
+        })
+        .await?;
         // Start watching immediately if requested (tech-spec 07 §3.1).
         if watch {
             self.watchers.ensure(id);
@@ -1418,8 +1497,15 @@ impl LibraryService for EmbeddedLibrary {
     ) -> Result<(), LibError> {
         Self::require_full_visibility(ctx, "removing a source")?;
         let id = *id;
-        self.db(move |s| s.remove_source(&id, req.keep_metadata))
-            .await?;
+        let secrets = self.secrets.clone();
+        self.db(move |s| {
+            s.remove_source(&id, req.keep_metadata)?;
+            if !req.keep_metadata {
+                credentials::cleanup_pending_credentials(s, &secrets)?;
+            }
+            Ok(())
+        })
+        .await?;
         self.fed.invalidate().await;
         Ok(())
     }
@@ -1630,12 +1716,13 @@ impl LibraryService for EmbeddedLibrary {
         self.cancels.lock().unwrap().insert(job, cancel.clone());
 
         let store = self.store.clone();
+        let secrets = self.secrets.clone();
         let events = self.events.clone();
         let governor = self.governor.clone();
         let scratch = self.scratch();
         tokio::task::spawn_blocking(move || {
             scan::run_scan(
-                store, events, job, sources, mode, cancel, &governor, &scratch,
+                store, secrets, events, job, sources, mode, cancel, &governor, &scratch,
             );
         });
 
@@ -1651,8 +1738,16 @@ impl LibraryService for EmbeddedLibrary {
         // Plan: resolve the due (or requested) targets up front so the job total is known (§1.2).
         let assets = req.assets.clone();
         let force = req.force;
+        let secrets = self.secrets.clone();
         let targets = self
-            .db(move |s| s.list_analysis_targets(analysis::PIPELINE_VERSION, force, &assets))
+            .db(move |s| {
+                let mut targets =
+                    s.list_analysis_targets(analysis::PIPELINE_VERSION, force, &assets)?;
+                for target in &mut targets {
+                    target.connection = secrets.resolve(target.connection.clone())?;
+                }
+                Ok(targets)
+            })
             .await?;
         if targets.is_empty() {
             return Err(LibError::BadRequest(

@@ -44,6 +44,7 @@ enum WatchEntry {
 
 pub(crate) struct WatchManager {
     store: Arc<Store>,
+    secrets: crate::credentials::SecretVault,
     events: broadcast::Sender<LibraryEvent>,
     rt: tokio::runtime::Handle,
     live: Arc<Mutex<HashMap<SourceId, WatchEntry>>>,
@@ -58,6 +59,7 @@ pub(crate) struct WatchManager {
 impl WatchManager {
     pub(crate) fn new(
         store: Arc<Store>,
+        secrets: crate::credentials::SecretVault,
         events: broadcast::Sender<LibraryEvent>,
         rt: tokio::runtime::Handle,
         governor: Arc<crate::resources::Governor>,
@@ -65,6 +67,7 @@ impl WatchManager {
     ) -> WatchManager {
         WatchManager {
             store,
+            secrets,
             events,
             rt,
             live: Arc::new(Mutex::new(HashMap::new())),
@@ -119,6 +122,7 @@ impl WatchManager {
     /// every role with it. The slot is left `Pending` until the watcher lands (or is dropped on error).
     fn spawn_local(&self, id: SourceId, root: String) {
         let store = self.store.clone();
+        let secrets = self.secrets.clone();
         let events = self.events.clone();
         let in_flight = self.in_flight.clone();
         let live = self.live.clone();
@@ -161,7 +165,7 @@ impl WatchManager {
                             more = rx.recv() => if more.is_none() { return },
                         }
                     }
-                    trigger_delta(&store, &events, &in_flight, &governor, &scratch, id);
+                    trigger_delta(&store, &secrets, &events, &in_flight, &governor, &scratch, id);
                 }
             });
             // Publish the live watcher, replacing the `Pending` reservation.
@@ -173,6 +177,7 @@ impl WatchManager {
 
     fn spawn_poll(&self, id: SourceId) {
         let store = self.store.clone();
+        let secrets = self.secrets.clone();
         let events = self.events.clone();
         let in_flight = self.in_flight.clone();
         let governor = self.governor.clone();
@@ -180,7 +185,7 @@ impl WatchManager {
         self.rt.spawn(async move {
             loop {
                 tokio::time::sleep(POLL_INTERVAL).await;
-                trigger_delta(&store, &events, &in_flight, &governor, &scratch, id);
+                trigger_delta(&store, &secrets, &events, &in_flight, &governor, &scratch, id);
             }
         });
     }
@@ -208,6 +213,7 @@ fn is_content_change(kind: &EventKind) -> bool {
 /// Submit a background delta scan for one source, unless one is already running for it.
 fn trigger_delta(
     store: &Arc<Store>,
+    secrets: &crate::credentials::SecretVault,
     events: &broadcast::Sender<LibraryEvent>,
     in_flight: &Arc<Mutex<HashSet<SourceId>>>,
     governor: &Arc<crate::resources::Governor>,
@@ -240,6 +246,7 @@ fn trigger_delta(
         }
     };
     let store = store.clone();
+    let secrets = secrets.clone();
     let events = events.clone();
     let in_flight = in_flight.clone();
     let governor = governor.clone();
@@ -248,6 +255,7 @@ fn trigger_delta(
         let cancel = Arc::new(AtomicBool::new(false));
         scan::run_scan(
             store,
+            secrets,
             events,
             job,
             vec![info],

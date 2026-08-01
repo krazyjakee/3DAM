@@ -48,6 +48,7 @@ import { hasInteractive3D } from "@/lib/model-formats";
 import { useViewState } from "@/lib/view-state";
 import { shortcutLabel, SHORTCUT_EVENT, type ShortcutId } from "@/lib/shortcuts";
 import { ModelViewerIsland } from "@/islands/ModelViewerIsland";
+import { useMediaBlob, useMediaTicket } from "@/lib/media-blob";
 import { AudioPlayer } from "./AudioPlayer";
 import { LicenseBadge } from "./LicenseBadge";
 import { ImageViewer } from "./ImageViewer";
@@ -225,13 +226,36 @@ function InspectorSkeleton() {
 function Preview({ asset }: { asset: Asset }) {
   const { summary } = asset;
   const [tiling, setTiling] = useState(false);
+  const mediaPath =
+    summary.media === "model" && hasInteractive3D(summary.format)
+      ? api.assetPreviewMeshUrl(summary.id)
+      : api.assetContentUrl(summary.id);
+  const streaming = summary.media === "audio" || summary.media === "video";
+  const blob = useMediaBlob(mediaPath, !streaming);
+  const ticket = useMediaTicket(mediaPath, streaming);
+  const media = streaming ? ticket : blob;
+  if (media.status === "loading" || media.status === "idle") {
+    return (
+      <div className="flex aspect-square items-center justify-center border-b border-border text-xs text-fg-dim">
+        Loading preview…
+      </div>
+    );
+  }
+  if (media.status === "error" || !media.url) {
+    return (
+      <div className="flex aspect-square items-center justify-center border-b border-border text-xs text-fg-dim">
+        Preview unavailable.
+      </div>
+    );
+  }
+  const src = media.url;
   if (summary.media === "model") {
     // Interactive island for every Assimp-decodable mesh format (issue #18) — the server decodes the
     // preview blob so the DOM never resolves external buffers.
     if (hasInteractive3D(summary.format)) {
       return (
         <div className="aspect-square border-b border-border">
-          <ModelViewerIsland src={api.assetPreviewMeshUrl(summary.id)} />
+          <ModelViewerIsland src={src} />
         </div>
       );
     }
@@ -243,7 +267,6 @@ function Preview({ asset }: { asset: Asset }) {
       return <NoModelPreview format={summary.format} />;
     }
   }
-  const src = api.assetContentUrl(summary.id);
   if (summary.media === "audio") {
     // Playable inline: waveform + transport, with the playhead driven by real progress (issues
     // #16, #14). Keyed by id so switching assets resets playback + the decoded waveform.
@@ -253,7 +276,13 @@ function Preview({ asset }: { asset: Asset }) {
       asset.attributes?.media === "audio" ? (asset.attributes.peaks ?? null) : null;
     return (
       <div className="border-b border-border">
-        <AudioPlayer key={summary.id} src={src} assetId={summary.id} peaks={peaks} />
+        <AudioPlayer
+          key={summary.id}
+          src={src}
+          assetId={summary.id}
+          peaks={peaks}
+          onCredentialExpired={media.renew}
+        />
       </div>
     );
   }
@@ -283,7 +312,7 @@ function Preview({ asset }: { asset: Asset }) {
     // user has asked to watch it — the server's range support (see `ranged_content_response`) is
     // what makes both that and seeking work. Playback works regardless of what the *server* can
     // decode; only the metadata and poster frame depend on its ffmpeg (ADR 0015).
-    return <VideoPreview key={summary.id} src={src} />;
+    return <VideoPreview key={summary.id} src={src} onCredentialExpired={media.renew} />;
   }
   if (summary.media === "document") {
     const excerpt =
@@ -305,15 +334,43 @@ function Preview({ asset }: { asset: Asset }) {
  *  render a poster frame, and every video tile in the grid stays a typed glyph. Left unexplained
  *  that reads as a broken thumbnailer rather than a missing optional dependency, so we say it once,
  *  here, where the user is already looking at a video. */
-function VideoPreview({ src }: { src: string }) {
+function VideoPreview({
+  src,
+  onCredentialExpired,
+}: {
+  src: string;
+  onCredentialExpired: () => void;
+}) {
   const version = useVersion();
+  const resumeAt = useRef(0);
+  const lastRenewal = useRef(0);
   // Only claim a decoder is missing once we've actually heard from the server — mid-fetch,
   // `capabilities` is undefined, and asserting "not installed" then would be a guess.
   const probeMissing =
     version.data != null && !version.data.capabilities.includes("video_probe");
   return (
     <div className="border-b border-border">
-      <video src={src} controls preload="metadata" playsInline className="max-h-[60vh] w-full bg-black">
+      <video
+        src={src}
+        controls
+        preload="metadata"
+        playsInline
+        className="max-h-[60vh] w-full bg-black"
+        onTimeUpdate={(event) => {
+          resumeAt.current = event.currentTarget.currentTime;
+        }}
+        onLoadedMetadata={(event) => {
+          if (resumeAt.current > 0) event.currentTarget.currentTime = resumeAt.current;
+        }}
+        onError={() => {
+          // An expired ticket is opaque to HTMLMediaElement. Re-mint at most once per minute: a
+          // genuinely unsupported codec fails again immediately and then stays failed, while a
+          // long playback recovers after each five-minute ticket without a bearer URL.
+          if (Date.now() - lastRenewal.current < 60_000) return;
+          lastRenewal.current = Date.now();
+          onCredentialExpired();
+        }}
+      >
         <track kind="captions" />
       </video>
       {probeMissing && (

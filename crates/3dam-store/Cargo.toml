@@ -7,8 +7,8 @@ description = "SQLite metadata store: schema, migrations, and row↔DTO queries 
 
 [dependencies]
 dam-api.workspace = true
-# The connection model + secret-free display URI live in dam-sources; the store persists the
-# connection blob and hands back a `SourceConnection`. Network backends aren't needed here, so the
+# The connection model + secret-free display URI live in dam-sources; the store persists only its
+# non-secret fields plus an opaque auth_ref. Network backends aren't needed here, so the
 # heavy SFTP/SMB stack is dropped (default-features = false).
 dam-sources = { workspace = true }
 rusqlite.workspace = true

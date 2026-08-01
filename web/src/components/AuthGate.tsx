@@ -11,7 +11,15 @@ import { useQuery } from "@tanstack/react-query";
 import { api, ApiError } from "@/api/client";
 import { authApi } from "@/api/auth";
 import { useVersion } from "@/api/queries";
-import { getServer, isRemote, resolveUrl, serverLabel, setServer } from "@/lib/server";
+import {
+  getServer,
+  hasBearerCredential,
+  isRemote,
+  resolveUrl,
+  serverLabel,
+  setServer,
+  takeCredentialMigrationNotice,
+} from "@/lib/server";
 import { AUTH_COPY, isUnauthorized, useAuthExpired } from "@/lib/auth";
 import { bootDecision } from "@/lib/auth-policy";
 import { useFocusTrap } from "@/lib/use-focus-trap";
@@ -37,6 +45,7 @@ function oidcStartUrl(): string {
 }
 
 export function AuthGate({ children }: { children: ReactNode }) {
+  const [credentialMigrated] = useState(takeCredentialMigrationNotice);
   const version = useVersion();
   const expired = useAuthExpired();
   const auth = version.data?.auth;
@@ -51,15 +60,16 @@ export function AuthGate({ children }: { children: ReactNode }) {
   // recovery hatch, ADR 0014) also reports `unclaimed`, but every existing user's password still
   // works — so the claim screen must not be exclusive there.
   const noAccounts = (version.data?.account_count ?? 0) === 0;
-  const token = getServer().token;
+  const hasBearer = hasBearerCredential();
 
   // Validate a stored credential before mounting the app: in token mode it decides gate-vs-app; in
   // anonymous mode a stale token would 401 every read, which must fall back to the gate (with a
   // read-only escape), not a broken grid. With accounts enabled the credential may be a session
   // cookie instead of a stored token, so the probe runs even token-less (cookies ride along).
-  const needsProbe = (auth === "token" || auth === "anonymous") && (!!token || accounts);
+  const needsProbe = (auth === "token" || auth === "anonymous") && (hasBearer || accounts);
   const probe = useQuery({
-    queryKey: ["auth-probe", token],
+    // Never put the bearer itself in a query/cache key: diagnostics and devtools inspect keys.
+    queryKey: ["auth-probe", getServer().base, hasBearer ? "bearer" : "session"],
     queryFn: () => api.stats(),
     enabled: needsProbe,
     retry: false,
@@ -82,7 +92,13 @@ export function AuthGate({ children }: { children: ReactNode }) {
   if (expired)
     return (
       <LoginScreen
-        reason={token || hasSessionHint() ? AUTH_COPY.sessionExpired : null}
+        reason={
+          credentialMigrated
+            ? "A previously saved browser token was removed for security. Paste it again to continue."
+            : hasBearer || hasSessionHint()
+              ? AUTH_COPY.sessionExpired
+              : null
+        }
         allowReadOnly={auth === "anonymous"}
         accounts={accounts}
         oidc={oidc}
@@ -97,7 +113,9 @@ export function AuthGate({ children }: { children: ReactNode }) {
       return (
         <LoginScreen
           reason={
-            token
+            credentialMigrated
+              ? "A previously saved browser token was removed for security. Paste it again to continue."
+              : hasBearer
               ? AUTH_COPY.tokenRejected
               : hasSessionHint()
                 ? AUTH_COPY.sessionExpired
@@ -114,7 +132,11 @@ export function AuthGate({ children }: { children: ReactNode }) {
   if (bootDecision(auth, false) === "gate")
     return (
       <LoginScreen
-        reason={null}
+        reason={
+          credentialMigrated
+            ? "A previously saved browser token was removed for security. Paste it again to continue."
+            : null
+        }
         allowReadOnly={false}
         accounts={accounts}
         oidc={oidc}
@@ -533,7 +555,7 @@ function ClaimScreen({ onSignIn }: { onSignIn?: () => void } = {}) {
 }
 
 /** The token sign-in form — shared by the full-screen gate and the StatusBar sign-in modal. The
- *  token is validated against the server before it is persisted, so a typo lands back here with a
+ *  token is validated against the server before it is retained for this tab, so a typo lands back here with a
  *  message instead of in a broken, reloading app. */
 export function TokenLoginForm({
   reason,
@@ -569,8 +591,8 @@ export function TokenLoginForm({
         setError(AUTH_COPY.lacksRead);
         return;
       }
-      // Valid (or the server is mid-hiccup — the app's offline UX owns that): persist and restart
-      // every transport with the credential (queries, WS, media `?token=` URLs).
+      // Valid (or the server is mid-hiccup — the app's offline UX owns that): retain it for this tab
+      // and restart every transport. No URL or durable cache contains the credential.
       setServer(getServer().base, t);
       location.reload();
     } catch {
@@ -593,6 +615,10 @@ export function TokenLoginForm({
       <p className="mb-3 text-[12px] text-fg-dim">
         This server requires a token. Paste one issued by its operator (
         <code className="font-mono">3dam admin token add</code>).
+      </p>
+      <p className="mb-3 rounded border border-border bg-surface-2 px-2 py-1.5 text-[11px] text-fg-dim">
+        Browser tokens last only for this tab and are forgotten when it closes. Use Sign out to
+        forget one sooner. The desktop app stores command-line connection tokens in the OS keychain.
       </p>
 
       {error && (

@@ -693,7 +693,7 @@ pub struct SourceInfo {
     pub writable: bool,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct AddSource {
     pub kind: SourceKind,
     pub uri: String,
@@ -703,7 +703,20 @@ pub struct AddSource {
     pub options: SourceOptions,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+impl std::fmt::Debug for AddSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AddSource")
+            .field("kind", &self.kind)
+            // Network URI userinfo may itself contain a password. The parsed SourceConnection has
+            // a safe display URI, but this transport DTO has not crossed that boundary yet.
+            .field("uri", &"[REDACTED]")
+            .field("name", &self.name)
+            .field("options", &self.options)
+            .finish()
+    }
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct SourceOptions {
     #[serde(default)]
     pub watch: bool,
@@ -715,7 +728,8 @@ pub struct SourceOptions {
     /// Login user (overrides any `user@` in the URI).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
-    /// Password (SFTP or SMB). Stored in the source's connection blob, never returned to clients.
+    /// Password (SFTP or SMB). Write-only input; moved into the host secret store before the source
+    /// row is created and never returned to clients or stored in the portable catalog.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
     /// Path to a private key file for SFTP key auth.
@@ -730,6 +744,28 @@ pub struct SourceOptions {
     /// Override the default port (22 SFTP / 445 SMB).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
+}
+
+impl std::fmt::Debug for SourceOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SourceOptions")
+            .field("watch", &self.watch)
+            .field("include", &self.include)
+            .field("exclude", &self.exclude)
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "private_key",
+                &self.private_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "passphrase",
+                &self.passphrase.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("domain", &self.domain)
+            .field("port", &self.port)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

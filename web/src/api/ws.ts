@@ -6,12 +6,18 @@ import { useEffect, useSyncExternalStore } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import type { LibraryEvent } from "./types";
 import { qk } from "./queries";
-import { wsUrl as resolveWsUrl } from "@/lib/server";
+import { authenticatedFetch, csrfHeaders, wsUrl as resolveWsUrl } from "@/lib/server";
 
-// The firehose URL, derived from the configured server base (same-origin by default) with the token
-// carried as a `?token=` query param — a browser can't set headers on a WebSocket (issue #74).
-function wsUrl(): string {
-  return resolveWsUrl("/api/v1/ws");
+// Browser WebSockets cannot attach Authorization. Mint a 30-second, one-use, WS-only ticket over
+// an authenticated fetch, then put only that derived credential in the upgrade URI (issue #128).
+async function wsUrl(): Promise<string> {
+  const response = await authenticatedFetch("/api/v1/ws-ticket", {
+    method: "POST",
+    headers: { accept: "application/json", ...csrfHeaders() },
+  });
+  if (!response.ok) throw new Error(`live-update ticket failed (${response.status})`);
+  const body = (await response.json()) as { ticket: string };
+  return resolveWsUrl("/api/v1/ws", body.ticket);
 }
 
 // Live-connection state, surfaced to the UI so a silent disconnect becomes visible (issue #25).
@@ -99,9 +105,18 @@ export function useLiveUpdates(): void {
       }
     };
 
-    const connect = () => {
+    const connect = async () => {
       if (closed) return;
-      socket = new WebSocket(wsUrl());
+      try {
+        socket = new WebSocket(await wsUrl());
+      } catch {
+        if (closed) return;
+        setWsConnected(false);
+        const delay = Math.min(1000 * 2 ** retry, 15000);
+        retry += 1;
+        timer = setTimeout(() => void connect(), delay);
+        return;
+      }
       socket.onopen = () => {
         retry = 0;
         setWsConnected(true);
@@ -118,12 +133,12 @@ export function useLiveUpdates(): void {
         if (closed) return;
         const delay = Math.min(1000 * 2 ** retry, 15000);
         retry += 1;
-        timer = setTimeout(connect, delay);
+        timer = setTimeout(() => void connect(), delay);
       };
       socket.onerror = () => socket?.close();
     };
 
-    connect();
+    void connect();
     return () => {
       closed = true;
       if (timer) clearTimeout(timer);

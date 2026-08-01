@@ -95,6 +95,12 @@ pub struct ServerBlock {
     /// attacker-controlled on any deployment that doesn't strip it, so trusting it would make the
     /// flag settable by the client. Pairs with `[accounts] require_claim_token`.
     pub secure_cookies: Option<bool>,
+    /// Exact socket-peer addresses allowed to assert one client address in `X-Forwarded-For` for
+    /// auth rate limiting. Empty by default: forwarding headers from every peer are ignored.
+    /// Proxies named here must strip the inbound header and replace it with one bare IPv4/IPv6
+    /// address; malformed/missing attribution is deliberately collapsed into a shared bucket.
+    #[serde(default)]
+    pub trusted_proxies: Vec<IpAddr>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]

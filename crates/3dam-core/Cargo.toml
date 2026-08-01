@@ -26,6 +26,7 @@ serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 directories.workspace = true
+tempfile.workspace = true
 # watch/auto-rescan (local FS change notification) + CSV manifest export (phase 4 Reach).
 notify.workspace = true
 csv.workspace = true
@@ -47,8 +48,17 @@ ort = { version = "=2.0.0-rc.10", default-features = false, features = ["load-dy
 
 # Host-resource awareness (tech-spec 14 §5): renice + idle-ioprio the background workers on Linux
 # so co-tenant workloads preempt 3DAM's grind. Linux-only; other platforms skip the calls.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [target.'cfg(target_os = "linux")'.dependencies]
-libc = "0.2"
+keyring = { workspace = true, features = ["linux-native-async-persistent", "async-io", "crypto-rust"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { workspace = true, features = ["apple-native"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { workspace = true, features = ["windows-native"] }
 
 [features]
 # 3D model thumbnails via the wgpu renderer. Pulls wgpu in transitively — enabled by `serve`, kept
@@ -75,3 +85,4 @@ semantic = [
 tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread"] }
 image.workspace = true
 hound.workspace = true
+rusqlite.workspace = true

@@ -9,8 +9,9 @@
 //!
 //! Auth rides the front-door design unchanged (tech-spec 10): with the `Authentication` flag Off,
 //! the local anonymous caller already resolves to owner trust; when it is on, the shell mints a
-//! per-launch owner token in-process and seeds it into the web client's own credential store
-//! (`localStorage["3dam.server"]`, see `web/src/lib/server.ts`) via a webview init script.
+//! per-launch owner token in-process. Hosted tokens live in the OS keychain; a pre-page fetch
+//! wrapper attaches native credentials only to the selected server without exposing them to page
+//! JavaScript (issues #128/#129).
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -26,6 +27,7 @@ use tauri_plugin_window_state::StateFlags;
 const ZOOM_MIN: f64 = 0.25;
 const ZOOM_MAX: f64 = 3.0;
 const ZOOM_STEP: f64 = 0.1;
+const KEYCHAIN_SERVICE: &str = "io.github.krazyjakee.threedam.connected-server";
 
 /// Entry point for the GUI role. Bare `3dam` serves the platform-default embedded library to the
 /// webview; `--connect <url> [--token <t>]` opens straight against a remote `3dam serve`, and
@@ -40,7 +42,8 @@ pub fn run(args: Vec<OsString>) -> u8 {
     };
 
     // Resolve what the webview loads: a remote server, or an in-process one over the local library.
-    let (url, token) = match &launch.connect {
+    let hosted = launch.connect.is_some();
+    let (url, mut token) = match &launch.connect {
         Some(raw) => match url::Url::parse(raw) {
             Ok(endpoint) => (endpoint, launch.token.clone()),
             Err(e) => {
@@ -60,15 +63,37 @@ pub fn run(args: Vec<OsString>) -> u8 {
         }
     };
 
-    // Seed the credential where the web client already looks (web/src/lib/server.ts): base "" keeps
-    // it same-origin; the script runs before any app JS on every navigation, so the client boots
-    // signed-in instead of landing on the AuthGate. `to_string` JSON-escapes the token for us.
-    let init_script = token.as_deref().map(|t| {
-        format!(
-            "localStorage.setItem('3dam.server', JSON.stringify({{ base: '', token: {} }}));",
-            serde_json::to_string(t).expect("a string always serializes")
-        )
-    });
+    let keychain_account = hosted.then(|| credential_account(&url));
+    if let Some(account) = keychain_account.as_deref() {
+        let entry = match keyring::Entry::new(KEYCHAIN_SERVICE, account) {
+            Ok(entry) => entry,
+            Err(error) => {
+                eprintln!("3dam desktop: OS credential store is unavailable: {error}");
+                return 1;
+            }
+        };
+        if let Some(supplied) = token.as_deref() {
+            if let Err(error) = entry.set_password(supplied) {
+                eprintln!("3dam desktop: could not save the server credential: {error}");
+                return 1;
+            }
+        } else {
+            token = match entry.get_password() {
+                Ok(saved) => Some(saved),
+                Err(keyring::Error::NoEntry) => None,
+                Err(error) => {
+                    eprintln!("3dam desktop: could not read the server credential: {error}");
+                    return 1;
+                }
+            };
+        }
+    }
+
+    // Runs before page scripts. The secret remains captured in native-installed plumbing and is
+    // attached only to this server's origin+mount; the app sees only a non-secret capability bit.
+    let init_script = token
+        .as_deref()
+        .map(|secret| native_credential_script(&url, secret, hosted));
 
     // The webview zoom factor lives in the menu-event closure: `set_zoom` is write-only, so the
     // shell is the source of truth for Zoom In/Out stepping.
@@ -90,10 +115,20 @@ pub fn run(args: Vec<OsString>) -> u8 {
                 .build(),
         )
         .menu(app_menu)
-        .on_menu_event(move |app, event| handle_menu_event(app, event.id().as_ref(), &zoom))
+        .on_menu_event(move |app, event| {
+            handle_menu_event(
+                app,
+                event.id().as_ref(),
+                &zoom,
+                keychain_account.as_deref(),
+            )
+        })
         .setup(move |app| {
             let mut win = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url))
                 .title("3DAM")
+                // A fresh renderer partition means a service worker from an earlier compromised
+                // page can never sit below the initialization wrapper and observe Authorization.
+                .incognito(true)
                 .inner_size(1200.0, 760.0)
                 .min_inner_size(720.0, 480.0)
                 // Let OS file drops reach the *page* (issue #80). Tauri enables this on every
@@ -126,6 +161,11 @@ pub fn run(args: Vec<OsString>) -> u8 {
 /// Windows/Linux convention; a macOS app-menu arrangement can come with the bundle work.
 fn app_menu<R: Runtime>(handle: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     let file = SubmenuBuilder::new(handle, "File")
+        .item(
+            &MenuItemBuilder::with_id("forget-server-credential", "Forget Server Credential")
+                .build(handle)?,
+        )
+        .separator()
         .item(
             &MenuItemBuilder::with_id("quit", "Quit")
                 .accelerator("CmdOrCtrl+Q")
@@ -188,7 +228,12 @@ fn app_menu<R: Runtime>(handle: &AppHandle<R>) -> tauri::Result<Menu<R>> {
 
 /// Service a menu click. Fail-soft throughout (golden rule 6): a webview call that errors — or a
 /// window that has already gone away — drops the click rather than crashing the shell.
-fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, id: &str, zoom: &Mutex<f64>) {
+fn handle_menu_event<R: Runtime>(
+    app: &AppHandle<R>,
+    id: &str,
+    zoom: &Mutex<f64>,
+    keychain_account: Option<&str>,
+) {
     if id == "quit" {
         app.exit(0);
         return;
@@ -197,6 +242,21 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, id: &str, zoom: &Mutex<f64>
         return;
     };
     match id {
+        "forget-server-credential" => {
+            let Some(account) = keychain_account else {
+                return;
+            };
+            match keyring::Entry::new(KEYCHAIN_SERVICE, account)
+                .and_then(|entry| entry.delete_credential())
+            {
+                Ok(()) | Err(keyring::Error::NoEntry) => {
+                    // The current page's closure is deliberately immutable; exit ensures the next
+                    // launch starts without it and gives an honest, complete forget operation.
+                    app.exit(0);
+                }
+                Err(error) => eprintln!("3dam desktop: could not forget the credential: {error}"),
+            }
+        }
         "reload" => {
             let _ = win.reload();
         }
@@ -227,6 +287,42 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, id: &str, zoom: &Mutex<f64>
         }
         _ => {}
     }
+}
+
+fn credential_account(url: &url::Url) -> String {
+    // Origin + reverse-proxy mount keep credentials for distinct instances separate. Userinfo,
+    // query, and fragment never become secret-store identifiers.
+    format!(
+        "{}://{}{}{}",
+        url.scheme(),
+        url.host_str().unwrap_or_default(),
+        url.port().map(|port| format!(":{port}")).unwrap_or_default(),
+        url.path().trim_end_matches('/'),
+    )
+}
+
+fn native_credential_script(url: &url::Url, secret: &str, forgettable: bool) -> String {
+    let origin = url.origin().ascii_serialization();
+    let path = if url.path().is_empty() { "/" } else { url.path() };
+    let base = path.trim_end_matches('/');
+    include_str!("native-credential.js")
+        .replace(
+            "__3DAM_CREDENTIAL_JSON__",
+            &serde_json::to_string(secret).expect("string JSON"),
+        )
+        .replace(
+            "__3DAM_ORIGIN_JSON__",
+            &serde_json::to_string(&origin).expect("string JSON"),
+        )
+        .replace(
+            "__3DAM_PATH_JSON__",
+            &serde_json::to_string(path).expect("string JSON"),
+        )
+        .replace(
+            "__3DAM_BASE_JSON__",
+            &serde_json::to_string(base).expect("string JSON"),
+        )
+        .replace("__3DAM_FORGETTABLE_JSON__", if forgettable { "true" } else { "false" })
 }
 
 /// Boot the in-process server on a background thread — its own Tokio runtime, since the main thread

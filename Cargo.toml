@@ -104,6 +104,9 @@ toml = "0.8"
 # fs / platform
 walkdir = "2"
 directories = "5"
+# Native OS credential stores for outbound source credentials. Platform features are selected by
+# dam-core so a production build never falls back to keyring's in-memory mock backend.
+keyring = { version = "3.6.3", default-features = false }
 # temp files for materialising remote-source bytes to a local path the (path-based) media
 # handlers can read (tech-spec 07 §2); suffixed with the logical extension so detection holds.
 tempfile = "3"

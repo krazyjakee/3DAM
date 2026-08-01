@@ -34,8 +34,18 @@ impl Store {
         };
 
         let tx = conn.transaction().map_err(internal)?;
+        // Preserve opaque refs in the retry queue before `source` is emptied. Credential deletion
+        // happens in the host backend after this transaction; failures remain recoverable on the
+        // next open/reset instead of silently orphaning secrets.
+        tx.execute(
+            "INSERT OR IGNORE INTO host_secret_cleanup(auth_ref)
+             SELECT auth_ref FROM source WHERE auth_ref IS NOT NULL",
+            [],
+        )
+        .map_err(internal)?;
         // Child → parent order (explicit even though the FKs cascade — clearer, and order-safe
-        // inside one transaction). Every table in `library.db` is catalog content.
+        // inside one transaction). `host_migration` and `host_secret_cleanup` are operational
+        // metadata: the former survives resets; the latter is drained after this commit.
         for table in [
             "embedding",
             "asset_tag",

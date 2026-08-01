@@ -20,6 +20,7 @@ use std::sync::Arc;
 /// Run a convert plan against the store. `dry_run` writes nothing.
 pub(crate) fn run_convert(
     store: &Store,
+    secrets: &crate::credentials::SecretVault,
     req: ConvertRequest,
     scratch: &Path,
 ) -> Result<ConvertReport, LibError> {
@@ -54,6 +55,7 @@ pub(crate) fn run_convert(
     for input in &req.inputs {
         let item = plan_and_maybe_encode(
             store,
+            secrets,
             *input,
             &req,
             &output_dir,
@@ -75,6 +77,7 @@ type Backends = HashMap<SourceId, Result<Arc<dyn dam_sources::FileSource>, Strin
 /// Rebuild (or recall) the backend for one source.
 fn backend_for<'a>(
     store: &Store,
+    secrets: &crate::credentials::SecretVault,
     backends: &'a mut Backends,
     source_id: &SourceId,
     scratch: &Path,
@@ -82,6 +85,7 @@ fn backend_for<'a>(
     backends.entry(*source_id).or_insert_with(|| {
         let opened = store
             .get_source_connection(source_id)
+            .and_then(|connection| secrets.resolve(connection))
             .and_then(|c| dam_sources::open_source(&c, scratch));
         match opened {
             Ok(fs) => Ok(Arc::from(fs)),
@@ -98,6 +102,7 @@ fn backend_for<'a>(
 #[allow(clippy::too_many_arguments)] // the per-item plan context; a struct would just rename it
 fn plan_and_maybe_encode(
     store: &Store,
+    secrets: &crate::credentials::SecretVault,
     input: AssetId,
     req: &ConvertRequest,
     output_dir: &Path,
@@ -203,7 +208,7 @@ fn plan_and_maybe_encode(
     // Commit. Materialise the input locally first (issue #48): in place for a local source, a temp
     // download for SFTP/SMB. Non-destructive either way — `fetch` only ever reads, and the output
     // still goes to `output_dir` via temp→atomic-rename, never back to the source (§5.1).
-    let fetched = match backend_for(store, backends, &asset.source_id, scratch) {
+    let fetched = match backend_for(store, secrets, backends, &asset.source_id, scratch) {
         Ok(fs) => match fs.fetch(&asset.path) {
             Ok(f) => f,
             Err(e) => {

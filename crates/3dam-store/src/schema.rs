@@ -564,6 +564,23 @@ pub const MIGRATIONS: &[&str] = &[
     ALTER TABLE job ADD COLUMN initiator TEXT;
     ALTER TABLE job ADD COLUMN result_artifacts TEXT;
     "#,
+    // ── V17: host-side migration completion markers (issue #103) ────────────────────────────────
+    // Credential extraction cannot be performed by SQLite alone: it must commit each legacy secret
+    // to the OS/host secret backend before redacting the row. This marker is deliberately separate
+    // from `user_version`, which is advanced before dam-core can do that host operation. It carries
+    // no host identity or credential material and is therefore safe in the portable catalog.
+    r#"
+    CREATE TABLE host_migration (
+        key          TEXT PRIMARY KEY,
+        completed_at INTEGER NOT NULL
+    ) STRICT;
+
+    -- Two-store deletion is not atomic. Queue opaque refs in the catalog transaction before source
+    -- rows disappear; dam-core removes each queue row only after the host backend confirms deletion.
+    CREATE TABLE host_secret_cleanup (
+        auth_ref TEXT PRIMARY KEY
+    ) STRICT;
+    "#,
 ];
 
 #[cfg(test)]

@@ -22,10 +22,12 @@ export function AudioPlayer({
   src,
   assetId,
   peaks,
+  onCredentialExpired,
 }: {
   src: string;
   assetId?: string;
   peaks?: number[] | null;
+  onCredentialExpired?: () => void;
 }) {
   const audioRef = useRef<HTMLAudioElement>(null);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -33,6 +35,7 @@ export function AudioPlayer({
   const [time, setTime] = useState(0);
   const [dur, setDur] = useState(0);
   const [error, setError] = useState(false);
+  const lastRenewal = useRef(0);
 
   const progress = dur > 0 ? time / dur : 0;
 
@@ -122,13 +125,24 @@ export function AudioPlayer({
         ref={audioRef}
         src={src}
         preload="metadata"
-        onLoadedMetadata={(e) => setDur(e.currentTarget.duration)}
+        onLoadedMetadata={(e) => {
+          setDur(e.currentTarget.duration);
+          if (time > 0) e.currentTarget.currentTime = time;
+          setError(false);
+        }}
         onDurationChange={(e) => setDur(e.currentTarget.duration)}
         onTimeUpdate={(e) => setTime(e.currentTarget.currentTime)}
         onPlay={() => setPlaying(true)}
         onPause={() => setPlaying(false)}
         onEnded={() => setPlaying(false)}
-        onError={() => setError(true)}
+        onError={() => {
+          if (onCredentialExpired && Date.now() - lastRenewal.current >= 60_000) {
+            lastRenewal.current = Date.now();
+            onCredentialExpired();
+          } else {
+            setError(true);
+          }
+        }}
       />
     </div>
   );

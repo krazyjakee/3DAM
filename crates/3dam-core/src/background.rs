@@ -101,8 +101,16 @@ impl EmbeddedLibrary {
     /// (both clients see the server working). Awaited to completion — the worker won't start a second
     /// overlapping analyze job.
     async fn drain_analysis(&self) -> Result<(), LibError> {
+        let secrets = self.secrets.clone();
         let targets = self
-            .db(|s| s.list_analysis_targets(crate::analysis::PIPELINE_VERSION, false, &[]))
+            .db(move |s| {
+                let mut targets =
+                    s.list_analysis_targets(crate::analysis::PIPELINE_VERSION, false, &[])?;
+                for target in &mut targets {
+                    target.connection = secrets.resolve(target.connection.clone())?;
+                }
+                Ok(targets)
+            })
             .await?;
         if targets.is_empty() {
             return Ok(()); // everything already analysed — idempotent no-op
@@ -146,6 +154,7 @@ impl EmbeddedLibrary {
         }
         let data_dir = self.data_dir.clone();
         let store = self.store.clone();
+        let secrets = self.secrets.clone();
         let governor = self.governor.clone();
         let generated = tokio::task::spawn_blocking(move || {
             let never_cancelled = AtomicBool::new(false);
@@ -170,13 +179,13 @@ impl EmbeddedLibrary {
                     continue; // vanished between listing and read — fail-soft
                 };
                 if !thumb.exists()
-                    && gen_thumbnail(&data_dir, &store, &asset, PREGEN_THUMB_EDGE).is_ok()
+                    && gen_thumbnail(&data_dir, &store, &secrets, &asset, PREGEN_THUMB_EDGE).is_ok()
                 {
                     generated += 1;
                 }
                 if is_model {
                     // Idempotent: reads the cached blob if present, renders + caches on miss.
-                    let _ = gen_model_preview(&data_dir, &store, &asset);
+                    let _ = gen_model_preview(&data_dir, &store, &secrets, &asset);
                 }
             }
             generated

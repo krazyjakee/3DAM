@@ -157,6 +157,7 @@ impl TestSftpServer {
             password: Some(self.password.clone()),
             private_key: None,
             passphrase: None,
+            credential_ref: None,
         }
     }
 

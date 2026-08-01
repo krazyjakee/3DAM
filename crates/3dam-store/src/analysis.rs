@@ -27,7 +27,8 @@ impl Store {
     ) -> Result<Vec<AnalysisTarget>, LibError> {
         let conn = self.conn.lock().unwrap();
         let mut sql = String::from(
-            "SELECT a.id, s.connection, a.path, a.media_type, a.format, a.content_hash, a.source_id
+            "SELECT a.id, s.connection, a.path, a.media_type, a.format, a.content_hash, a.source_id,
+                    s.auth_ref
              FROM asset a JOIN source s ON s.id = a.source_id
              WHERE s.kind <> 'federated'",
         );
@@ -52,18 +53,22 @@ impl Store {
                 let format: String = r.get(4)?;
                 let hash: Option<Vec<u8>> = r.get(5)?;
                 let source_id = blob_to_source_id(&r.get::<_, Vec<u8>>(6)?);
+                let auth_ref: Option<String> = r.get(7)?;
                 Ok(parse_connection(&connection)
                     .ok()
-                    .map(|connection| AnalysisTarget {
-                        id,
-                        source_id,
-                        connection,
-                        path,
-                        media: MediaType::parse(&media_s).unwrap_or(MediaType::Image),
-                        format,
-                        content_hash: hash
-                            .and_then(|h| <[u8; 32]>::try_from(h.as_slice()).ok())
-                            .map(ContentHash),
+                    .map(|mut connection| {
+                        connection.set_credential_ref(auth_ref);
+                        AnalysisTarget {
+                            id,
+                            source_id,
+                            connection,
+                            path,
+                            media: MediaType::parse(&media_s).unwrap_or(MediaType::Image),
+                            format,
+                            content_hash: hash
+                                .and_then(|h| <[u8; 32]>::try_from(h.as_slice()).ok())
+                                .map(ContentHash),
+                        }
                     }))
             })
             .map_err(internal)?;
@@ -847,13 +852,16 @@ mod tests {
             password: Some("p".into()),
             private_key: None,
             passphrase: None,
+            credential_ref: None,
         })
     }
 
     /// Add one source and one asset on it; return the store and the asset id.
     fn store_with_asset_on(conn: &SourceConnection, kind_name: &str) -> (Store, AssetId) {
         let store = Store::open_in_memory().unwrap();
-        let src = store.add_source(conn, kind_name, false).unwrap();
+        let mut stored = conn.clone();
+        let _ = stored.take_credentials();
+        let src = store.add_source(&stored, kind_name, false).unwrap();
         let (id, _) = store
             .upsert_asset(&NewAsset {
                 source_id: src,
@@ -895,6 +903,7 @@ mod tests {
             &SourceConnection::Federated(FederatedConfig {
                 endpoint: "http://peer.invalid:7878".into(),
                 token: None,
+                credential_ref: None,
             }),
             "peer",
         );

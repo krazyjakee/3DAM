@@ -37,12 +37,13 @@ const MAX_SUFFIX_ATTEMPTS: u32 = 10_000;
 /// buffers the asset in memory, and a failed write costs a temp file rather than a partial asset.
 pub(crate) fn run_upload(
     store: &Store,
+    secrets: &crate::credentials::SecretVault,
     events: &broadcast::Sender<LibraryEvent>,
     req: UploadRequest,
     staged: &Path,
     scratch: &Path,
 ) -> Result<UploadOutcome, LibError> {
-    let conn = store.get_source_connection(&req.source)?;
+    let conn = secrets.resolve(store.get_source_connection(&req.source)?)?;
 
     // A peer is refused here as well as in the destination picker. The picker keeps it out of the
     // UI; this keeps it out of the *API*, so a hand-written request cannot try to push bytes into
@@ -325,6 +326,7 @@ mod tests {
                 &SourceConnection::Federated(dam_sources::FederatedConfig {
                     endpoint: "http://127.0.0.1:9".into(),
                     token: None,
+                    credential_ref: None,
                 }),
                 "peer",
                 false,
@@ -337,6 +339,7 @@ mod tests {
 
         let err = run_upload(
             &store,
+            &crate::credentials::SecretVault::memory(),
             &events,
             UploadRequest {
                 source: sid,

@@ -51,8 +51,9 @@ pub struct AnalysisTarget {
     /// The source this asset belongs to — attribution for the `AssetChanged` event the pass emits per
     /// analysed asset, and for the analyse job's own `sources` set (issue #42).
     pub source_id: SourceId,
-    /// How to rebuild this asset's source backend, secret included — the pass fetches its bytes
-    /// through `FileSource::fetch` rather than joining a root onto `path`, so an SFTP/SMB asset
+    /// How to rebuild this asset's source backend. Protected connections carry only an opaque ref
+    /// until dam-core hydrates them from the host secret store; the pass fetches bytes through
+    /// `FileSource::fetch` rather than joining a root onto `path`, so an SFTP/SMB asset
     /// materialises to a temp file exactly as it does during a scan (issue #48). Held per target
     /// (not per source) because targets arrive as one flat list; the runner de-duplicates by
     /// `source_id` so a backend is opened once per source, not once per asset.

@@ -12,41 +12,201 @@ impl Store {
         watch: bool,
     ) -> Result<SourceId, LibError> {
         let id = SourceId::new();
+        self.add_source_with_auth(id, connection, name, watch, None)?;
+        Ok(id)
+    }
+
+    /// Insert a source whose credential, if any, has already been committed to the host secret
+    /// store. Inline secrets are rejected even though `SourceConnection` serde also omits them:
+    /// silently dropping a password would leave a source registered but unusable.
+    pub fn add_source_with_auth(
+        &self,
+        id: SourceId,
+        connection: &SourceConnection,
+        name: &str,
+        watch: bool,
+        auth_ref: Option<&str>,
+    ) -> Result<(), LibError> {
+        if connection.has_inline_credentials() {
+            return Err(LibError::Internal(
+                "source credentials must be secured before catalog persistence".into(),
+            ));
+        }
+        if auth_ref.is_some_and(|reference| reference != format!("3dam.source.{id}")) {
+            return Err(LibError::Internal(
+                "source credential reference is not a canonical opaque source key".into(),
+            ));
+        }
         let now = now_ms();
-        // The connection blob carries the secret (§3.2). It is persisted here and only ever handed
-        // back to the engine via `get_source_connection`; `SourceInfo` exposes the sanitised URI.
+        // `SourceConnection` structurally omits runtime credential fields; `auth_ref` is the only
+        // persisted auth value, and is an opaque identifier rather than credential material.
         let conn_json = serde_json::to_string(connection).map_err(internal)?;
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO source (id, name, kind, connection, online, watch, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?6)",
+            "INSERT INTO source (id, name, kind, connection, auth_ref, online, watch, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, ?7)",
             params![
                 id.as_bytes().to_vec(),
                 name,
                 connection.kind(),
                 conn_json,
+                auth_ref,
                 watch as i64,
                 now,
             ],
         )
         .map_err(internal)?;
-        Ok(id)
+        Ok(())
     }
 
-    /// The full connection blob (**including the secret**) for rebuilding a backend at scan/read
-    /// time. Never leaves the engine — clients only ever see the sanitised `SourceInfo.uri`.
+    /// The secret-free connection plus its opaque credential reference. The engine resolves that
+    /// reference immediately before opening a backend; clients only see `SourceInfo.uri`.
     pub fn get_source_connection(&self, id: &SourceId) -> Result<SourceConnection, LibError> {
         let conn = self.conn.lock().unwrap();
-        let blob: String = conn
+        let (blob, auth_ref): (String, Option<String>) = conn
             .query_row(
-                "SELECT connection FROM source WHERE id = ?1",
+                "SELECT connection, auth_ref FROM source WHERE id = ?1",
                 params![id.as_bytes().to_vec()],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()
             .map_err(internal)?
             .ok_or_else(|| LibError::NotFound(format!("source {id}")))?;
-        parse_connection(&blob)
+        let mut connection = parse_connection(&blob)?;
+        connection.set_credential_ref(auth_ref);
+        Ok(connection)
+    }
+
+    /// Every source row's stored connection and opaque auth reference. Used only by the startup
+    /// migration that extracts credentials from pre-issue-103 connection JSON.
+    pub fn source_connections(
+        &self,
+    ) -> Result<Vec<(SourceId, SourceConnection, Option<String>)>, LibError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT id, connection, auth_ref FROM source ORDER BY created_at")
+            .map_err(internal)?;
+        let rows = stmt
+            .query_map([], |r| {
+                let id = blob_to_source_id(&r.get::<_, Vec<u8>>(0)?);
+                Ok((id, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?))
+            })
+            .map_err(internal)?;
+        let rows = rows
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(internal)?;
+        rows.into_iter()
+            .map(|(id, blob, auth_ref)| Ok((id, parse_connection(&blob)?, auth_ref)))
+            .collect()
+    }
+
+    pub fn source_credentials_migrated(&self) -> Result<bool, LibError> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM host_migration WHERE key = 'source_credentials_v1')",
+            [],
+            |r| r.get::<_, bool>(0),
+        )
+        .map_err(internal)
+    }
+
+    pub fn mark_source_credentials_migrated(&self) -> Result<(), LibError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO host_migration (key, completed_at) VALUES ('source_credentials_v1', ?1)
+             ON CONFLICT(key) DO UPDATE SET completed_at = excluded.completed_at",
+            params![now_ms()],
+        )
+        .map_err(internal)?;
+        Ok(())
+    }
+
+    /// Atomically replace legacy inline connection blobs with their redacted forms and install
+    /// the corresponding opaque references. The caller writes all secret-store entries first, so
+    /// a failure here leaves the old rows (and therefore source availability) intact for retry.
+    pub fn rewrite_source_credentials(
+        &self,
+        updates: &[(SourceId, SourceConnection, String)],
+    ) -> Result<(), LibError> {
+        let encoded = updates
+            .iter()
+            .map(|(id, connection, auth_ref)| {
+                if connection.has_inline_credentials() {
+                    return Err(LibError::Internal(
+                        "credential migration attempted to persist inline material".into(),
+                    ));
+                }
+                if auth_ref != &format!("3dam.source.{id}") {
+                    return Err(LibError::Internal(
+                        "credential migration produced a non-canonical source reference".into(),
+                    ));
+                }
+                Ok((*id, serde_json::to_string(connection).map_err(internal)?, auth_ref.clone()))
+            })
+            .collect::<Result<Vec<_>, LibError>>()?;
+        let mut conn = self.conn.lock().unwrap();
+        // Deleted/updated SQLite payload can otherwise survive in free pages. `secure_delete`
+        // zeros cells changed below; the checkpoint + VACUUM in `scrub_source_storage_locked`
+        // removes older copies from the WAL and rebuilds the main file without free-page remnants.
+        conn.pragma_update(None, "secure_delete", "ON")
+            .map_err(internal)?;
+        let tx = conn.transaction().map_err(internal)?;
+        for (id, blob, auth_ref) in encoded {
+            tx.execute(
+                "UPDATE source SET connection = ?2, auth_ref = ?3, updated_at = ?4 WHERE id = ?1",
+                params![id.as_bytes().to_vec(), blob, auth_ref, now_ms()],
+            )
+            .map_err(internal)?;
+        }
+        tx.commit().map_err(internal)?;
+        Self::scrub_source_storage_locked(&conn)
+    }
+
+    /// Complete or retry the physical scrub after a prior process committed redacted rows but
+    /// failed before checkpoint/VACUUM. Idempotent and invoked only while the host migration marker
+    /// is absent, never on ordinary opens.
+    pub fn scrub_source_storage(&self) -> Result<(), LibError> {
+        let conn = self.conn.lock().unwrap();
+        Self::scrub_source_storage_locked(&conn)
+    }
+
+    fn scrub_source_storage_locked(conn: &Connection) -> Result<(), LibError> {
+        let checkpoint = |connection: &Connection| -> Result<(), LibError> {
+            let busy: i64 = connection
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
+                .map_err(internal)?;
+            if busy != 0 {
+                return Err(LibError::SourceUnavailable(
+                    "credential migration cleanup is blocked by another library process; close it and retry"
+                        .into(),
+                ));
+            }
+            Ok(())
+        };
+        checkpoint(conn)?;
+        conn.execute("VACUUM", []).map_err(internal)?;
+        checkpoint(conn)
+    }
+
+    pub fn pending_source_credential_cleanup(&self) -> Result<Vec<String>, LibError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT auth_ref FROM host_secret_cleanup ORDER BY auth_ref")
+            .map_err(internal)?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(internal)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(internal)
+    }
+
+    pub fn complete_source_credential_cleanup(&self, auth_ref: &str) -> Result<(), LibError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM host_secret_cleanup WHERE auth_ref = ?1",
+            params![auth_ref],
+        )
+        .map_err(internal)?;
+        Ok(())
     }
 
     pub fn list_sources(&self) -> Result<Vec<SourceInfo>, LibError> {
@@ -178,16 +338,24 @@ impl Store {
             )
             .map_err(internal)?;
         } else {
+            // Queue the opaque ref in the same transaction that removes the source. Host-secret
+            // deletion is acknowledged separately, so a locked provider cannot create an orphan.
+            let mut conn = conn;
+            let tx = conn.transaction().map_err(internal)?;
+            tx.execute(
+                "INSERT OR IGNORE INTO host_secret_cleanup(auth_ref)
+                 SELECT auth_ref FROM source WHERE id = ?1 AND auth_ref IS NOT NULL",
+                params![id.as_bytes().to_vec()],
+            )
+            .map_err(internal)?;
             // ON DELETE CASCADE clears its assets.
-            let n = conn
-                .execute(
-                    "DELETE FROM source WHERE id = ?1",
-                    params![id.as_bytes().to_vec()],
-                )
+            let n = tx
+                .execute("DELETE FROM source WHERE id = ?1", params![id.as_bytes().to_vec()])
                 .map_err(internal)?;
             if n == 0 {
                 return Err(LibError::NotFound(format!("source {id}")));
             }
+            tx.commit().map_err(internal)?;
         }
         Ok(())
     }

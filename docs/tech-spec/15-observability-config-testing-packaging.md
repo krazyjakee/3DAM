@@ -248,7 +248,8 @@ one library by default:
   safe to delete; the DB and vector index are the source of truth.
 - **`serve`** typically takes an explicit `--config` / `--db` (a NAS or container path) rather
   than the per-user default, but resolves through the same loader and precedence.
-- Credentials never live in any of these files — they go to the OS keychain via `keyring`
+- Credentials never live in portable library/config/export files — they go to the OS keychain via
+  `keyring`, or to the explicit owner-only headless host backend documented in `DEPLOYMENT.md`
   ([10](10-auth-accounts-and-flags.md)).
 
 ---

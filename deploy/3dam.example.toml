@@ -27,6 +27,14 @@ tls_key  = "/etc/3dam/tls/privkey.pem"
 # X-Forwarded-Proto — a forwarded header is attacker-controlled unless the proxy strips it.
 #secure_cookies = true
 
+# Socket-peer IPs of reverse proxies trusted to SET client attribution for auth rate limiting.
+# Empty by default: direct deployments ignore every forwarding header and key limits on the peer
+# socket. A named proxy MUST strip any inbound X-Forwarded-For and replace it with exactly one bare
+# IPv4/IPv6 address. Missing, invalid, repeated, or comma-list values collapse into a shared
+# "unknown behind this proxy" bucket (safe but stricter); X-Real-IP and Forwarded are never trusted.
+# For a same-host Caddy/nginx/Traefik deployment this is normally:
+#trusted_proxies = ["127.0.0.1", "::1"]
+
 [flags]
 # Require a bearer token for the API/MCP/admin surface (issue tokens with `3dam admin token create`).
 # Off = the local owner has full trust (only safe on localhost).

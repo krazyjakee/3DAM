@@ -6,9 +6,9 @@
 //! push-notification channel over SFTP, so watch is poll-based upstream (§3.2) — this backend only
 //! provides enumerate + fetch.
 //!
-//! v1 secret handling: the password/key comes straight from the source record's connection blob
-//! (tech-spec 10 owns a real keyring later), and the server host key is trust-on-first-use
-//! (accepted) — a documented v1 limitation, revisited with the auth work.
+//! Password/key material is hydrated from the host secret store immediately before construction;
+//! the portable source connection contains only non-secret host/path/user fields (issue #103).
+//! The server host key is trust-on-first-use (accepted) — a documented v1 limitation.
 
 use crate::{guard_rel_path, Fetched, FileEntry, FileSource, SftpConfig};
 use dam_api::LibError;

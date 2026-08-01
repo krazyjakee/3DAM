@@ -11,6 +11,7 @@
 
 mod admin;
 mod auth;
+mod auth_rate;
 mod authn;
 mod comments;
 mod config;
@@ -36,8 +37,9 @@ use futures::StreamExt;
 use rust_embed::RustEmbed;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tower_http::compression::predicate::{Predicate, SizeAbove};
 use tower_http::compression::CompressionLayer;
@@ -49,6 +51,8 @@ use auth::{Reader, Writer};
 pub use config::ServeFile;
 pub use mcp::{McpAdapter, WriteGate};
 pub use store::ServerStore;
+
+const WORKER_CSP: &str = "worker-src 'none'";
 
 /// The built React web client (tech-spec 09 §A.4). `pnpm build` emits content-hashed assets into
 /// `web/dist/`; this bakes them into the `3dam` binary so one file serves the whole UI with no
@@ -89,6 +93,8 @@ pub(crate) struct AppState {
     /// Refuse the *open* (loopback-peer) first-run claim path outright, so only bootstrap-token
     /// redemption can claim (`[accounts] require_claim_token`; ADR 0014).
     pub require_claim_token: bool,
+    /// Process-local request and expensive-work bounds for the unauthenticated auth surfaces.
+    pub auth_protection: Arc<auth_rate::AuthProtection>,
     /// Flips `false → true` once when shutdown begins, so long-lived handlers (the `/api/v1/ws`
     /// loop) can stop awaiting and close cleanly instead of pinning the graceful drain open.
     pub shutdown: watch::Receiver<bool>,
@@ -97,6 +103,38 @@ pub(crate) struct AppState {
     pub ready: Arc<std::sync::atomic::AtomicBool>,
     /// Per-file upload ceiling in bytes (`[upload] max_file_mb`, issue #80).
     pub max_upload_bytes: u64,
+    /// One-use, 30-second WebSocket handshakes. Keys are hashes so even a process diagnostic never
+    /// contains the browser-visible ticket. Each value carries the already-resolved context plus
+    /// the hidden parent credential needed to re-resolve visibility on a long-lived connection.
+    ws_tickets: Arc<std::sync::Mutex<HashMap<[u8; 32], WsTicket>>>,
+    /// Renewable range-stream tickets for audio/video. They are exact-target bound and retain the
+    /// parent credential only server-side so every use observes token/session revocation.
+    media_tickets: Arc<std::sync::Mutex<HashMap<[u8; 32], MediaTicket>>>,
+}
+
+#[derive(Clone)]
+struct WsTicket {
+    expires: Instant,
+    ctx: dam_api::service::AuthContext,
+    token: Option<String>,
+    cookie: Option<String>,
+}
+
+#[derive(Clone)]
+pub(crate) struct MediaTicket {
+    expires: Instant,
+    target: String,
+    ctx: dam_api::service::AuthContext,
+    token: Option<String>,
+    cookie: Option<String>,
+}
+
+fn empty_ws_tickets() -> Arc<std::sync::Mutex<HashMap<[u8; 32], WsTicket>>> {
+    Arc::new(std::sync::Mutex::new(HashMap::new()))
+}
+
+fn empty_media_tickets() -> Arc<std::sync::Mutex<HashMap<[u8; 32], MediaTicket>>> {
+    Arc::new(std::sync::Mutex::new(HashMap::new()))
 }
 
 /// The audit actor string for a request (tech-spec 10 §4.5). A signed-in account records as
@@ -149,6 +187,10 @@ impl From<LibError> for ApiError {
 }
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        let retry_after = match &self.0 {
+            LibError::RateLimited { retry_after } => Some(*retry_after),
+            _ => None,
+        };
         let status =
             StatusCode::from_u16(self.0.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         let mut resp = (status, Json(self.0.to_body())).into_response();
@@ -159,6 +201,13 @@ impl IntoResponse for ApiError {
                 header::WWW_AUTHENTICATE,
                 header::HeaderValue::from_static("Bearer"),
             );
+        }
+        // The typed body is useful to 3DAM clients; the standard header lets browsers, proxies,
+        // generic HTTP clients, and operators apply the same backoff without parsing JSON.
+        if let Some(seconds) = retry_after {
+            if let Ok(value) = header::HeaderValue::from_str(&seconds.to_string()) {
+                resp.headers_mut().insert(header::RETRY_AFTER, value);
+            }
         }
         resp
     }
@@ -274,6 +323,8 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/api/v1/jobs/list", post(list_jobs))
         .route("/api/v1/jobs/{id}", get(get_job))
         .route("/api/v1/jobs/{id}/cancel", post(cancel_job))
+        .route("/api/v1/media-ticket", post(mint_media_ticket))
+        .route("/api/v1/ws-ticket", post(mint_ws_ticket))
         .route("/api/v1/ws", get(ws_handler))
         // The MCP endpoint (tech-spec 11): present, but the handler 404s when the flag is Off.
         .route("/mcp", post(mcp_http))
@@ -291,17 +342,38 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .merge(admin::routes(state.clone()))
         // SPA fallback: any non-API GET serves the embedded web client (tech-spec 09 §A.4).
         .fallback(static_handler)
-        .layer(TraceLayer::new_for_http())
+        // Record only the path, never the query. A WebSocket ticket is short-lived and one-use,
+        // but defense in depth still keeps it out of debug spans and downstream diagnostics.
+        .layer(TraceLayer::new_for_http().make_span_with(
+            |request: &axum::http::Request<Body>| {
+                tracing::debug_span!(
+                    "request",
+                    method = %request.method(),
+                    uri = %trace_path(request.uri()),
+                    version = ?request.version(),
+                )
+            },
+        ))
         .layer(CorsLayer::permissive())
-        // Reads carry the bearer as a `?token=` query param on `<img>`/`<audio>`/WS loads (browsers
-        // can't header-auth those). `no-referrer` stops that token leaking onward via the `Referer`
-        // header when a preview or the page links out. Applied to every response, cheaply.
+        // Media has no URL credential and WebSockets carry only a derived one-use ticket. Keep the
+        // no-referrer policy as another boundary against future sensitive URL material.
         .layer(SetResponseHeaderLayer::overriding(
             header::REFERRER_POLICY,
             header::HeaderValue::from_static("no-referrer"),
         ))
+        // No worker may sit below the page's fetch boundary and inspect Authorization. This also
+        // denies ServiceWorker registration; the Tauri shell additionally uses an incognito
+        // renderer partition so a worker from a previous release cannot survive into this launch.
+        .layer(SetResponseHeaderLayer::overriding(
+            header::CONTENT_SECURITY_POLICY,
+            header::HeaderValue::from_static(WORKER_CSP),
+        ))
         .layer(response_compression())
         .with_state(state)
+}
+
+fn trace_path(uri: &Uri) -> &str {
+    uri.path()
 }
 
 fn response_compression() -> CompressionLayer<impl Predicate> {
@@ -364,10 +436,13 @@ pub fn router(
         tls: false,
         secure_cookies: false,
         require_claim_token: false,
+        auth_protection: Arc::new(auth_rate::AuthProtection::new([])),
         shutdown,
         // The test seam is ready the moment it's built (no async pipeline warm-up to await).
         ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         max_upload_bytes: crate::config::UploadBlock::default().max_bytes(),
+        ws_tickets: empty_ws_tickets(),
+        media_tickets: empty_media_tickets(),
     })
 }
 
@@ -447,9 +522,14 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
         tls,
         secure_cookies: file.server.secure_cookies == Some(true),
         require_claim_token: file.accounts.require_claim_token == Some(true),
+        auth_protection: Arc::new(auth_rate::AuthProtection::new(
+            file.server.trusted_proxies.iter().copied(),
+        )),
         shutdown: shutdown_rx,
         ready: ready.clone(),
         max_upload_bytes: file.upload.max_bytes(),
+        ws_tickets: empty_ws_tickets(),
+        media_tickets: empty_media_tickets(),
     };
     let app = build_router(state);
 
@@ -712,11 +792,14 @@ async fn desktop_setup(
         // and the open claim path is exactly right for the solo-dev first run (ADR 0013/0014).
         secure_cookies: false,
         require_claim_token: false,
+        auth_protection: Arc::new(auth_rate::AuthProtection::new([])),
         shutdown,
         ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         // The desktop shell reads no serve config file, so the built-in ceiling stands. A local
         // drag-and-drop is the *least* constrained case anyway: no network hop to protect.
         max_upload_bytes: crate::config::UploadBlock::default().max_bytes(),
+        ws_tickets: empty_ws_tickets(),
+        media_tickets: empty_media_tickets(),
     };
     tracing::info!(%actual, "3dam desktop server listening");
     Ok((
@@ -1645,29 +1728,245 @@ async fn cancel_job(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Auth for the WebSocket firehose: a browser can't set the `Authorization` header on a WS, so we
-/// also accept the bearer secret as `?token=` (issue #74).
+const WS_TICKET_TTL: Duration = Duration::from_secs(30);
+const MEDIA_TICKET_TTL: Duration = Duration::from_secs(5 * 60);
+const MAX_ACTIVE_TICKETS: usize = 4096;
+
+fn ticket_secret(prefix: &str) -> String {
+    // UUIDv7 has 74 random bits; two independent values give a comfortably unguessable ephemeral
+    // secret without adding another RNG dependency. Only its BLAKE3 digest is retained server-side.
+    format!(
+        "{prefix}{}_{}",
+        uuid::Uuid::now_v7().simple(),
+        uuid::Uuid::now_v7().simple()
+    )
+}
+
+fn ticket_key(secret: &str) -> [u8; 32] {
+    *blake3::hash(secret.as_bytes()).as_bytes()
+}
+
+fn csrf_for_ticket(headers: &HeaderMap, resolved: &auth::Resolved) -> Result<(), LibError> {
+    let Some(session) = &resolved.session else {
+        return Ok(());
+    };
+    let csrf = headers
+        .get(auth::CSRF_HEADER)
+        .and_then(|value| value.to_str().ok());
+    if csrf == Some(session.csrf.as_str()) {
+        Ok(())
+    } else {
+        Err(LibError::Forbidden("missing or invalid CSRF token".into()))
+    }
+}
+
+fn ticket_credentials(
+    headers: &HeaderMap,
+    resolved: &auth::Resolved,
+) -> (Option<String>, Option<String>) {
+    // Auth-off ignores a supplied header; do not retain attacker-controlled text in that case.
+    let token = (resolved.session.is_none() && resolved.ctx.identity.is_some())
+        .then(|| auth::bearer_header(headers))
+        .flatten();
+    let cookie = resolved
+        .session
+        .as_ref()
+        .and_then(|_| auth::cookie_value(headers, auth::SESSION_COOKIE));
+    (token, cookie)
+}
+
+#[derive(serde::Serialize)]
+struct TicketReply {
+    ticket: String,
+    expires_in: u64,
+}
+
+async fn mint_ws_ticket(headers: HeaderMap, State(st): State<AppState>) -> Response {
+    let resolved = match auth::resolve_ws(&st.store, &headers) {
+        Ok(value) => value,
+        Err(error) => return ApiError(error).into_response(),
+    };
+    if let Err(error) = csrf_for_ticket(&headers, &resolved) {
+        return ApiError(error).into_response();
+    }
+    let (token, cookie) = ticket_credentials(&headers, &resolved);
+    let secret = ticket_secret("dam_ws_");
+    let now = Instant::now();
+    let mut tickets = match st.ws_tickets.lock() {
+        Ok(tickets) => tickets,
+        Err(_) => return ApiError(LibError::Internal("ticket service unavailable".into())).into_response(),
+    };
+    tickets.retain(|_, value| value.expires > now);
+    if tickets.len() >= MAX_ACTIVE_TICKETS {
+        return ApiError(LibError::RateLimited { retry_after: 1 }).into_response();
+    }
+    tickets.insert(
+        ticket_key(&secret),
+        WsTicket {
+            expires: now + WS_TICKET_TTL,
+            ctx: resolved.ctx,
+            token,
+            cookie,
+        },
+    );
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(TicketReply {
+            ticket: secret,
+            expires_in: WS_TICKET_TTL.as_secs(),
+        }),
+    )
+        .into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct MediaTicketRequest {
+    target: String,
+}
+
+fn allowed_media_target(target: &str) -> bool {
+    let Ok(uri) = target.parse::<Uri>() else {
+        return false;
+    };
+    if uri.scheme().is_some() || uri.authority().is_some() {
+        return false;
+    }
+    let segments: Vec<_> = uri.path().split('/').filter(|part| !part.is_empty()).collect();
+    if segments.len() != 5
+        || segments[..3] != ["api", "v1", "assets"]
+        || segments[3].parse::<AssetId>().is_err()
+        || !matches!(segments[4], "content" | "related" | "preview-mesh" | "thumbnail")
+    {
+        return false;
+    }
+    !uri
+        .query()
+        .unwrap_or_default()
+        .split('&')
+        .any(|pair| pair.starts_with("ticket=") || pair.starts_with("token="))
+}
+
+async fn mint_media_ticket(
+    headers: HeaderMap,
+    State(st): State<AppState>,
+    Json(request): Json<MediaTicketRequest>,
+) -> Response {
+    if !allowed_media_target(&request.target) {
+        return ApiError(LibError::BadRequest("invalid media target".into())).into_response();
+    }
+    let resolved = match auth::resolve_ws(&st.store, &headers) {
+        Ok(value) => value,
+        Err(error) => return ApiError(error).into_response(),
+    };
+    if let Err(error) = csrf_for_ticket(&headers, &resolved) {
+        return ApiError(error).into_response();
+    }
+    let (token, cookie) = ticket_credentials(&headers, &resolved);
+    let secret = ticket_secret("dam_media_");
+    let now = Instant::now();
+    let mut tickets = match st.media_tickets.lock() {
+        Ok(tickets) => tickets,
+        Err(_) => return ApiError(LibError::Internal("ticket service unavailable".into())).into_response(),
+    };
+    tickets.retain(|_, value| value.expires > now);
+    if tickets.len() >= MAX_ACTIVE_TICKETS {
+        return ApiError(LibError::RateLimited { retry_after: 1 }).into_response();
+    }
+    tickets.insert(
+        ticket_key(&secret),
+        MediaTicket {
+            expires: now + MEDIA_TICKET_TTL,
+            target: request.target,
+            ctx: resolved.ctx,
+            token,
+            cookie,
+        },
+    );
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(TicketReply {
+            ticket: secret,
+            expires_in: MEDIA_TICKET_TTL.as_secs(),
+        }),
+    )
+        .into_response()
+}
+
+/// Resolve a media ticket only for the exact path+query it was minted for. Unlike a WebSocket
+/// ticket it is replayable until expiry because browsers issue multiple Range GETs while seeking.
+/// The parent credential is re-verified on every use, so revocation takes effect immediately.
+pub(crate) fn resolve_media_ticket(
+    st: &AppState,
+    parts: &axum::http::request::Parts,
+) -> Option<Result<dam_api::service::AuthContext, LibError>> {
+    let query = parts.uri.query()?;
+    let secret = query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("ticket="))
+        .filter(|value| !value.is_empty())?;
+    let clean_query = query
+        .split('&')
+        .filter(|pair| !pair.starts_with("ticket="))
+        .collect::<Vec<_>>()
+        .join("&");
+    let target = if clean_query.is_empty() {
+        parts.uri.path().to_string()
+    } else {
+        format!("{}?{clean_query}", parts.uri.path())
+    };
+    let ticket = match st.media_tickets.lock() {
+        Ok(mut tickets) => {
+            let now = Instant::now();
+            tickets.retain(|_, value| value.expires > now);
+            tickets.get(&ticket_key(secret)).cloned()
+        }
+        Err(_) => return Some(Err(LibError::Internal("ticket service unavailable".into()))),
+    };
+    let Some(ticket) = ticket else {
+        return Some(Err(LibError::Unauthorized));
+    };
+    if ticket.target != target {
+        return Some(Err(LibError::Unauthorized));
+    }
+    let resolved = if ticket.token.is_some() || ticket.cookie.is_some() {
+        auth::resolve(&st.store, ticket.token, ticket.cookie).map(|value| value.ctx)
+    } else {
+        Ok(ticket.ctx)
+    };
+    Some(resolved.and_then(|ctx| {
+        ctx.require(dam_api::service::Scope::Read)?;
+        Ok(ctx)
+    }))
+}
+
+/// Auth for the WebSocket firehose: the URI carries only a short-lived one-use ticket minted by an
+/// authenticated header/cookie request. A long-lived bearer is never accepted here (issue #128).
 #[derive(serde::Deserialize)]
 struct WsAuthQuery {
-    #[serde(default)]
-    token: Option<String>,
+    ticket: String,
 }
 
 async fn ws_handler(
     ws: WebSocketUpgrade,
     Query(q): Query<WsAuthQuery>,
-    headers: HeaderMap,
     State(st): State<AppState>,
 ) -> Response {
-    let resolved = match auth::resolve_ws(&st.store, &headers, q.token.clone()) {
-        Ok(r) => r,
-        Err(e) => return ApiError(e).into_response(),
+    let ticket = match st.ws_tickets.lock() {
+        Ok(mut tickets) => tickets.remove(&ticket_key(&q.ticket)),
+        Err(_) => return ApiError(LibError::Internal("ticket service unavailable".into())).into_response(),
     };
-    // Keep the raw credentials so the long-lived loop can *re-resolve* when shares/groups change
-    // (issue #42): a revoked share must not keep feeding a stale ceiling to an open socket.
-    let token = auth::bearer_header(&headers).or(q.token);
-    let cookie = auth::cookie_value(&headers, auth::SESSION_COOKIE);
-    ws.on_upgrade(move |socket| ws_loop(socket, st, resolved.ctx, token, cookie))
+    let Some(ticket) = ticket.filter(|ticket| ticket.expires > Instant::now()) else {
+        return ApiError(LibError::Unauthorized).into_response();
+    };
+    let ctx = if ticket.token.is_some() || ticket.cookie.is_some() {
+        match auth::resolve(&st.store, ticket.token.clone(), ticket.cookie.clone()) {
+            Ok(resolved) if resolved.ctx.scopes.has(dam_api::service::Scope::Read) => resolved.ctx,
+            _ => return ApiError(LibError::Unauthorized).into_response(),
+        }
+    } else {
+        ticket.ctx
+    };
+    ws.on_upgrade(move |socket| ws_loop(socket, st, ctx, ticket.token, ticket.cookie))
 }
 
 async fn ws_loop(
@@ -1685,12 +1984,24 @@ async fn ws_loop(
         Err(_) => return,
     };
     let mut shutdown = st.shutdown.clone();
+    let mut auth_check = tokio::time::interval(Duration::from_secs(30));
     loop {
         tokio::select! {
             // Server is stopping: send a courteous Close frame and let the drain complete.
             _ = shutdown.changed() => {
                 let _ = socket.send(Message::Close(None)).await;
                 break;
+            }
+            _ = auth_check.tick(), if token.is_some() || cookie.is_some() => {
+                // Revoking the parent token/session closes an already-open socket within one
+                // ticket TTL, independently of catalog traffic or visibility mutations.
+                match auth::resolve(&st.store, token.clone(), cookie.clone()) {
+                    Ok(resolved) if resolved.ctx.scopes.has(dam_api::service::Scope::Read) => {}
+                    _ => {
+                        let _ = socket.send(Message::Close(None)).await;
+                        break;
+                    }
+                }
             }
             ev = stream.next() => {
                 let Some(ev) = ev else { break }; // event bus closed (engine shutting down)
@@ -1788,8 +2099,9 @@ async fn mcp_http(State(st): State<AppState>, headers: HeaderMap, body: Body) ->
 #[cfg(test)]
 mod tests {
     use super::{
-        available_static_encoding, parse_range, response_compression, serve_embedded,
-        static_encoding_candidates, RangeSpec, StaticEncoding,
+        allowed_media_target, available_static_encoding, parse_range, response_compression,
+        serve_embedded, static_encoding_candidates, trace_path, RangeSpec, StaticEncoding,
+        WORKER_CSP,
     };
     use axum::body::Body;
     use axum::http::{header, HeaderMap, Request};
@@ -1800,6 +2112,39 @@ mod tests {
 
     fn sat(first: u64, last: u64) -> RangeSpec {
         RangeSpec::Satisfiable(first, last)
+    }
+
+    #[test]
+    fn credential_material_is_absent_from_traced_targets() {
+        let sentinel = "dam_XSS_SENTINEL_DO_NOT_LOG";
+        let uri: axum::http::Uri = format!(
+            "/api/v1/ws?ticket=dam_ws_short&token={sentinel}&diagnostic={sentinel}"
+        )
+        .parse()
+        .unwrap();
+        assert_eq!(trace_path(&uri), "/api/v1/ws");
+        assert!(!trace_path(&uri).contains(sentinel));
+    }
+
+    #[test]
+    fn worker_policy_denies_service_worker_registration() {
+        assert_eq!(WORKER_CSP, "worker-src 'none'");
+    }
+
+    #[test]
+    fn media_ticket_targets_are_exact_media_resources() {
+        let id = uuid::Uuid::now_v7();
+        assert!(allowed_media_target(&format!(
+            "/api/v1/assets/{id}/content"
+        )));
+        assert!(allowed_media_target(&format!(
+            "/api/v1/assets/{id}/related?path=materials%2Fa.png"
+        )));
+        assert!(!allowed_media_target(&format!("/api/v1/assets/{id}")));
+        assert!(!allowed_media_target(&format!(
+            "/api/v1/assets/{id}/content?token=dam_secret"
+        )));
+        assert!(!allowed_media_target("https://other.test/api/v1/assets/x/content"));
     }
 
     fn accepted(value: &'static str) -> HeaderMap {

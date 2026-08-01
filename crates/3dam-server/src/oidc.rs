@@ -40,6 +40,7 @@
 //! optimisation for when it matters.
 
 use crate::authn::{session_cookies, with_cookies};
+use crate::auth_rate::{self, Endpoint, PeerAddr};
 use crate::store::oidc::{StoredOidc, TakeLogin};
 use crate::{ApiError, AppState};
 use axum::extract::{Query, State};
@@ -166,13 +167,18 @@ struct StartQuery {
 /// understand the provider to start a login.
 async fn start(
     State(st): State<AppState>,
+    PeerAddr(peer): PeerAddr,
+    headers: HeaderMap,
     Query(q): Query<StartQuery>,
 ) -> Result<Response, ApiError> {
+    auth_rate::enforce(&st, Endpoint::OidcStart, peer, &headers, None)?;
     let cfg = provider(&st)?;
     // Before the outbound request, not after: `/start` is unauthenticated, so the cheap refusal
     // has to come first or a flood still costs one round trip to the provider each.
     st.store.check_oidc_login_capacity()?;
+    let discovery_permit = st.auth_protection.discovery_permit()?;
     let (metadata, _http) = discover(&cfg).await?;
+    drop(discovery_permit);
     let client = build_client!(metadata, cfg);
 
     let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
@@ -258,9 +264,17 @@ struct CallbackQuery {
 /// `GET /api/v1/auth/oidc/callback` — redeem the code and sign the caller in.
 async fn callback(
     State(st): State<AppState>,
+    PeerAddr(peer): PeerAddr,
     headers: HeaderMap,
     Query(q): Query<CallbackQuery>,
 ) -> Result<Response, ApiError> {
+    auth_rate::enforce(
+        &st,
+        Endpoint::OidcCallback,
+        peer,
+        &headers,
+        q.state.as_deref(),
+    )?;
     if let Some(err) = q.error {
         // These two are query parameters, so *anyone* can call this route and choose their content
         // — they are not evidence that a provider said anything. Echoing them back raw would make
@@ -291,6 +305,9 @@ async fn callback(
         }
     };
 
+    // Reserve discovery capacity before consuming the single-use state. If the independent
+    // outbound ceiling is busy, the browser receives a retryable 429 and can retry this same
+    // callback; consuming state first would strand an otherwise completed provider login.
     // Redeeming the state proves this callback belongs to a login *we* started, and — because the
     // browser hash is checked as part of the same operation — that it belongs to a login *this
     // browser* started. The second half is what stops login CSRF: an attacker who completes an
@@ -298,7 +315,10 @@ async fn callback(
     // silently signed in as the attacker and works inside the attacker's library.
     let presented = login_cookie(&headers).unwrap_or_default();
     let presented_hash = blake3::hash(presented.as_bytes()).to_hex().to_string();
-    let pending = match st.store.take_oidc_login(&state, &presented_hash)? {
+    let (discovery_permit, taken) = st
+        .auth_protection
+        .with_discovery_capacity(|| st.store.take_oidc_login(&state, &presented_hash))?;
+    let pending = match taken {
         TakeLogin::Redeemed(p) => *p,
         TakeLogin::WrongBrowser => {
             st.store
@@ -322,6 +342,7 @@ async fn callback(
 
     let cfg = provider(&st)?;
     let (metadata, http) = discover(&cfg).await?;
+    drop(discovery_permit);
     let client = build_client!(metadata, cfg);
 
     let tokens = client

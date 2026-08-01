@@ -22,10 +22,10 @@
 //!   reports `unclaimed: true`.
 
 use crate::auth::{self, CSRF_COOKIE, SESSION_COOKIE};
+use crate::auth_rate::{self, Endpoint, PeerAddr};
 use crate::store::accounts::NewSession;
 use crate::{ApiError, AppState};
-use axum::extract::{ConnectInfo, FromRequestParts, Path as AxPath, State};
-use axum::http::request::Parts;
+use axum::extract::{Path as AxPath, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -33,23 +33,6 @@ use axum::{Json, Router};
 use dam_api::accounts::*;
 use dam_api::service::Scope;
 use dam_api::LibError;
-use std::net::SocketAddr;
-
-/// The peer address, when the serve stack registered connect-info (`None` in the in-process test
-/// seam, which never crosses a socket). Infallible — absence is data here, not an error, because
-/// the claim gate treats "unknown peer" as "not loopback".
-struct PeerAddr(Option<SocketAddr>);
-impl<S: Send + Sync> FromRequestParts<S> for PeerAddr {
-    type Rejection = std::convert::Infallible;
-    async fn from_request_parts(parts: &mut Parts, _s: &S) -> Result<Self, Self::Rejection> {
-        Ok(PeerAddr(
-            parts
-                .extensions
-                .get::<ConnectInfo<SocketAddr>>()
-                .map(|ci| ci.0),
-        ))
-    }
-}
 
 /// The whole `/api/v1/auth` surface, behind **one** router-level `UserAccounts` gate. ADR 0004 says
 /// off *unmounts* the route, and every handler here is gated identically, so the guard belongs on
@@ -138,7 +121,12 @@ pub(crate) fn with_cookies(body: impl IntoResponse, cookies: [String; 2]) -> Res
 /// `GET /api/v1/auth/status` — the public posture a client needs to render the right gate
 /// (login vs first-run claim). Deliberately unauthenticated: it reveals only what the login page
 /// itself would.
-async fn status(State(st): State<AppState>) -> Result<Json<AccountsStatus>, ApiError> {
+async fn status(
+    State(st): State<AppState>,
+    PeerAddr(peer): PeerAddr,
+    headers: HeaderMap,
+) -> Result<Json<AccountsStatus>, ApiError> {
+    auth_rate::enforce(&st, Endpoint::Status, peer, &headers, None)?;
     Ok(Json(AccountsStatus {
         enabled: true,
         unclaimed: st.store.unclaimed(),
@@ -154,6 +142,7 @@ async fn claim(
     headers: HeaderMap,
     Json(req): Json<ClaimRequest>,
 ) -> Result<Response, ApiError> {
+    auth_rate::enforce(&st, Endpoint::Claim, peer, &headers, Some(&req.username))?;
     if !st.store.unclaimed() {
         return Err(ApiError(LibError::Conflict(
             "this instance is already claimed".into(),
@@ -183,8 +172,12 @@ async fn claim(
     }
     // argon2id is deliberately expensive; it belongs on the blocking pool, never on a tokio worker
     // (CLAUDE.md golden rule 5 — the engine wraps every store call the same way).
+    let permit = st.auth_protection.password_permit()?;
     let store = st.store.clone();
-    let account = tokio::task::spawn_blocking(move || store.claim(&req, "claim"))
+    let account = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        store.claim(&req, "claim")
+    })
         .await
         .map_err(|e| ApiError(LibError::Internal(e.to_string())))??;
     let ident = AccountIdentity {
@@ -210,14 +203,18 @@ async fn claim(
 /// failures / 15 min (ADR 0009 §4) surfaces as 429.
 async fn login(
     State(st): State<AppState>,
+    PeerAddr(peer): PeerAddr,
     headers: HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> Result<Response, ApiError> {
+    auth_rate::enforce(&st, Endpoint::Login, peer, &headers, Some(&req.username))?;
     // The password verify is a KDF: run it on the blocking pool so a burst of failed logins cannot
     // pin tokio's workers (see `ServerStore::login`, which also keeps it off the DB mutex).
+    let permit = st.auth_protection.password_permit()?;
     let store = st.store.clone();
     let ua = user_agent(&headers);
     let (sess, ident) = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         store.login(&req.username, &req.password, ua.as_deref())
     })
     .await

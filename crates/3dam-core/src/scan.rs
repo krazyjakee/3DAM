@@ -33,6 +33,7 @@ fn record_warning(total: &mut u64, details: &mut Vec<String>, message: String) {
 #[allow(clippy::too_many_arguments)] // the job runner's full context; a struct would just rename it
 pub(crate) fn run_scan(
     store: Arc<Store>,
+    secrets: crate::credentials::SecretVault,
     events: broadcast::Sender<LibraryEvent>,
     job: JobId,
     sources: Vec<SourceInfo>,
@@ -50,7 +51,7 @@ pub(crate) fn run_scan(
     // listed): off only by files added/removed since the last scan, and the bar clamps at 100%.
     // `None` ⇒ nothing countable ⇒ indeterminate bar, which still works.
     let total = match mode {
-        ScanMode::Full => count_total(&store, &sources, &cancel, scratch),
+        ScanMode::Full => count_total(&store, &secrets, &sources, &cancel, scratch),
         ScanMode::Delta => {
             let n: u64 = sources.iter().map(|s| s.stats.asset_count).sum();
             (n > 0).then_some(n)
@@ -71,9 +72,12 @@ pub(crate) fn run_scan(
         let sid = src.id;
         let source_label = src.name.clone();
 
-        // Rebuild the backend from the persisted connection (incl. secret). An unreachable host or
-        // bad credentials mark the source offline and move on — degrade one edge, not the job.
-        let conn = match store.get_source_connection(&sid) {
+        // Rebuild from the persisted non-secret connection + its resolved host credential. An
+        // unreachable host, locked store, or bad credential marks this source offline and moves on.
+        let conn = match store
+            .get_source_connection(&sid)
+            .and_then(|connection| secrets.resolve(connection))
+        {
             Ok(c) => c,
             Err(e) => {
                 let _ = store.set_source_error(&sid, &e.to_string());
@@ -400,6 +404,7 @@ pub(crate) fn key_attrs_of(attrs: &MediaAttributes) -> SmallMap {
 /// (no byte fetch/hash), so this is far cheaper than the main pass it precedes.
 fn count_total(
     store: &Store,
+    secrets: &crate::credentials::SecretVault,
     sources: &[SourceInfo],
     cancel: &AtomicBool,
     scratch: &Path,
@@ -413,7 +418,10 @@ fn count_total(
         if cancel.load(Ordering::Relaxed) {
             return None;
         }
-        let Ok(conn) = store.get_source_connection(&src.id) else {
+        let Ok(conn) = store
+            .get_source_connection(&src.id)
+            .and_then(|connection| secrets.resolve(connection))
+        else {
             continue;
         };
         let Ok(fs) = open_source(&conn, scratch) else {

@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Loader2 } from "lucide-react";
 import type { AssetSummary } from "@/api/types";
 import { api } from "@/api/client";
+import { useMediaBlob } from "@/lib/media-blob";
 import { useThumbnailVersion } from "@/lib/thumbnail-cache";
 import { MediaIcon } from "./MediaIcon";
 
@@ -55,10 +56,18 @@ export function Thumbnail({ asset, size = 28 }: { asset: AssetSummary; size?: nu
   const [status, setStatus] = useState<"loading" | "loaded" | "failed">("loading");
   // Regeneration epoch: bumped when the user forces a rebuild, so the <img> re-fetches past the cache.
   const version = useThumbnailVersion(asset.id);
+  const edge = Math.min(512, Math.max(64, size * 4));
+  const media = useMediaBlob(
+    api.assetThumbnailUrl(asset.id, edge, version),
+    hasServerThumbnail(asset.media),
+  );
 
   // A virtualised cell may be reused for a different asset without remounting — reset when the id
   // (or regeneration epoch) changes so the placeholder/spinner tracks the new image.
   useEffect(() => setStatus("loading"), [asset.id, version]);
+  useEffect(() => {
+    if (media.status === "error") setStatus("failed");
+  }, [media.status]);
 
   // Media with no server thumbnail (audio), or a preview that failed to load, shows the typed tile.
   if (!hasServerThumbnail(asset.media) || status === "failed") {
@@ -66,7 +75,6 @@ export function Thumbnail({ asset, size = 28 }: { asset: AssetSummary; size?: nu
   }
 
   // Request roughly 2× the render box (capped) so the thumbnail stays crisp on HiDPI grids.
-  const edge = Math.min(512, Math.max(64, size * 4));
   return (
     <div className="relative h-full w-full" style={{ background: "var(--color-bg)" }}>
       {status === "loading" && (
@@ -78,7 +86,7 @@ export function Thumbnail({ asset, size = 28 }: { asset: AssetSummary; size?: nu
         </div>
       )}
       <img
-        src={api.assetThumbnailUrl(asset.id, edge, version)}
+        src={media.url ?? undefined}
         alt={asset.name}
         loading="lazy"
         decoding="async"

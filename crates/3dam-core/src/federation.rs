@@ -116,17 +116,26 @@ impl EmbeddedLibrary {
                 }
             }
         }
+        let secrets = self.secrets.clone();
         let rows: Vec<(SourceId, String, String, Option<String>)> = self
-            .db(|s| {
+            .db(move |s| {
                 let mut out = Vec::new();
                 for info in s.list_sources()? {
                     if info.kind != SourceKind::Federated {
                         continue;
                     }
-                    if let dam_sources::SourceConnection::Federated(cfg) =
-                        s.get_source_connection(&info.id)?
+                    match s
+                        .get_source_connection(&info.id)
+                        .and_then(|connection| secrets.resolve(connection))
                     {
-                        out.push((info.id, info.name, cfg.endpoint, cfg.token));
+                        Ok(dam_sources::SourceConnection::Federated(cfg)) => {
+                            out.push((info.id, info.name, cfg.endpoint, cfg.token));
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            let _ = s.set_source_error(&info.id, &error.to_string());
+                            tracing::warn!(peer = %info.name, "federated peer credentials unavailable: {error}");
+                        }
                     }
                 }
                 Ok(out)
