@@ -7,9 +7,10 @@
 //! (catalog rows, not bytes) is a separate surface that lands with phase 6.
 //!
 //! **Byte access is uniform.** The media handlers ([`dam_media`]) are path-based, so every source
-//! resolves an entry to a real local path via [`FileSource::fetch`]: local sources hand back the
-//! file in place (no copy); remote sources download it to a temp file whose suffix preserves the
-//! logical extension, so detection and the cheap-tier probes behave exactly as they do locally.
+//! resolves an entry to a private local path via [`FileSource::fetch`]. Remote sources download to
+//! it; local sources copy from a capability-relative, already-open handle. That copy is intentional:
+//! path-based handlers would otherwise reopen an attacker-swappable source pathname after fetch
+//! returned. The temp suffix preserves the logical extension for extension-keyed detection.
 
 use dam_api::LibError;
 use serde::{Deserialize, Serialize};
@@ -35,21 +36,17 @@ pub struct FileEntry {
     pub modified_ms: Option<i64>,
 }
 
-/// A locally-readable handle to an entry's bytes. For a local source it borrows the real file in
-/// place; for a remote source it is a downloaded temp file, removed on drop. Either way `path()`
-/// hands the (path-based) media handlers something they can open.
+/// A locally-readable handle to an entry's bytes. Every backend materialises a private temp file,
+/// removed on drop, so path-based media handlers never reopen an attacker-swappable source path.
 pub enum Fetched {
-    /// The source file itself (local FS): zero-copy.
-    InPlace(PathBuf),
-    /// A downloaded copy (SFTP/SMB), deleted when this drops. Suffixed with the logical extension
-    /// so extension-keyed detection (tech-spec 04 §7) still works.
+    /// A pinned/materialised copy, deleted when this drops. Suffixed with the logical extension so
+    /// extension-keyed detection (tech-spec 04 §7) still works.
     Temp(tempfile::NamedTempFile),
 }
 
 impl Fetched {
     pub fn path(&self) -> &Path {
         match self {
-            Fetched::InPlace(p) => p.as_path(),
             Fetched::Temp(f) => f.path(),
         }
     }
@@ -65,8 +62,8 @@ pub trait FileSource: Send + Sync {
         sink: &mut dyn FnMut(Result<FileEntry, LibError>) -> bool,
     ) -> Result<(), LibError>;
 
-    /// Resolve an entry's bytes to a local path for the media handlers. Local → in place; remote →
-    /// a downloaded temp file. Guards against `..` traversal out of the source root.
+    /// Resolve an entry's bytes to a private local path for the media handlers. Guards all rooted,
+    /// prefixed, URL, and traversal shapes and pins local reads to the registered root capability.
     fn fetch(&self, rel_path: &str) -> Result<Fetched, LibError>;
 
     // ── write side (issue #80) ───────────────────────────────────────────────
@@ -266,19 +263,19 @@ impl SourceConnection {
 }
 
 /// Build the concrete backend for a connection. Remote kinds require the matching crate feature.
-/// `scratch` is where a remote backend materialises downloaded bytes (issue #87). It is a required
+/// `scratch` is where a backend materialises fetched bytes (issue #87). It is a required
 /// positional argument rather than an option with a default, for the same reason `Visibility` is:
 /// the sensible-looking default (`std::env::temp_dir()`) is the wrong one on most Linux hosts, and a
-/// caller that inherited it by omission would reintroduce the bug in silence. Local sources ignore
-/// it — they never copy anything.
+/// caller that inherited it by omission would reintroduce the bug in silence.
 pub fn open_source(
     conn: &SourceConnection,
     scratch: &Path,
 ) -> Result<Box<dyn FileSource>, LibError> {
-    #[cfg(not(any(feature = "sftp", feature = "smb")))]
-    let _ = scratch; // only the remote backends materialise bytes
     match conn {
-        SourceConnection::LocalFs { root } => Ok(Box::new(LocalFsSource::new(root))),
+        SourceConnection::LocalFs { root } => Ok(Box::new(LocalFsSource::registered(
+            root,
+            Some(scratch.to_path_buf()),
+        ))),
         #[cfg(feature = "sftp")]
         SourceConnection::Sftp(cfg) => Ok(Box::new(sftp::SftpSource::connect(
             cfg.clone(),
@@ -327,7 +324,7 @@ pub fn open_source(
 pub fn writable_without_handshake(conn: &SourceConnection) -> bool {
     match conn {
         // The only kind whose answer varies, and the only one cheap enough to ask for real.
-        SourceConnection::LocalFs { root } => LocalFsSource::new(root).writable(),
+        SourceConnection::LocalFs { root } => LocalFsSource::registered(root, None).writable(),
         SourceConnection::Sftp(_) => cfg!(feature = "sftp"),
         // The port check mirrors `SmbSource::connect`, which refuses a non-default port outright.
         // Offering such a source would not be the documented "the credential might lack permission"
@@ -551,17 +548,51 @@ fn split_once_or<'a>(s: &'a str, sep: char, default: (&'a str, &'a str)) -> (&'a
     }
 }
 
-/// Reject a relative path that escapes its source root. Shared by every backend's `fetch`.
-pub(crate) fn guard_rel_path(rel_path: &str) -> Result<(), LibError> {
-    if Path::new(rel_path)
-        .components()
-        .any(|c| matches!(c, std::path::Component::ParentDir))
+/// Validate and normalise a source-relative path before any backend sees it.
+///
+/// This is deliberately a path-*geometry* check, not the stricter upload naming policy: an existing
+/// POSIX file named `CON` or `report.` remains readable. In particular, a path which is merely an
+/// ordinary filename on Unix (`C:\\secret`, for example) is still a drive path when the same
+/// catalog is opened on Windows. Remote backends use it too, so changing source kind can never
+/// change whether a path is interpreted as rooted, prefixed, URL-like, or traversing.
+pub(crate) fn guard_rel_path(rel_path: &str) -> Result<String, LibError> {
+    let reject = || LibError::BadRequest("asset path must stay within its source root".into());
+    if rel_path.trim().is_empty()
+        || rel_path.starts_with('/')
+        || rel_path.starts_with('\\')
+        // Backslash is a separator on Windows. The scanner normalises separators to `/`, so one in
+        // a stored/requested path is ambiguous across platforms and must not reach a backend.
+        || rel_path.contains('\\')
     {
-        return Err(LibError::BadRequest(
-            "asset path escapes its source root".into(),
-        ));
+        return Err(reject());
     }
-    Ok(())
+    let bytes = rel_path.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' && (bytes[0] as char).is_ascii_alphabetic() {
+        return Err(reject()); // drive-absolute and drive-relative (`C:/x`, `C:x`)
+    }
+    // Reject every URI-scheme shape, not only `://`: `file:/x` and `file:x` are URLs too.
+    if let Some((scheme, _)) = rel_path.split_once(':') {
+        if !scheme.is_empty()
+            && scheme
+                .chars()
+                .enumerate()
+                .all(|(i, c)| c.is_ascii_alphabetic() || (i > 0 && (c.is_ascii_digit() || "+-.".contains(c))))
+        {
+            return Err(reject());
+        }
+    }
+    let mut parts = Vec::new();
+    for part in rel_path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => return Err(reject()),
+            other => parts.push(other),
+        }
+    }
+    if parts.is_empty() {
+        return Err(reject());
+    }
+    Ok(parts.join("/"))
 }
 
 /// Transfer buffer for a streaming remote fetch. This is now the *whole* memory cost of downloading
@@ -569,8 +600,8 @@ pub(crate) fn guard_rel_path(rel_path: &str) -> Result<(), LibError> {
 /// amortised and small enough that a pool of concurrent fetches is still nothing.
 pub(crate) const FETCH_CHUNK: usize = 256 * 1024;
 
-/// Filename prefix every remote download carries. Also what [`clean_scratch`] matches on, so the
-/// two must agree — a rename here silently orphans whatever a previous build left behind.
+/// Filename prefix every fetched-byte materialisation carries (remote download or secured local
+/// copy). Also what [`clean_scratch`] matches, so changing it would orphan older leftovers.
 pub(crate) const SCRATCH_PREFIX: &str = "3dam-remote-";
 
 /// Filename prefix for an **inbound upload** staged in scratch (issue #80).
@@ -582,7 +613,7 @@ pub(crate) const SCRATCH_PREFIX: &str = "3dam-remote-";
 /// as well.
 pub const UPLOAD_SCRATCH_PREFIX: &str = "3dam-upload-";
 
-/// Open a temp file for a remote download, **inside the engine's scratch directory**.
+/// Open a temp file for fetched bytes, **inside the engine's scratch directory**.
 ///
 /// The directory matters (issue #87): `tempfile`'s default is `std::env::temp_dir()`, which on most
 /// Linux distributions is a tmpfs — RAM backed by swap. That was harmless when this seam only
@@ -595,7 +626,6 @@ pub const UPLOAD_SCRATCH_PREFIX: &str = "3dam-upload-";
 ///
 /// The suffix preserves the entry's logical extension so extension-keyed detection (tech-spec 04 §7)
 /// still works on a file whose stem is random.
-#[cfg(any(feature = "sftp", feature = "smb"))]
 pub(crate) fn temp_sink(
     rel_path: &str,
     scratch: &Path,
@@ -628,7 +658,7 @@ pub(crate) fn temp_sink(
     }
 }
 
-/// Delete stale remote downloads left in `scratch` by a previous run.
+/// Delete stale fetched-byte materialisations left in `scratch` by a previous run.
 ///
 /// [`Fetched::Temp`] removes its file on drop, which covers every normal path — but not a kill -9,
 /// a panic-abort, or a power cut mid-fetch. Without this, a crash during a large remote pass leaves
@@ -639,7 +669,7 @@ pub(crate) fn temp_sink(
 /// race here — but they already race on `library.db`'s write lock, so that is not a new constraint.)
 /// Best-effort: a scratch directory we cannot read is not worth failing to start over.
 ///
-/// Sweeps **both** things that stage bytes in scratch: remote downloads and inbound uploads. An
+/// Sweeps **both** things that stage bytes in scratch: fetched copies and inbound uploads. An
 /// upload can be larger than any download, since it is bounded only by `[upload] max_file_mb`.
 pub fn clean_scratch(scratch: &Path) -> usize {
     let Ok(entries) = std::fs::read_dir(scratch) else {
@@ -662,19 +692,77 @@ pub fn clean_scratch(scratch: &Path) -> usize {
 
 // ── local filesystem source ───────────────────────────────────────────────────────────────────
 
-/// A local directory tree walked with `walkdir`.
+/// A local directory tree traversed relative to an open root capability.
 pub struct LocalFsSource {
     root: PathBuf,
+    /// The registered root as an open capability. All content reads and writes resolve relative to
+    /// this handle, so renaming/replacing the path (or swapping a child for a symlink) cannot retarget
+    /// an operation outside the tree between a check and an open.
+    root_dir: Option<cap_std::fs::Dir>,
+    /// Materialised local bytes use the same configured, disk-backed scratch area as remote
+    /// downloads. `None` is used only by the cheap writability probe, which never fetches.
+    scratch: Option<PathBuf>,
 }
 
 impl LocalFsSource {
-    pub fn new(root: impl Into<PathBuf>) -> LocalFsSource {
-        LocalFsSource { root: root.into() }
+    /// Construct only for metadata/writability operations which cannot fetch. Byte-bearing callers
+    /// must come through [`open_source`], where configured scratch is mandatory.
+    fn without_scratch(root: impl Into<PathBuf>) -> LocalFsSource {
+        let supplied = root.into();
+        let root = supplied.canonicalize().unwrap_or(supplied);
+        let root_dir = open_registered_root(&root);
+        LocalFsSource {
+            root,
+            root_dir,
+            scratch: None,
+        }
     }
 
     pub fn root(&self) -> &Path {
         &self.root
     }
+
+    /// Reopen a persisted source root. Local roots are canonicalised before registration; opening
+    /// every component with no-follow semantics prevents replacing that registered path (or any
+    /// ancestor) with a link to a different tree between requests.
+    fn registered(root: impl Into<PathBuf>, scratch: Option<PathBuf>) -> LocalFsSource {
+        let root = root.into();
+        let root_dir = open_registered_root(&root);
+        LocalFsSource {
+            root,
+            root_dir,
+            scratch,
+        }
+    }
+}
+
+/// Open a persisted canonical root one component at a time without following symlinks.
+///
+/// Starting at the platform filesystem root (`/`, `C:\\`, UNC prefix, …) matters: opening the
+/// immediate parent ambiently would still let an attacker replace an earlier ancestor. Each step
+/// is relative to the directory handle returned by the previous step, and `open_dir_nofollow`
+/// combines the no-link decision with the open on Unix and Windows. On a target/filesystem which
+/// cannot provide that primitive, the operation returns `None` and the source fails closed.
+fn open_registered_root(root: &Path) -> Option<cap_std::fs::Dir> {
+    use std::path::Component;
+
+    let mut components = root.components().peekable();
+    let mut anchor = PathBuf::new();
+    while matches!(components.peek(), Some(Component::Prefix(_) | Component::RootDir)) {
+        anchor.push(components.next()?.as_os_str());
+    }
+    if anchor.as_os_str().is_empty() {
+        return None; // registered roots are canonical absolute paths
+    }
+    let anchor = cap_std::fs::Dir::open_ambient_dir(&anchor, cap_std::ambient_authority()).ok()?;
+    let mut current = anchor.into_std_file();
+    for component in components {
+        let Component::Normal(name) = component else {
+            return None;
+        };
+        current = cap_primitives::fs::open_dir_nofollow(&current, Path::new(name)).ok()?;
+    }
+    Some(cap_std::fs::Dir::from_std_file(current))
 }
 
 impl FileSource for LocalFsSource {
@@ -682,48 +770,56 @@ impl FileSource for LocalFsSource {
         &self,
         sink: &mut dyn FnMut(Result<FileEntry, LibError>) -> bool,
     ) -> Result<(), LibError> {
-        if !self.root.exists() {
-            return Err(LibError::SourceUnavailable(format!(
-                "path does not exist: {}",
-                self.root.display()
-            )));
-        }
-        for entry in walkdir::WalkDir::new(&self.root).follow_links(false) {
-            let cont = match entry {
-                Ok(de) if de.file_type().is_file() => {
-                    let abs = de.path().to_path_buf();
-                    let rel = abs
-                        .strip_prefix(&self.root)
-                        .unwrap_or(&abs)
-                        .to_string_lossy()
-                        .replace('\\', "/");
-                    let (size, modified_ms) = match de.metadata() {
-                        Ok(m) => (m.len(), m.modified().ok().and_then(system_time_ms)),
+        let root = self.cap_root()?;
+        let mut stack = vec![PathBuf::new()];
+        while let Some(rel_dir) = stack.pop() {
+            let entries = root.read_dir(&rel_dir).map_err(|_| {
+                LibError::SourceUnavailable("registered local source root is unavailable".into())
+            })?;
+            for entry in entries {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(_) => {
+                        if !sink(Err(LibError::SourceUnavailable(
+                            "local source entry is unavailable".into(),
+                        ))) {
+                            return Ok(());
+                        }
+                        continue;
+                    }
+                };
+                let child = rel_dir.join(entry.file_name());
+                let kind = match entry.file_type() {
+                    Ok(kind) => kind,
+                    Err(_) => continue,
+                };
+                if kind.is_dir() {
+                    stack.push(child);
+                } else if kind.is_file() {
+                    let rel_path = child.to_string_lossy().replace('\\', "/");
+                    // Reopen through the entry capability before reading metadata. A path-based
+                    // metadata call after `file_type` would be another swap window (and could
+                    // disclose an external target's size/mtime even though fetch later refused it).
+                    let (size, modified_ms) = match entry.open().and_then(|file| file.metadata()) {
+                        Ok(meta) => (meta.len(), meta.modified().ok().and_then(system_time_ms)),
                         Err(_) => (0, None),
                     };
-                    sink(Ok(FileEntry {
-                        rel_path: rel,
+                    if !sink(Ok(FileEntry {
+                        rel_path,
                         size,
                         modified_ms,
-                    }))
+                    })) {
+                        return Ok(());
+                    }
                 }
-                Ok(_) => true, // directories/symlinks: skip, keep going
-                Err(e) => sink(Err(LibError::Internal(e.to_string()))),
-            };
-            if !cont {
-                break; // sink asked to stop (cancellation)
             }
         }
         Ok(())
     }
 
     fn fetch(&self, rel_path: &str) -> Result<Fetched, LibError> {
-        guard_rel_path(rel_path)?;
-        let abs = self.root.join(rel_path);
-        if !abs.is_file() {
-            return Err(LibError::NotFound(format!("file gone: {rel_path}")));
-        }
-        Ok(Fetched::InPlace(abs))
+        let rel = guard_rel_path(rel_path)?;
+        self.fetch_after_validation(&rel, || {})
     }
 
     /// Probed, not assumed (issue #80). A local source can sit on a read-only mount, a full disk,
@@ -750,15 +846,18 @@ impl FileSource for LocalFsSource {
     fn writable(&self) -> bool {
         #[cfg(unix)]
         {
-            use std::os::unix::ffi::OsStrExt;
-            let Ok(path) = std::ffi::CString::new(self.root.as_os_str().as_bytes()) else {
-                return false; // an interior NUL cannot name a real directory
+            use std::os::fd::AsRawFd;
+            let Some(root) = self.root_dir.as_ref() else {
+                return false;
             };
-            // SAFETY: `path` is a valid NUL-terminated C string that outlives the call, and
-            // `faccessat` only reads it.
+            // Ask about `.` relative to the already-open root descriptor. Using the registered
+            // pathname here would let a post-open root swap retarget even this metadata probe.
+            let path = c".";
+            // SAFETY: `path` is a static NUL-terminated C string and `root` remains open for the
+            // duration of the call; `faccessat` only reads both.
             unsafe {
                 libc::faccessat(
-                    libc::AT_FDCWD,
+                    root.as_raw_fd(),
                     path.as_ptr(),
                     libc::W_OK | libc::X_OK,
                     libc::AT_EACCESS,
@@ -771,53 +870,59 @@ impl FileSource for LocalFsSource {
         // the rescan loop described above, which is a worse failure than an honest error at commit.
         #[cfg(not(unix))]
         {
-            self.root.is_dir()
+            self.root_dir.is_some()
         }
     }
 
     fn mkdir(&self, rel_path: &str) -> Result<(), LibError> {
         let rel = safe_name::check_rel_path(rel_path)?;
-        let abs = self.resolve_within(&rel)?;
-        std::fs::create_dir_all(&abs).map_err(|e| LibError::Internal(format!("create {rel}: {e}")))
+        self.cap_root()?.create_dir_all(&rel).map_err(|_| {
+            LibError::BadRequest("destination must stay within its source root".into())
+        })
     }
 
     fn put(&self, rel_path: &str, bytes: &mut dyn std::io::Read) -> Result<(), LibError> {
-        use std::io::Write;
         let rel = safe_name::check_rel_path(rel_path)?;
-        let abs = self.resolve_within(&rel)?;
+        self.put_after_validation(&rel, bytes, || {})
+    }
+}
 
-        // Create-only. Checked here *and* enforced by the rename below, because this check alone
-        // is a TOCTOU window — see the atomic-rename comment.
-        //
-        // `Conflict`, not `BadRequest`: "the name is taken" is the one failure a caller *routinely*
-        // recovers from (retry under a suffix, or report a skip), so it has to be distinguishable
-        // from "that name is malformed" without matching on message text. It is also the honest
-        // status — 409, not 400, since the request was well-formed and the world disagreed.
-        if abs.exists() {
-            return Err(LibError::Conflict(format!("{rel} already exists")));
-        }
-        if let Some(parent) = abs.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| LibError::Internal(format!("create parent of {rel}: {e}")))?;
+impl LocalFsSource {
+    fn put_after_validation(
+        &self,
+        rel: &str,
+        bytes: &mut dyn std::io::Read,
+        before_create: impl FnOnce(),
+    ) -> Result<(), LibError> {
+        use std::io::Write;
+        let root = self.cap_root()?;
+        before_create();
+        if let Some(parent) = Path::new(rel).parent().filter(|p| !p.as_os_str().is_empty()) {
+            root.create_dir_all(parent).map_err(|_| {
+                LibError::BadRequest("destination must stay within its source root".into())
+            })?;
         }
 
-        // Temp file in the *destination* directory, so the rename below is same-filesystem and
-        // therefore atomic. A temp in /tmp could land on another mount and degrade to a copy,
-        // which is exactly the half-written-file window this is here to close (tech-spec 08 §5.2).
-        let dir = abs.parent().unwrap_or(&self.root);
-        let mut tmp = tempfile::Builder::new()
-            .prefix(".3dam-upload-")
-            .tempfile_in(dir)
-            .map_err(|e| LibError::Internal(format!("temp file in {}: {e}", dir.display())))?;
-        std::io::copy(bytes, &mut tmp)
-            .map_err(|e| LibError::Internal(format!("write {rel}: {e}")))?;
-        tmp.flush()
-            .map_err(|e| LibError::Internal(format!("flush {rel}: {e}")))?;
-        // fsync before the rename: a rename is atomic with respect to *ordering*, not durability,
-        // so without this a power cut can leave the name pointing at unwritten blocks.
-        tmp.as_file()
-            .sync_all()
-            .map_err(|e| LibError::Internal(format!("fsync {rel}: {e}")))?;
+        // Stage under a random sibling name, but create it relative to the pinned capability too.
+        // cap-std performs component resolution beneath the root handle on Unix and Windows and
+        // refuses a link which would leave it.
+        let temp_name = format!(".3dam-upload-{}", uuid::Uuid::now_v7());
+        let temp_rel = match Path::new(rel).parent().filter(|p| !p.as_os_str().is_empty()) {
+            Some(parent) => parent.join(temp_name),
+            None => PathBuf::from(temp_name),
+        };
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        let mut file = root.open_with(&temp_rel, &options).map_err(|_| {
+            LibError::BadRequest("destination must stay within its source root".into())
+        })?;
+        let written = (|| {
+            std::io::copy(bytes, &mut file)
+                .map_err(|e| LibError::Internal(format!("write {rel}: {e}")))?;
+            file.flush()
+                .map_err(|e| LibError::Internal(format!("flush {rel}: {e}")))?;
+            file.sync_all()
+                .map_err(|e| LibError::Internal(format!("fsync {rel}: {e}")))?;
 
         // Widen the mode *before* the rename, so the file is never visible at its real name with
         // the wrong permissions.
@@ -833,65 +938,67 @@ impl FileSource for LocalFsSource {
         // that may be group- or world-writable, and a path-based `set_permissions` there could be
         // redirected by someone swapping the temp name for a symlink between creation and this
         // call. The fd already refers to the file we made, so there is nothing to redirect.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            tmp.as_file()
-                .set_permissions(std::fs::Permissions::from_mode(0o644))
-                .map_err(|e| LibError::Internal(format!("chmod {rel}: {e}")))?;
+            #[cfg(unix)]
+            {
+                use cap_std::fs::PermissionsExt;
+                file.set_permissions(cap_std::fs::Permissions::from_mode(0o644))
+                    .map_err(|e| LibError::Internal(format!("chmod {rel}: {e}")))?;
+            }
+            Ok::<(), LibError>(())
+        })();
+        drop(file);
+        if let Err(error) = written {
+            let _ = root.remove_file(&temp_rel);
+            return Err(error);
         }
 
-        // `persist_noclobber` fails rather than replacing, which closes the TOCTOU window the
-        // `exists()` check above leaves open: between that check and this call another writer
-        // could have created the path, and a plain rename would silently destroy their file.
-        tmp.persist_noclobber(&abs).map_err(|e| {
-            if e.error.kind() == std::io::ErrorKind::AlreadyExists {
+        // Publishing is an atomic, no-clobber hard link: if the destination exists, the kernel
+        // refuses the link; if it does not, readers see the fully written and synced inode in one
+        // step. Both names are resolved relative to the same capability, closing symlink swaps.
+        let published = root.hard_link(&temp_rel, root, &rel).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
                 LibError::Conflict(format!("{rel} already exists"))
             } else {
-                LibError::Internal(format!("commit {rel}: {}", e.error))
+                LibError::BadRequest("destination must stay within its source root".into())
             }
-        })?;
+        });
+        let _ = root.remove_file(&temp_rel);
+        published?;
         Ok(())
     }
-}
+    fn cap_root(&self) -> Result<&cap_std::fs::Dir, LibError> {
+        self.root_dir.as_ref().ok_or_else(|| {
+            LibError::SourceUnavailable("registered local source root is unavailable".into())
+        })
+    }
 
-impl LocalFsSource {
-    /// Join a **validated** relative path onto the root and prove the result is still inside it
-    /// after symlink resolution.
-    ///
-    /// The lexical guard in `safe_name` cannot see a symlink: if `Textures/` is a link to `/etc`,
-    /// then `Textures/passwd` passes every string check and still escapes. So the deepest existing
-    /// ancestor is canonicalised and compared against the canonical root — checking the ancestor
-    /// rather than the target because the target is a file we are about to *create* and so does not
-    /// exist yet.
-    fn resolve_within(&self, rel: &str) -> Result<PathBuf, LibError> {
-        let root = self
-            .root
-            .canonicalize()
-            .map_err(|e| LibError::SourceUnavailable(format!("source root: {e}")))?;
-        let abs = root.join(rel);
-
-        let mut probe = abs.as_path();
-        let existing = loop {
-            if probe.exists() {
-                break probe;
-            }
-            match probe.parent() {
-                // Walked above the root without finding anything that exists: the root itself was
-                // canonicalised above, so this cannot be inside it.
-                Some(p) if p.starts_with(&root) => probe = p,
-                _ => break root.as_path(),
-            }
-        };
-        let real = existing
-            .canonicalize()
-            .map_err(|e| LibError::Internal(format!("resolve {rel}: {e}")))?;
-        if !real.starts_with(&root) {
-            return Err(LibError::BadRequest(format!(
-                "{rel} resolves outside the source root"
-            )));
+    /// Open from the pinned root capability, then copy from that already-open handle to a private
+    /// temp file. Existing media handlers are path-based; returning the original path would make
+    /// them reopen it and reintroduce a symlink-swap race after this method returned.
+    fn fetch_after_validation(
+        &self,
+        rel: &str,
+        before_open: impl FnOnce(),
+    ) -> Result<Fetched, LibError> {
+        before_open();
+        let mut source = self.cap_root()?.open(rel).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => LibError::NotFound("source file is unavailable".into()),
+            _ => LibError::BadRequest("asset path must stay within its source root".into()),
+        })?;
+        if !source
+            .metadata()
+            .map_err(|_| LibError::NotFound("source file is unavailable".into()))?
+            .is_file()
+        {
+            return Err(LibError::NotFound("source file is unavailable".into()));
         }
-        Ok(abs)
+        let scratch = self.scratch.as_deref().ok_or_else(|| {
+            LibError::Internal("local source fetch has no configured scratch directory".into())
+        })?;
+        let mut sink = temp_sink(rel, scratch)?;
+        std::io::copy(&mut source, &mut sink)
+            .map_err(|e| LibError::Internal(format!("local fetch copy: {e}")))?;
+        Ok(Fetched::Temp(sink))
     }
 }
 
@@ -1102,9 +1209,126 @@ mod tests {
     }
 
     #[test]
-    fn rejects_traversal() {
-        assert!(guard_rel_path("../etc/passwd").is_err());
-        assert!(guard_rel_path("a/b/c.png").is_ok());
+    fn fetch_paths_are_relative_under_unix_and_windows_semantics() {
+        for bad in [
+            "../etc/passwd",
+            "a/../../etc/passwd",
+            "/etc/passwd",
+            "\\\\server\\share\\secret",
+            "\\windows\\system32",
+            "C:/Windows/System32",
+            "C:notes.txt",
+            "file:///etc/passwd",
+            "file:/etc/passwd",
+            "https://example.invalid/secret",
+            "",
+            ".",
+        ] {
+            let error = guard_rel_path(bad).unwrap_err();
+            assert!(matches!(error, LibError::BadRequest(_)), "{bad:?}: {error}");
+            assert!(!error.to_string().contains(bad), "escape was echoed: {error}");
+        }
+        assert_eq!(guard_rel_path("a/./b//c.png").unwrap(), "a/b/c.png");
+
+        // Existing-file reads do not inherit upload's cross-platform *creation* policy.
+        for valid_posix_name in ["CON", "report.", "photo\u{202e}gnp.exe"] {
+            assert!(guard_rel_path(valid_posix_name).is_ok(), "{valid_posix_name:?}");
+        }
+    }
+
+    fn fetched_local(root: &Path, scratch: &Path) -> LocalFsSource {
+        LocalFsSource::registered(
+            root.canonicalize().unwrap(),
+            Some(scratch.to_path_buf()),
+        )
+    }
+
+    #[test]
+    fn local_fetch_materialises_from_the_open_capability_in_configured_scratch() {
+        let root = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("asset.bin"), b"inside").unwrap();
+        let source = fetched_local(root.path(), scratch.path());
+        let fetched = source.fetch("asset.bin").unwrap();
+        assert_eq!(std::fs::read(fetched.path()).unwrap(), b"inside");
+        assert_eq!(fetched.path().parent(), Some(scratch.path()));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn local_fetch_rejects_symlinked_files_and_directories_without_disclosure() {
+        let root = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("do-not-disclose.bin");
+        std::fs::write(&secret, b"outside secret bytes").unwrap();
+        std::os::unix::fs::symlink(&secret, root.path().join("file-link.bin")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("dir-link")).unwrap();
+        let source = fetched_local(root.path(), scratch.path());
+
+        for rel in ["file-link.bin", "dir-link/do-not-disclose.bin"] {
+            let error = source.fetch(rel).err().expect("escape must be rejected");
+            assert!(matches!(error, LibError::BadRequest(_)), "{rel}: {error}");
+            let rendered = error.to_string();
+            assert!(!rendered.contains(&outside.path().to_string_lossy().to_string()));
+            assert!(!rendered.contains("outside secret bytes"));
+        }
+    }
+
+    /// Deterministically swap a checked directory for an external symlink after lexical validation
+    /// but before the capability-relative open. This is the check/open race issue #124 reported.
+    #[test]
+    #[cfg(unix)]
+    fn a_swap_between_validation_and_open_cannot_retarget_fetch() {
+        let root = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("models")).unwrap();
+        std::fs::write(root.path().join("models/scene.bin"), b"inside").unwrap();
+        std::fs::write(outside.path().join("scene.bin"), b"outside secret").unwrap();
+        let source = fetched_local(root.path(), scratch.path());
+        let rel = guard_rel_path("models/scene.bin").unwrap();
+        let parked = root.path().join("models-parked");
+
+        let error = source
+            .fetch_after_validation(&rel, || {
+                std::fs::rename(root.path().join("models"), &parked).unwrap();
+                std::os::unix::fs::symlink(outside.path(), root.path().join("models")).unwrap();
+            })
+            .err()
+            .expect("swap must be rejected");
+        assert!(matches!(error, LibError::BadRequest(_)), "{error}");
+        assert!(!error.to_string().contains("outside secret"));
+
+        std::fs::remove_file(root.path().join("models")).unwrap();
+        std::fs::rename(parked, root.path().join("models")).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn replacing_the_registered_root_path_cannot_retarget_reads_or_writes() {
+        let parent = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = parent.path().join("source");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("asset.bin"), b"inside").unwrap();
+        let registered_root = root.canonicalize().unwrap();
+        let parked = parent.path().join("source-parked");
+        std::fs::rename(&root, &parked).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &root).unwrap();
+
+        // Rebuilding a backend from the persisted canonical connection refuses the replacement.
+        let source = LocalFsSource::registered(
+            registered_root,
+            Some(scratch.path().to_path_buf()),
+        );
+        assert!(matches!(source.fetch("asset.bin"), Err(LibError::SourceUnavailable(_))));
+        assert!(source.put("stolen.bin", &mut &b"x"[..]).is_err());
+        assert!(!outside.path().join("stolen.bin").exists());
+
+        std::fs::remove_file(&root).unwrap();
+        std::fs::rename(parked, root).unwrap();
     }
 
     /// The point of issue #87: a download must land in the *given* directory, not
@@ -1225,7 +1449,7 @@ mod tests {
 
     fn local_root() -> (tempfile::TempDir, LocalFsSource) {
         let dir = tempfile::tempdir().unwrap();
-        let src = LocalFsSource::new(dir.path());
+        let src = LocalFsSource::without_scratch(dir.path());
         (dir, src)
     }
 
@@ -1292,10 +1516,42 @@ mod tests {
 
         let err = src.put("escape/stolen.png", &mut &b"x"[..]).unwrap_err();
         assert!(matches!(err, LibError::BadRequest(_)), "got {err:?}");
+        let mkdir_err = src.mkdir("escape/stolen-folder").unwrap_err();
+        assert!(matches!(mkdir_err, LibError::BadRequest(_)), "got {mkdir_err:?}");
         assert!(
-            !outside.path().join("stolen.png").exists(),
-            "nothing may be written outside the source root"
+            !outside.path().join("stolen.png").exists()
+                && !outside.path().join("stolen-folder").exists(),
+            "neither file nor directory creation may escape the source root"
         );
+    }
+
+    /// The write counterpart to the fetch race: validation succeeds while `uploads` is an ordinary
+    /// in-root directory, then an attacker replaces it before the first create. Both the staging
+    /// create and final no-clobber publish remain relative to the pinned root capability.
+    #[test]
+    #[cfg(unix)]
+    fn a_swap_between_validation_and_create_cannot_retarget_upload() {
+        let (dir, src) = local_root();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("uploads")).unwrap();
+        let parked = dir.path().join("uploads-parked");
+        let rel = safe_name::check_rel_path("uploads/stolen.bin").unwrap();
+
+        let error = src
+            .put_after_validation(&rel, &mut &b"secret"[..], || {
+                std::fs::rename(dir.path().join("uploads"), &parked).unwrap();
+                std::os::unix::fs::symlink(outside.path(), dir.path().join("uploads")).unwrap();
+            })
+            .unwrap_err();
+        assert!(matches!(error, LibError::BadRequest(_)), "{error}");
+        assert!(!outside.path().join("stolen.bin").exists());
+        assert!(
+            std::fs::read_dir(outside.path()).unwrap().next().is_none(),
+            "no staging file may escape either"
+        );
+
+        std::fs::remove_file(dir.path().join("uploads")).unwrap();
+        std::fs::rename(parked, dir.path().join("uploads")).unwrap();
     }
 
     #[test]

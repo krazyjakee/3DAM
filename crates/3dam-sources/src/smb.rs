@@ -131,9 +131,9 @@ impl FileSource for SmbSource {
     /// blocks; it used to accumulate them into one `Vec<u8>` that was then written out, so a large
     /// asset sat in memory twice over. Now each block goes straight to disk.
     fn fetch(&self, rel_path: &str) -> Result<Fetched, LibError> {
-        guard_rel_path(rel_path)?;
-        let unc = self.unc_for(rel_path);
-        let mut sink = crate::temp_sink(rel_path, &self.scratch)?;
+        let rel_path = guard_rel_path(rel_path)?;
+        let unc = self.unc_for(&rel_path);
+        let mut sink = crate::temp_sink(&rel_path, &self.scratch)?;
         self.rt
             .block_on(read_file_into(&self.client, &unc, &mut sink))?;
         std::io::Write::flush(&mut sink).ok();

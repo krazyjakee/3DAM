@@ -107,6 +107,11 @@ directories = "5"
 # temp files for materialising remote-source bytes to a local path the (path-based) media
 # handlers can read (tech-spec 07 §2); suffixed with the logical extension so detection holds.
 tempfile = "3"
+# Capability-relative filesystem access for local sources. Holding the registered root open and
+# resolving every entry beneath that handle closes symlink-swap races which path canonicalisation
+# cannot close (issue #124).
+cap-std = "4"
+cap-primitives = "4"
 # `faccessat` for the upload destination-writability probe (issue #80). Asking the kernel whether a
 # write *would* succeed is the only check that both sees mount flags/ownership and touches nothing —
 # and touching the source root is what makes a watcher rescan it.

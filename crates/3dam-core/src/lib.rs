@@ -343,8 +343,8 @@ fn map_handler_err(e: dam_media::HandlerError) -> LibError {
     }
 }
 
-/// Rebuild the asset's source backend and resolve its bytes to a local path (in place for local,
-/// downloaded to a temp file for SFTP/SMB). Traversal-guarded inside `fetch`. Pure/blocking.
+/// Rebuild the asset's source backend and resolve its bytes to a private local temp path. Local
+/// bytes are copied from an already-open root capability; remote bytes are downloaded. Pure/blocking.
 fn fetch_asset(
     store: &Store,
     asset: &Asset,
@@ -394,7 +394,22 @@ fn resolve_sibling(base: &str, rel: &str) -> Result<String, LibError> {
         return Err(LibError::BadRequest("empty related path".into()));
     }
     // Absolute paths (POSIX or Windows-drive) and URLs are never source-relative siblings.
-    if rel.starts_with('/') || rel.starts_with('\\') || rel.contains("://") {
+    let bytes = rel.as_bytes();
+    let windows_drive = bytes.len() >= 2
+        && bytes[1] == b':'
+        && (bytes[0] as char).is_ascii_alphabetic();
+    let uri_scheme = rel.split_once(':').is_some_and(|(scheme, _)| {
+        !scheme.is_empty()
+            && scheme.chars().enumerate().all(|(i, c)| {
+                c.is_ascii_alphabetic()
+                    || (i > 0 && (c.is_ascii_digit() || "+-.".contains(c)))
+            })
+    });
+    if rel.starts_with('/')
+        || rel.starts_with('\\')
+        || windows_drive
+        || uri_scheme
+    {
         return Err(LibError::BadRequest(
             "related path must be source-relative".into(),
         ));
@@ -501,7 +516,7 @@ impl EmbeddedLibrary {
         resources: ResourceOptions,
     ) -> Result<EmbeddedLibrary, LibError> {
         let resources = resources.or_env();
-        // Scratch for remote downloads (issue #87). Created up front so `temp_sink` never has to,
+        // Scratch for fetched byte copies (issue #87). Created up front so `temp_sink` never has to,
         // and swept of anything a previous run left behind: `Fetched::Temp` cleans up on drop, but
         // a kill -9 mid-fetch can strand a multi-gigabyte file with nothing to collect it.
         let scratch = paths::scratch_dir(data_dir);
@@ -2063,7 +2078,10 @@ mod tests {
         // Absolute paths and URLs are never source-relative siblings.
         assert!(resolve_sibling("m/s.gltf", "/etc/passwd").is_err());
         assert!(resolve_sibling("m/s.gltf", "\\windows\\system32").is_err());
+        assert!(resolve_sibling("m/s.gltf", "C:\\windows\\system32").is_err());
+        assert!(resolve_sibling("m/s.gltf", "C:drive-relative.bin").is_err());
         assert!(resolve_sibling("m/s.gltf", "http://evil/x").is_err());
+        assert!(resolve_sibling("m/s.gltf", "file:/etc/passwd").is_err());
         // Empty is rejected.
         assert!(resolve_sibling("m/s.gltf", "  ").is_err());
     }

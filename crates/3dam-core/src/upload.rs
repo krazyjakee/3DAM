@@ -108,7 +108,7 @@ pub(crate) fn run_upload(
     // and textures), so reading the scratch copy would look for those siblings in the scratch dir,
     // find none, and record a `dependency_bytes` — and an `AssetAdded` size — that under-reports
     // the asset by its whole texture set. `fetch` is the seam's own answer for "give me these bytes
-    // locally" and is zero-copy for a local source.
+    // locally" and pins local reads before handing path-based media code a private copy.
     let landed = fs.fetch(&written);
     let read_from = match &landed {
         Ok(f) => f.path(),

@@ -175,9 +175,9 @@ impl FileSource for SftpSource {
     /// a file that may be gigabytes. `open` hands back an `AsyncRead` instead, so bytes go
     /// chunk-by-chunk from the socket to disk and peak memory is one buffer.
     fn fetch(&self, rel_path: &str) -> Result<Fetched, LibError> {
-        guard_rel_path(rel_path)?;
-        let abs = self.remote_path(rel_path);
-        let mut sink = crate::temp_sink(rel_path, &self.scratch)?;
+        let rel_path = guard_rel_path(rel_path)?;
+        let abs = self.remote_path(&rel_path);
+        let mut sink = crate::temp_sink(&rel_path, &self.scratch)?;
         self.rt.block_on(async {
             use tokio::io::AsyncReadExt;
             let session = self.session.lock().await;
