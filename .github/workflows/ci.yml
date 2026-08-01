@@ -1,0 +1,65 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  msrv:
+    name: Rust 1.91 MSRV
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.91.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv-1.91
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang cmake libclang-dev libgtk-3-dev librsvg2-dev \
+            libssl-dev libwebkit2gtk-4.1-dev pkg-config
+
+      - name: Check workspace at the supported floor
+        run: cargo check --workspace --locked
+
+  stable:
+    name: Current stable Clippy
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: stable-clippy
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang cmake libclang-dev libgtk-3-dev librsvg2-dev \
+            libssl-dev libwebkit2gtk-4.1-dev pkg-config
+
+      - name: Lint workspace on current stable
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings

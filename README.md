@@ -63,7 +63,8 @@ model-backed extractors are a later feature-gated bump. See
 
 ### Build from source
 
-Requires a recent stable Rust toolchain (MSRV **1.91** — set by the dependency tree, notably libsqlite3-sys 0.38's `cfg_select!` build script).
+Requires Rust **1.91** or newer. CI checks the complete workspace against that exact MSRV as well
+as running Clippy on current stable.
 
 ```sh
 git clone https://github.com/krazyjakee/3DAM.git

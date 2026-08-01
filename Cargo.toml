@@ -22,11 +22,10 @@ version = "0.1.1"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/krazyjakee/3DAM"
-# MSRV floor is set by the locked dependency tree, not our own source: libsqlite3-sys
-# 0.38's build.rs uses the `cfg_select!` macro (stable since 1.91), and image 0.25 / wgpu 30
-# / naga 30 declare 1.87–1.88. Setting this makes `cargo build` fail fast with a clear
-# message on older toolchains instead of a cryptic `cfg_select` error. Bump only after
-# rebuilding to confirm the new floor; keep CLAUDE.md / README.md in sync.
+# Rust 1.91 is the workspace's supported floor. The locked dependency tree currently declares
+# requirements up to Rust 1.89; rusqlite stays on the 0.39 line because 0.40 pulls in
+# libsqlite3-sys 0.38, whose build script uses `std::cfg_select!` (stable only since Rust 1.95).
+# The MSRV CI job checks this exact floor. Keep CLAUDE.md / README.md in sync when it changes.
 rust-version = "1.91"
 
 # One place for third-party versions; crates opt in with `dep.workspace = true`.
@@ -63,7 +62,9 @@ blake3 = "1"
 bytes = "1"
 
 # storage
-rusqlite = { version = "0.40", features = ["bundled"] }
+# rusqlite 0.40 requires libsqlite3-sys 0.38, which does not build on the workspace MSRV because
+# it uses `std::cfg_select!`; stay on the compatible 0.39/0.37 pair until the MSRV reaches 1.95.
+rusqlite = { version = "0.39", features = ["bundled"] }
 # argon2id password hashing for user accounts (phase 6, issue #42; ADR 0009 §4). API-token secrets
 # stay on blake3 (high-entropy keys need no KDF); argon2 is for low-entropy user passwords only.
 argon2 = "0.5"
