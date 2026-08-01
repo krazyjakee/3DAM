@@ -183,7 +183,7 @@ One binary must serve the whole UI with no separate deploy (PRODUCT_SPEC §8; §
 
 # Part B — The web client (React + CSS + WASM islands)
 
-The web client is a **separate front-end codebase** (the sole non-Rust codebase in the workspace — file 00), served by `3dam serve`. Per the hybrid React+CSS + WASM-islands decision ([ADR 0008](../adr/0008-web-client-stack.md)), it is an ordinary **React + CSS** app for all chrome/layout, with **WASM/wgpu islands only** for the interactive 3D viewer and hot render paths (waveforms/thumbnails). It talks to the engine **purely over the serve API** (file 03) — it is always in *connected* mode (PRODUCT_SPEC §4.2), never touching a DB or the engine directly.
+The web client is a **separate front-end codebase** (the sole non-Rust codebase in the workspace — file 00), served by `3dam serve`. Per the hybrid React+CSS + WASM-islands decision ([ADR 0008](../adr/0008-web-client-stack.md)), it is an ordinary **React + CSS** app for all chrome/layout, with a **WASM/wgpu island only** for the interactive 3D viewer. Audio waveforms use Canvas2D over server-produced peaks and thumbnails remain server-rendered, so neither path downloads wgpu. It talks to the engine **purely over the serve API** (file 03) — it is always in *connected* mode (PRODUCT_SPEC §4.2), never touching a DB or the engine directly.
 
 Rationale for the split (React/CSS chrome, WASM only for heavy canvas) is settled in [ADR 0008](../adr/0008-web-client-stack.md) and PRODUCT_SPEC §7 — not re-argued here. This part specifies the *architecture and packaging*.
 
@@ -220,13 +220,13 @@ These are *candidates to validate*, mirroring the tech-spec convention that stac
 
 ## B.3 WASM / wgpu viewer islands — packaging & data handoff
 
-The interactive 3D viewer and hot render paths (waveforms, thumbnails) are the parts DOM/CSS can't do well; they are **focused WASM/wgpu components embedded *in* the DOM layout — not a full-page canvas** ([ADR 0009 §9](../adr/0009-v1-scope-decisions.md)). The wgpu **viewer internals** are files [06](06-3d-render.md)/[12](12-desktop-gui.md); this file owns only how that Rust code becomes a DOM-embeddable island and how the DOM hands it data.
+The interactive 3D viewer is a **focused WASM/wgpu component embedded *in* the DOM layout — not a full-page canvas** ([ADR 0009 §9](../adr/0009-v1-scope-decisions.md)). The wgpu **viewer internals** are files [06](06-3d-render.md)/[12](12-desktop-gui.md); this file owns only how that Rust code becomes a DOM-embeddable island and how the DOM hands it data. The waveform stays in a separate Canvas2D path because its min/max bars do not justify the model viewer's multi-megabyte GPU runtime.
 
 **Packaging.**
 
 - The viewer is a Rust crate (sharing render code with file 06) compiled to `wasm32-unknown-unknown` and wrapped with `wasm-bindgen` (via `wasm-pack`/`trunk`-style tooling) into an ES module + `.wasm`. wgpu targets **WebGPU** in the browser (WebGL2 fallback where WebGPU is unavailable).
-- The `.wasm` and its JS glue are built into `web/dist/` alongside the React bundle, so the **same `rust-embed` step (§A.4) ships them in the one binary**. Vite loads the island module **lazily** (dynamic `import()`), so the heavy WASM is fetched only when a 3D asset (or a waveform view) is actually shown — the grid of thumbnails needs none of it.
-- **Not a full-page canvas.** Each island mounts into a specific DOM node (the inspector's viewer slot, a grid cell's waveform). A thin React wrapper component owns a `<canvas>` and the island's lifecycle (init on mount, teardown on unmount) so islands coexist with — and are laid out by — the surrounding DOM/CSS.
+- The `.wasm` and its JS glue are built into `web/dist/` alongside the React bundle, so the **same `rust-embed` step (§A.4) ships them in the one binary**. Vite loads the island module **lazily** (dynamic `import()`), so the heavy WASM is fetched only when a 3D asset is shown — browsing, thumbnails, and waveforms need none of it.
+- **Not a full-page canvas.** The model island mounts into the inspector's viewer slot. A thin React wrapper component owns its `<canvas>` and lifecycle (init on mount, teardown on unmount), so it coexists with — and is laid out by — the surrounding DOM/CSS. The separate waveform component owns a Canvas2D element with no WASM lifecycle.
 
 **Data handoff (DOM → island).**
 
@@ -239,9 +239,9 @@ The interactive 3D viewer and hot render paths (waveforms, thumbnails) are the p
   unmount               ──▶  drop()                       ──▶ release Surface/GPU
 ```
 
-- The **DOM side owns the data**: it fetches model bytes / waveform samples / preview data over the file-03 API (a bytes/preview endpoint) and *hands them to the island* through the wasm-bindgen boundary (`load_model(bytes)`, `set_waveform(samples)`), rather than the island doing its own networking. This keeps the island a pure renderer and keeps all API/auth on the DOM side (§B.1).
-- **DOM owns interaction chrome and layout**; the island owns pixels. Camera controls, playback transport, and buttons are DOM (so they get accessibility/touch/keyboard for free); they call into the island (`set_camera`, `play`, `resize`). Islands are handed their canvas node and size from CSS layout and re-`resize()`d on container changes.
-- **Exact packaging boundary and the data-handoff API are an open question** (below) — the shape above is the intended contract for files 06/12 to satisfy on the web target.
+- The **DOM side owns the data**: it fetches model preview bytes over the file-03 API and *hands them to the island* through the wasm-bindgen boundary (`load_model(bytes)`), rather than the island doing its own networking. Waveform peaks are already part of the asset DTO, with a DOM-side audio decode fallback while analysis is pending. This keeps API/auth out of the renderer (§B.1).
+- **DOM owns interaction chrome and layout**; the island owns pixels. Camera controls and buttons are DOM (so they get accessibility/touch/keyboard for free); they call into the island (`set_camera`, `resize`). The island is handed its canvas node and size from CSS layout and re-`resize()`d on container changes. Audio playback and waveform progress remain entirely DOM-side.
+- **The packaging boundary is checked.** Route features are dynamic chunks; the Canvas2D waveform has no wgpu dependency; and the model-viewer JS/WASM stays behind its own dynamic import. `pnpm bundle:check` derives initial versus lazy artifacts from Vite's manifest and enforces raw and Brotli budgets for each output.
 
 ## B.4 Hosting the admin / Settings surface
 
@@ -267,7 +267,7 @@ Desktop/tablet-first; phones graceful-degrade — cheap precisely because the sh
 Carried from PRODUCT_SPEC §10 open questions (this file is where they bottom out for the server/web-client area):
 
 - ~~**Exact React stack**~~ — **Decided: React + TypeScript + Tailwind** on the Vite/pnpm base of §B.2, a client router, and a query/cache layer ([ADR 0008](../adr/0008-web-client-stack.md)). Styling is Tailwind (the "small utility layer" §B.2 anticipated); typography is a modern self-hosted sans per [DESIGN_GUIDELINES §4](../DESIGN_GUIDELINES.md). Exact router/query packages stay directional.
-- **WASM-island packaging & data handoff** (§B.3) — the precise wasm-bindgen boundary (`load_model` / `set_waveform` / `set_camera` shapes), WebGPU-vs-WebGL2 fallback policy, whether waveform/thumbnail rendering is a WASM island at all or stays a server-rendered preview, and how island lifecycle interacts with the virtualised grid. Depends on files 06/12 landing the shared render crate on the web target.
+- **Viewer packaging follow-ups** (§B.3) — WebGPU-vs-WebGL2 compatibility and how future viewer controls interact with the virtualised grid. The shipping boundary is fixed: a lazy WASM model viewer, a Canvas2D waveform, and server-rendered thumbnails.
 - **Serve config ⇄ flags-store reconciliation** — *deferred to file 10* ([ADR 0004](../adr/0004-feature-flags-admin.md) §10, "two writers, one state"): which control plane wins on conflict, whether the config file is watched and re-applied, and which flags flip live vs need a restart (this file's `build_router` must know the live set to rebuild routes safely).
 - **Dev-proxy vs embedded parity** — ensuring routes/auth behave identically whether the SPA is proxied to Vite or served from `rust-embed`, especially for WebSocket upgrades and `.wasm` MIME/caching.
 - **TLS termination** — whether serve terminates TLS in-process (`rustls`, §A.1) or expects a reverse proxy in front; shared with the PRODUCT_SPEC §10 auth/exposure question (file 10).

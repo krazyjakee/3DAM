@@ -1,8 +1,9 @@
-# WASM viewer islands (DOM side)
+# Model viewer and waveform renderers
 
-**WASM viewer islands.** The `wgpu` viewer islands live in the Rust crate
-[`crates/3dam-viewer`](../../../crates/3dam-viewer) and are compiled to `wasm32-unknown-unknown`
-with `wasm-pack`. This folder is the **DOM-side boundary** the React chrome builds on
+The heavyweight `wgpu` model viewer lives in the Rust crate
+[`crates/3dam-viewer`](../../../crates/3dam-viewer) and is compiled to `wasm32-unknown-unknown`
+with `wasm-pack`. The audio waveform is deliberately a lightweight Canvas2D renderer. This folder
+is the **DOM-side boundary** the React chrome builds on
 (tech-spec 09 §B.3, ADR 0009 §9).
 
 ## What's here
@@ -10,14 +11,15 @@ with `wasm-pack`. This folder is the **DOM-side boundary** the React chrome buil
 - [`index.ts`](index.ts) — framework-agnostic loaders and typed handles:
   - `createModelViewer(canvas) → ModelViewerHandle` — interactive 3D (server-decoded `DMSH` preview
     mesh; every Assimp format, textured).
-  - `createWaveform(canvas) → WaveformHandle` — audio waveform (a "hot render path").
-  - The `.wasm` is fetched **lazily** on first use, so the thumbnail grid pays nothing for it.
+- [`WaveformIsland.tsx`](WaveformIsland.tsx) — Canvas2D audio waveform using server-produced peaks,
+  with Web Audio decoding only as a fallback for assets awaiting analysis.
+- The `.wasm` is fetched **lazily only for a 3D preview**. Browsing and the first audio interaction
+  never download or instantiate wgpu.
 
 The React wrapper (owned by the web-client work) supplies a `<canvas>`, drives the island's
-lifecycle (`create` on mount → `free()` on unmount), and calls `setCamera` / `setProgress` /
-`resize` from DOM controls. **The DOM owns the data and chrome; the island owns pixels** — fetch
-model bytes / waveform samples over [`@/api/client`](../api/client.ts) and hand them in; the island
-never does its own networking.
+lifecycle (`create` on mount → `free()` on unmount), and calls `setCamera` / `resize` from DOM
+controls. **The DOM owns the data and chrome; the island owns pixels** — model preview bytes arrive
+over [`@/api/client`](../api/client.ts), and the island never does its own networking.
 
 ## Building the WASM
 
@@ -30,7 +32,13 @@ cargo xtask wasm   # wasm-pack build --target web → web/src/wasm/
 
 `cargo xtask web` (and `ci`) build it automatically before the Vite bundle, so one `rust-embed`
 step ships the React bundle **and** the `.wasm` in the single `3dam` binary (§A.4). Requires the
-`wasm32-unknown-unknown` target (`rustup target add wasm32-unknown-unknown`) and `wasm-pack`.
+`wasm32-unknown-unknown` target (`rustup target add wasm32-unknown-unknown`) and
+`wasm-pack 0.13.1`. Release builds run the checked `wasm-opt -Oz --enable-bulk-memory` profile
+from the crate manifest; the explicit feature matches the workspace's Rust 1.91 WASM output.
+
+The Vite build then runs `pnpm bundle:check`. Its manifest-based raw and Brotli artifact budgets
+live in [`bundle-budgets.json`](../../bundle-budgets.json); see
+[`docs/web-performance.md`](../../../docs/web-performance.md) for measurement and update policy.
 
 ## Backend
 

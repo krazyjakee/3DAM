@@ -367,16 +367,34 @@ fn build_web() -> bool {
         && require_artifacts("xtask web", &web.join("dist"), WEB_ARTIFACTS)
 }
 
-/// Build the `dam-viewer` WASM islands (3D + waveform, tech-spec 09 §B.3 / ADR 0009 §9) with
+/// Build the `dam-viewer` WASM model viewer (tech-spec 09 §B.3 / ADR 0009 §9) with
 /// `wasm-pack` into `web/src/wasm/` (a gitignored build artifact the web client lazily imports).
 /// The generated module is a required Vite input, so unlike an entirely skipped web build this task
 /// must fail when `wasm-pack` is absent. Otherwise a clean checkout reaches Vite before reporting a
 /// misleading missing-module error.
 fn build_wasm() -> bool {
-    if which("wasm-pack").is_none() {
+    const WASM_PACK_VERSION: &str = "0.13.1";
+    let installed_version = Command::new("wasm-pack")
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok());
+    let Some(installed_version) = installed_version else {
         eprintln!(
             "xtask wasm: required tool `wasm-pack` was not found; install it with \
-             `cargo install wasm-pack`, then retry `cargo xtask wasm` or `cargo xtask web`."
+             `cargo install wasm-pack --version {WASM_PACK_VERSION} --locked`, then retry \
+             `cargo xtask wasm` or `cargo xtask web`."
+        );
+        return false;
+    };
+    let expected_version = format!("wasm-pack {WASM_PACK_VERSION}");
+    if installed_version.trim() != expected_version {
+        eprintln!(
+            "xtask wasm: deterministic release artifacts require {expected_version}, but found \
+             `{}`; install the pinned tool with `cargo install wasm-pack --version \
+             {WASM_PACK_VERSION} --locked --force`.",
+            installed_version.trim()
         );
         return false;
     }

@@ -1,11 +1,10 @@
-// React wrapper that mounts the audio `WaveformView` WASM island (tech-spec 09 §B.3, ADR 0009 §9 —
-// waveforms are a WASM island; thumbnails stay server-rendered). The DOM fetches the audio bytes and
-// decodes them to mono samples with the Web Audio API, then hands the samples across the boundary;
-// the island reduces them to peaks and renders. `progress` (0..1) drives the playhead.
+// Lightweight audio waveform canvas. Keeping this on Canvas2D means opening audio never downloads
+// or instantiates the multi-megabyte wgpu model-viewer module. Server-computed peaks remain the fast
+// path; unanalyzed audio falls back to a DOM-side Web Audio decode.
 
-import { useEffect, useRef, useState } from "react";
-import { createWaveform } from "./index";
-import type { WaveformHandle } from "./index";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { expandSymmetricPeaks, reduceWaveform } from "@/lib/waveform";
+import type { WaveformRange } from "@/lib/waveform";
 
 type Status = "loading" | "ready" | "error";
 
@@ -33,16 +32,32 @@ function toMono(buf: AudioBuffer): Float32Array {
   return out;
 }
 
-/** Expand server-side peaks (0–1 per bucket) into interleaved ±amplitude "samples" the island
- *  reduces to symmetric bars — so a pre-computed waveform draws with no client-side decode (#73). */
-function peaksToSamples(peaks: number[]): Float32Array {
-  const out = new Float32Array(peaks.length * 2);
-  for (let i = 0; i < peaks.length; i++) {
-    const p = peaks[i];
-    out[i * 2] = -p;
-    out[i * 2 + 1] = p;
+function waveformColumns(canvas: HTMLCanvasElement, maximum = 1_200) {
+  return Math.max(1, Math.min(canvas.width, maximum));
+}
+
+function paint(canvas: HTMLCanvasElement, ranges: WaveformRange[], progress: number) {
+  const context = canvas.getContext("2d");
+  if (!context) throw new Error("Canvas2D is unavailable");
+
+  const width = canvas.width;
+  const height = canvas.height;
+  const columns = ranges.length;
+  const playedUntil = Math.max(0, Math.min(1, progress));
+  const columnWidth = width / columns;
+  const minimumHalfHeight = Math.max(1, height * 0.01);
+
+  context.fillStyle = "#14171c";
+  context.fillRect(0, 0, width, height);
+  for (let column = 0; column < columns; column++) {
+    const range = ranges[column];
+    const top = Math.min(height / 2 - minimumHalfHeight, ((1 - range.max) * height) / 2);
+    const bottom = Math.max(height / 2 + minimumHalfHeight, ((1 - range.min) * height) / 2);
+    context.fillStyle = (column + 0.5) / columns <= playedUntil
+      ? "#5c8cfa"
+      : "#5c667a";
+    context.fillRect(column * columnWidth, top, columnWidth + 0.5, bottom - top);
   }
-  return out;
 }
 
 export function WaveformIsland({
@@ -56,11 +71,20 @@ export function WaveformIsland({
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const handleRef = useRef<WaveformHandle | null>(null);
+  const samplesRef = useRef<Float32Array | null>(null);
+  const rangesRef = useRef<{ canvasWidth: number; ranges: WaveformRange[] } | null>(null);
+  const progressRef = useRef(progress);
   const [status, setStatus] = useState<Status>("loading");
   // Prefer server-provided peaks (hosted mode, issue #73): no re-download, no re-decode. Falls back
   // to DOM decode only when the asset hasn't been analysed yet.
   const hasServerPeaks = Array.isArray(peaks) && peaks.length > 0;
+  // Query data is normally referentially stable, but callers need not preserve the array identity.
+  // Keying the lightweight conversion by content avoids tearing down the effect on such rerenders.
+  const peaksKey = hasServerPeaks ? (peaks?.join(",") ?? "") : "";
+  const serverSamples = useMemo(
+    () => expandSymmetricPeaks(peaksKey.split(",").filter(Boolean).map(Number)),
+    [peaksKey],
+  );
 
   useEffect(() => {
     const container = containerRef.current;
@@ -69,39 +93,47 @@ export function WaveformIsland({
 
     let disposed = false;
     let audioCtx: AudioContext | null = null;
+    // Each server peak expands to a signed pair. Never split those pairs into separate columns or a
+    // sparse peak set would alternate one-sided bars when the canvas is wider than the data.
+    const maximumColumns = hasServerPeaks ? Math.max(1, serverSamples.length / 2) : 1_200;
 
     setStatus("loading");
+    samplesRef.current = null;
+    rangesRef.current = null;
     fitCanvas(canvas, container);
 
     const ro = new ResizeObserver(() => {
-      const { w, h, changed } = fitCanvas(canvas, container);
-      if (changed && handleRef.current) handleRef.current.resize(w, h);
+      const { changed } = fitCanvas(canvas, container);
+      const samples = samplesRef.current;
+      if (changed && samples) {
+        const cached = rangesRef.current;
+        const ranges = cached?.canvasWidth === canvas.width
+          ? cached.ranges
+          : reduceWaveform(samples, waveformColumns(canvas, maximumColumns));
+        rangesRef.current = { canvasWidth: canvas.width, ranges };
+        paint(canvas, ranges, progressRef.current);
+      }
     });
 
     (async () => {
       try {
-        const h = await createWaveform(canvas);
-        if (disposed) {
-          h.free();
-          return;
-        }
-        handleRef.current = h;
+        let samples: Float32Array;
         if (hasServerPeaks) {
-          // Draw straight from the server array — the whole point of #73.
-          h.setWaveform(peaksToSamples(peaks as number[]));
-          h.setProgress(progress);
-          setStatus("ready");
-          return;
+          samples = serverSamples;
+        } else {
+          const res = await fetch(src);
+          if (!res.ok) throw new Error(`content ${res.status}`);
+          const bytes = await res.arrayBuffer();
+          if (disposed) return;
+          audioCtx = new AudioContext();
+          const decoded = await audioCtx.decodeAudioData(bytes);
+          samples = toMono(decoded);
         }
-        const res = await fetch(src);
-        if (!res.ok) throw new Error(`content ${res.status}`);
-        const bytes = await res.arrayBuffer();
         if (disposed) return;
-        audioCtx = new AudioContext();
-        const decoded = await audioCtx.decodeAudioData(bytes);
-        if (disposed) return;
-        h.setWaveform(toMono(decoded));
-        h.setProgress(progress);
+        samplesRef.current = samples;
+        const ranges = reduceWaveform(samples, waveformColumns(canvas, maximumColumns));
+        rangesRef.current = { canvasWidth: canvas.width, ranges };
+        paint(canvas, ranges, progressRef.current);
         setStatus("ready");
       } catch (err) {
         if (!disposed) {
@@ -117,14 +149,17 @@ export function WaveformIsland({
       disposed = true;
       ro.disconnect();
       audioCtx?.close().catch(() => {});
-      handleRef.current?.free();
-      handleRef.current = null;
+      samplesRef.current = null;
+      rangesRef.current = null;
     };
-  }, [src, hasServerPeaks]);
+  }, [src, hasServerPeaks, serverSamples]);
 
   // Playhead updates are cheap — a separate effect so changing `progress` doesn't rebuild the island.
   useEffect(() => {
-    handleRef.current?.setProgress(progress);
+    progressRef.current = progress;
+    const canvas = canvasRef.current;
+    const cached = rangesRef.current;
+    if (canvas && cached?.canvasWidth === canvas.width) paint(canvas, cached.ranges, progress);
   }, [progress]);
 
   return (
@@ -132,7 +167,7 @@ export function WaveformIsland({
       <canvas ref={canvasRef} className="h-full w-full" />
       {status !== "ready" && (
         <div className="pointer-events-none absolute inset-0 flex items-center justify-center text-[11px] text-fg-dim">
-          {status === "loading" ? "Decoding waveform…" : "Waveform unavailable."}
+          {status === "loading" ? "Loading waveform…" : "Waveform unavailable."}
         </div>
       )}
     </div>

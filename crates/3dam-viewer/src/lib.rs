@@ -2,21 +2,21 @@
 //!
 //! **WASM viewer islands:** the parts the DOM/CSS chrome can't do well are
 //! shipped as focused `wgpu` components embedded *in* the React layout — **not** a full-page
-//! canvas ([tech-spec 09] §B.3, [ADR 0009] §9). Two islands live here:
+//! canvas ([tech-spec 09] §B.3, [ADR 0009] §9). One island lives here:
 //!
 //! - [`ModelViewer`] — the interactive 3D viewer (server-decoded `DMSH` mesh → textured PBR orbit
 //!   view; every Assimp format, with materials).
-//! - [`WaveformView`] — the audio waveform (a "hot render path", also a WASM island per ADR 0009 §9;
-//!   thumbnails stay *server-rendered* previews and are deliberately **not** here).
+//! Audio waveforms use the web client's lightweight Canvas2D path, so audio does not pay the wgpu
+//! download/initialisation cost. Thumbnails stay *server-rendered* previews.
 //!
 //! **The wasm-bindgen contract** ratified in ADR 0009 §9 / tech-spec 09 §B.3 is:
-//! `init(canvas) · load_preview_mesh(bytes) / set_waveform(samples) · set_camera(..) · resize(w,h) · drop()`.
-//! Each island maps that onto an exported struct: `create()` (async init), a data-in method,
-//! `set_camera`/`set_progress`, `resize`, and `free()` (wasm-bindgen's generated destructor = `drop`).
+//! `init(canvas) · load_preview_mesh(bytes) · set_camera(..) · resize(w,h) · drop()`.
+//! The island maps that onto an exported struct: `create()` (async init), a data-in method,
+//! `set_camera`, `resize`, and `free()` (wasm-bindgen's generated destructor = `drop`).
 //!
 //! **The DOM owns the data and the chrome; the island owns pixels** (tech-spec 09 §B.3). The React
-//! wrapper fetches model bytes / waveform samples over the file-03 API and hands them across this
-//! boundary; camera/transport controls are DOM and call in. The island does **no** networking.
+//! wrapper fetches model bytes over the file-03 API and hands them across this boundary; camera
+//! controls are DOM and call in. The island does **no** networking.
 //!
 //! **Relationship to `dam-render` (ADR 0002).** The GPU internals here (PBR-lite shader, one draw
 //! loop, versioned bounds auto-fit framing) are the *browser embodiment* of the [tech-spec 06]
@@ -56,8 +56,6 @@ mod preview_mesh;
 mod raf;
 #[cfg(target_arch = "wasm32")]
 mod scene;
-#[cfg(target_arch = "wasm32")]
-mod waveform;
 
 /// Magic prefix of the server's `DMSH` preview blob (see `dam-render`'s `preview` module). Shared by
 /// the parser; kept crate-level so it stays in lockstep with the serializer's constant.
@@ -66,8 +64,6 @@ pub(crate) const DMSH_MAGIC: &[u8; 4] = b"DMSH";
 
 #[cfg(target_arch = "wasm32")]
 pub use model_viewer::ModelViewer;
-#[cfg(target_arch = "wasm32")]
-pub use waveform::WaveformView;
 
 /// Module-load hook (wasm-bindgen runs this once when the ES module is imported). Installs the
 /// panic hook so a Rust panic surfaces as a readable JS console error instead of an opaque

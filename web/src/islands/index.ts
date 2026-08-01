@@ -1,14 +1,14 @@
-// WASM viewer islands — the DOM-side boundary for the `dam-viewer` wgpu components
+// WASM model-viewer island — the DOM-side boundary for the `dam-viewer` wgpu component
 // (tech-spec 09 §B.3, ADR 0009 §9). This is the seam a React wrapper builds on: it owns a `<canvas>`
 // and this module's lifecycle (create on mount, `free()` on unmount), while the island owns pixels.
 //
-// The DOM owns the data and the chrome (tech-spec 09 §B.1/§B.3): fetch GLB bytes / waveform samples
-// over the file-03 API (`@/api/client`) and hand them across; camera + transport controls are DOM
-// and call `setCamera` / `setProgress`. The island never does its own networking.
+// The DOM owns the data and the chrome (tech-spec 09 §B.1/§B.3): fetch preview-mesh bytes over the
+// file-03 API (`@/api/client`) and hand them across; camera controls are DOM and call `setCamera`.
+// The island never does its own networking.
 //
 // The heavy `.wasm` (built by `cargo xtask wasm` → wasm-pack) is fetched **lazily** on first use, so
-// the browse grid of server-rendered thumbnails pays nothing for it — only opening a 3D asset or a
-// waveform pulls it in.
+// the browse grid and Canvas2D audio waveform pay nothing for it — only opening a 3D asset pulls it
+// in.
 
 /** Live 3D viewer. Mirrors the `ModelViewer` wasm-bindgen export in `crates/3dam-viewer`. */
 export interface ModelViewerHandle {
@@ -32,23 +32,11 @@ export interface ModelViewerHandle {
   free(): void;
 }
 
-/** Live audio waveform. Mirrors the `WaveformView` wasm-bindgen export in `crates/3dam-viewer`. */
-export interface WaveformHandle {
-  readonly backend: string;
-  /** Mono samples in `[-1, 1]` (downmixed/decoded DOM-side); reduced to per-column peaks. */
-  setWaveform(samples: Float32Array): void;
-  /** Move the playhead; `progress` is clamped to `[0, 1]`. */
-  setProgress(progress: number): void;
-  resize(width: number, height: number): void;
-  free(): void;
-}
-
 /** Shape of the wasm-pack ES module (`web/src/wasm/dam_viewer.js`), typed locally. */
 interface DamViewerModule {
   /** wasm-bindgen `init` — instantiates the `.wasm`; no-arg form fetches the sibling file. */
   default: () => Promise<unknown>;
   ModelViewer: { create(canvas: HTMLCanvasElement): Promise<ModelViewerHandle> };
-  WaveformView: { create(canvas: HTMLCanvasElement): Promise<WaveformHandle> };
 }
 
 let modulePromise: Promise<DamViewerModule> | null = null;
@@ -76,12 +64,4 @@ export async function createModelViewer(
 ): Promise<ModelViewerHandle> {
   const mod = await loadModule();
   return mod.ModelViewer.create(canvas);
-}
-
-/** Spin up a waveform island bound to `canvas`. */
-export async function createWaveform(
-  canvas: HTMLCanvasElement,
-): Promise<WaveformHandle> {
-  const mod = await loadModule();
-  return mod.WaveformView.create(canvas);
 }

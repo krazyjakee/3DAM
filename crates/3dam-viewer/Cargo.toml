@@ -3,7 +3,7 @@ name = "dam-viewer"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Browser WASM/wgpu viewer islands (3D model + audio waveform) embedded in the web client (tech-spec 09 §B.3, ADR 0009 §9). WebGPU with WebGL2 fallback."
+description = "Browser WASM/wgpu 3D model viewer embedded in the web client (tech-spec 09 §B.3, ADR 0009 §9). WebGPU with WebGL2 fallback."
 
 # `cdylib` is what wasm-bindgen/wasm-pack link into the `.wasm`; `rlib` keeps the crate usable
 # as a normal library dependency (and lets `cargo doc`/tests see it on native).
@@ -27,8 +27,6 @@ wasm-bindgen.workspace = true
 wasm-bindgen-futures.workspace = true
 web-sys = { workspace = true, features = [
     "Window",
-    "Document",
-    "Element",
     "HtmlCanvasElement",
     "console",
 ] }
@@ -36,7 +34,8 @@ console_error_panic_hook.workspace = true
 console_log.workspace = true
 log.workspace = true
 
-# `wasm-opt` is run by wasm-pack; disable its bundled auto-download in CI-less envs via
-# the profile below rather than a build script.
+# Release builds use Binaryen's size-optimising pass through wasm-pack. Keeping the exact pass list
+# here (instead of an ad-hoc post-build command) makes local, CI, and release artifacts follow one
+# deterministic pipeline. CI pins wasm-pack, which in turn pins the compatible Binaryen build.
 [package.metadata.wasm-pack.profile.release]
-wasm-opt = false
+wasm-opt = ["-Oz", "--enable-bulk-memory"]

@@ -1,11 +1,6 @@
+import { lazy, Suspense } from "react";
 import { MutationCache, QueryCache, QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { BrowserRouter, Route, Routes } from "react-router";
-import { Workspace } from "./components/Workspace";
-import { Settings } from "./components/Settings";
-import { Duplicates } from "./components/Duplicates";
-import { Blocklist } from "./components/Blocklist";
-import { Upload } from "./components/Upload";
-import { JobHistory } from "./components/JobHistory";
 import { JobNotifications } from "./components/StatusBar";
 import { Toaster } from "./components/Toaster";
 import { AuthGate } from "./components/AuthGate";
@@ -16,6 +11,36 @@ import { ThemeProvider } from "./lib/theme";
 import { AUTH_COPY, isUnauthorized, notifyUnauthorized } from "./lib/auth";
 import { getServer } from "./lib/server";
 import { errorMessage, toast } from "./lib/toast";
+
+// Keep route implementations out of the application shell. In particular, the browse workspace
+// pulls in virtualisation and every preview surface, while settings and upload bring their own API
+// trees. A direct visit still loads exactly one route chunk; navigation asks Vite for it on demand.
+const Workspace = lazy(() =>
+  import("./components/Workspace").then(({ Workspace }) => ({ default: Workspace })),
+);
+const Settings = lazy(() =>
+  import("./components/Settings").then(({ Settings }) => ({ default: Settings })),
+);
+const Duplicates = lazy(() =>
+  import("./components/Duplicates").then(({ Duplicates }) => ({ default: Duplicates })),
+);
+const Blocklist = lazy(() =>
+  import("./components/Blocklist").then(({ Blocklist }) => ({ default: Blocklist })),
+);
+const Upload = lazy(() =>
+  import("./components/Upload").then(({ Upload }) => ({ default: Upload })),
+);
+const JobHistory = lazy(() =>
+  import("./components/JobHistory").then(({ JobHistory }) => ({ default: JobHistory })),
+);
+
+function RouteFallback() {
+  return (
+    <main className="flex min-h-0 flex-1 items-center justify-center text-sm text-fg-dim">
+      Loading view…
+    </main>
+  );
+}
 
 // A write refused with 403 while browsing an anonymous-mode server signed out isn't an error to
 // shout about — it's the read-only posture. Point at the fix instead of dumping the raw message.
@@ -83,20 +108,22 @@ export function App() {
       <AuthGate>
         <BrowserRouter>
           <JobNotifications />
-          <Routes>
-            {/* The admin / Settings surface (tech-spec 09 §B.4, 10). */}
-            <Route path="/settings" element={<Settings />} />
-            {/* Duplicate / dedupe review (tech-spec 05 §4). */}
-            <Route path="/duplicates" element={<Duplicates />} />
-            {/* Rescan blocklist management (issue #21). */}
-            <Route path="/blocklist" element={<Blocklist />} />
-            {/* Writing files into a source — the one write-into-source path (issue #80). */}
-            <Route path="/upload" element={<Upload />} />
-            {/* Durable background operation outcomes and reports (issue #117). */}
-            <Route path="/jobs" element={<JobHistory />} />
-            {/* URL owns view state via ?query params (lib/view-state.ts); one workspace route. */}
-            <Route path="*" element={<Workspace />} />
-          </Routes>
+          <Suspense fallback={<RouteFallback />}>
+            <Routes>
+              {/* The admin / Settings surface (tech-spec 09 §B.4, 10). */}
+              <Route path="/settings" element={<Settings />} />
+              {/* Duplicate / dedupe review (tech-spec 05 §4). */}
+              <Route path="/duplicates" element={<Duplicates />} />
+              {/* Rescan blocklist management (issue #21). */}
+              <Route path="/blocklist" element={<Blocklist />} />
+              {/* Writing files into a source — the one write-into-source path (issue #80). */}
+              <Route path="/upload" element={<Upload />} />
+              {/* Durable background operation outcomes and reports (issue #117). */}
+              <Route path="/jobs" element={<JobHistory />} />
+              {/* URL owns view state via ?query params (lib/view-state.ts); one workspace route. */}
+              <Route path="*" element={<Workspace />} />
+            </Routes>
+          </Suspense>
         </BrowserRouter>
       </AuthGate>
       {/* Global toast viewport — feedback for every mutation, on top of every route. */}

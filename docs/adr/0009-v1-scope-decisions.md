@@ -135,10 +135,11 @@ code change; "post-v1" means deliberately deferred, not rejected.
 
 ### 9. Web islands, GUI & transport — [09](../tech-spec/09-server-and-web-client.md), [12](../tech-spec/12-desktop-gui.md), [03](../tech-spec/03-library-service-and-api.md)
 
-- **WASM islands:** `wasm-pack` ES module + `.wasm`, lazy dynamic `import()`, embedded via the same
-  `rust-embed` step; **WebGPU with WebGL2 fallback.** The §B.3 wasm-bindgen contract
-  (`init/load_model/set_waveform/set_camera/resize/drop`) is ratified as the v1 shape. **Waveforms
-  are a WASM island; thumbnails stay server-rendered previews.**
+- **WASM model-viewer island:** `wasm-pack` ES module + `.wasm`, lazy dynamic `import()`, embedded via
+  the same `rust-embed` step; **WebGPU with WebGL2 fallback.** The §B.3 wasm-bindgen contract
+  (`init/load_model/set_camera/resize/drop`) is the v1 shape. Issue #148 refined the original
+  packaging boundary: **waveforms use lightweight Canvas2D over server peaks** so audio never loads
+  wgpu; thumbnails stay server-rendered previews.
 - **View-logic sharing:** **each frontend owns its own presentation** over the file-03 API in v1;
   **no shared view-logic crate** (revisit post-v1 only if duplication proves costly). The
   `LibraryService` seam is the only shared layer.

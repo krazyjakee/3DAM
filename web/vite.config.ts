@@ -74,6 +74,10 @@ export default defineConfig({
     outDir: "dist",
     emptyOutDir: true,
     sourcemap: false,
+    // The manifest is the authoritative static/dynamic import graph used by bundle:check. It also
+    // lets that check prove the wgpu WASM is unreachable from the initial application shell.
+    manifest: true,
+    chunkSizeWarningLimit: 350,
   },
   server: {
     port: 5173,

@@ -1,0 +1,16 @@
+{
+  "initialJavaScript": {
+    "perArtifactBytes": 350000,
+    "perArtifactBrotliBytes": 120000,
+    "totalBytes": 450000,
+    "totalBrotliBytes": 150000
+  },
+  "lazyJavaScript": {
+    "perArtifactBytes": 350000,
+    "perArtifactBrotliBytes": 120000
+  },
+  "lazyWasm": {
+    "perArtifactBytes": 4000000,
+    "perArtifactBrotliBytes": 1250000
+  }
+}

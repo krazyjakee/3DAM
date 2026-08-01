@@ -73,7 +73,7 @@ cargo build -p dam --release
 ```
 
 The binary lands at `target/release/3dam`. A native-only build skips the wasm-only viewer
-deps; `wasm-pack` (WASM viewer) and `pnpm` (web client) are optional and only needed for a
+deps; `wasm-pack 0.13.1` (WASM viewer) and `pnpm` (web client) are optional and only needed for a
 complete `serve` (and desktop shell) with the live web UI. Linux builds need the usual system
 libs (GTK3 + webkit2gtk-4.1 for the Tauri desktop shell, ssl/pkg-config).
 
@@ -155,7 +155,7 @@ eval "$(3dam completions bash)"        # or zsh / fish / powershell — for the 
 `3dam serve` exposes a versioned `/api/v1` REST + WebSocket API and serves the embedded
 web client — a three-region workspace (Navigation / Browser / Inspector) built with React
 19 + TypeScript + Tailwind v4, with a virtualised grid that handles 100k+ rows and
-lazy-loaded WASM islands for the 3D-model and audio-waveform previews. Live job progress
+lazy-loaded WASM for 3D-model previews and a lightweight Canvas2D audio waveform. Live job progress
 and catalog changes stream over WebSocket.
 
 Remote access, auth, accounts, MCP, and analysis are **off-by-default runtime feature
@@ -209,7 +209,8 @@ cargo clippy --all-targets -- -D warnings     # lint
 cargo xtask ci                                # the canonical pre-push gate (fmt + clippy + tests + web build)
 cargo xtask check-deps                        # enforce the exact direct internal crate graph
 cargo xtask web                               # build the React client → web/dist/
-cargo xtask wasm                              # wasm-pack build the dam-viewer islands
+cargo install wasm-pack --version 0.13.1 --locked # pinned WASM/Binaryen release toolchain
+cargo xtask wasm                              # wasm-pack build the 3D model viewer
 cargo xtask packaging                         # stage shell completions + man pages → packaging/
 cargo xtask bundle                            # package the desktop app (deb/AppImage via tauri-cli)
 ```

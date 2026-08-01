@@ -9,7 +9,8 @@
   "description": "3DAM web client — the browser front-end served by `3dam serve`.",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build",
+    "build": "tsc -b && vite build && pnpm bundle:check",
+    "bundle:check": "node scripts/check-bundle-budgets.mjs",
     "preview": "vite preview",
     "test": "node --experimental-strip-types --test tests/*.test.ts",
     "typecheck": "tsc -b",
