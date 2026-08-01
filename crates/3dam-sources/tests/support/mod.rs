@@ -37,6 +37,7 @@ use tokio::sync::Mutex;
 ///
 /// Dropping it shuts the server (and its runtime) down.
 pub struct TestSftpServer {
+    host: String,
     port: u16,
     root: PathBuf,
     username: String,
@@ -57,6 +58,21 @@ impl TestSftpServer {
         username: &str,
         password: &str,
     ) -> TestSftpServer {
+        Self::try_start_with_credentials_on(root, username, password, "127.0.0.1:0")
+            .expect("bind IPv4 SFTP test server")
+    }
+
+    /// Start on IPv6 loopback, or return `None` on hosts where IPv6 is unavailable.
+    pub fn start_ipv6(root: impl AsRef<Path>) -> Option<TestSftpServer> {
+        Self::try_start_with_credentials_on(root, "test", "test", "[::1]:0")
+    }
+
+    fn try_start_with_credentials_on(
+        root: impl AsRef<Path>,
+        username: &str,
+        password: &str,
+        bind_address: &str,
+    ) -> Option<TestSftpServer> {
         let root = root
             .as_ref()
             .canonicalize()
@@ -68,10 +84,10 @@ impl TestSftpServer {
             .build()
             .expect("build sftp test server runtime");
 
-        let listener = rt
-            .block_on(TcpListener::bind("127.0.0.1:0"))
-            .expect("bind sftp test server");
-        let port = listener.local_addr().expect("local_addr").port();
+        let listener = rt.block_on(TcpListener::bind(bind_address)).ok()?;
+        let address = listener.local_addr().expect("local_addr");
+        let host = address.ip().to_string();
+        let port = address.port();
 
         let config = Arc::new(russh::server::Config {
             // Keep rejections snappy: a test that mistypes a password shouldn't sit for a second.
@@ -95,13 +111,14 @@ impl TestSftpServer {
             let _ = server.run_on_socket(config, &listener).await;
         });
 
-        TestSftpServer {
+        Some(TestSftpServer {
+            host,
             port,
             root,
             username: username.to_string(),
             password: password.to_string(),
             _rt: rt,
-        }
+        })
     }
 
     pub fn port(&self) -> u16 {
@@ -109,7 +126,7 @@ impl TestSftpServer {
     }
 
     pub fn host(&self) -> &str {
-        "127.0.0.1"
+        &self.host
     }
 
     /// The (canonicalised) directory the server serves. Assert against this.

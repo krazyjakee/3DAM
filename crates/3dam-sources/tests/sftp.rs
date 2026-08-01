@@ -9,6 +9,7 @@
 mod support;
 
 use dam_sources::FileSource;
+use dam_sources::{ConnOptions, SourceConnection};
 use support::TestSftpServer;
 
 /// Collect a source's tree into (rel_path, size) pairs, sorted.
@@ -57,6 +58,30 @@ fn the_sftp_source_walks_and_fetches_real_files() {
         fetched.path().starts_with(scratch.path()),
         "a remote fetch must land in the scratch dir, not the OS temp dir (issue #87)"
     );
+}
+
+#[test]
+fn an_ipv6_sftp_url_connects_when_ipv6_loopback_is_available() {
+    let root = tempfile::tempdir().expect("root");
+    let scratch = tempfile::tempdir().expect("scratch");
+    std::fs::write(root.path().join("ipv6.txt"), b"over IPv6").unwrap();
+
+    let Some(srv) = TestSftpServer::start_ipv6(root.path()) else {
+        return;
+    };
+    let uri = format!(
+        "sftp://{}:{}@[{}]:{}/",
+        srv.username(),
+        srv.password(),
+        srv.host(),
+        srv.port()
+    );
+    let connection = SourceConnection::parse("sftp", &uri, &ConnOptions::default())
+        .expect("parse bracketed IPv6 SFTP URL");
+    let source = dam_sources::open_source(&connection, scratch.path())
+        .expect("connect to IPv6 SFTP fixture");
+
+    assert_eq!(walk_all(source.as_ref()), vec![("ipv6.txt".into(), 9)]);
 }
 
 // ── write side (issue #80 slice 7) ──────────────────────────────────────────

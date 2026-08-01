@@ -13,7 +13,9 @@
 
 use dam_api::LibError;
 use serde::{Deserialize, Serialize};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use url::{Host, Url};
 
 pub mod safe_name;
 #[cfg(feature = "sftp")]
@@ -213,15 +215,34 @@ impl SourceConnection {
             SourceConnection::LocalFs { root } => root.clone(),
             SourceConnection::Sftp(c) => {
                 let base = c.base_path.trim_start_matches('/');
-                format!("sftp://{}@{}:{}/{}", c.username, c.host, c.port, base)
+                format!(
+                    "sftp://{}@{}:{}/{}",
+                    percent_encode_component(&c.username),
+                    display_host(&c.host),
+                    c.port,
+                    percent_encode_path(base)
+                )
             }
             SourceConnection::Smb(c) => {
+                let authority = if c.port == default_smb_port() {
+                    display_host(&c.host)
+                } else {
+                    format!("{}:{}", display_host(&c.host), c.port)
+                };
                 let base = if c.base_path.is_empty() {
                     String::new()
                 } else {
-                    format!("/{}", c.base_path.trim_start_matches('/'))
+                    format!(
+                        "/{}",
+                        percent_encode_path(c.base_path.trim_start_matches('/'))
+                    )
                 };
-                format!("smb://{}/{}{}", c.host, c.share.trim_matches('/'), base)
+                format!(
+                    "smb://{}/{}{}",
+                    authority,
+                    percent_encode_component(c.share.trim_matches('/')),
+                    base
+                )
             }
             SourceConnection::Federated(c) => c.endpoint.clone(),
         }
@@ -326,37 +347,33 @@ fn strip_scheme<'a>(uri: &'a str, scheme: &str) -> &'a str {
 
 /// `sftp://[user[:pass]@]host[:port]/base/path`. Options override userinfo.
 fn parse_sftp(uri: &str, opts: &ConnOptions) -> Result<SourceConnection, LibError> {
-    let rest = uri
-        .strip_prefix("sftp://")
-        .ok_or_else(|| LibError::BadRequest("sftp source uri must start with sftp://".into()))?;
-    let (authority, path) = split_once_or(rest, '/', ("", ""));
-    let (userinfo, hostport) = match authority.rsplit_once('@') {
-        Some((u, h)) => (Some(u), h),
-        None => (None, authority),
+    let parsed = parse_connection_url(uri, "sftp")?;
+    let host = parsed_host(&parsed, "sftp")?;
+    let uri_user = if parsed.username().is_empty() {
+        None
+    } else {
+        Some(decode_component(parsed.username(), "sftp")?)
     };
-    let (uri_user, uri_pass) = match userinfo {
-        Some(ui) => match ui.split_once(':') {
-            Some((u, p)) => (Some(u.to_string()), Some(p.to_string())),
-            None => (Some(ui.to_string()), None),
-        },
-        None => (None, None),
-    };
-    let (host, uri_port) = split_host_port(hostport);
-    if host.is_empty() {
-        return Err(LibError::BadRequest(
-            "sftp source uri is missing a host".into(),
-        ));
-    }
+    let uri_pass = parsed
+        .password()
+        .map(|password| decode_component(password, "sftp"))
+        .transpose()?;
     let username = opts
         .username
         .clone()
         .or(uri_user)
         .ok_or_else(|| LibError::BadRequest("sftp source requires a username".into()))?;
+    if username.is_empty() {
+        return Err(LibError::BadRequest(
+            "sftp source requires a username".into(),
+        ));
+    }
+    let path = decode_component(parsed.path(), "sftp")?;
     Ok(SourceConnection::Sftp(SftpConfig {
-        host: host.to_string(),
-        port: opts.port.or(uri_port).unwrap_or(22),
+        host,
+        port: opts.port.or(parsed.port()).unwrap_or(22),
         username,
-        base_path: if path.is_empty() {
+        base_path: if path.is_empty() || path == "/" {
             default_remote_root()
         } else {
             format!("/{}", path.trim_start_matches('/'))
@@ -367,33 +384,130 @@ fn parse_sftp(uri: &str, opts: &ConnOptions) -> Result<SourceConnection, LibErro
     }))
 }
 
-/// `smb://host[:port]/share[/base/path]`. Credentials come from options (or the `domain` field).
+/// `smb://[user[:pass]@]host[:port]/share[/base/path]`. Options override URI userinfo.
 fn parse_smb(uri: &str, opts: &ConnOptions) -> Result<SourceConnection, LibError> {
-    let rest = uri
-        .strip_prefix("smb://")
-        .ok_or_else(|| LibError::BadRequest("smb source uri must start with smb://".into()))?;
-    let (authority, path) = split_once_or(rest, '/', ("", ""));
-    let (host, uri_port) = split_host_port(authority);
-    if host.is_empty() {
-        return Err(LibError::BadRequest(
-            "smb source uri is missing a host".into(),
-        ));
-    }
-    let (share, base) = split_once_or(path, '/', (path, ""));
+    let parsed = parse_connection_url(uri, "smb")?;
+    let host = parsed_host(&parsed, "smb")?;
+    let mut segments = parsed
+        .path_segments()
+        .ok_or_else(|| LibError::BadRequest("invalid smb source uri".into()))?;
+    let share = decode_component(segments.next().unwrap_or_default(), "smb")?;
     if share.is_empty() {
         return Err(LibError::BadRequest(
             "smb source uri must include a share: smb://host/share/…".into(),
         ));
     }
+    let base = segments
+        .map(|segment| decode_component(segment, "smb"))
+        .collect::<Result<Vec<_>, _>>()?
+        .join("/");
+    let uri_user = if parsed.username().is_empty() {
+        None
+    } else {
+        Some(decode_component(parsed.username(), "smb")?)
+    };
+    let uri_pass = parsed
+        .password()
+        .map(|password| decode_component(password, "smb"))
+        .transpose()?;
     Ok(SourceConnection::Smb(SmbConfig {
-        host: host.to_string(),
-        port: opts.port.or(uri_port).unwrap_or(445),
-        share: share.to_string(),
+        host,
+        port: opts.port.or(parsed.port()).unwrap_or(445),
+        share,
         base_path: base.trim_matches('/').to_string(),
-        username: opts.username.clone().unwrap_or_default(),
-        password: opts.password.clone(),
+        username: opts.username.clone().or(uri_user).unwrap_or_default(),
+        password: opts.password.clone().or(uri_pass),
         domain: opts.domain.clone(),
     }))
+}
+
+fn parse_connection_url(uri: &str, scheme: &str) -> Result<Url, LibError> {
+    validate_percent_escapes(uri, scheme)?;
+    let parsed = Url::parse(uri)
+        .map_err(|_| LibError::BadRequest(format!("invalid {scheme} source uri")))?;
+    if parsed.scheme() != scheme || parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(LibError::BadRequest(format!(
+            "invalid {scheme} source uri"
+        )));
+    }
+    Ok(parsed)
+}
+
+fn parsed_host(parsed: &Url, scheme: &str) -> Result<String, LibError> {
+    match parsed.host() {
+        Some(Host::Domain(host)) if !host.is_empty() => Ok(host.to_string()),
+        Some(Host::Ipv4(host)) => Ok(host.to_string()),
+        Some(Host::Ipv6(host)) => Ok(host.to_string()),
+        _ => Err(LibError::BadRequest(format!(
+            "{scheme} source uri is missing a host"
+        ))),
+    }
+}
+
+fn validate_percent_escapes(uri: &str, scheme: &str) -> Result<(), LibError> {
+    let bytes = uri.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && (i + 2 >= bytes.len()
+                || !bytes[i + 1].is_ascii_hexdigit()
+                || !bytes[i + 2].is_ascii_hexdigit())
+        {
+            return Err(LibError::BadRequest(format!(
+                "invalid percent escape in {scheme} source uri"
+            )));
+        }
+        i += if bytes[i] == b'%' { 3 } else { 1 };
+    }
+    Ok(())
+}
+
+fn decode_component(value: &str, scheme: &str) -> Result<String, LibError> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = &value[i + 1..i + 3];
+            decoded.push(u8::from_str_radix(hex, 16).expect("escapes validated before URL parsing"));
+            i += 3;
+        } else {
+            decoded.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(decoded)
+        .map_err(|_| LibError::BadRequest(format!("invalid UTF-8 in {scheme} source uri")))
+}
+
+fn percent_encode_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            write!(&mut encoded, "%{byte:02X}").expect("writing to a String cannot fail");
+        }
+    }
+    encoded
+}
+
+fn percent_encode_path(path: &str) -> String {
+    path.split('/')
+        .map(percent_encode_component)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn display_host(host: &str) -> String {
+    let unbracketed = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    match unbracketed.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(address)) => format!("[{address}]"),
+        _ => host.to_string(),
+    }
 }
 
 /// `3dam://host[:port][/]` (plain HTTP), `3dams://…` (HTTPS), or a literal `http(s)://…` endpoint.
@@ -434,13 +548,6 @@ fn split_once_or<'a>(s: &'a str, sep: char, default: (&'a str, &'a str)) -> (&'a
                 default
             }
         }
-    }
-}
-
-fn split_host_port(s: &str) -> (&str, Option<u16>) {
-    match s.rsplit_once(':') {
-        Some((h, p)) => (h, p.parse().ok()),
-        None => (s, None),
     }
 }
 
@@ -818,6 +925,54 @@ mod tests {
     }
 
     #[test]
+    fn parses_and_displays_sftp_ipv6_and_encoded_userinfo() {
+        let c = SourceConnection::parse(
+            "sftp",
+            "sftp://first%40last:p%3Ass@[::1]:2200/My%20Assets",
+            &ConnOptions::default(),
+        )
+        .unwrap();
+        let SourceConnection::Sftp(cfg) = &c else {
+            panic!()
+        };
+        assert_eq!(cfg.host, "::1");
+        assert_eq!(cfg.port, 2200);
+        assert_eq!(cfg.username, "first@last");
+        assert_eq!(cfg.password.as_deref(), Some("p:ss"));
+        assert_eq!(cfg.base_path, "/My Assets");
+        assert_eq!(
+            c.display_uri(),
+            "sftp://first%40last@[::1]:2200/My%20Assets"
+        );
+
+        let reparsed = SourceConnection::parse("sftp", &c.display_uri(), &ConnOptions::default())
+            .expect("sanitized SFTP display URI must remain parseable");
+        let SourceConnection::Sftp(reparsed) = reparsed else {
+            panic!()
+        };
+        assert_eq!(reparsed.host, cfg.host);
+        assert_eq!(reparsed.port, cfg.port);
+        assert_eq!(reparsed.username, cfg.username);
+        assert_eq!(reparsed.base_path, cfg.base_path);
+        assert_eq!(reparsed.password, None);
+    }
+
+    #[test]
+    fn parses_sftp_ipv6_without_an_explicit_port() {
+        let c = SourceConnection::parse(
+            "sftp",
+            "sftp://bob@[2001:db8::1]/assets",
+            &ConnOptions::default(),
+        )
+        .unwrap();
+        let SourceConnection::Sftp(cfg) = c else {
+            panic!()
+        };
+        assert_eq!(cfg.host, "2001:db8::1");
+        assert_eq!(cfg.port, 22);
+    }
+
+    #[test]
     fn options_override_uri_userinfo() {
         let opts = ConnOptions {
             username: Some("alice".into()),
@@ -851,6 +1006,99 @@ mod tests {
         assert_eq!(cfg.share, "textures");
         assert_eq!(cfg.base_path, "pbr");
         assert_eq!(c.display_uri(), "smb://nas.local/textures/pbr");
+    }
+
+    #[test]
+    fn parses_smb_ipv6_port_userinfo_and_encoded_paths() {
+        let c = SourceConnection::parse(
+            "smb",
+            "smb://domain%5Cuser:p%40ss@[::1]:1445/team%20share/art%20work",
+            &ConnOptions::default(),
+        )
+        .unwrap();
+        let SourceConnection::Smb(cfg) = &c else {
+            panic!()
+        };
+        assert_eq!(cfg.host, "::1");
+        assert_eq!(cfg.port, 1445);
+        assert_eq!(cfg.username, "domain\\user");
+        assert_eq!(cfg.password.as_deref(), Some("p@ss"));
+        assert_eq!(cfg.share, "team share");
+        assert_eq!(cfg.base_path, "art work");
+        assert_eq!(
+            c.display_uri(),
+            "smb://[::1]:1445/team%20share/art%20work"
+        );
+
+        let reparsed = SourceConnection::parse("smb", &c.display_uri(), &ConnOptions::default())
+            .expect("sanitized SMB display URI must remain parseable");
+        let SourceConnection::Smb(reparsed) = reparsed else {
+            panic!()
+        };
+        assert_eq!(reparsed.host, cfg.host);
+        assert_eq!(reparsed.port, cfg.port);
+        assert_eq!(reparsed.share, cfg.share);
+        assert_eq!(reparsed.base_path, cfg.base_path);
+    }
+
+    #[test]
+    fn options_override_all_uri_connection_fields() {
+        let opts = ConnOptions {
+            username: Some("option-user".into()),
+            password: Some("option-password".into()),
+            port: Some(2022),
+            ..Default::default()
+        };
+        let c = SourceConnection::parse(
+            "sftp",
+            "sftp://uri-user:uri-password@host.example:22/assets",
+            &opts,
+        )
+        .unwrap();
+        let SourceConnection::Sftp(cfg) = c else {
+            panic!()
+        };
+        assert_eq!(cfg.username, "option-user");
+        assert_eq!(cfg.password.as_deref(), Some("option-password"));
+        assert_eq!(cfg.port, 2022);
+    }
+
+    #[test]
+    fn malformed_remote_authorities_are_secret_free_bad_requests() {
+        for (kind, uri, secret) in [
+            ("sftp", "sftp://user:top-secret@[::1/assets", "top-secret"),
+            ("sftp", "sftp://user:top-secret@host:nope/assets", "top-secret"),
+            ("sftp", "sftp://user:top-secret@host:70000/assets", "top-secret"),
+            ("sftp", "sftp://user:top%ZZsecret@host/assets", "top%ZZsecret"),
+            ("smb", "smb://[::1/share", ""),
+            ("smb", "smb://host:not-a-port/share", ""),
+        ] {
+            let error = SourceConnection::parse(kind, uri, &ConnOptions::default()).unwrap_err();
+            assert!(matches!(error, LibError::BadRequest(_)), "{uri}: {error}");
+            assert!(
+                secret.is_empty() || !error.to_string().contains(secret),
+                "parse error leaked URI credentials: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn existing_connection_records_keep_their_serialized_meaning() {
+        let json = r#"{
+            "kind":"sftp",
+            "host":"nas.example",
+            "username":"legacy",
+            "base_path":"/assets",
+            "password":"secret"
+        }"#;
+        let SourceConnection::Sftp(cfg) = serde_json::from_str(json).unwrap() else {
+            panic!()
+        };
+        assert_eq!(cfg.host, "nas.example");
+        assert_eq!(cfg.port, 22);
+        assert_eq!(cfg.username, "legacy");
+        assert_eq!(cfg.base_path, "/assets");
+        assert_eq!(cfg.password.as_deref(), Some("secret"));
     }
 
     #[test]
