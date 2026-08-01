@@ -105,10 +105,11 @@ line can be traced back to the asset and job that produced it.
 No-telemetry is a **hard invariant, not a default** (PRODUCT_SPEC §8, DESIGN_GUIDELINES §1.5).
 It is enforced structurally rather than trusted:
 
-- **No analytics/telemetry/crash-reporting dependency** may enter the tree. A CI
-  **`cargo-deny`** advisories/bans list denies known telemetry SDKs; adding one fails the
-  build. (This is the same `cargo-deny` invocation used for the dependency-direction guard,
-  §15.4.4.)
+- **No analytics/telemetry/crash-reporting dependency** may enter the tree. The push/PR
+  **`cargo-deny`** gate reads [`deny.toml`](../../deny.toml), whose bans list names the common
+  telemetry, remote-tracing, analytics, and crash-reporting SDKs; adding one fails CI. The same
+  dependency-hygiene job enforces advisories, licenses, trusted sources, and the reviewed
+  GPU/windowing/transport owners (§15.4.5).
 - **All network egress is source-initiated.** The only crates permitted to open outbound
   connections are the source layer (SFTP/SMB/federated peer, [07](07-sources-and-federation.md))
   and the auth layer's configured OIDC/OAuth2 endpoints ([10](10-auth-accounts-and-flags.md)) —
@@ -307,19 +308,42 @@ out-of-core) belong to [14](14-concurrency-performance-reliability.md); this fil
   regresses past a threshold** against the committed baseline. The thresholds trace directly
   to the `14` targets, so a perf regression is caught as a build failure, not in the field.
 
-### 15.4.5 CI dependency-direction guard (ADR 0002)
+### 15.4.5 CI dependency and feature guards
 
-[ADR 0002](../adr/0002-3d-render-crate-boundary.md) requires that **`3dam-core` never depends
-on `wgpu`, `winit`, or any GPU/windowing crate** — the boundary that keeps the engine linkable
-into the CLI and API server without dragging in GPU deps (PRODUCT_SPEC §4.3). This is enforced,
-not trusted:
+[ADR 0002](../adr/0002-3d-render-crate-boundary.md) permits GPU rendering only through the
+optional `dam-core/render → dam-render → wgpu` path; a default/lean core must remain GPU- and
+window-free. The push/PR workflow enforces the current architecture at three complementary levels:
 
-- A **CI check** asserts `3dam-core`'s dependency tree contains no GPU/windowing crate —
-  implemented as a **`cargo-deny` bans rule** (deny `wgpu`, `winit`, et al. in `3dam-core`'s
-  graph) and/or a small `cargo metadata` graph test. It runs on every push and fails the build
-  if a GPU crate leaks into core.
-- This shares the single `cargo-deny` invocation with the **no-telemetry ban list** (§15.1.5)
-  and the license/advisory checks — one dependency-hygiene gate covering all three.
+- `cargo xtask check-deps` compares every direct internal edge with tech-spec 01's exact reviewed
+  allowlist. A new frontend-to-store edge, transport edge, or optionality change fails the job.
+- [`deny.toml`](../../deny.toml) uses cargo-deny wrapper rules so `wgpu`, Tauri/tao/wry, SFTP/SMB,
+  and HTTP clients can be acquired directly only by their reviewed renderer, desktop, source,
+  client, auth, or build owners. `winit` is banned outright. The same invocation fails on a known
+  vulnerability, yanked crate, unapproved license/source, wildcard requirement, or telemetry SDK.
+- Lean-profile `cargo tree` assertions prove `dam-core --no-default-features` excludes renderer,
+  GPU, and window crates; `dam-media --no-default-features` excludes Assimp conversion; and
+  `dam-sources --no-default-features` excludes SFTP/SMB transports. These absence checks protect
+  feature boundaries that a whole-workspace graph cannot express.
+
+### 15.4.6 Push/pull-request quality matrix
+
+`.github/workflows/ci.yml` runs on every push and every pull request. It keeps a stable
+`Required CI` aggregate result for branch protection while its constituent checks remain explicit:
+
+| Check | Profile and failure contract |
+|---|---|
+| MSRV | Rust 1.91, default workspace, locked `cargo check` |
+| Format | `cargo fmt --all --check` |
+| Tests | default workspace, locked unit/integration/doc tests |
+| Feature matrix | all features + all targets under Clippy `-D warnings`; lean core/media/sources |
+| Dependency hygiene | current lockfile, exact internal edges, cargo-deny advisories/licenses/bans/sources |
+| Web | frozen pnpm install via `xtask web`, WASM/Vite build, ESLint, and TypeScript |
+
+Native matrix commands and the xtask entry point use `--locked`; pnpm uses the frozen lockfile
+inside `cargo xtask web`. A separate locked metadata gate catches any stale Cargo lockfile before
+the aggregate result can pass. Caches key compiled/downloaded inputs only and do not make a missing
+lockfile, generated WASM/Vite artifact, test failure, lint warning, or type error soft. Release
+packaging and container publication remain exclusively in their existing tag/manual workflows.
 
 ---
 

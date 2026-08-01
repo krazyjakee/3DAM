@@ -1,15 +1,12 @@
 name: ci
 
-on:
-  push:
-    branches: [main]
-  pull_request:
+on: [push, pull_request]
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -17,49 +14,174 @@ env:
 
 jobs:
   msrv:
-    name: Rust 1.91 MSRV
+    name: Rust 1.91 / default features
     runs-on: ubuntu-22.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@1.91.0
-
       - uses: Swatinem/rust-cache@v2
         with:
           key: msrv-1.91
-
       - name: Install native dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             clang cmake libclang-dev libgtk-3-dev librsvg2-dev \
             libssl-dev libwebkit2gtk-4.1-dev pkg-config
-
       - name: Check workspace at the supported floor
         run: cargo check --workspace --locked
 
-  stable:
-    name: Current stable Clippy
+  format:
+    name: Rustfmt
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  tests:
+    name: Rust tests / default features
     runs-on: ubuntu-22.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-
       - uses: Swatinem/rust-cache@v2
         with:
-          key: stable-clippy
-
+          key: stable-tests-default
       - name: Install native dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             clang cmake libclang-dev libgtk-3-dev librsvg2-dev \
             libssl-dev libwebkit2gtk-4.1-dev pkg-config
+      - run: cargo test --workspace --locked
 
-      - name: Lint workspace on current stable
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+  features:
+    name: Rust features / ${{ matrix.profile }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - profile: all features + Clippy
+            command: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+            tree: ""
+            forbidden: ""
+            native: true
+          - profile: lean core
+            command: cargo check -p dam-core --no-default-features --locked
+            tree: cargo tree --locked -p dam-core --no-default-features --edges normal --prefix none
+            forbidden: "^(ash|glow|gpu-alloc|gpu-allocator|naga|tao|tauri|winit|wgpu|wry)( |-)|^dam-render "
+            native: false
+          - profile: lean media
+            command: cargo check -p dam-media --no-default-features --locked
+            tree: cargo tree --locked -p dam-media --no-default-features --edges normal --prefix none
+            forbidden: "^russimp(-| )"
+            native: false
+          - profile: local sources
+            command: cargo check -p dam-sources --no-default-features --locked
+            tree: cargo tree --locked -p dam-sources --no-default-features --edges normal --prefix none
+            forbidden: "^(russh|russh-sftp|smb)( |-)"
+            native: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: feature-${{ matrix.profile }}
+      - name: Install native dependencies
+        if: matrix.native
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang cmake libclang-dev libgtk-3-dev librsvg2-dev \
+            libssl-dev libwebkit2gtk-4.1-dev pkg-config
+      - name: Compile profile
+        run: ${{ matrix.command }}
+      - name: Assert lean dependency boundary
+        if: matrix.forbidden != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ${{ matrix.tree }} | grep -E '${{ matrix.forbidden }}'; then
+            echo "::error::${{ matrix.profile }} contains a dependency outside its lean boundary"
+            exit 1
+          fi
+
+  dependencies:
+    name: Dependency hygiene
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.91.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: dependency-hygiene
+      - name: Require a current lockfile and reviewed internal edges
+        run: |
+          cargo metadata --no-deps --format-version 1 --locked > /dev/null
+          cargo run --locked --package xtask -- check-deps
+      - name: Check advisories, licenses, bans, and sources
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          rust-version: "1.91.0"
+          command: check
+          arguments: --all-features
+      - name: Assert dependency checks did not rewrite the lockfile
+        run: git diff --exit-code -- Cargo.lock
+
+  web:
+    name: Web lint, typecheck & build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: web-ci
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.22.0
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - name: Build WASM islands and web client
+        run: cargo run --locked --package xtask -- web
+      - name: Lint and typecheck web client
+        working-directory: web
+        run: |
+          pnpm run lint
+          pnpm run typecheck
+
+  required:
+    name: Required CI
+    if: always()
+    needs: [msrv, format, tests, features, dependencies, web]
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Require every quality gate
+        env:
+          RESULTS: >-
+            ${{ needs.msrv.result }} ${{ needs.format.result }} ${{ needs.tests.result }}
+            ${{ needs.features.result }} ${{ needs.dependencies.result }} ${{ needs.web.result }}
+        run: |
+          for result in ${RESULTS}; do
+            test "${result}" = success
+          done

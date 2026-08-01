@@ -1,0 +1,84 @@
+# Dependency policy for `cargo deny check --all-features` in push/PR CI (issue #93).
+# Cargo feature profiles and package-specific absence checks live in ci.yml; cargo-deny's wrapper
+# rules below ensure the boundary-owning crates remain the only direct users in the full graph.
+
+[advisories]
+yanked = "deny"
+unmaintained = "workspace"
+ignore = []
+
+[licenses]
+confidence-threshold = 0.8
+unused-allowed-license = "allow"
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+
+[bans]
+# The current GUI/network stack legitimately resolves several version lines. Keep duplicates visible
+# without making unrelated upgrades impossible; explicit bans and wildcard requirements are hard.
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "simplest-path"
+deny = [
+    # GPU and window ownership: headless rendering/browser islands own wgpu, while only the desktop
+    # shell and Tauri's own plugins/runtime may acquire a native window/event loop.
+    { crate = "wgpu", wrappers = ["dam-render", "dam-viewer"], reason = "GPU code belongs in the renderer or browser viewer island" },
+    { crate = "winit", reason = "3DAM uses the reviewed Tauri/tao/wry desktop stack; other window loops require an architecture review" },
+    { crate = "tauri", wrappers = ["dam-desktop", "tauri-plugin-dialog", "tauri-plugin-fs", "tauri-plugin-window-state"], reason = "Tauri belongs at the desktop shell boundary" },
+    { crate = "tao", wrappers = ["tauri-runtime-wry"], reason = "The event loop is owned by Tauri's desktop runtime" },
+    { crate = "wry", wrappers = ["tauri-runtime-wry"], reason = "The webview is owned by Tauri's desktop runtime" },
+
+    # Transport ownership: source protocols stay behind dam-sources. HTTP is limited to the API
+    # client, configured OIDC/server calls, Tauri internals, SMB auth, and Assimp's build helper.
+    { crate = "russh", wrappers = ["dam-sources"], reason = "SFTP transport belongs in dam-sources" },
+    { crate = "russh-sftp", wrappers = ["dam-sources"], reason = "SFTP transport belongs in dam-sources" },
+    { crate = "smb", wrappers = ["dam-sources"], reason = "SMB transport belongs in dam-sources" },
+    { crate = "reqwest", wrappers = ["dam-client", "dam-server", "oauth2", "russimp-sys-ng", "sspi", "tauri"], reason = "Outbound HTTP is restricted to reviewed transport/auth/build boundaries" },
+
+    # No analytics, remote tracing, crash reporting, or product telemetry may enter the tree.
+    { crate = "sentry", reason = "3DAM observability is local-only" },
+    { crate = "sentry-core", reason = "3DAM observability is local-only" },
+    { crate = "opentelemetry", reason = "3DAM observability is local-only" },
+    { crate = "opentelemetry_sdk", reason = "3DAM observability is local-only" },
+    { crate = "opentelemetry-otlp", reason = "3DAM observability is local-only" },
+    { crate = "tracing-opentelemetry", reason = "3DAM observability is local-only" },
+    { crate = "datadog", reason = "3DAM ships no telemetry SDK" },
+    { crate = "newrelic", reason = "3DAM ships no telemetry SDK" },
+    { crate = "posthog", reason = "3DAM ships no analytics SDK" },
+    { crate = "posthog-rs", reason = "3DAM ships no analytics SDK" },
+    { crate = "segment", reason = "3DAM ships no analytics SDK" },
+    { crate = "segment_analytics", reason = "3DAM ships no analytics SDK" },
+    { crate = "mixpanel", reason = "3DAM ships no analytics SDK" },
+    { crate = "amplitude", reason = "3DAM ships no analytics SDK" },
+    { crate = "bugsnag", reason = "3DAM ships no crash-reporting SDK" },
+    { crate = "rollbar", reason = "3DAM ships no crash-reporting SDK" },
+    { crate = "honeycomb", reason = "3DAM ships no remote tracing SDK" },
+]
+
+[bans.workspace-dependencies]
+duplicates = "deny"
+include-path-dependencies = true
+unused = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+required-git-spec = "rev"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
