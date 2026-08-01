@@ -10,6 +10,30 @@ catalog (`library.db`), server config (`server.db`), and the derivative caches u
 directory, watches its sources for changes, and — in hosted mode — proactively renders thumbnails
 and runs analysis in the background so clients hit ready data (issue #71).
 
+## Database upgrades and recovery
+
+Both databases have independent, forward-only schema versions. Back up the whole data directory
+before installing a new release and never open a copied data directory with two 3DAM versions at
+once. An older binary clearly refuses a database written by a newer one; it does not attempt a
+downgrade or partially initialize missing tables.
+
+When `server.db` needs an upgrade, 3DAM first writes a SQLite-consistent sibling such as
+`server.db.pre-migration-v2-to-v3.bak`. It then runs every pending step and the schema-version update
+inside one immediate transaction. A SQL or process failure before commit leaves `server.db` at its
+original version, so the normal recovery is to correct the deployment problem and restart. Keep the
+`.bak` until the upgraded server has been checked; it contains the same credentials, sessions, OIDC
+secrets, and account data as the original and therefore needs the same filesystem permissions and
+backup handling. On Unix, 3DAM creates and verifies it as an owner-only regular file (`0600`) and
+syncs both the completed file and its directory entry before starting schema changes; on other
+platforms the data directory's inherited access-control policy remains authoritative.
+
+If an upgrade committed but a release-specific semantic problem is found, stop every 3DAM process,
+move the upgraded `server.db` (and any `server.db-wal`/`server.db-shm`) aside, copy the matching
+`.bak` back to `server.db`, and run the older binary that understands that version. Do not merge rows
+between versions or edit `PRAGMA user_version` by hand. Migration backups are intentionally not
+auto-deleted; after verification the operator may archive or securely remove them under the site's
+normal credential-backup retention policy.
+
 ## Safe-by-default posture
 
 Out of the box `serve` binds `127.0.0.1:7878` with **no auth** (the local owner is trusted) and is

@@ -1,7 +1,6 @@
 //! The accounts / sessions / groups / shares surface of [`ServerStore`] (phase 6, issue #42;
-//! tech-spec 10 §4). A child of `store` so it reaches the private connection; the schema lives in
-//! the parent's `SCHEMA` batch (server-store convention: `CREATE TABLE IF NOT EXISTS`, not the
-//! catalog's numbered migrations).
+//! tech-spec 10 §4). A child of `store` so it reaches the private connection; its schema is the
+//! server store's append-only V2 migration.
 //!
 //! Security posture, all decided in ADR 0009 §3–§4 and implemented here:
 //! - argon2id password hashes (PHC strings); session cookie secrets hashed with blake3 (they are

@@ -64,7 +64,7 @@ bytes = "1"
 # storage
 # rusqlite 0.40 requires libsqlite3-sys 0.38, which does not build on the workspace MSRV because
 # it uses `std::cfg_select!`; stay on the compatible 0.39/0.37 pair until the MSRV reaches 1.95.
-rusqlite = { version = "0.39", features = ["bundled"] }
+rusqlite = { version = "0.39", features = ["backup", "bundled"] }
 # argon2id password hashing for user accounts (phase 6, issue #42; ADR 0009 §4). API-token secrets
 # stay on blake3 (high-entropy keys need no KDF); argon2 is for low-entropy user passwords only.
 argon2 = "0.5"

@@ -17,6 +17,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Mutex, RwLock};
+use std::time::Duration;
 
 /// The live, in-memory flag values + their optimistic-concurrency versions (tech-spec 10 §2.2).
 #[derive(Clone, Debug)]
@@ -186,21 +187,24 @@ impl ServerStore {
             let _ = std::fs::create_dir_all(parent);
         }
         let conn = Connection::open(path).map_err(internal)?;
-        Self::from_conn(conn)
+        Self::from_conn(conn, Some(path))
     }
 
     /// Open an in-memory store (tests, and the CLI's embedded no-serve-store path).
     pub fn open_in_memory() -> Result<ServerStore, LibError> {
         let conn = Connection::open_in_memory().map_err(internal)?;
-        Self::from_conn(conn)
+        Self::from_conn(conn, None)
     }
 
-    fn from_conn(conn: Connection) -> Result<ServerStore, LibError> {
+    fn from_conn(mut conn: Connection, path: Option<&Path>) -> Result<ServerStore, LibError> {
+        // A second process opening the same data directory should wait for the short, serialized
+        // migration transaction and then observe its version, not fail spuriously with SQLITE_BUSY.
+        conn.busy_timeout(Duration::from_secs(30)).map_err(internal)?;
         // The accounts tables lean on cascading deletes (sessions/memberships/shares follow their
         // account or group); rusqlite leaves foreign keys off per SQLite default, so opt in.
         conn.pragma_update(None, "foreign_keys", "ON")
             .map_err(internal)?;
-        conn.execute_batch(SCHEMA).map_err(internal)?;
+        schema::migrate(&mut conn, path)?;
         let store = ServerStore {
             conn: Mutex::new(conn),
             flags: RwLock::new(FlagState::defaults()),
@@ -747,134 +751,7 @@ fn hash_secret(secret: &str) -> String {
     blake3::hash(secret.as_bytes()).to_hex().to_string()
 }
 
-const SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS feature_flag (
-  key        TEXT PRIMARY KEY,
-  value      TEXT NOT NULL,
-  version    INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL,
-  updated_by TEXT
-);
-CREATE TABLE IF NOT EXISTS token (
-  token_id    TEXT PRIMARY KEY,
-  label       TEXT NOT NULL,
-  secret_hash TEXT NOT NULL UNIQUE,
-  scopes      TEXT NOT NULL,
-  created     INTEGER NOT NULL,
-  expires     INTEGER,
-  last_used   INTEGER
-);
-CREATE INDEX IF NOT EXISTS token_secret ON token(secret_hash);
-CREATE TABLE IF NOT EXISTS audit_log (
-  id     INTEGER PRIMARY KEY AUTOINCREMENT,
-  at     INTEGER NOT NULL,
-  actor  TEXT NOT NULL,
-  action TEXT NOT NULL,
-  target TEXT,
-  detail TEXT
-);
-
--- ── user accounts / sessions / groups / shares (phase 6, issue #42; tech-spec 10 §4) ──
--- Identity lives here, beside the flags and tokens, so a library file can move between hosts
--- without carrying accounts. `share.resource_id` is a soft reference into library.db (a uuid,
--- never recycled); orphans are GC'd when the resource is deleted, not FK-enforced.
-CREATE TABLE IF NOT EXISTS account (
-  account_id    TEXT PRIMARY KEY,
-  username      TEXT NOT NULL UNIQUE COLLATE NOCASE,
-  display_name  TEXT,
-  password_hash TEXT,               -- argon2id PHC string; NULL for an OIDC-only account (#41)
-  role          TEXT NOT NULL,      -- 'admin' | 'editor' | 'viewer'
-  disabled      INTEGER NOT NULL DEFAULT 0,
-  created       INTEGER NOT NULL,
-  last_login    INTEGER
-);
-CREATE TABLE IF NOT EXISTS session (
-  session_id    TEXT PRIMARY KEY,
-  account_id    TEXT NOT NULL REFERENCES account(account_id) ON DELETE CASCADE,
-  secret_hash   TEXT NOT NULL,      -- blake3 of the cookie's random secret half
-  csrf          TEXT NOT NULL,      -- double-submit token, echoed in x-dam-csrf on writes
-  created       INTEGER NOT NULL,
-  last_seen     INTEGER NOT NULL,   -- drives the 14-day inactivity expiry
-  absolute_exp  INTEGER NOT NULL,   -- 90-day hard ceiling
-  user_agent    TEXT
-);
-CREATE INDEX IF NOT EXISTS session_account ON session(account_id);
-CREATE TABLE IF NOT EXISTS login_failure (
-  username TEXT NOT NULL COLLATE NOCASE,
-  at       INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS login_failure_user ON login_failure(username, at);
-CREATE TABLE IF NOT EXISTS group_ (
-  group_id TEXT PRIMARY KEY,
-  name     TEXT NOT NULL UNIQUE COLLATE NOCASE,
-  created  INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS group_member (
-  group_id   TEXT NOT NULL REFERENCES group_(group_id)    ON DELETE CASCADE,
-  account_id TEXT NOT NULL REFERENCES account(account_id) ON DELETE CASCADE,
-  PRIMARY KEY (group_id, account_id)
-);
-CREATE TABLE IF NOT EXISTS share (
-  share_id    TEXT PRIMARY KEY,
-  resource    TEXT NOT NULL,        -- 'source' | 'collection'
-  resource_id TEXT NOT NULL,
-  account_id  TEXT REFERENCES account(account_id) ON DELETE CASCADE,
-  group_id    TEXT REFERENCES group_(group_id)    ON DELETE CASCADE,
-  access      TEXT NOT NULL,        -- 'read' | 'write'
-  granted_by  TEXT NOT NULL,
-  created     INTEGER NOT NULL,
-  CHECK ((account_id IS NULL) != (group_id IS NULL))
-);
-CREATE INDEX IF NOT EXISTS share_resource ON share(resource, resource_id);
-
--- OIDC / OAuth2 login (phase 6, issue #41).
---
--- Single-row provider config. `rowid = 1` is enforced by the CHECK, so a write is an upsert and
--- there is no way to end up with two providers disagreeing about who may sign in.
-CREATE TABLE IF NOT EXISTS oidc_provider (
-  id            INTEGER PRIMARY KEY CHECK (id = 1),
-  issuer        TEXT NOT NULL,
-  client_id     TEXT NOT NULL,
-  client_secret TEXT,               -- write-only; never returned by the admin API (tech-spec 10 §5)
-  redirect_url  TEXT NOT NULL,
-  scopes        TEXT NOT NULL,      -- JSON array of extra scopes; `openid` is always requested
-  provisioning  TEXT NOT NULL,      -- 'linked' | 'auto_viewer' | 'auto_editor'
-  updated_at    INTEGER NOT NULL,
-  updated_by    TEXT
-);
-
--- Which external identity is which local account.
---
--- Keyed on (issuer, subject), not subject alone: `sub` is only unique *within* an issuer, so a bare
--- subject key would let a second configured provider hand out a `sub` that collides with a linked
--- one and inherit that account. Kept in its own table rather than as a column on `account` partly
--- for that composite key, and partly because `server.db` has no migration mechanism — the schema is
--- one `CREATE TABLE IF NOT EXISTS` batch, so adding a table is free where `ALTER TABLE` is not.
-CREATE TABLE IF NOT EXISTS oidc_identity (
-  issuer     TEXT NOT NULL,
-  subject    TEXT NOT NULL,
-  account_id TEXT NOT NULL REFERENCES account(account_id) ON DELETE CASCADE,
-  linked_at  INTEGER NOT NULL,
-  PRIMARY KEY (issuer, subject)
-);
-CREATE INDEX IF NOT EXISTS oidc_identity_account ON oidc_identity(account_id);
-
--- In-flight authorization requests: the CSRF `state`, the replay-binding `nonce`, and the PKCE
--- verifier, held between the redirect out and the callback back.
---
--- Server-side rather than in a cookie because the verifier is the one secret that must never reach
--- the browser — PKCE exists precisely so that a stolen authorization code is useless without it.
--- Rows are single-use (deleted when redeemed) and swept by age, so a login the user abandons
--- expires rather than accumulating.
-CREATE TABLE IF NOT EXISTS oidc_login (
-  state         TEXT PRIMARY KEY,
-  nonce         TEXT NOT NULL,
-  pkce_verifier TEXT NOT NULL,
-  return_to     TEXT,               -- validated same-origin path to land on after login
-  browser_hash  TEXT NOT NULL,      -- blake3 of the `dam_oidc` cookie that started this login
-  created       INTEGER NOT NULL
-);
-";
+mod schema;
 
 // The accounts/sessions/groups/shares surface (issue #42) — a child module so it can reach the
 // private `conn`/`flags` fields while keeping this file to flags/tokens/audit.

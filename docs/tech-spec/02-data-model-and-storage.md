@@ -314,7 +314,7 @@ Rules:
 ## 6. Migrations
 
 - **Crate: `rusqlite`** (with the `bundled` SQLite feature for a pinned, portable engine and to guarantee the `fts5` / `json1` extensions we rely on). Chosen over `sqlx` because: (a) 3DAM is single-file embedded SQLite, not a networked pool — `sqlx`'s async pool and compile-time query checking against a live DB add ceremony we don't need for an embedded store; (b) `bundled` gives a reproducible engine across all three OSes (PRODUCT_SPEC §8 portability) without depending on the system SQLite; (c) synchronous calls fit our model where DB access already runs on a bounded blocking pool off the async runtime ([14](14-concurrency-performance-reliability.md) owns that split). This is a mechanics choice; if a later ADR revisits it, that ADR wins.
-- **Versioned, forward-only.** A single integer schema version lives in SQLite's built-in `PRAGMA user_version` (mirrored into a `schema_version` row for human/JSON inspection). Migrations are an ordered list of embedded SQL steps `V1, V2, …`; on open, `3dam-core` applies every step with number `> user_version` inside one transaction, then bumps `user_version`. No down-migrations — forward-only, matching the "documented, stable" promise (DESIGN_GUIDELINES §1.5): older binaries refuse a newer DB with a clear message rather than corrupting it.
+- **Versioned, forward-only.** A single integer schema version lives in SQLite's built-in `PRAGMA user_version`. Each store owns an append-only ordered list of embedded SQL steps `V1, V2, …`; on open it applies every step with number `> user_version` transactionally, then bumps `user_version`. No down-migrations — forward-only, matching the "documented, stable" promise (DESIGN_GUIDELINES §1.5): older binaries refuse a newer DB with a clear message rather than corrupting it. `library.db` and `server.db` have independent version sequences because neither may attach or modify the other.
 - **Additive-first.** Prefer additive changes (new nullable column, new table, new index) so an in-progress library upgrades without a rewrite. Destructive column changes go through SQLite's 12-step table rebuild only when unavoidable.
 - **Cache/vectors are not migrated** — they carry their own version tags (§8.2) and are regenerated on mismatch, so schema migrations never need to touch derived data.
 
@@ -410,6 +410,16 @@ Paths follow OS conventions (via a `directories`-style resolver), overridable by
 Feature flags, user accounts, and the audit log **must live outside `library.db`** (PRODUCT_SPEC §5 end, §6.11) — they are host configuration and identity, not catalog data, and must never travel in a library copy or an export. This file defines *where and the shape*; **[10-auth-accounts-and-flags.md](10-auth-accounts-and-flags.md) owns the semantics** (flag lifecycle live-vs-restart, role/scope meaning, auth flow, [ADR 0004](../adr/0004-feature-flags-admin.md)).
 
 Location & shape: a **second SQLite file, `server.db`**, beside the library but physically separate (own file → cannot leak into a library export). Only present/used in `serve` mode; a purely embedded client never creates it.
+
+`server.db` uses its own forward-only migration list. V1 is the original flags/tokens/audit shape,
+V2 adds accounts/sessions/groups/shares, and V3 adds OIDC state; these first three steps use
+`IF NOT EXISTS` solely to adopt already-shipped, unversioned databases without replacing their
+tables. Future changes append exactly one new migration and must not edit an earlier step. Opening
+takes an immediate SQLite transaction, refuses a `user_version` newer than the binary, snapshots a
+non-empty on-disk database through SQLite's online-backup API, and commits the whole ordered upgrade
+atomically. A failed statement therefore leaves the original schema/version usable on restart; the
+snapshot is the operator's recovery copy if the migration itself is later found to be semantically
+wrong.
 
 ```sql
 -- feature flags: versioned, persisted, seeded by the config file, edited by the admin API (§6.11)
