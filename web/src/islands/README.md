@@ -16,10 +16,18 @@ is the **DOM-side boundary** the React chrome builds on
 - The `.wasm` is fetched **lazily only for a 3D preview**. Browsing and the first audio interaction
   never download or instantiate wgpu.
 
-The React wrapper (owned by the web-client work) supplies a `<canvas>`, drives the island's
-lifecycle (`create` on mount → `free()` on unmount), and calls `setCamera` / `resize` from DOM
-controls. **The DOM owns the data and chrome; the island owns pixels** — model preview bytes arrive
-over [`@/api/client`](../api/client.ts), and the island never does its own networking.
+The React wrapper supplies a focusable `<canvas>`, drives the island's lifecycle (`create` on mount
+→ `free()` on unmount), and calls `setCameraPose` / `resize` from DOM controls. **The DOM owns the
+data and chrome; the island owns pixels** — model preview bytes arrive over
+[`@/api/client`](../api/client.ts), and the island never does its own networking.
+
+Controls are input-agnostic: mouse/pen drag or arrow keys orbit; Shift/middle/right drag or
+Shift+arrows pan; horizontal one-finger touch orbits while vertical one-finger movement remains
+page scrolling; and two-finger drag/pinch pans/zooms. Focused wheel/trackpad and `+`/`-` zoom, Home
+resets, and Escape returns wheel scrolling to the page. The canvas exposes these instructions to
+assistive technology and has a visible focus ring. Auto-orbit is unavailable under
+`prefers-reduced-motion`; all manual controls remain usable. Failed GPU setup shows an honest,
+retryable fallback rather than a blank canvas.
 
 ## Building the WASM
 
@@ -43,11 +51,21 @@ live in [`bundle-budgets.json`](../../bundle-budgets.json); see
 ## Backend
 
 WebGPU with a **WebGL2 fallback** (ADR 0009 §9); `handle.backend` reports which was chosen
-(`"webgpu"` / `"webgl2"`) for logging.
+(`"webgpu"` / `"webgl2"`) for logging. The surface format is probed rather than guessed by backend:
+the renderer uses 4× MSAA when supported, then 2×, then an explicit 1× fallback. The effective
+sample count is available as `handle.antialiasingSamples` and `data-viewer-msaa` for regression
+capture.
 
-## Status (not finalized)
+## Render parity and batching
 
-These islands are intentionally unfinished pending the parallel web-client work and the shared
-`dam-render` crate (tech-spec 06). Known follow-ups: touch/pointer orbit gestures wired from DOM,
-MSAA/anti-aliasing, per-material batching, and reconciling the framing/shader with `dam-render` so
-the browser viewer and the server thumbnail match "by construction" (ADR 0002).
+The browser and headless renderer implement **framing convention v1** (40° vertical FOV,
+aspect-aware bounding-sphere fit, one canonical yaw/pitch/margin). A CPU-only parity contract pins
+those constants and the studio PBR light/material conventions across both implementations. Opaque
+and masked submeshes sharing a material are merged at upload; transparent meshes remain separate
+for per-frame depth sorting. Source/actual draws are exposed as `data-viewer-source-draws` and
+`data-viewer-batched-draws`.
+
+Visual cases, backend capture steps, the synthetic 126-submesh batching measurement, and the
+real-device touch/Tauri checklist live in
+[`docs/viewer-validation.md`](../../../docs/viewer-validation.md). Hardware capture is an explicit
+final-validation gate, not something a source-only change can honestly claim to have executed.

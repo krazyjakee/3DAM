@@ -1,3 +1,4 @@
+// 3DAM_PBR_CONVENTION_V1
 // Metallic-roughness PBR for turntable thumbnails (tech-spec 06). Positions/normals/tangents arrive
 // already in world space (node transforms baked by Assimp PreTransformVertices), so the only matrix
 // is the view-projection. A fixed 3-light studio rig + hemispheric ambient gives a neutral,

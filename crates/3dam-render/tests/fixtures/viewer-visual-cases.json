@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "framingConvention": 1,
+  "backends": ["webgpu", "webgl2"],
+  "cases": [
+    {
+      "asset": "textured_cube.gltf",
+      "assert": ["framing", "base-color", "uv-orientation", "silhouette-aa"]
+    },
+    {
+      "asset": "glass_cube.gltf",
+      "assert": ["framing", "alpha-blend", "back-to-front-order"]
+    },
+    {
+      "asset": "multi_material_grid.obj",
+      "assert": ["framing", "material-batching", "material-factors"]
+    }
+  ]
+}

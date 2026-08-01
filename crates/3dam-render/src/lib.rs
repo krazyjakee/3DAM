@@ -16,6 +16,10 @@ mod model;
 mod preview;
 mod renderer;
 
+pub use camera::{
+    canonical_direction as framing_direction, clip_planes as framing_clip_planes,
+    fit_distance as framing_fit_distance, framing_convention, FramingConvention,
+};
 pub use renderer::Renderer;
 
 use std::path::Path;
@@ -110,7 +114,8 @@ pub fn render_model_thumbnail_png(
 /// game-asset companion-map discovery + sibling texture folders, dropped uniform-constant vertex
 /// colours (export junk that tinted albedo), shininess→roughness, and SSAA thumbnails. v5: material
 /// transparency — glTF `alphaMode`/opacity/transmission render as alpha-blended glass, not opaque.
-pub const RENDER_VERSION: u32 = 5;
+/// v6: canonical framing v1 shared with the interactive viewer (aspect-aware sphere fit).
+pub const RENDER_VERSION: u32 = 6;
 
 /// Decode a model to the compact self-contained `DMSH` blob the browser 3D island uploads
 /// directly (see [`preview`]). Reuses the **same Assimp decode** as the turntable thumbnail, so the

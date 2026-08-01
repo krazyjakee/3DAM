@@ -8,7 +8,10 @@ Small models used by `tests/render.rs` to verify import + textured PBR rendering
 | `textured_cube.gltf` | glTF with an **embedded** base-colour PNG + UVs — embedded-texture path |
 | `obj_cube.obj` / `obj_cube.mtl` / `quad.png` | OBJ whose MTL `map_Kd` references a **sibling** PNG — external-texture resolution |
 | `textured_cube.fbx` | FBX with an **embedded** base-colour texture — Assimp FBX importer + embedded-texture extraction |
+| `glass_cube.gltf` | Transparent glTF material — blend state and back-to-front pass |
+| `multi_material_grid.obj` / `.mtl` | Twelve visible parts reusing four materials — material-factor parity and batching diagnostics |
 | `quad.png` | The base-colour texture: red/green/blue/yellow quadrants + white grid, so UV mapping and colour are visually obvious and assertable |
+| `viewer-visual-cases.json` | Backend-neutral manifest for WebGPU/WebGL2 screenshot capture and parity review |
 
 ## Regenerating the FBX
 

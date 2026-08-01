@@ -20,6 +20,14 @@ export interface ModelViewerHandle {
   loadPreviewMesh(bytes: Uint8Array): void;
   /** Orbit + zoom. `yaw`/`pitch` in radians; `zoom` multiplies the bounds-fit distance. */
   setCamera(yaw: number, pitch: number, zoom: number): void;
+  /** Orbit, zoom, and view-plane pan (`panX`/`panY` are viewport fractions). */
+  setCameraPose(
+    yaw: number,
+    pitch: number,
+    zoom: number,
+    panX: number,
+    panY: number,
+  ): void;
   /** Lighting mode (issue #65): 0 studio (3-light rig + hemi), 1 soft (shadowless fill), 2 flat/unlit. */
   setLighting(mode: number): void;
   /** Toggle the wireframe overlay — mesh edges instead of shaded surfaces (issue #65). */
@@ -28,6 +36,14 @@ export interface ModelViewerHandle {
   resize(width: number, height: number): void;
   /** Whether a model has loaded (vs the empty neutral background). */
   hasModel(): boolean;
+  /** Effective 4×/2×/1× MSAA count selected for the active backend. */
+  readonly antialiasingSamples: number;
+  /** Source submesh draws before material batching. */
+  readonly sourceDrawCount: number;
+  /** Actual shaded draws after opaque/masked material batching. */
+  readonly batchedDrawCount: number;
+  /** Versioned browser/headless framing contract. */
+  readonly framingVersion: number;
   /** Tear down the island: stops its render loop and releases the GPU device/surface. */
   free(): void;
 }

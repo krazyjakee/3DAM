@@ -44,6 +44,12 @@ mod native_stub {
 #[cfg(not(target_arch = "wasm32"))]
 pub use native_stub::NOT_ON_NATIVE;
 
+#[cfg(any(target_arch = "wasm32", test))]
+mod batching;
+#[cfg(any(target_arch = "wasm32", test))]
+mod framing;
+#[cfg(any(target_arch = "wasm32", test))]
+mod render_quality;
 #[cfg(target_arch = "wasm32")]
 mod camera;
 #[cfg(target_arch = "wasm32")]

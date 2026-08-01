@@ -327,17 +327,20 @@ question below.
 
 ## 5. Camera framing — versioned, reproducible auto-fit
 
-Framing math is pure and lives in **`3dam-core`** (ADR 0002); `3dam-render` calls it and never
-re-implements it. It is mined from MoGen ([3d-handler-notes.md](../3d-handler-notes.md) §2):
+Framing math is pure. The native implementation lives beside `3dam-render`'s current model bounds;
+the WASM target mirrors it under a cross-implementation contract test. Moving the types into
+**`3dam-core`** remains the ADR 0002 end state. It is mined from MoGen
+([3d-handler-notes.md](../3d-handler-notes.md) §2):
 
 ```rust
 // in 3dam-core (pure glam):
-pub struct CameraFraming { pub yaw: f32, pub pitch: f32, pub fov_deg: f32, pub fit_mul: f32 }
+pub struct CameraFraming { pub yaw: f32, pub pitch: f32, pub fov_deg: f32, pub fit_margin: f32 }
 
 fn auto_fit(bounds: &Aabb, f: &CameraFraming, zoom: f32) -> Camera {
     let center = bounds.center();
     let radius = bounds.bounding_sphere_radius().max(1e-3);
-    let fit_distance = radius * f.fit_mul;        // MoGen: radius * 2.8 at 45° FOV
+    let limiting_fov = min(vertical_fov(f), horizontal_fov(f, aspect));
+    let fit_distance = radius / sin(limiting_fov / 2) * f.fit_margin;
     let dist = fit_distance * zoom;               // user zoom is a SEPARATE multiplier
     let eye = center + dist * dir_from(f.yaw, f.pitch);
     Camera::look_at(eye, center, f.fov_deg)
@@ -350,9 +353,11 @@ trust them):
 - **`fit_distance` is derived from bounds; user `zoom` is separate.** The default framing is a
   deterministic function of the mesh — re-render the same asset → byte-similar framing. The
   interactive viewer applies live `zoom`/orbit on top *without changing* the stored default.
-- **A `FramingVersion`.** The defaults (`fit_mul = 2.8`, `yaw = π/4`, `pitch ≈ 0.5`,
-  `fov = 45°`, plus background/light rig and image size) are captured in a small versioned
-  struct. The thumbnail derivative records which `FramingVersion` produced it; the
+- **A `FramingVersion`.** Convention v1 (`fit_margin = 1.12`, `yaw = 0.7328151`,
+  `pitch = 0.450713`, `fov_y = 40°`) uses the narrower horizontal/vertical FOV to fit the bounds
+  sphere at every aspect ratio. The values are pinned by a cross-implementation parity fixture;
+  the browser viewer resets to the exact same pose. The thumbnail derivative records which
+  `FramingVersion` produced it; the
   extractor-versioning scheme in [05](05-analysis-similarity-dedup.md) bumps it when framing
   changes, so re-analysis is deterministic and stale thumbnails are detectable. **Same
   `FramingVersion` in → same pixels out** (modulo GPU driver rounding), which is what makes the
@@ -437,23 +442,29 @@ concrete integration hardens once the toolkit ADR lands; the seam (`draw_viewer`
 
 ---
 
-## 9. The shared shader set and draw loop
+## 9. The PBR compatibility contract and draw loops
 
-One WGSL module (`shaders/pbr.wgsl`) and one `draw.rs` are used by **both** entry points —
-this is the ADR 0002 "match by construction" mechanism made concrete:
+The native headless renderer and target-specific WASM viewer consume the same decoded geometry and
+material record and pin their WGSL implementations to one compatibility contract:
 
 - **PBR-lite shading**: base colour + metallic/roughness from `Material`, a fixed key/fill
   light rig, neutral background. Simple and stable — the point is *consistent* framing/shading
   across thumbnail and viewer, not photoreal.
-- **One draw loop**: bind camera uniforms → per-node model matrix → bind material → draw
-  indexed. `draw.rs::draw_into(encoder, scene, camera, color_view, depth_view)` is the single
-  body; `render_offscreen` (§4.2) and `draw_viewer` (§8) both call it, differing only in the
-  target views they pass and (offscreen) the copy-to-buffer that follows.
-- **MSAA / depth** are configured identically for both paths (down-tiered on software
-  adapters, §4.1) so silhouettes match between preview and thumbnail.
+- **Equivalent draw phases**: opaque/mask first with depth writes, then back-to-front transparent
+  draws without depth writes. The browser additionally batches opaque geometry by material.
+- **MSAA / depth conventions** match, while the headless still path can also supersample and
+  downscale. Browser WebGPU/WebGL2 select the supported 4×/2×/1× surface path.
 
-Because there is exactly one draw body and one shader, a change to shading changes both
-surfaces together — divergence is structurally impossible, not merely discouraged.
+The shipping browser viewer is a target-specific wgpu crate, so it mirrors rather than links the
+native shader module. `tests/viewer_parity.rs` makes that boundary explicit: it pins framing v1 and
+the PBR convention marker, Fresnel baseline, studio lights, hemi fill, and tone mapping on both
+shader sources. The same Assimp decode/`DMSH` geometry and material records feed both. This is a
+tested compatibility contract; a future shared target-neutral render crate can replace the mirror
+without changing the contract.
+
+The browser surface probes multisample support on both WebGPU and WebGL2 (4×, then 2×, then 1×),
+and exposes the selected count for capture. At upload it merges opaque/masked geometry by material,
+reducing draw calls and bind changes while preserving independently sorted transparent meshes.
 
 ---
 

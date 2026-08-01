@@ -3,15 +3,16 @@
 //! The *same shape* as `dam-render`'s headless renderer (tech-spec 06 §9): one WGSL set (`pbr.wgsl`,
 //! ported from `crates/3dam-render/src/shaders/pbr.wgsl`), per-material textured draws, a fixed
 //! studio light rig. The point is consistent framing/shading with the server thumbnail — the browser
-//! now decodes the *same* `DMSH` blob the thumbnail came from, so the interactive view and the grid
-//! tile agree by construction. Uses 4× MSAA under WebGPU (resolving an off-screen colour target to
-//! the swapchain) and falls back to single-sample on WebGL2, which can't multisample-resolve an
-//! off-screen target; the headless path keeps its own MSAA + mip chains for higher-fidelity stills.
+//! now decodes the *same* `DMSH` blob the thumbnail came from, while a numeric/source parity contract
+//! pins camera and PBR conventions across targets. Uses the highest supported 4×/2× MSAA path on
+//! both WebGPU and WebGL2, resolving an off-screen colour target into the swapchain; an adapter
+//! without multisample support falls back honestly to 1× and exposes that fact to diagnostics.
 
 use wgpu::util::DeviceExt;
 
 use crate::camera::OrbitCamera;
-use crate::gpu::GpuContext;
+use crate::batching::{self, BatchItem};
+use crate::gpu::{GpuContext, VIEWER_DEPTH_FORMAT};
 use crate::preview_mesh::{CpuMaterial, CpuModel, CpuTexture};
 
 /// Interleaved vertex — identical layout to `dam-render`'s `Vertex`, so the `DMSH` blob's vertex
@@ -61,7 +62,6 @@ struct MaterialU {
     flags: [f32; 4], // x has_base, y has_mr, z has_normal, w has_emissive
 }
 
-const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const SRGB: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 const LINEAR: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
@@ -78,6 +78,14 @@ struct GpuMesh {
     material: usize,
     blend: bool,
     centroid: glam::Vec3,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct DrawStats {
+    pub source_draws: u32,
+    pub batched_draws: u32,
+    pub opaque_batches: u32,
+    pub blended_draws: u32,
 }
 
 /// 1×1 fallback textures for absent material maps (same neutral values as the headless renderer).
@@ -118,16 +126,14 @@ pub struct ModelRenderer {
     lighting_mode: f32,
     /// Wireframe overlay toggle (issue #65) — draws mesh edges instead of the shaded surfaces.
     wireframe: bool,
+    draw_stats: DrawStats,
 }
 
 impl ModelRenderer {
     pub fn new(ctx: &GpuContext) -> Self {
         let device = &ctx.device;
 
-        // MSAA only under WebGPU: the WebGL2 fallback can't multisample an off-screen colour target
-        // and resolve it, so it stays single-sample (the raised preview-texture cap still sharpens
-        // it). 4× is universally supported on WebGPU for the swapchain formats we use.
-        let sample_count = if ctx.backend == "webgpu" { 4 } else { 1 };
+        let sample_count = ctx.sample_count;
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("pbr.wgsl"),
@@ -236,7 +242,7 @@ impl ModelRenderer {
                     ..Default::default()
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
-                    format: DEPTH_FORMAT,
+                    format: VIEWER_DEPTH_FORMAT,
                     depth_write_enabled: Some(depth_write),
                     depth_compare: Some(wgpu::CompareFunction::Less),
                     stencil: wgpu::StencilState::default(),
@@ -281,7 +287,7 @@ impl ModelRenderer {
                 ..Default::default()
             },
             depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
+                format: VIEWER_DEPTH_FORMAT,
                 depth_write_enabled: Some(true),
                 depth_compare: Some(wgpu::CompareFunction::LessEqual),
                 stencil: wgpu::StencilState::default(),
@@ -359,6 +365,7 @@ impl ModelRenderer {
             srgb_output: ctx.config.format.is_srgb() as u32 as f32,
             lighting_mode: 0.0,
             wireframe: false,
+            draw_stats: DrawStats::default(),
         }
     }
 
@@ -375,35 +382,61 @@ impl ModelRenderer {
     /// Replace the drawn geometry + materials with a freshly decoded preview model.
     pub fn upload(&mut self, ctx: &GpuContext, model: &CpuModel) {
         let device = &ctx.device;
-        self.meshes = model
+        let items: Vec<_> = model
             .submeshes
             .iter()
-            .map(|s| GpuMesh {
-                vbuf: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("viewer-verts"),
-                    contents: bytemuck::cast_slice(&s.vertices),
-                    usage: wgpu::BufferUsages::VERTEX,
-                }),
-                ibuf: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("viewer-indices"),
-                    contents: bytemuck::cast_slice(&s.indices),
-                    usage: wgpu::BufferUsages::INDEX,
-                }),
-                index_count: s.indices.len() as u32,
-                line_ibuf: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("viewer-line-indices"),
-                    contents: bytemuck::cast_slice(&triangle_edges(&s.indices)),
-                    usage: wgpu::BufferUsages::INDEX,
-                }),
-                line_count: (s.indices.len() / 3 * 6) as u32,
-                material: s.material,
-                blend: model
+            .map(|s| BatchItem {
+                // Invalid slots all use the one fallback material and can share a batch.
+                material: (s.material < model.materials.len())
+                    .then_some(s.material)
+                    .unwrap_or(usize::MAX),
+                blended: model
                     .materials
                     .get(s.material)
                     .is_some_and(|m| m.alpha_mode == 2),
-                centroid: submesh_centroid(&s.vertices),
             })
             .collect();
+        let plan = batching::plan(&items);
+        let opaque_batches = plan.opaque_groups.len();
+        let blended_draws = plan.blended.len();
+
+        let mut meshes = Vec::with_capacity(opaque_batches + blended_draws);
+        for group in plan.opaque_groups {
+            let material = items[group[0]].material;
+            let mut vertices = Vec::new();
+            let mut indices = Vec::new();
+            for source_index in group {
+                let source = &model.submeshes[source_index];
+                let base = vertices.len() as u32;
+                vertices.extend_from_slice(&source.vertices);
+                indices.extend(source.indices.iter().map(|index| index.saturating_add(base)));
+            }
+            meshes.push(upload_mesh(device, &vertices, &indices, material, false));
+        }
+        for source_index in plan.blended {
+            let source = &model.submeshes[source_index];
+            meshes.push(upload_mesh(
+                device,
+                &source.vertices,
+                &source.indices,
+                items[source_index].material,
+                true,
+            ));
+        }
+        self.meshes = meshes;
+        self.draw_stats = DrawStats {
+            source_draws: model.submeshes.len() as u32,
+            batched_draws: (opaque_batches + blended_draws) as u32,
+            opaque_batches: opaque_batches as u32,
+            blended_draws: blended_draws as u32,
+        };
+        log::info!(
+            "dam-viewer: material batching {} source draws -> {} draws ({} opaque batches, {} ordered blend draws)",
+            self.draw_stats.source_draws,
+            self.draw_stats.batched_draws,
+            self.draw_stats.opaque_batches,
+            self.draw_stats.blended_draws,
+        );
 
         self.materials = model
             .materials
@@ -420,6 +453,14 @@ impl ModelRenderer {
                 )
             })
             .collect();
+    }
+
+    pub fn draw_stats(&self) -> DrawStats {
+        self.draw_stats
+    }
+
+    pub fn sample_count(&self) -> u32 {
+        self.sample_count
     }
 
     pub fn has_model(&self) -> bool {
@@ -440,9 +481,10 @@ impl ModelRenderer {
     pub fn render(&mut self, ctx: &mut GpuContext, camera: &OrbitCamera) {
         self.ensure_targets(ctx);
 
+        let aspect = ctx.aspect();
         let globals = Globals {
-            view_proj: camera.view_proj(ctx.aspect()).to_cols_array_2d(),
-            camera_pos: camera.eye_pos().extend(1.0).to_array(),
+            view_proj: camera.view_proj(aspect).to_cols_array_2d(),
+            camera_pos: camera.eye_pos(aspect).extend(1.0).to_array(),
             params: [self.srgb_output, self.lighting_mode, 0.0, 0.0],
         };
         ctx.queue
@@ -529,7 +571,7 @@ impl ModelRenderer {
                     let mut blended: Vec<&GpuMesh> =
                         self.meshes.iter().filter(|m| m.blend).collect();
                     if !blended.is_empty() {
-                        let eye = camera.eye_pos();
+                        let eye = camera.eye_pos(aspect);
                         blended.sort_by(|a, b| {
                             let da = (a.centroid - eye).length_squared();
                             let db = (b.centroid - eye).length_squared();
@@ -545,6 +587,38 @@ impl ModelRenderer {
         }
         ctx.queue.submit([encoder.finish()]);
         ctx.queue.present(frame);
+    }
+}
+
+fn upload_mesh(
+    device: &wgpu::Device,
+    vertices: &[Vertex],
+    indices: &[u32],
+    material: usize,
+    blend: bool,
+) -> GpuMesh {
+    let edges = triangle_edges(indices);
+    GpuMesh {
+        vbuf: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("viewer-verts"),
+            contents: bytemuck::cast_slice(vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        }),
+        ibuf: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("viewer-indices"),
+            contents: bytemuck::cast_slice(indices),
+            usage: wgpu::BufferUsages::INDEX,
+        }),
+        index_count: indices.len() as u32,
+        line_ibuf: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("viewer-line-indices"),
+            contents: bytemuck::cast_slice(&edges),
+            usage: wgpu::BufferUsages::INDEX,
+        }),
+        line_count: edges.len() as u32,
+        material,
+        blend,
+        centroid: submesh_centroid(vertices),
     }
 }
 
@@ -707,15 +781,15 @@ fn make_depth(device: &wgpu::Device, (w, h): (u32, u32), sample_count: u32) -> w
         mip_level_count: 1,
         sample_count,
         dimension: wgpu::TextureDimension::D2,
-        format: DEPTH_FORMAT,
+        format: VIEWER_DEPTH_FORMAT,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
         view_formats: &[],
     });
     tex.create_view(&wgpu::TextureViewDescriptor::default())
 }
 
-/// The multisampled colour target the pass resolves into the swapchain — `None` when single-sample
-/// (WebGL2), where the pass draws straight to the swapchain view.
+/// The multisampled colour target the pass resolves into the swapchain — `None` when the negotiated
+/// common color/depth count is one, where the pass draws straight to the swapchain view.
 fn make_msaa(
     device: &wgpu::Device,
     (w, h): (u32, u32),

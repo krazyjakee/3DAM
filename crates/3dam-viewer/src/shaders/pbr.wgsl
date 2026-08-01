@@ -1,3 +1,4 @@
+// 3DAM_PBR_CONVENTION_V1
 // Metallic-roughness PBR for the interactive 3D island — ported from
 // `crates/3dam-render/src/shaders/pbr.wgsl` so the browser view and the server thumbnail shade the
 // same way (both now consume the same Assimp-decoded mesh). Positions/normals/tangents arrive in

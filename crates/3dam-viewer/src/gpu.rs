@@ -12,6 +12,12 @@
 
 use web_sys::HtmlCanvasElement;
 
+use crate::render_quality::common_sample_count;
+
+/// Web-compatible depth attachment. The viewer does not sample depth; 24-bit depth gives WebGL2 a
+/// broader multisample path than `Depth32Float` while retaining ample precision for fitted bounds.
+pub const VIEWER_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
+
 /// Everything the render paths need to draw one frame into a canvas.
 pub struct GpuContext {
     /// `'static` because [`wgpu::SurfaceTarget::Canvas`] clones the canvas handle into the surface.
@@ -19,6 +25,9 @@ pub struct GpuContext {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub config: wgpu::SurfaceConfiguration,
+    /// Adapter-supported MSAA count for the configured surface format. Both WebGPU and WebGL2 use
+    /// 4× when available, otherwise the renderer honestly reports single-sample fallback.
+    pub sample_count: u32,
     /// Human-readable backend actually chosen (`"webgpu"` / `"webgl2"` / …), surfaced to JS so the
     /// web client can log which path a browser landed on.
     pub backend: &'static str,
@@ -67,6 +76,16 @@ impl GpuContext {
             .get_default_config(&adapter, width, height)
             .ok_or_else(|| "surface is not supported by the chosen adapter".to_string())?;
         config.usage = wgpu::TextureUsages::RENDER_ATTACHMENT;
+        let color = adapter.get_texture_format_features(config.format).flags;
+        let depth = adapter
+            .get_texture_format_features(VIEWER_DEPTH_FORMAT)
+            .flags;
+        let sample_count = common_sample_count(
+            color.sample_count_supported(4),
+            color.sample_count_supported(2),
+            depth.sample_count_supported(4),
+            depth.sample_count_supported(2),
+        );
         surface.configure(&device, &config);
 
         Ok(Self {
@@ -74,6 +93,7 @@ impl GpuContext {
             device,
             queue,
             config,
+            sample_count,
             backend,
         })
     }

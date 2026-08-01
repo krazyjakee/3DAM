@@ -112,6 +112,24 @@ impl ModelViewer {
         inner.dirty = true;
     }
 
+    /// Full DOM-driven camera pose. Pan is expressed in viewport fractions, so the same two-finger
+    /// or keyboard movement feels consistent across canvas sizes and authored model scales.
+    #[wasm_bindgen(js_name = setCameraPose)]
+    pub fn set_camera_pose(
+        &self,
+        yaw: f32,
+        pitch: f32,
+        zoom: f32,
+        pan_x: f32,
+        pan_y: f32,
+    ) {
+        let mut inner = self.inner.borrow_mut();
+        inner
+            .camera
+            .update_pose(yaw, pitch, zoom, pan_x, pan_y);
+        inner.dirty = true;
+    }
+
     /// Lighting mode for the on-canvas control bar (issue #65): 0 studio (3-light rig + hemi),
     /// 1 soft (shadowless hemispheric fill), 2 flat/unlit (raw albedo). Out-of-range values clamp to
     /// flat via the shader's `>= 2` branch.
@@ -148,6 +166,30 @@ impl ModelViewer {
     #[wasm_bindgen(js_name = hasModel)]
     pub fn has_model(&self) -> bool {
         self.inner.borrow().renderer.has_model()
+    }
+
+    /// Effective sample count (4/2/1), exposed for WebGPU/WebGL2 visual-regression diagnostics.
+    #[wasm_bindgen(getter = "antialiasingSamples")]
+    pub fn antialiasing_samples(&self) -> u32 {
+        self.inner.borrow().renderer.sample_count()
+    }
+
+    /// Source submeshes before opaque material batching.
+    #[wasm_bindgen(getter = "sourceDrawCount")]
+    pub fn source_draw_count(&self) -> u32 {
+        self.inner.borrow().renderer.draw_stats().source_draws
+    }
+
+    /// Actual shaded draw count after batching (transparent draws remain independently sortable).
+    #[wasm_bindgen(getter = "batchedDrawCount")]
+    pub fn batched_draw_count(&self) -> u32 {
+        self.inner.borrow().renderer.draw_stats().batched_draws
+    }
+
+    /// Camera/PBR framing contract version for screenshot metadata.
+    #[wasm_bindgen(getter = "framingVersion")]
+    pub fn framing_version(&self) -> u32 {
+        crate::framing::FRAMING_VERSION
     }
 }
 
