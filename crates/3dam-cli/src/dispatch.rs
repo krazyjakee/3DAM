@@ -13,13 +13,27 @@ pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         return run_admin(&global, cmd).await;
     }
 
+    // Completions and man pages are pure functions of the command tree, so they are dispatched
+    // before the backend opens too — not just as an optimisation: `EmbeddedLibrary::open` *creates*
+    // the data directory and runs every migration, which a packaging step must not do as a side
+    // effect of asking the binary to describe itself.
+    match cmd {
+        Cmd::Completions { shell, out } => {
+            return crate::generate::completions(shell, out.as_deref())
+        }
+        Cmd::Man { out } => return crate::generate::man(out.as_deref()),
+        _ => {}
+    }
+
     let ctx = AuthContext::embedded();
     let lib = open(&global).await?;
     let json = global.json;
 
     match cmd {
         // Dispatched above (before the engine backend is opened).
-        Cmd::Admin { .. } => unreachable!("admin is handled before the backend opens"),
+        Cmd::Admin { .. } | Cmd::Completions { .. } | Cmd::Man { .. } => {
+            unreachable!("admin/completions/man are handled before the backend opens")
+        }
         Cmd::Scan {
             source,
             delta,

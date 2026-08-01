@@ -24,6 +24,16 @@
       "icons/icon.ico",
       "icons/icon.icns",
       "icons/icon.png"
-    ]
+    ],
+    "linux": {
+      "deb": {
+        "files": {
+          "/usr/share/bash-completion/completions/3dam": "../../packaging/completions/3dam.bash",
+          "/usr/share/zsh/vendor-completions/_3dam": "../../packaging/completions/_3dam",
+          "/usr/share/fish/vendor_completions.d/3dam.fish": "../../packaging/completions/3dam.fish",
+          "/usr/share/man/man1": "../../packaging/man"
+        }
+      }
+    }
   }
 }

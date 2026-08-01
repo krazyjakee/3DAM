@@ -92,6 +92,11 @@ rust-embed = { version = "8", features = ["mime-guess"] }
 
 # cli
 clap = { version = "4", features = ["derive"] }
+# Shell completions + man pages, generated from the live clap tree (ADR 0009 §10). Kept as runtime
+# deps of `dam-cli` rather than a build script so the command tree stays the single source of truth:
+# `3dam completions <shell>` / `3dam man` render from the same `Command` the parser uses.
+clap_complete = "4"
+clap_mangen = "0.3"
 # serve config file (tech-spec 09 §A.1): TOML is the documented default; the loader is serde-driven.
 toml = "0.8"
 

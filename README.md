@@ -133,6 +133,17 @@ the local catalog.
 Run `3dam --help` for the full tree. Human-readable output is the default; `--json` /
 `--csv` are opt-in.
 
+### Shell completions & man pages
+
+Release archives ship `completions/` and `man/` beside the binary, and the `.deb` installs both
+to the usual paths. If you built from source, the binary can render them itself:
+
+```bash
+eval "$(3dam completions bash)"        # or zsh / fish / powershell — for the current shell
+3dam completions zsh --out ~/.zfunc    # or write the conventionally-named file somewhere durable
+3dam man | man -l -                    # the 3dam(1) page; `--out <dir>` writes one page per subcommand
+```
+
 ## Server & web client
 
 ```sh
@@ -197,6 +208,7 @@ cargo clippy --all-targets -- -D warnings     # lint
 cargo xtask ci                                # the canonical pre-push gate (fmt + clippy + tests + web build)
 cargo xtask web                               # build the React client → web/dist/
 cargo xtask wasm                              # wasm-pack build the dam-viewer islands
+cargo xtask packaging                         # stage shell completions + man pages → packaging/
 cargo xtask bundle                            # package the desktop app (deb/AppImage via tauri-cli)
 ```
 

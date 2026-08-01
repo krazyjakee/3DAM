@@ -1,5 +1,10 @@
 # Rust build output
 /target/
 **/target/
+# Generated shell completions + man pages (`cargo xtask packaging`). Deliberately NOT under
+# target/: `tauri.conf.json` names these paths as literal strings under `bundle.linux.deb.files`
+# and cannot interpolate a `[build] target-dir` override, which is a normal thing for a developer
+# to set (and is set on at least one machine here).
+/packaging/
 # Spike-generated artefacts (regeneratable — see spike READMEs)
 spikes/**/out-*

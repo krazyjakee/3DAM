@@ -251,6 +251,44 @@ jobs:
       - name: Build 3dam
         run: cargo build -p dam --release --locked --target ${{ matrix.target }}
 
+      # Shell completions + man pages (ADR 0009 §10). They are rendered by *running the binary
+      # this leg just built* (`3dam completions <shell>` / `3dam man`, hidden subcommands) rather
+      # than by a build script, so the clap tree in dam-cli stays the only copy of the grammar and
+      # what ships is by construction what this binary accepts. xtask invokes it through
+      # `cargo run` with the same flags as the step above, so this is a cache hit, not a rebuild.
+      #
+      # Must precede both consumers: the portable archive carries the files, and the .deb installs
+      # them from the same packaging/ dir named in tauri.conf.json — where the bundler treats a
+      # missing source as a hard error. Note packaging/ is top-level, NOT under target/: the deb
+      # config needs a literal path and `[build] target-dir` can move target/ anywhere.
+      - name: Generate shell completions and man pages
+        run: cargo xtask packaging --target ${{ matrix.target }}
+
+      # Assert rather than glob, matching `Collect installers` below. These filenames are not ours
+      # to choose — clap_complete picks them and the shells' completion loaders look them up by
+      # name, so an upstream rename would otherwise ship a .deb whose completions silently never
+      # load. `if-no-files-found: error` on the upload cannot catch it: the archive exists either
+      # way, just with less in it.
+      - name: Assert the packaging assets were generated
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in 3dam.bash _3dam 3dam.fish _3dam.ps1; do
+            test -f "packaging/completions/${f}"
+          done
+          # xtask gzips the pages where `gzip` exists (Debian policy §12.1 wants them compressed
+          # and the Tauri bundler compresses nothing itself). Only the .deb needs that, and only
+          # Linux builds one — elsewhere the uncompressed page is fine, so require .gz on Linux
+          # only rather than making the Windows leg depend on Git Bash's gzip being on PATH.
+          if [[ "${RUNNER_OS}" == "Linux" ]]; then
+            test -f packaging/man/3dam.1.gz
+          fi
+          # More than one page: clap_mangen recurses into subcommands, so a tree that rendered
+          # only `3dam.1` would mean the graft in dam-cli's generate.rs stopped working.
+          pages=$(find packaging/man -name '3dam*.1' -o -name '3dam*.1.gz' | wc -l)
+          echo "staged ${pages} man pages"
+          [[ "${pages}" -gt 1 ]]
+
       # NOTE: the portable archive MUST be cut before the Tauri bundler runs. The bundler
       # rewrites the built binary in place ("Patching … with bundle type information: deb"),
       # stamping a fixed-width token that `tauri::process` reads back at runtime. Since
@@ -270,11 +308,18 @@ jobs:
           if [[ "${RUNNER_OS}" == "Windows" ]]; then bin=3dam.exe; fi
           rm -rf dist && mkdir -p dist
           cp "target/${TARGET}/release/${bin}" "dist/${bin}"
+          # Completions and man pages ride along in every portable archive, not just the .deb —
+          # the archive is the only channel for macOS and Windows, and for anyone on Linux who
+          # does not install the package (ADR 0009 §10). Same files on every platform: they are
+          # plain text describing the command tree, not host-specific, and pruning per-OS would
+          # cost more explaining than the few kB it saves.
+          cp -R packaging/completions dist/completions
+          cp -R packaging/man dist/man
           if [[ "${RUNNER_OS}" == "Windows" ]]; then
-            (cd dist && 7z a -tzip "../3dam-${TAG}-${TARGET}.zip" "${bin}" >/dev/null)
+            (cd dist && 7z a -tzip "../3dam-${TAG}-${TARGET}.zip" "${bin}" completions man >/dev/null)
           else
             chmod +x "dist/${bin}"
-            tar -czf "3dam-${TAG}-${TARGET}.tar.gz" -C dist "${bin}"
+            tar -czf "3dam-${TAG}-${TARGET}.tar.gz" -C dist "${bin}" completions man
           fi
 
       # The acceptance criterion for issue #45 is that each artifact actually launches on a
@@ -303,6 +348,13 @@ jobs:
           # 2. The engine opens a fresh catalog — which runs every schema migration — and
           #    emits the JSON contract the CLI promises.
           "${exe}" --data smoke/data stats --json | grep -q '"total"'
+
+          # 2b. The archive carries the completions and man pages, and the binary can still
+          #     render them (they are generated, not compiled in, so a broken `completions`
+          #     subcommand would otherwise only surface at the next release).
+          test -f smoke/unpacked/completions/3dam.bash
+          test -f smoke/unpacked/man/3dam.1 || test -f smoke/unpacked/man/3dam.1.gz
+          "${exe}" completions bash | grep -q '3dam'
 
           # 3. The serve role binds, answers /healthz, and serves the *embedded* client.
           #    Grepping for `assets/` distinguishes the real bundle from dam-server's

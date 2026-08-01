@@ -451,7 +451,67 @@ with **`if-no-files-found: error`** — with `warn`, a leg that produced nothing
 creates no artifact object at all, and `publish` then fails while downloading it, a long way
 from the cause.
 
-### 15.5.7 Smoke-testing the artifact
+### 15.5.7 Shell completions & man pages
+
+[ADR 0009 §10](../adr/0009-v1-scope-decisions.md) commits to shipping `clap_complete` shell
+completions and `clap_mangen` man pages. Both are **rendered at runtime by the binary the leg
+just built**, through two hidden verbs — `3dam completions <bash|zsh|fish|powershell>` and
+`3dam man` — each of which also takes `--out <DIR>` to write conventionally-named files instead
+of streaming to stdout.
+
+*Runtime verbs, not a `build.rs` and not an xtask that re-declares the grammar.* The clap tree in
+[13](13-cli.md) is the single source of truth and a build script cannot see it — it would have to
+parse or duplicate the derive types, which is exactly the second copy this avoids. Generating
+from the shipped binary makes the artifacts by construction the ones that binary accepts, and it
+gives users `eval "$(3dam completions zsh)"` with no download. The cost is that generation is a
+*packaging* step rather than a build output, hence `cargo xtask packaging [--target <triple>]`,
+which stages:
+
+```
+packaging/completions/{3dam.bash,_3dam,3dam.fish,_3dam.ps1}
+packaging/man/{3dam.1.gz, 3dam-scan.1.gz, 3dam-admin-token-add.1.gz, …}
+```
+
+One wrinkle: `serve` and `mcp` are roles that `classify` intercepts *before* the CLI grammar
+([01](01-architecture.md) §5), so their arguments live in their own `Parser` structs and are
+invisible to `Cli::command()`. Completions describe the *binary*, not the CLI role, so the
+generator grafts them back on — with a unit test guarding the graft, since losing it would
+silently drop two of the four roles from every completion script. `clap_mangen` then recurses,
+giving the deep `admin` tree a page each, which is the point: `man 3dam-admin-token-add` is
+where a reader actually looks. Pages are gzipped (Debian policy §12.1; the Tauri bundler
+compresses nothing but its own changelog), skipped with a notice where `gzip` is absent, since
+only the `.deb` needs the compressed form.
+
+Two consumers read that directory, and CI **asserts** the filenames rather than globbing them —
+the same reasoning as `Collect installers` (§15.5.6). `clap_complete` chooses these names and the
+shells' completion loaders look them up by name, so an upstream rename would otherwise ship a
+package whose completions silently never load, with every job still green.
+
+- **Every portable archive** carries `completions/` and `man/` beside the binary. The archive is
+  the only channel on macOS and Windows, and for anyone on Linux who does not install the package.
+- **The `.deb`** installs them to the usual paths via `bundle.linux.deb.files` in
+  [`tauri.conf.json`](../../crates/3dam-desktop/tauri.conf.json):
+  `/usr/share/bash-completion/completions/3dam`, `/usr/share/zsh/vendor-completions/_3dam`,
+  `/usr/share/fish/vendor_completions.d/3dam.fish`, and the whole man directory to
+  `/usr/share/man/man1`. Two things about that map are easy to get wrong: its *source* paths
+  resolve relative to the `tauri.conf.json` directory (not the workspace root), and **a missing
+  source is a hard bundler error**. Staging is therefore a prerequisite of `cargo tauri bundle`,
+  not an optional extra — `cargo xtask bundle` stages before it bundles, every time, so a renamed
+  subcommand cannot leave a stale page behind.
+
+Deliberately **not** in the AppImage: its bundler keeps a separate `files` map that does not
+inherit the deb's, and completions/man pages are inert inside an image that is never installed
+system-wide. PowerShell completions are likewise absent from the `.deb`, which has no
+conventional path for them — they ship in the archives.
+
+`packaging/` is a gitignored **top-level** directory rather than the more obvious
+`target/packaging/`, because `bundle.linux.deb.files` takes a *literal* string and cargo's target
+directory is not a fixed location — `[build] target-dir` in `~/.cargo/config.toml` or
+`CARGO_TARGET_DIR` relocates it wholesale, which is a normal thing for a developer to set. For
+the same reason `xtask packaging` renders through `cargo run` rather than executing a binary path
+it constructs: cargo knows where its own output lives, and we do not.
+
+### 15.5.8 Smoke-testing the artifact
 
 Acceptance for packaging is that the artifact *launches*, not that it builds. A CI runner is a
 clean machine, so each leg unpacks its own archive into a fresh directory and, against that
@@ -460,11 +520,14 @@ copy (which also proves the archive is well-formed):
 1. `3dam --version` matches the version this run claims to ship.
 2. `3dam --data <tmp> stats --json` opens a fresh catalog — running every schema migration —
    and emits the documented JSON.
-3. `3dam serve` binds, answers `/healthz`, and serves the **embedded** client: the response
+3. The unpacked archive carries `completions/3dam.bash` and a `man/3dam.1`, and the binary can
+   still render them on demand (`3dam completions bash`). They are generated rather than
+   compiled in, so without this a broken generator would only surface at the *next* release.
+4. `3dam serve` binds, answers `/healthz`, and serves the **embedded** client: the response
    body is grepped for `assets/`, which the "bundle is not present" placeholder does not
    contain, so a binary built without `web/dist` fails here instead of shipping.
 
-### 15.5.8 Publish
+### 15.5.9 Publish
 
 A `publish` job (`needs: [build]`, tag-gated):
 
@@ -489,7 +552,7 @@ packaging/release scope:
   Developer ID + notarization or Windows signing certificate, and no signing/notarization/stapling
   steps in §15.5.6 for v1. Revisit post-v1.
 - **Distribution channels beyond GitHub Releases.** Homebrew tap, winget, AUR,
-  `cargo-binstall` — which, and when. All TBD; GitHub Releases is the v1 channel (§15.5.8).
+  `cargo-binstall` — which, and when. All TBD; GitHub Releases is the v1 channel (§15.5.9).
 
 Owned in this file, surfaced for the roll-up ([00](00-overview.md) §Open questions):
 

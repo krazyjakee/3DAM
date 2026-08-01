@@ -23,9 +23,16 @@ fn main() -> ExitCode {
         "wasm" => build_wasm(),
         // Package the desktop app (deb/AppImage on Linux) via the Tauri bundler.
         "bundle" => bundle(),
+        // Render the shell completions + man pages the .deb and the release archives install.
+        // `--target <triple>` mirrors the release workflow, which cross-builds per matrix leg;
+        // it is passed through to the `cargo run` that renders them, so the files come from the
+        // binary that leg built.
+        "packaging" => stage_packaging(flag_value("--target").as_deref()),
         "check-deps" => check_deps(),
         other => {
-            eprintln!("unknown xtask '{other}'. try: ci | web | wasm | bundle | check-deps");
+            eprintln!(
+                "unknown xtask '{other}'. try: ci | web | wasm | bundle | packaging | check-deps"
+            );
             false
         }
     };
@@ -57,8 +64,135 @@ fn bundle() -> bool {
         return false;
     }
     let desktop = Path::new(env!("CARGO_MANIFEST_DIR")).join("../crates/3dam-desktop");
-    run("cargo", &["build", "-p", "dam", "--release"])
+    run("cargo", &["build", "-p", "dam", "--release", "--locked"])
+        // `tauri.conf.json` lists the staged files under `bundle.linux.deb.files`, and the bundler
+        // treats a missing source as a hard error ("… does not exist"), so this is a build
+        // prerequisite of the .deb — not an optional extra. Always re-staged rather than only when
+        // absent, so a renamed subcommand cannot leave a stale page behind.
+        && stage_packaging(None)
         && run_in(&desktop, "cargo", &["tauri", "bundle"])
+}
+
+/// The value following `flag` in argv, e.g. `--target x86_64-unknown-linux-gnu`.
+fn flag_value(flag: &str) -> Option<String> {
+    let args: Vec<String> = std::env::args().collect();
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1).cloned())
+}
+
+/// Staging directory for generated packaging assets, relative to the workspace root.
+///
+/// Deliberately **not** under `target/`, which would otherwise be the obvious home. The path has to
+/// appear as a literal string in `crates/3dam-desktop/tauri.conf.json` (`bundle.linux.deb.files`),
+/// and cargo's target directory is not a fixed location: `[build] target-dir` in `~/.cargo/config
+/// .toml` or `CARGO_TARGET_DIR` relocates it wholesale, which is a normal thing for a developer to
+/// set and is set on at least one machine here. Gitignored instead.
+const PACKAGING_DIR: &str = "packaging";
+
+/// The four shells ADR 0009 §10 commits to shipping, with the filename `clap_complete` gives each.
+/// The names are conventions the completion loaders rely on, so they are asserted rather than
+/// globbed — a rename upstream would otherwise quietly ship a .deb whose completions never load.
+const COMPLETIONS: &[(&str, &str)] = &[
+    ("bash", "3dam.bash"),
+    ("zsh", "_3dam"),
+    ("fish", "3dam.fish"),
+    ("powershell", "_3dam.ps1"),
+];
+
+/// Render the shell completions and man pages into `packaging/` (ADR 0009 §10, tech-spec 15 §15.5).
+///
+/// The binary generates these itself (`3dam completions <shell>` / `3dam man`) so the clap tree in
+/// `dam-cli` stays the only copy of the grammar; this task is just the staging layout that the
+/// Tauri deb config and the release archives both point at.
+///
+/// Invoked through `cargo run` rather than by executing a path we construct. Cargo knows where its
+/// own output lives; we do not — `[build] target-dir` and `CARGO_TARGET_DIR` both relocate it, and
+/// `--target <triple>` moves it again. Against an already-built binary this is a cache hit, so the
+/// cost is cargo's own no-op check.
+///
+/// The output lands in `packaging/` regardless of `target`, because `tauri.conf.json` has to name
+/// those paths as a literal string. That is correct rather than merely convenient: staging renders
+/// the *command tree*, which is identical across triples. `target` matters only so cargo runs the
+/// binary this leg actually built. Cross-running a triple the host cannot execute is out of scope —
+/// the release matrix runs each leg on its own OS.
+fn stage_packaging(target: Option<&str>) -> bool {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let out = root.join(PACKAGING_DIR);
+    // Start clean: a stale page for a subcommand that has since been renamed would otherwise be
+    // installed forever, since nothing else ever removes files from this directory.
+    let _ = std::fs::remove_dir_all(&out);
+    let (completions, man) = (out.join("completions"), out.join("man"));
+
+    // `--` separates cargo's own flags from the binary's argv.
+    let dam = |args: &[&str]| {
+        let mut argv = vec!["run", "-p", "dam", "--release", "--locked", "--quiet"];
+        if let Some(t) = target {
+            argv.extend(["--target", t]);
+        }
+        argv.push("--");
+        argv.extend(args);
+        run("cargo", &argv)
+    };
+
+    for (shell, _) in COMPLETIONS {
+        if !dam(&[
+            "completions",
+            shell,
+            "--out",
+            &completions.to_string_lossy(),
+        ]) {
+            return false;
+        }
+    }
+    if !dam(&["man", "--out", &man.to_string_lossy()]) {
+        return false;
+    }
+    for (shell, file) in COMPLETIONS {
+        if !completions.join(file).exists() {
+            eprintln!("xtask packaging: {shell} completions did not produce {file}");
+            return false;
+        }
+    }
+    gzip_man_pages(&man)
+}
+
+/// Compress the generated man pages in place (`3dam.1` → `3dam.1.gz`).
+///
+/// Debian policy §12.1 requires installed manual pages be compressed, and the Tauri bundler does
+/// no compression of its own — it only gzips the changelog it generates. Shelling out to `gzip`
+/// keeps xtask dependency-free; `-n` omits the timestamp so the output is reproducible.
+fn gzip_man_pages(man: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(man) else {
+        eprintln!(
+            "xtask packaging: no man pages were generated in {}",
+            man.display()
+        );
+        return false;
+    };
+    let pages: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "1"))
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    if pages.is_empty() {
+        eprintln!("xtask packaging: no *.1 man pages in {}", man.display());
+        return false;
+    }
+    if which("gzip").is_none() {
+        // Only the .deb needs the compressed form, and the deb bundler only runs on Linux, so a
+        // gzip-less Windows/macOS box can still bundle. Say so rather than failing silently.
+        eprintln!(
+            "xtask packaging: `gzip` not found — leaving {} man pages uncompressed (fine unless \
+             you are building the .deb, whose tauri.conf.json expects *.1.gz).",
+            pages.len()
+        );
+        return true;
+    }
+    let mut args = vec!["-9", "-n"];
+    args.extend(pages.iter().map(|s| s.as_str()));
+    run("gzip", &args)
 }
 
 /// Placeholder for the dependency-direction guard (tech-spec 01 §2): assert the allowed-edge

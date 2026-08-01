@@ -25,16 +25,22 @@ use url::Url;
 mod admin;
 mod args;
 mod dispatch;
+mod generate;
 mod support;
 
 use args::*;
 use dispatch::dispatch;
 use support::{init_tracing, parse_endpoint};
 
+/// The installed binary name (ADR 0010: package `dam`, binary `3dam`). It is spelled out rather
+/// than taken from `argv[0]` because it is baked into generated completions and man pages, where a
+/// name resolved from however the user happened to invoke the binary would be wrong.
+pub(crate) const BIN: &str = "3dam";
+
 /// Entry point for the CLI role (run-and-exit verbs).
 pub async fn run(args: Vec<OsString>) -> ExitCode {
     init_tracing();
-    let cli = match Cli::try_parse_from(std::iter::once(OsString::from("3dam")).chain(args)) {
+    let cli = match Cli::try_parse_from(std::iter::once(OsString::from(BIN)).chain(args)) {
         Ok(c) => c,
         Err(e) => {
             // clap prints help/usage itself; propagate its exit code sense.

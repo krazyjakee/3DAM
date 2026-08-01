@@ -18,6 +18,9 @@ dam-core.workspace = true
 # binary compiled without `model-convert` rather than failing per item (issue #49).
 dam-media.workspace = true
 clap.workspace = true
+# `completions` / `man` render from the live command tree (ADR 0009 §10) — see src/generate.rs.
+clap_complete.workspace = true
+clap_mangen.workspace = true
 tokio.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
