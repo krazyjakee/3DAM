@@ -630,7 +630,7 @@ function Collections({
                 title: `Delete collection “${c.name}”?`,
                 message: "The assets themselves are untouched.",
                 danger: true,
-                confirmLabel: "Delete",
+                confirmLabel: "Delete collection",
               })
             ) {
               if (activeId === c.id) onSelect(null);

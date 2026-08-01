@@ -4,7 +4,7 @@
 // call site reads almost like the native one — `if (await confirm({…}))` / `await prompt({…})` — via
 // a single provider that renders one modal at a time (focus-trapped, Escape-to-cancel).
 
-import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useId, useRef, useState } from "react";
 import type React from "react";
 import { X } from "lucide-react";
 import { useEscape, useFocusTrap } from "./use-focus-trap";
@@ -149,6 +149,8 @@ export function Modal({
 
 function ConfirmModal({ opts, onResult }: { opts: ConfirmOpts; onResult: (b: boolean) => void }) {
   const ref = useFocusTrap<HTMLDivElement>(true);
+  const titleId = useId();
+  const descriptionId = useId();
   useEscape(() => onResult(false));
   return (
     <Overlay onClose={() => onResult(false)}>
@@ -156,22 +158,25 @@ function ConfirmModal({ opts, onResult }: { opts: ConfirmOpts; onResult: (b: boo
         ref={ref}
         role="alertdialog"
         aria-modal="true"
-        aria-labelledby="confirm-dialog-title"
+        aria-labelledby={titleId}
+        aria-describedby={opts.message != null ? descriptionId : undefined}
         className="w-full max-w-[380px] rounded-lg border border-border bg-surface p-4 shadow-xl"
         onClick={(e) => e.stopPropagation()}
       >
-        <h2 id="confirm-dialog-title" className="text-sm font-semibold text-fg">
+        <h2 id={titleId} className="text-sm font-semibold text-fg">
           {opts.title}
         </h2>
         {opts.message != null && (
-          <div className="mt-2 text-xs whitespace-pre-line text-fg-muted">{opts.message}</div>
+          <div id={descriptionId} className="mt-2 text-xs whitespace-pre-line text-fg-muted">
+            {opts.message}
+          </div>
         )}
         <div className="mt-4 flex justify-end gap-2">
-          <button className="btn" onClick={() => onResult(false)}>
+          <button className="btn" autoFocus={opts.danger} onClick={() => onResult(false)}>
             {opts.cancelLabel ?? "Cancel"}
           </button>
           <button
-            autoFocus
+            autoFocus={!opts.danger}
             className={`btn ${opts.danger ? "text-danger" : "btn-accent"}`}
             style={
               opts.danger

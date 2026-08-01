@@ -802,11 +802,24 @@ function AccountsSection({
     });
   };
 
-  const signOutEverywhere = (a: AccountInfo) =>
-    run(`sess:${a.account_id}`, async () => {
+  const signOutEverywhere = async (a: AccountInfo) => {
+    if (
+      !(await confirm({
+        title: `Sign out “${a.username}” everywhere?`,
+        message:
+          a.account_id === currentAccountId
+            ? "This includes the session you're using. Every browser and device signed in to this account must sign in again."
+            : "Every browser and device signed in to this account must sign in again.",
+        danger: true,
+        confirmLabel: "Sign out everywhere",
+      }))
+    )
+      return;
+    void run(`sess:${a.account_id}`, async () => {
       const r = await admin.revokeAccountSessions(a.account_id);
       return `Signed out ${r.revoked} session${r.revoked === 1 ? "" : "s"}`;
     });
+  };
 
   const remove = async (a: AccountInfo) => {
     const isSelf = a.account_id === currentAccountId;
@@ -1096,12 +1109,13 @@ function MySessionsSection() {
 
   const revoke = async (s: SessionInfo) => {
     if (
-      s.current &&
       !(await confirm({
-        title: "Sign out this session?",
-        message: "This is the session you're using — revoking it signs this browser out.",
+        title: s.current ? "Sign out this session?" : "Revoke this session?",
+        message: s.current
+          ? "This is the session you're using. This browser must sign in again."
+          : "That browser or device loses access immediately and must sign in again.",
         danger: true,
-        confirmLabel: "Sign out",
+        confirmLabel: s.current ? "Sign out" : "Revoke session",
       }))
     )
       return;

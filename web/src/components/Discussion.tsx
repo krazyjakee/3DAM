@@ -9,6 +9,7 @@ import {
   useWhoami,
 } from "@/api/queries";
 import type { Asset, Comment } from "@/api/types";
+import { useDialogs } from "@/lib/dialogs";
 import { relTime } from "@/lib/format";
 
 /** Per-asset discussion (issue #82) — append-only, authored, time-ordered.
@@ -154,8 +155,23 @@ function Message({
 }) {
   const edit = useEditComment(assetId);
   const del = useDeleteComment(assetId);
+  const { confirm } = useDialogs();
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(comment.body);
+
+  const remove = async () => {
+    if (
+      !(await confirm({
+        title: "Delete this message?",
+        message:
+          "The message body will be removed from the discussion. A deletion marker remains, and this cannot be undone.",
+        danger: true,
+        confirmLabel: "Delete message",
+      }))
+    )
+      return;
+    del.mutate(comment.id);
+  };
 
   if (comment.deleted_at) {
     return (
@@ -192,7 +208,7 @@ function Message({
               <Pencil size={11} />
             </button>
             <button
-              onClick={() => del.mutate(comment.id)}
+              onClick={() => void remove()}
               title="Delete"
               aria-label="Delete message"
               className="text-fg-dim hover:text-danger coarse:min-h-11 coarse:min-w-11"
