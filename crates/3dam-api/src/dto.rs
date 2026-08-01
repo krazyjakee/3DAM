@@ -5,6 +5,16 @@ use crate::id::{AssetId, CollectionId, CommentId, ContentHash, JobId, SourceId};
 use crate::page::PageParams;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::pin::Pin;
+
+/// Materialised preview consumers are deliberately capped. The HTTP content transport uses
+/// [`AssetContentStream`] instead, so a video may be much larger without being held in memory.
+pub const MAX_MATERIALIZED_CONTENT_BYTES: u64 = 256 * 1024 * 1024;
+
+/// A bounded, cancellation-aware byte stream. Producers should yield modest chunks and stop when
+/// the consumer drops the stream; transports can then apply their normal backpressure.
+pub type ContentByteStream =
+    Pin<Box<dyn futures::Stream<Item = Result<Vec<u8>, crate::LibError>> + Send>>;
 
 /// A few media-specific display attributes carried on a summary row (bpm, dims, tris…).
 pub type SmallMap = BTreeMap<String, String>;
@@ -39,6 +49,54 @@ pub struct AssetContent {
     /// The asset's format token (e.g. `glb`, `wav`), for logging/labels.
     pub format: String,
     pub media: MediaType,
+}
+
+/// Metadata needed to decide HTTP range and validator semantics before any bytes are opened.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AssetContentMetadata {
+    pub len: u64,
+    pub content_type: String,
+    pub format: String,
+    pub media: MediaType,
+    /// A quoted strong entity tag when the catalog has a content hash. `None` means an `If-Range`
+    /// validator cannot be proved current and the caller must send the complete representation.
+    pub etag: Option<String>,
+}
+
+/// Inclusive byte bounds within one representation. Keeping resolution of HTTP's suffix/open
+/// forms in the server leaves this transport-neutral and makes an invalid range unrepresentable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContentRange {
+    first: u64,
+    last: u64,
+}
+
+impl ContentRange {
+    /// Construct inclusive bounds, rejecting reversed bounds and the singular `0..=u64::MAX`
+    /// interval whose mathematical length cannot be represented by `u64`.
+    pub fn new(first: u64, last: u64) -> Option<Self> {
+        (first <= last && (last - first).checked_add(1).is_some()).then_some(Self { first, last })
+    }
+
+    pub fn first(self) -> u64 {
+        self.first
+    }
+
+    pub fn last(self) -> u64 {
+        self.last
+    }
+
+    pub fn len(self) -> u64 {
+        self.last - self.first + 1
+    }
+}
+
+/// A content representation opened for bounded streaming. `metadata.len` is the complete
+/// representation length; `range` names the exact bytes this stream will produce.
+pub struct AssetContentStream {
+    pub metadata: AssetContentMetadata,
+    pub range: ContentRange,
+    pub bytes: ContentByteStream,
 }
 
 /// Best-effort MIME for a `(media, format)` pair — covers the v1 decode matrix (ADR 0009 §8) and
@@ -1471,6 +1529,16 @@ pub struct ExportReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_ranges_are_ordered_and_have_representable_lengths() {
+        let range = ContentRange::new(10, 15).unwrap();
+        assert_eq!(range.first(), 10);
+        assert_eq!(range.last(), 15);
+        assert_eq!(range.len(), 6);
+        assert!(ContentRange::new(15, 10).is_none());
+        assert!(ContentRange::new(0, u64::MAX).is_none());
+    }
 
     /// The convert target is the one DTO whose wire shape three independent clients hand-write
     /// (the CLI, `web/src/api/types.ts`, and MCP's untyped tool arguments), so its tag and its

@@ -23,7 +23,7 @@ mod upload;
 use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as AxPath, Query, State};
-use axum::http::{header, Extensions, HeaderMap, StatusCode, Uri, Version};
+use axum::http::{header, Extensions, HeaderMap, Method, StatusCode, Uri, Version};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -1265,73 +1265,171 @@ fn parse_range(spec: &str, len: u64) -> RangeSpec {
 /// `Accept-Ranges: bytes` is advertised on every response, including the unranged `200`, so the
 /// client knows seeking is available before it tries.
 ///
-/// Note this slices bytes already resident in memory: `read_content` materialises the whole asset,
-/// per the transport design in ADR 0012. Range therefore buys correct seek semantics and bounded
-/// *response* size, not bounded server memory — streaming a large file straight from the source
-/// would be a change to the `LibraryService` seam, and is the natural follow-up if video libraries
-/// get big.
-fn ranged_content_response(
-    content: AssetContent,
+/// Bytes are pulled directly from the capability-confined local handle or the remote source range
+/// API into a two-chunk producer window. Axum polls that stream as the socket accepts data; a
+/// disconnect drops it, which stops the source loop instead of finishing a gigabyte transfer.
+fn streamed_content_response(
+    content: AssetContentStream,
+    status: StatusCode,
     cache_control: &'static str,
-    range_header: Option<&str>,
 ) -> Response {
-    let len = content.bytes.len() as u64;
-    let Some(spec) = range_header else {
-        let mut res = content_response(content, cache_control);
-        res.headers_mut().insert(
-            header::ACCEPT_RANGES,
-            header::HeaderValue::from_static("bytes"),
+    let mut response = Response::new(Body::from_stream(content.bytes));
+    *response.status_mut() = status;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        content.metadata.content_type.parse().unwrap_or_else(|_| {
+            header::HeaderValue::from_static("application/octet-stream")
+        }),
+    );
+    headers.insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static(cache_control),
+    );
+    headers.insert(
+        header::ACCEPT_RANGES,
+        header::HeaderValue::from_static("bytes"),
+    );
+    headers.insert(
+        header::CONTENT_LENGTH,
+        header::HeaderValue::from_str(&content.range.len().to_string()).unwrap(),
+    );
+    if status == StatusCode::PARTIAL_CONTENT {
+        headers.insert(
+            header::CONTENT_RANGE,
+            header::HeaderValue::from_str(&format!(
+                "bytes {}-{}/{}",
+                content.range.first(), content.range.last(), content.metadata.len
+            ))
+            .unwrap(),
         );
-        return res;
-    };
-
-    match parse_range(spec, len) {
-        RangeSpec::Satisfiable(first, last) => {
-            let slice = content.bytes[first as usize..=last as usize].to_vec();
-            (
-                StatusCode::PARTIAL_CONTENT,
-                [
-                    (header::CONTENT_TYPE, content.content_type),
-                    (header::CACHE_CONTROL, cache_control.to_string()),
-                    (header::ACCEPT_RANGES, "bytes".to_string()),
-                    (header::CONTENT_RANGE, format!("bytes {first}-{last}/{len}")),
-                ],
-                Body::from(slice),
-            )
-                .into_response()
-        }
-        // Valid but past the end (including any range against an empty body) is the one case 416
-        // describes; a malformed or unimplemented spec is ignored, per `RangeSpec`.
-        RangeSpec::Unsatisfiable => (
-            StatusCode::RANGE_NOT_SATISFIABLE,
-            [(header::CONTENT_RANGE, format!("bytes */{len}"))],
-        )
-            .into_response(),
-        RangeSpec::Ignore => {
-            let mut res = content_response(content, cache_control);
-            res.headers_mut().insert(
-                header::ACCEPT_RANGES,
-                header::HeaderValue::from_static("bytes"),
-            );
-            res
+    }
+    if let Some(etag) = content.metadata.etag {
+        if let Ok(etag) = header::HeaderValue::from_str(&etag) {
+            headers.insert(header::ETAG, etag);
         }
     }
+    response
+}
+
+fn metadata_only_response(
+    metadata: &AssetContentMetadata,
+    status: StatusCode,
+    cache_control: &'static str,
+    content_range: Option<String>,
+) -> Response {
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = status;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        metadata.content_type.parse().unwrap_or_else(|_| {
+            header::HeaderValue::from_static("application/octet-stream")
+        }),
+    );
+    headers.insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static(cache_control),
+    );
+    headers.insert(
+        header::ACCEPT_RANGES,
+        header::HeaderValue::from_static("bytes"),
+    );
+    headers.insert(
+        header::CONTENT_LENGTH,
+        header::HeaderValue::from_str(
+            &if status == StatusCode::OK {
+                metadata.len
+            } else {
+                0
+            }
+            .to_string(),
+        )
+        .unwrap(),
+    );
+    if let Some(value) = content_range {
+        headers.insert(
+            header::CONTENT_RANGE,
+            header::HeaderValue::from_str(&value).unwrap(),
+        );
+    }
+    if let Some(etag) = metadata.etag.as_deref() {
+        if let Ok(etag) = header::HeaderValue::from_str(etag) {
+            headers.insert(header::ETAG, etag);
+        }
+    }
+    response
+}
+
+/// `If-Range` is deliberately strict. Only the strong content-hash tag emitted by this route can
+/// prove the requested range belongs to the current representation; weak tags, dates, malformed
+/// values, and assets without a hash all fall back to a complete `200` stream.
+fn if_range_matches(headers: &HeaderMap, metadata: &AssetContentMetadata) -> bool {
+    let Some(value) = headers.get(header::IF_RANGE) else {
+        return true;
+    };
+    let Ok(value) = value.to_str() else {
+        return false;
+    };
+    !value.starts_with("W/") && metadata.etag.as_deref() == Some(value.trim())
 }
 
 async fn asset_content(
     Reader(ctx): Reader,
     State(st): State<AppState>,
     AxPath(id): AxPath<String>,
+    method: Method,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let id: AssetId = parse_id(&id, "asset")?;
-    let content = st.lib.read_content(&ctx, &id).await?;
-    let range = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
-    Ok(ranged_content_response(
-        content,
-        "private, max-age=60",
-        range,
-    ))
+    let metadata = st.lib.content_metadata(&ctx, &id).await?;
+    const CACHE_CONTROL: &str = "private, max-age=60";
+
+    // HEAD describes the complete selected representation. Range is defined for GET; more
+    // importantly this branch never starts a source producer, so an availability probe is cheap.
+    if method == Method::HEAD {
+        return Ok(metadata_only_response(
+            &metadata,
+            StatusCode::OK,
+            CACHE_CONTROL,
+            None,
+        ));
+    }
+
+    let range = headers
+        .get(header::RANGE)
+        .and_then(|value| value.to_str().ok())
+        .filter(|_| if_range_matches(&headers, &metadata));
+    let (status, range) = match range.map(|value| parse_range(value, metadata.len)) {
+        Some(RangeSpec::Satisfiable(first, last)) => {
+            (
+                StatusCode::PARTIAL_CONTENT,
+                ContentRange::new(first, last).expect("a satisfiable range is ordered"),
+            )
+        }
+        Some(RangeSpec::Unsatisfiable) => {
+            return Ok(metadata_only_response(
+                &metadata,
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                CACHE_CONTROL,
+                Some(format!("bytes */{}", metadata.len)),
+            ));
+        }
+        Some(RangeSpec::Ignore) | None if metadata.len > 0 => (
+            StatusCode::OK,
+            ContentRange::new(0, metadata.len - 1).expect("non-empty full range is ordered"),
+        ),
+        Some(RangeSpec::Ignore) | None => {
+            return Ok(metadata_only_response(
+                &metadata,
+                StatusCode::OK,
+                CACHE_CONTROL,
+                None,
+            ));
+        }
+    };
+    let content = st.lib.stream_content(&ctx, &id, range).await?;
+    Ok(streamed_content_response(content, status, CACHE_CONTROL))
 }
 
 async fn asset_related(

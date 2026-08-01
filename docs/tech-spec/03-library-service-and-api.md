@@ -501,6 +501,7 @@ body, response, status).
 | POST | `/api/v1/query` | `QueryRequest` | `Page<AssetSummary>` | `query` |
 | POST | `/api/v1/facets` | `FacetRequest` | `FacetResult` | `facets` |
 | GET | `/api/v1/assets/{id}` | — | `Asset` | `get_asset` |
+| GET / HEAD | `/api/v1/assets/{id}/content` | `Range`, `If-Range` headers | streamed original bytes (`200`/`206`/`416`) | `content_metadata` + `stream_content` |
 | POST | `/api/v1/similar` | `SimilarRequest` | `Page<SimilarHit>` | `find_similar` |
 | POST | `/api/v1/duplicates` | `DuplicateRequest` | `Page<DuplicateGroup>` | `find_duplicates` |
 | GET | `/api/v1/stats` | — | `LibraryStats` | `library_stats` |
@@ -531,6 +532,15 @@ Notes: `query`/`similar`/`facets` are **POST** because the request body (filters
 rich and often too large/complex for a URL — this is a read, not a mutation. `fetch_preview` returns raw bytes with an
 `ETag`; it supports `If-None-Match` → `304` for cache reuse ([DESIGN_GUIDELINES](../DESIGN_GUIDELINES.md) §3.2).
 Preview/query for a **federated** asset transparently proxies from the origin peer ([07](07-sources-and-federation.md)).
+
+The original-content route is distinct from materialised previews. `HEAD` performs auth/visibility
+and source stat but opens no byte producer. `GET` accepts one byte range, advertises
+`Accept-Ranges: bytes`, emits the content-hash `ETag`, and honours `If-Range` only when that strong
+tag matches; otherwise it streams the complete representation. Malformed/unsupported range forms
+fall back to `200`, while a valid range beyond EOF returns `416` with `Content-Range: bytes */N`.
+Local, SFTP, and SMB producers keep a fixed chunk window and stop when the HTTP receiver drops, so
+memory is independent of the representation size. `read_content` remains capped at 256 MiB for
+callers that explicitly request a materialised `AssetContent` blob.
 
 ### 8.3 Streaming & live-update endpoints
 

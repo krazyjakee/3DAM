@@ -168,6 +168,9 @@ All three implement `FileSource` behind the trait; `3dam-core` above them is ide
 - `std::fs` / `tokio::fs`. `list_dir` streams `read_dir`; `open_reader` returns a seekable file. `capabilities = { seekable: true, watchable: true }`.
 - **Watch** via a filesystem-notification crate (inotify/FSEvents/ReadDirectoryChangesW behind `notify`), debounced (coalesce a burst of writes to one `Modified`), mapped to `WatchEvent`. On `Desync` (event-queue overflow, or a bind-mount going away and returning) → delta re-scan of the subtree ([§2.2](#22-delta-re-scan)).
 - **Offline** = the path is gone (unmounted drive, missing network mount presented as a local path). `health_check` stats the root; failure → `Offline`. Cached catalog rows and derivatives remain browsable and searchable; the assets show an offline badge and cannot be re-opened until the mount returns.
+- **Content ranges** open and seek the regular file through the registered root capability. The
+  HTTP media path never reopens an ambient pathname and never copies the full local asset to
+  scratch; path-based media handlers continue to use their private materialised copy.
 
 ### 3.2 SFTP (`sftp`)
 
@@ -175,6 +178,10 @@ All three implement `FileSource` behind the trait; `3dam-core` above them is ide
 - One pooled session per source; SFTP file handles for `open_reader`. `capabilities = { seekable: true, watchable: false }` — SFTP has no push notifications.
 - **No watch → poll.** `watch()` returns `None`; delta re-scan runs on a configurable interval (default off; opt-in per source) using `stat` etags. Cheap because it walks attributes, not bytes.
 - **Offline / unreachable.** Connect/handshake/timeout errors → `Offline { last_error }`; auth-declined (permission, expired key) → `Degraded` so [10](10-auth-accounts-and-flags.md) can prompt re-auth rather than the UI blaming the network. Reconnect is lazy with backoff on next access; the source's cached rows stay usable throughout.
+- **Content ranges** use SFTP stat plus seek on the open remote handle. Only the requested chunks
+  cross SSH; receiver cancellation stops the loop. A third-party backend without native range I/O
+  may use the trait's disk-backed, bounded-memory materialisation fallback and must report that
+  degraded behavior rather than pretending to be seekable.
 
 ### 3.3 SMB (`smb`)
 
@@ -182,6 +189,9 @@ All three implement `FileSource` behind the trait; `3dam-core` above them is ide
 - `open_reader` is `AsyncRead` with best-effort seek; `capabilities.seekable` reflects what the negotiated dialect supports. Handlers (04) needing random access fall back to buffered read when seek is unavailable.
 - **No reliable watch → poll**, as SFTP. (SMB change-notify exists but is uneven across servers; v1 treats SMB as poll-only and revisits notify as an open question.)
 - **Offline / unreachable.** Same policy as SFTP: unreachable host → `Offline`; auth rejection → `Degraded`. Session re-established lazily with backoff.
+- **Content ranges** issue SMB reads with explicit offsets and bounded block sizes, so a seek never
+  downloads the prefix or remainder. A short remote read is a fail-soft source error, not a
+  silently truncated `206`.
 
 **Shared offline invariant (all file sources).** Losing a source is never fatal ([§6.1](../PRODUCT_SPEC.md), [DESIGN_GUIDELINES §2](../DESIGN_GUIDELINES.md)): mark it `Offline`/`Degraded`, keep every cached catalog row, thumbnail, waveform, and embedding fully usable for browse/search/similarity, pause any in-flight scan at its cursor, and resume automatically when health returns.
 
@@ -321,6 +331,10 @@ The engine never blocks the user on the slowest peer ([DESIGN_GUIDELINES §1.1](
 - **License travels with the asset.** Each federated row carries the peer-published license/rights block ([PRODUCT_SPEC §5](../PRODUCT_SPEC.md), [§6.7](../PRODUCT_SPEC.md)) — SPDX id, rights summary, attribution, provenance — verbatim from the peer. The [license facet (03)](03-library-service-and-api.md) therefore works across peers unchanged ("commercial-use assets across every store I've connected"). 3DAM transports and displays it; pricing/gating by license stays the peer's concern.
 - **Read-only references.** A federated asset is a reference owned by a peer, tagged with its origin. 3DAM stores enough to list/filter/rank it (identity, key attributes, tags, license, preview ref) but **never** regenerates its derivatives — they were computed remotely ([DESIGN_GUIDELINES §2](../DESIGN_GUIDELINES.md)). No local write path mutates a federated asset.
 - **Remote-owned previews, fetched on demand + cached.** Previews resolve lazily through `fetch_preview()` and land in the local blob cache ([02](02-data-model-and-storage.md)) keyed by `(source_id, peer_asset_id, derivative_kind, remote_etag)`, so a thumbnail is pulled once and reused; a change of `remote_etag` (from a later `query`/`advertise`) invalidates the cache entry. The original file is downloaded only if the user explicitly asks *and* the peer's permissions allow — that is an explicit user action, never part of a query, and never triggers local reprocessing.
+- **Peer media stays streamed.** Original-content `HEAD` and byte ranges proxy through the peer's
+  ordinary authenticated content route. The API client validates the peer's `Content-Range` and
+  `Content-Length` before exposing its response stream; downstream disconnect drops the upstream
+  response too. The local server does not cache or materialise the original representation.
 
 ### 7.5 How much of a peer's catalog to cache
 

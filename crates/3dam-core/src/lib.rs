@@ -54,11 +54,6 @@ use tokio::sync::broadcast;
 
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
 
-/// Upper bound on a single preview read (tech-spec 09 §B.3). Preview islands want interactive assets,
-/// not arbitrary blobs; a larger file returns a typed error and the UI degrades to metadata. Config-
-/// tunable later (ADR 0009 §11 storage knobs); a constant for now.
-const MAX_CONTENT_BYTES: u64 = 256 * 1024 * 1024;
-
 /// Clamp for a thumbnail's long edge (tech-spec 04 §6.4). Small enough that generation stays cheap
 /// and the cache stays compact; large enough for a crisp inspector preview.
 const THUMB_MIN_EDGE: u32 = 16;
@@ -361,9 +356,10 @@ fn fetch_asset(
     fs.fetch(&asset.path)
 }
 
-/// Read an asset's bytes for a preview, bounded by the content cap. The size gate is checked
-/// against the stored size *before* any (possibly remote) fetch, so an oversized asset never
-/// triggers a download. Pure/blocking — called inside a `spawn_blocking` closure.
+/// Read an asset's bytes for a preview, bounded by the content cap. Both the cheap catalog size and
+/// a live source stat are checked before any (possibly remote) fetch, so a file which grew since its
+/// last scan cannot turn this materialising compatibility path into an unbounded allocation.
+/// Pure/blocking — called inside a `spawn_blocking` closure.
 fn read_asset_content(
     store: &Store,
     secrets: &credentials::SecretVault,
@@ -371,13 +367,29 @@ fn read_asset_content(
     scratch: &Path,
 ) -> Result<AssetContent, LibError> {
     let size = asset.summary.size;
-    if size > MAX_CONTENT_BYTES {
+    if size > MAX_MATERIALIZED_CONTENT_BYTES {
         return Err(LibError::Unsupported(format!(
-            "asset is {size} bytes; preview content is capped at {MAX_CONTENT_BYTES} bytes"
+            "asset is {size} bytes; preview content is capped at {MAX_MATERIALIZED_CONTENT_BYTES} bytes"
         )));
     }
-    let fetched = fetch_asset(store, secrets, asset, scratch)?;
+    let conn = secrets.resolve(store.get_source_connection(&asset.source_id)?)?;
+    let source = dam_sources::open_source(&conn, scratch)?;
+    let live_size = source.content_stat(&asset.path)?.len;
+    if live_size > MAX_MATERIALIZED_CONTENT_BYTES {
+        return Err(LibError::Unsupported(format!(
+            "asset is {live_size} bytes; preview content is capped at {MAX_MATERIALIZED_CONTENT_BYTES} bytes"
+        )));
+    }
+    let fetched = source.fetch(&asset.path)?;
     let abs = fetched.path();
+    let fetched_size = std::fs::metadata(abs)
+        .map_err(|e| LibError::Internal(format!("stat fetched {}: {e}", abs.display())))?
+        .len();
+    if fetched_size > MAX_MATERIALIZED_CONTENT_BYTES {
+        return Err(LibError::Unsupported(format!(
+            "asset is {fetched_size} bytes; preview content is capped at {MAX_MATERIALIZED_CONTENT_BYTES} bytes"
+        )));
+    }
     let bytes = std::fs::read(abs)
         .map_err(|e| LibError::Internal(format!("read {}: {e}", abs.display())))?;
     let media = asset.summary.media;
@@ -389,6 +401,39 @@ fn read_asset_content(
         format,
         media,
     })
+}
+
+fn content_metadata(asset: &Asset, stat: dam_sources::ContentStat) -> AssetContentMetadata {
+    AssetContentMetadata {
+        len: stat.len,
+        content_type: content_type_for(asset.summary.media, &asset.summary.format).to_string(),
+        format: asset.summary.format.clone(),
+        media: asset.summary.media,
+        etag: asset.hash.map(|hash| format!("\"{hash}\"")),
+    }
+}
+
+/// Open a bounded producer over one source. The queue holds at most two chunks (plus the producer
+/// and HTTP consumer's current chunks): `blocking_send` applies backpressure, and receiver drop
+/// tells every source backend to stop its range loop promptly.
+fn source_content_stream(
+    source: Box<dyn dam_sources::FileSource>,
+    path: String,
+    metadata: AssetContentMetadata,
+    range: ContentRange,
+) -> AssetContentStream {
+    let (sender, receiver) = tokio::sync::mpsc::channel(2);
+    tokio::task::spawn_blocking(move || {
+        let mut send = |chunk| sender.blocking_send(Ok(chunk)).is_ok();
+        if let Err(error) = source.read_range(&path, range.first(), range.len(), &mut send) {
+            let _ = sender.blocking_send(Err(error));
+        }
+    });
+    AssetContentStream {
+        metadata,
+        range,
+        bytes: Box::pin(tokio_stream::wrappers::ReceiverStream::new(receiver)),
+    }
 }
 
 /// Resolve `rel` against the *directory* of `base` (a source-relative path), normalising `.`/`..`
@@ -452,14 +497,21 @@ fn read_related_content(
     let target = resolve_sibling(&asset.path, rel)?;
     let conn = secrets.resolve(store.get_source_connection(&asset.source_id)?)?;
     let fs = dam_sources::open_source(&conn, scratch)?;
+    let size = fs.content_stat(&target)?.len;
+    if size > MAX_MATERIALIZED_CONTENT_BYTES {
+        return Err(LibError::Unsupported(format!(
+            "related file is {} bytes; preview content is capped at {MAX_MATERIALIZED_CONTENT_BYTES} bytes",
+            size
+        )));
+    }
     let fetched = fs.fetch(&target)?;
     let abs = fetched.path();
-    let meta = std::fs::metadata(abs)
-        .map_err(|e| LibError::NotFound(format!("related file {target}: {e}")))?;
-    if meta.len() > MAX_CONTENT_BYTES {
+    let fetched_size = std::fs::metadata(abs)
+        .map_err(|e| LibError::Internal(format!("stat fetched {}: {e}", abs.display())))?
+        .len();
+    if fetched_size > MAX_MATERIALIZED_CONTENT_BYTES {
         return Err(LibError::Unsupported(format!(
-            "related file is {} bytes; preview content is capped at {MAX_CONTENT_BYTES} bytes",
-            meta.len()
+            "related file is {fetched_size} bytes; preview content is capped at {MAX_MATERIALIZED_CONTENT_BYTES} bytes"
         )));
     }
     let bytes = std::fs::read(abs)
@@ -1110,6 +1162,72 @@ impl LibraryService for EmbeddedLibrary {
                     .ok_or_else(|| LibError::NotFound(format!("asset {id}")))
             }
             r => r,
+        }
+    }
+
+    async fn content_metadata(
+        &self,
+        ctx: &AuthContext,
+        id: &AssetId,
+    ) -> Result<AssetContentMetadata, LibError> {
+        self.require_asset_visible(ctx, id).await?;
+        let id = *id;
+        let scratch = self.scratch();
+        let secrets = self.secrets.clone();
+        let local = self
+            .db(move |store| {
+                let asset = store.get_asset(&id)?;
+                let connection = secrets.resolve(store.get_source_connection(&asset.source_id)?)?;
+                let source = dam_sources::open_source(&connection, &scratch)?;
+                let stat = source.content_stat(&asset.path)?;
+                Ok(content_metadata(&asset, stat))
+            })
+            .await;
+        match local {
+            Err(LibError::NotFound(_)) if ctx.visibility.is_full() => {
+                federation::proxy_content_metadata(self, &id)
+                    .await
+                    .ok_or_else(|| LibError::NotFound(format!("asset {id}")))
+            }
+            result => result,
+        }
+    }
+
+    async fn stream_content(
+        &self,
+        ctx: &AuthContext,
+        id: &AssetId,
+        range: ContentRange,
+    ) -> Result<AssetContentStream, LibError> {
+        self.require_asset_visible(ctx, id).await?;
+        let id = *id;
+        let scratch = self.scratch();
+        let secrets = self.secrets.clone();
+        let local = self
+            .db(move |store| {
+                let asset = store.get_asset(&id)?;
+                let connection = secrets.resolve(store.get_source_connection(&asset.source_id)?)?;
+                let source = dam_sources::open_source(&connection, &scratch)?;
+                let stat = source.content_stat(&asset.path)?;
+                if range.last() >= stat.len {
+                    return Err(LibError::BadRequest(
+                        "content stream range is outside the representation".into(),
+                    ));
+                }
+                let metadata = content_metadata(&asset, stat);
+                Ok((source, asset.path, metadata))
+            })
+            .await;
+        match local {
+            Ok((source, path, metadata)) => {
+                Ok(source_content_stream(source, path, metadata, range))
+            }
+            Err(LibError::NotFound(_)) if ctx.visibility.is_full() => {
+                federation::proxy_stream_content(self, &id, range)
+                    .await
+                    .ok_or_else(|| LibError::NotFound(format!("asset {id}")))
+            }
+            Err(error) => Err(error),
         }
     }
 

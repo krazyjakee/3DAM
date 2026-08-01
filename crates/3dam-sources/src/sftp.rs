@@ -10,7 +10,7 @@
 //! the portable source connection contains only non-secret host/path/user fields (issue #103).
 //! The server host key is trust-on-first-use (accepted) — a documented v1 limitation.
 
-use crate::{guard_rel_path, Fetched, FileEntry, FileSource, SftpConfig};
+use crate::{guard_rel_path, ContentStat, Fetched, FileEntry, FileSource, SftpConfig};
 use dam_api::LibError;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
@@ -203,6 +203,56 @@ impl FileSource for SftpSource {
         })?;
         std::io::Write::flush(&mut sink).ok();
         Ok(Fetched::Temp(sink))
+    }
+
+    fn content_stat(&self, rel_path: &str) -> Result<ContentStat, LibError> {
+        let rel_path = guard_rel_path(rel_path)?;
+        let abs = self.remote_path(&rel_path);
+        self.rt.block_on(async {
+            let session = self.session.lock().await;
+            let metadata = session.metadata(abs.clone()).await.map_err(|e| {
+                LibError::SourceUnavailable(format!("sftp stat {abs}: {e}"))
+            })?;
+            Ok(ContentStat {
+                len: metadata.len(),
+                modified_ms: metadata.modified().ok().and_then(crate::system_time_ms),
+            })
+        })
+    }
+
+    fn read_range(
+        &self,
+        rel_path: &str,
+        offset: u64,
+        mut length: u64,
+        sink: &mut dyn FnMut(Vec<u8>) -> bool,
+    ) -> Result<(), LibError> {
+        let rel_path = guard_rel_path(rel_path)?;
+        let abs = self.remote_path(&rel_path);
+        self.rt.block_on(async {
+            use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+            let session = self.session.lock().await;
+            let mut remote = session.open(abs.clone()).await.map_err(|e| {
+                LibError::SourceUnavailable(format!("sftp open {abs}: {e}"))
+            })?;
+            remote
+                .seek(std::io::SeekFrom::Start(offset))
+                .await
+                .map_err(|e| LibError::SourceUnavailable(format!("sftp seek {abs}: {e}")))?;
+            while length > 0 {
+                let wanted = length.min(crate::FETCH_CHUNK as u64) as usize;
+                let mut chunk = vec![0u8; wanted];
+                remote.read_exact(&mut chunk).await.map_err(|e| {
+                    LibError::SourceUnavailable(format!("sftp range read {abs}: {e}"))
+                })?;
+                length -= wanted as u64;
+                if !sink(chunk) {
+                    return Ok(());
+                }
+            }
+            Ok(())
+        })
     }
 
     // ── write side (issue #80 slice 7) ───────────────────────────────────────

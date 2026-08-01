@@ -242,6 +242,86 @@ impl ApiClient {
         Ok((content_type, bytes))
     }
 
+    /// Materialise a raw response while enforcing the cap against both the declared and actual
+    /// bytes. The prior `HEAD` is only an optimisation: a changed or dishonest peer cannot turn it
+    /// into an unbounded `Response::bytes()` allocation.
+    async fn fetch_bytes_bounded(
+        &self,
+        req: reqwest::RequestBuilder,
+        ceiling: u64,
+    ) -> Result<(Option<String>, Vec<u8>), LibError> {
+        let response = req
+            .send()
+            .await
+            .map_err(|error| LibError::SourceUnavailable(error.to_string()))?;
+        let status = response.status();
+        if !status.is_success() {
+            // Do not materialise an untrusted error body on the content path. The status is enough
+            // to fail this compatibility read; structured errors remain available on JSON calls.
+            return Err(LibError::Upstream(format!("HTTP {}", status.as_u16())));
+        }
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let announced = response.content_length();
+        if announced.is_some_and(|length| length > ceiling) {
+            return Err(LibError::Unsupported(format!(
+                "asset is larger than the {ceiling}-byte preview content cap"
+            )));
+        }
+        let capacity = announced
+            .and_then(|length| usize::try_from(length).ok())
+            .unwrap_or(0);
+        let mut bytes = Vec::with_capacity(capacity);
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| LibError::Upstream(error.to_string()))?;
+            let actual = (bytes.len() as u64)
+                .checked_add(chunk.len() as u64)
+                .ok_or_else(|| LibError::Unsupported("preview content is too large".into()))?;
+            if actual > ceiling {
+                return Err(LibError::Unsupported(format!(
+                    "asset is larger than the {ceiling}-byte preview content cap"
+                )));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok((content_type, bytes))
+    }
+
+    fn content_metadata_from_headers(
+        headers: &reqwest::header::HeaderMap,
+        len: u64,
+    ) -> AssetContentMetadata {
+        let content_type = headers
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        let (media, format) = media_from_content_type(&content_type);
+        let etag = headers
+            .get(reqwest::header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        AssetContentMetadata {
+            len,
+            content_type,
+            format,
+            media,
+            etag,
+        }
+    }
+
+    fn response_content_len(headers: &reqwest::header::HeaderMap) -> Result<u64, LibError> {
+        headers
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse().ok())
+            .ok_or_else(|| LibError::Upstream("content response omitted Content-Length".into()))
+    }
+
     async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, LibError> {
         let resp = self
             .http
@@ -513,15 +593,23 @@ impl LibraryService for ApiClient {
 
     async fn read_content(
         &self,
-        _ctx: &AuthContext,
+        ctx: &AuthContext,
         id: &AssetId,
     ) -> Result<AssetContent, LibError> {
+        let metadata = self.content_metadata(ctx, id).await?;
+        if metadata.len > MAX_MATERIALIZED_CONTENT_BYTES {
+            return Err(LibError::Unsupported(format!(
+                "asset is {} bytes; preview content is capped at {MAX_MATERIALIZED_CONTENT_BYTES} bytes",
+                metadata.len
+            )));
+        }
         // Raw bytes, not JSON — reconstruct `AssetContent` from the HTTP response. Media/format are
         // recovered from the `Content-Type` header (the server sets it via `content_type_for`).
         let (ct, bytes) = self
-            .fetch_bytes(
+            .fetch_bytes_bounded(
                 self.http
                     .get(self.url(&format!("/api/v1/assets/{id}/content"))?),
+                MAX_MATERIALIZED_CONTENT_BYTES,
             )
             .await?;
         let content_type = ct.unwrap_or_else(|| "application/octet-stream".to_string());
@@ -531,6 +619,97 @@ impl LibraryService for ApiClient {
             content_type,
             format,
             media,
+        })
+    }
+
+    async fn content_metadata(
+        &self,
+        _ctx: &AuthContext,
+        id: &AssetId,
+    ) -> Result<AssetContentMetadata, LibError> {
+        let response = self
+            .http
+            .head(self.url(&format!("/api/v1/assets/{id}/content"))?)
+            .send()
+            .await
+            .map_err(|error| LibError::SourceUnavailable(error.to_string()))?;
+        if !response.status().is_success() {
+            return Err(LibError::Upstream(format!(
+                "HTTP {}",
+                response.status().as_u16()
+            )));
+        }
+        let len = Self::response_content_len(response.headers())?;
+        Ok(Self::content_metadata_from_headers(response.headers(), len))
+    }
+
+    async fn stream_content(
+        &self,
+        _ctx: &AuthContext,
+        id: &AssetId,
+        range: ContentRange,
+    ) -> Result<AssetContentStream, LibError> {
+        let response = self
+            .http
+            .get(self.url(&format!("/api/v1/assets/{id}/content"))?)
+            .header(
+                reqwest::header::RANGE,
+                format!("bytes={}-{}", range.first(), range.last()),
+            )
+            .send()
+            .await
+            .map_err(|error| LibError::SourceUnavailable(error.to_string()))?;
+        if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+            return Err(LibError::Upstream(format!(
+                "range endpoint returned HTTP {}",
+                response.status().as_u16()
+            )));
+        }
+        let content_range = response
+            .headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| LibError::Upstream("range response omitted Content-Range".into()))?;
+        let (bounds, total_len) = content_range
+            .strip_prefix("bytes ")
+            .and_then(|value| value.split_once('/'))
+            .ok_or_else(|| LibError::Upstream("range response has invalid Content-Range".into()))?;
+        let (first, last) = bounds
+            .split_once('-')
+            .ok_or_else(|| LibError::Upstream("range response has invalid Content-Range".into()))?;
+        let first = first
+            .parse()
+            .map_err(|_| LibError::Upstream("range response has invalid Content-Range".into()))?;
+        let last = last
+            .parse()
+            .map_err(|_| LibError::Upstream("range response has invalid Content-Range".into()))?;
+        let total_len = total_len
+            .parse()
+            .map_err(|_| LibError::Upstream("range response has invalid Content-Range".into()))?;
+        if first != range.first() || last != range.last() {
+            return Err(LibError::Upstream(
+                "range response bounds do not match the request".into(),
+            ));
+        }
+        if range.last() >= total_len {
+            return Err(LibError::Upstream(
+                "range response bounds exceed the representation length".into(),
+            ));
+        }
+        if Self::response_content_len(response.headers())? != range.len() {
+            return Err(LibError::Upstream(
+                "range response Content-Length does not match the request".into(),
+            ));
+        }
+        let metadata = Self::content_metadata_from_headers(response.headers(), total_len);
+        let bytes = response.bytes_stream().map(|item| {
+            item.map(|chunk| chunk.to_vec())
+                .map_err(|error| LibError::Upstream(error.to_string()))
+        });
+        Ok(AssetContentStream {
+            metadata,
+            range,
+            bytes: Box::pin(bytes),
         })
     }
 
@@ -1044,6 +1223,48 @@ impl LibraryService for ApiClient {
 mod tests {
     use super::*;
 
+    async fn range_server(
+        headers: &'static str,
+        body: &'static [u8],
+    ) -> (Url, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 8192];
+            let read = socket.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..read]).into_owned();
+            socket
+                .write_all(format!("HTTP/1.1 206 Partial Content\r\n{headers}\r\n").as_bytes())
+                .await
+                .unwrap();
+            for chunk in body.chunks(3) {
+                if socket.write_all(chunk).await.is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            request
+        });
+        (Url::parse(&format!("http://{address}/")).unwrap(), task)
+    }
+
+    async fn raw_server(response: &'static [u8]) -> Url {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 8192];
+            let _ = socket.read(&mut request).await;
+            let _ = socket.write_all(response).await;
+        });
+        Url::parse(&format!("http://{address}/")).unwrap()
+    }
+
     /// [`media_from_content_type`] is the documented inverse of `dto::content_type_for`, and the
     /// two live in different crates — nothing but this test stops them drifting. Only the media
     /// *class* has to survive the round trip: the format token is informational, and a MIME shared
@@ -1083,5 +1304,55 @@ mod tests {
                 assert_eq!(got, *media, "{f} served as {ct} came back as {got:?}");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn client_range_stream_validates_wire_bounds_without_materialising_the_total() {
+        let (endpoint, request) = range_server(
+            "Content-Type: video/mp4\r\nContent-Length: 6\r\nContent-Range: bytes 10-15/300000000\r\nETag: \"peer-hash\"\r\nConnection: close\r\n",
+            b"abcdef",
+        )
+        .await;
+        let client = ApiClient::connect(endpoint).await.unwrap();
+        let range = ContentRange::new(10, 15).unwrap();
+        let mut content = client
+            .stream_content(&AuthContext::embedded(), &AssetId::new(), range)
+            .await
+            .unwrap();
+        assert_eq!(content.metadata.len, 300_000_000);
+        assert_eq!(content.metadata.media, MediaType::Video);
+        let mut received = Vec::new();
+        while let Some(chunk) = content.bytes.next().await {
+            received.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(received, b"abcdef");
+        let request = request.await.unwrap();
+        assert!(request.to_ascii_lowercase().contains("range: bytes=10-15\r\n"));
+
+        let (endpoint, request) = range_server(
+            "Content-Type: video/mp4\r\nContent-Length: 5\r\nContent-Range: bytes 10-15/300000000\r\nConnection: close\r\n",
+            b"abcde",
+        )
+        .await;
+        let client = ApiClient::connect(endpoint).await.unwrap();
+        let error = client
+            .stream_content(&AuthContext::embedded(), &AssetId::new(), range)
+            .await
+            .err()
+            .expect("mismatched Content-Length must fail before exposing a stream");
+        assert!(matches!(error, LibError::Upstream(_)));
+        request.await.unwrap();
+
+        let endpoint = raw_server(
+            b"HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n3\r\nabc\r\n3\r\ndef\r\n0\r\n\r\n",
+        )
+        .await;
+        let client = ApiClient::connect(endpoint).await.unwrap();
+        let error = client
+            .fetch_bytes_bounded(client.http.get(client.url("content").unwrap()), 4)
+            .await
+            .err()
+            .expect("actual streamed bytes must enforce the materialisation cap");
+        assert!(matches!(error, LibError::Unsupported(_)));
     }
 }

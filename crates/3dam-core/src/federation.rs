@@ -664,6 +664,32 @@ pub(crate) async fn proxy_read_content(
     .await
 }
 
+/// Stat and stream peer-owned content through the peer's HTTP range transport. No cache is used:
+/// validators and revocation remain the owning peer's authority, and dropping the downstream body
+/// drops reqwest's upstream response stream as well.
+pub(crate) async fn proxy_content_metadata(
+    lib: &EmbeddedLibrary,
+    id: &AssetId,
+) -> Option<AssetContentMetadata> {
+    let id = *id;
+    try_peers(lib, |peer| async move {
+        peer.client.content_metadata(&ectx(), &id).await
+    })
+    .await
+}
+
+pub(crate) async fn proxy_stream_content(
+    lib: &EmbeddedLibrary,
+    id: &AssetId,
+    range: ContentRange,
+) -> Option<AssetContentStream> {
+    let id = *id;
+    try_peers(lib, |peer| async move {
+        peer.client.stream_content(&ectx(), &id, range).await
+    })
+    .await
+}
+
 pub(crate) async fn proxy_read_related(
     lib: &EmbeddedLibrary,
     id: &AssetId,

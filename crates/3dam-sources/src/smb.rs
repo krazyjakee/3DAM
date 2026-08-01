@@ -10,13 +10,13 @@
 //! Only the default SMB port is supported in v1 (share_connect resolves the server from the UNC);
 //! a non-default port is rejected up front rather than silently ignored.
 
-use crate::{guard_rel_path, Fetched, FileEntry, FileSource, SmbConfig};
+use crate::{guard_rel_path, ContentStat, Fetched, FileEntry, FileSource, SmbConfig};
 use dam_api::LibError;
 use futures::StreamExt;
 use smb::create::CreateDisposition;
 use smb::resource::{Directory, Resource};
 use smb::{
-    Client, ClientConfig, CreateOptions, FileAccessMask, FileAttributes, FileCreateArgs,
+    Client, ClientConfig, CreateOptions, FileAccessMask, FileAttributes, FileCreateArgs, GetLen,
     FileDirectoryInformation, UncPath,
 };
 use std::str::FromStr;
@@ -139,6 +139,90 @@ impl FileSource for SmbSource {
             .block_on(read_file_into(&self.client, &unc, &mut sink))?;
         std::io::Write::flush(&mut sink).ok();
         Ok(Fetched::Temp(sink))
+    }
+
+    fn content_stat(&self, rel_path: &str) -> Result<ContentStat, LibError> {
+        let rel_path = guard_rel_path(rel_path)?;
+        let unc = self.unc_for(&rel_path);
+        self.rt.block_on(async {
+            let args = FileCreateArgs::make_open_existing(
+                FileAccessMask::new().with_generic_read(true),
+            );
+            let resource = self.client.create_file(&unc, &args).await.map_err(|e| {
+                LibError::SourceUnavailable(format!("smb stat {rel_path}: {e}"))
+            })?;
+            let file = match resource {
+                Resource::File(file) => file,
+                other => {
+                    close_resource(other).await;
+                    return Err(LibError::NotFound(format!("source file {rel_path}")));
+                }
+            };
+            let len = file.get_len().await.map_err(|e| {
+                LibError::SourceUnavailable(format!("smb stat {rel_path}: {e}"))
+            });
+            let _ = file.close().await;
+            Ok(ContentStat {
+                len: len?,
+                modified_ms: None,
+            })
+        })
+    }
+
+    fn read_range(
+        &self,
+        rel_path: &str,
+        offset: u64,
+        mut length: u64,
+        sink: &mut dyn FnMut(Vec<u8>) -> bool,
+    ) -> Result<(), LibError> {
+        let rel_path = guard_rel_path(rel_path)?;
+        let unc = self.unc_for(&rel_path);
+        self.rt.block_on(async {
+            let args = FileCreateArgs::make_open_existing(
+                FileAccessMask::new().with_generic_read(true),
+            );
+            let resource = self.client.create_file(&unc, &args).await.map_err(|e| {
+                LibError::SourceUnavailable(format!("smb open {rel_path}: {e}"))
+            })?;
+            let file = match resource {
+                Resource::File(file) => file,
+                other => {
+                    close_resource(other).await;
+                    return Err(LibError::NotFound(format!("source file {rel_path}")));
+                }
+            };
+            let result = async {
+                let mut position = offset;
+                while length > 0 {
+                    let wanted = length.min(crate::FETCH_CHUNK as u64) as usize;
+                    let mut chunk = vec![0u8; wanted];
+                    let read = file
+                        .read_block(&mut chunk, position, None, false)
+                        .await
+                        .map_err(|e| {
+                            LibError::SourceUnavailable(format!(
+                                "smb range read {rel_path}: {e}"
+                            ))
+                        })?;
+                    if read == 0 {
+                        return Err(LibError::SourceUnavailable(
+                            "content changed or ended during range read".into(),
+                        ));
+                    }
+                    chunk.truncate(read);
+                    position += read as u64;
+                    length -= read as u64;
+                    if !sink(chunk) {
+                        return Ok(());
+                    }
+                }
+                Ok(())
+            }
+            .await;
+            let _ = file.close().await;
+            result
+        })
     }
 
     // ── write side (issue #80 slice 7) ───────────────────────────────────────

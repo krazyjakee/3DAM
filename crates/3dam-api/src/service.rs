@@ -351,6 +351,24 @@ pub trait LibraryService: Send + Sync {
     async fn read_content(&self, ctx: &AuthContext, id: &AssetId)
         -> Result<AssetContent, LibError>;
 
+    /// Describe the original representation without opening its byte stream. Servers use this to
+    /// answer `HEAD`, resolve `Range`, and reject `416` before a local or remote transfer starts.
+    async fn content_metadata(
+        &self,
+        ctx: &AuthContext,
+        id: &AssetId,
+    ) -> Result<AssetContentMetadata, LibError>;
+
+    /// Stream an exact inclusive range of the original representation. Unlike [`Self::read_content`]
+    /// this is not subject to the preview materialisation cap: memory is bounded by the producer's
+    /// chunk/window size, and dropping the returned stream cooperatively cancels source I/O.
+    async fn stream_content(
+        &self,
+        ctx: &AuthContext,
+        id: &AssetId,
+        range: ContentRange,
+    ) -> Result<AssetContentStream, LibError>;
+
     /// Read a file referenced *by relative path* from an asset's own directory within the same
     /// source — the loose-glTF case where a `.gltf` points at sibling `.bin`/texture files by
     /// relative URI (issue #56). `rel` is resolved against the asset's directory and confined to the

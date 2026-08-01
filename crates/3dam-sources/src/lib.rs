@@ -36,6 +36,15 @@ pub struct FileEntry {
     pub modified_ms: Option<i64>,
 }
 
+/// Stable facts needed before opening a range stream. Backends obtain these without downloading
+/// the representation; the default implementation is a bounded-memory disk-materialising fallback
+/// for third-party backends which have not implemented native stat/range operations yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContentStat {
+    pub len: u64,
+    pub modified_ms: Option<i64>,
+}
+
 /// A locally-readable handle to an entry's bytes. Every backend materialises a private temp file,
 /// removed on drop, so path-based media handlers never reopen an attacker-swappable source path.
 pub enum Fetched {
@@ -65,6 +74,39 @@ pub trait FileSource: Send + Sync {
     /// Resolve an entry's bytes to a private local path for the media handlers. Guards all rooted,
     /// prefixed, URL, and traversal shapes and pins local reads to the registered root capability.
     fn fetch(&self, rel_path: &str) -> Result<Fetched, LibError>;
+
+    /// Stat one source-relative file without reading its contents.
+    fn content_stat(&self, rel_path: &str) -> Result<ContentStat, LibError> {
+        let fetched = self.fetch(rel_path)?;
+        let metadata = std::fs::metadata(fetched.path())
+            .map_err(|e| LibError::SourceUnavailable(format!("content stat: {e}")))?;
+        Ok(ContentStat {
+            len: metadata.len(),
+            modified_ms: metadata.modified().ok().and_then(system_time_ms),
+        })
+    }
+
+    /// Read exactly `length` bytes starting at `offset`, yielding bounded chunks to `sink`.
+    /// `sink == false` is cooperative cancellation (normally an HTTP client disconnected).
+    ///
+    /// The default keeps memory bounded by one chunk but materialises the remote object to scratch;
+    /// built-in local, SFTP, and SMB sources override this with direct seek/range I/O.
+    fn read_range(
+        &self,
+        rel_path: &str,
+        offset: u64,
+        length: u64,
+        sink: &mut dyn FnMut(Vec<u8>) -> bool,
+    ) -> Result<(), LibError> {
+        use std::io::{Read, Seek};
+
+        let fetched = self.fetch(rel_path)?;
+        let mut file = std::fs::File::open(fetched.path())
+            .map_err(|e| LibError::SourceUnavailable(format!("content open: {e}")))?;
+        file.seek(std::io::SeekFrom::Start(offset))
+            .map_err(|e| LibError::SourceUnavailable(format!("content seek: {e}")))?;
+        copy_range(&mut file, length, sink)
+    }
 
     // ── write side (issue #80) ───────────────────────────────────────────────
     //
@@ -752,6 +794,35 @@ pub(crate) fn guard_rel_path(rel_path: &str) -> Result<String, LibError> {
 /// amortised and small enough that a pool of concurrent fetches is still nothing.
 pub(crate) const FETCH_CHUNK: usize = 256 * 1024;
 
+/// Copy an exact range from a blocking reader without allocating in proportion to the asset.
+fn copy_range(
+    reader: &mut dyn std::io::Read,
+    mut remaining: u64,
+    sink: &mut dyn FnMut(Vec<u8>) -> bool,
+) -> Result<(), LibError> {
+    while remaining > 0 {
+        let wanted = remaining.min(FETCH_CHUNK as u64) as usize;
+        let mut chunk = vec![0u8; wanted];
+        let mut filled = 0;
+        while filled < wanted {
+            let read = reader
+                .read(&mut chunk[filled..])
+                .map_err(|e| LibError::SourceUnavailable(format!("content read: {e}")))?;
+            if read == 0 {
+                return Err(LibError::SourceUnavailable(
+                    "content changed or ended during range read".into(),
+                ));
+            }
+            filled += read;
+        }
+        remaining -= filled as u64;
+        if !sink(chunk) {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
 /// Filename prefix every fetched-byte materialisation carries (remote download or secured local
 /// copy). Also what [`clean_scratch`] matches, so changing it would orphan older leftovers.
 pub(crate) const SCRATCH_PREFIX: &str = "3dam-remote-";
@@ -974,6 +1045,34 @@ impl FileSource for LocalFsSource {
         self.fetch_after_validation(&rel, || {})
     }
 
+    fn content_stat(&self, rel_path: &str) -> Result<ContentStat, LibError> {
+        let rel = guard_rel_path(rel_path)?;
+        let file = self.open_content_file(&rel)?;
+        let metadata = file
+            .metadata()
+            .map_err(|_| LibError::NotFound("source file is unavailable".into()))?;
+        Ok(ContentStat {
+            len: metadata.len(),
+            modified_ms: metadata.modified().ok().and_then(system_time_ms),
+        })
+    }
+
+    fn read_range(
+        &self,
+        rel_path: &str,
+        offset: u64,
+        length: u64,
+        sink: &mut dyn FnMut(Vec<u8>) -> bool,
+    ) -> Result<(), LibError> {
+        use std::io::Seek;
+
+        let rel = guard_rel_path(rel_path)?;
+        let mut file = self.open_content_file(&rel)?;
+        file.seek(std::io::SeekFrom::Start(offset))
+            .map_err(|e| LibError::SourceUnavailable(format!("content seek: {e}")))?;
+        copy_range(&mut file, length, sink)
+    }
+
     /// Probed, not assumed (issue #80). A local source can sit on a read-only mount, a full disk,
     /// or a directory the server process does not own — none of which the *kind* tells you. The
     /// answer feeds a destination picker, so being wrong here means offering the user a folder they
@@ -1124,6 +1223,24 @@ impl LocalFsSource {
         })
     }
 
+    /// Open one regular file relative to the pinned root capability. Returning the handle (never
+    /// an ambient path) lets range reads seek safely without the scratch copy required by legacy
+    /// path-based media handlers.
+    fn open_content_file(&self, rel: &str) -> Result<cap_std::fs::File, LibError> {
+        let file = self.cap_root()?.open(rel).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => LibError::NotFound("source file is unavailable".into()),
+            _ => LibError::BadRequest("asset path must stay within its source root".into()),
+        })?;
+        if !file
+            .metadata()
+            .map_err(|_| LibError::NotFound("source file is unavailable".into()))?
+            .is_file()
+        {
+            return Err(LibError::NotFound("source file is unavailable".into()));
+        }
+        Ok(file)
+    }
+
     /// Open from the pinned root capability, then copy from that already-open handle to a private
     /// temp file. Existing media handlers are path-based; returning the original path would make
     /// them reopen it and reintroduce a symlink-swap race after this method returned.
@@ -1133,17 +1250,7 @@ impl LocalFsSource {
         before_open: impl FnOnce(),
     ) -> Result<Fetched, LibError> {
         before_open();
-        let mut source = self.cap_root()?.open(rel).map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => LibError::NotFound("source file is unavailable".into()),
-            _ => LibError::BadRequest("asset path must stay within its source root".into()),
-        })?;
-        if !source
-            .metadata()
-            .map_err(|_| LibError::NotFound("source file is unavailable".into()))?
-            .is_file()
-        {
-            return Err(LibError::NotFound("source file is unavailable".into()));
-        }
+        let mut source = self.open_content_file(rel)?;
         let scratch = self.scratch.as_deref().ok_or_else(|| {
             LibError::Internal("local source fetch has no configured scratch directory".into())
         })?;
@@ -1429,6 +1536,53 @@ mod tests {
         let fetched = source.fetch("asset.bin").unwrap();
         assert_eq!(std::fs::read(fetched.path()).unwrap(), b"inside");
         assert_eq!(fetched.path().parent(), Some(scratch.path()));
+    }
+
+    #[test]
+    fn local_range_reads_large_sparse_files_in_bounded_chunks_without_materialising() {
+        use std::io::{Seek, Write};
+
+        let root = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let path = root.path().join("large-video.mp4");
+        let mut file = std::fs::File::create(&path).unwrap();
+        let total = dam_api::dto::MAX_MATERIALIZED_CONTENT_BYTES + 4096;
+        file.set_len(total).unwrap();
+        let offset = total - 1024;
+        file.seek(std::io::SeekFrom::Start(offset)).unwrap();
+        file.write_all(&vec![0x5a; 1024]).unwrap();
+        drop(file);
+
+        let source = fetched_local(root.path(), scratch.path());
+        assert_eq!(source.content_stat("large-video.mp4").unwrap().len, total);
+        let mut chunks = Vec::new();
+        source
+            .read_range("large-video.mp4", offset, 1024, &mut |chunk| {
+                assert!(chunk.len() <= FETCH_CHUNK);
+                chunks.extend_from_slice(&chunk);
+                true
+            })
+            .unwrap();
+        assert_eq!(chunks, vec![0x5a; 1024]);
+        assert_eq!(
+            std::fs::read_dir(scratch.path()).unwrap().count(),
+            0,
+            "range path must not copy the representation to scratch"
+        );
+
+        let mut yielded = 0;
+        source
+            .read_range(
+                "large-video.mp4",
+                0,
+                (FETCH_CHUNK * 3) as u64,
+                &mut |_| {
+                    yielded += 1;
+                    false
+                },
+            )
+            .unwrap();
+        assert_eq!(yielded, 1, "receiver drop must stop the source loop");
     }
 
     #[test]
