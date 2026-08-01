@@ -503,19 +503,44 @@ async fn link_oidc_identity(
     Ok(Json(st.store.list_oidc_identities()?))
 }
 
+/// Optional `?issuer=` on unlink — see [`unlink_oidc_identity`].
+#[derive(serde::Deserialize)]
+struct UnlinkQuery {
+    #[serde(default)]
+    issuer: Option<String>,
+}
+
 /// `DELETE /admin/api/oidc/identities/{subject}` — revoke the provider's ability to sign in as the
 /// linked account. The account itself is untouched.
+///
+/// `?issuer=` exists because links are keyed on `(issuer, subject)` while the provider config holds
+/// exactly one issuer. Change the issuer and every existing link is instantly *stale*: it no longer
+/// authenticates anyone, and — if this route could only ever delete under the configured issuer —
+/// it could never be removed either. A caller that can see a row (they all carry their issuer) can
+/// therefore name it. Omitted, it means the configured issuer, which is what an ordinary unlink is.
 async fn unlink_oidc_identity(
     AdminAuth(ctx): AdminAuth,
     State(st): State<AppState>,
     Path(subject): Path<String>,
+    Query(q): Query<UnlinkQuery>,
 ) -> Result<Json<Vec<OidcIdentity>>, ApiError> {
-    let cfg = st.store.oidc_config_info()?.ok_or_else(|| {
-        ApiError(LibError::BadRequest(
-            "no OIDC provider is configured".into(),
-        ))
-    })?;
+    let issuer = match q.issuer {
+        Some(i) => i,
+        None => {
+            st.store
+                .oidc_config_info()?
+                .ok_or_else(|| {
+                    ApiError(LibError::BadRequest(
+                        "no OIDC provider is configured — name the issuer explicitly to remove a \
+                         link left behind by a previous one"
+                            .into(),
+                    ))
+                })?
+                .config
+                .issuer
+        }
+    };
     st.store
-        .unlink_oidc_identity(&cfg.config.issuer, &subject, &actor_of(&ctx))?;
+        .unlink_oidc_identity(&issuer, &subject, &actor_of(&ctx))?;
     Ok(Json(st.store.list_oidc_identities()?))
 }

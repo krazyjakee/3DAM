@@ -751,6 +751,58 @@ export interface SessionInfo {
   current: boolean;
 }
 
+// ── OIDC / OAuth2 login (issue #41) ─────────────────────────────────────────
+
+/** What to do with a verified subject that no local account is linked to. The v1 default is
+ *  `linked` — reject unless an admin has linked it, because for most issuers *anyone* can hold a
+ *  valid account, so "the provider vouched for this token" is not authority to create one here. */
+export type OidcProvisioning = "linked" | "auto_viewer" | "auto_editor";
+
+/** What an operator may configure about the OIDC provider. */
+export interface OidcConfig {
+  /** Issuer URL; its discovery document supplies the endpoints and the JWKS URI. */
+  issuer: string;
+  client_id: string;
+  /** Where the issuer sends the browser back. Must match what is registered with the provider. */
+  redirect_url: string;
+  /** Extra scopes beyond `openid`, which is always requested. */
+  scopes: string[];
+  provisioning: OidcProvisioning;
+}
+
+/** `GET /admin/api/oidc` — the config as read back. Flat on the wire (the Rust side flattens
+ *  `OidcConfig` into it), and with **no field for the client secret**: "never returned by a GET"
+ *  (tech-spec 10 §5) is enforced by the shape, not by remembering to strip it. */
+export interface OidcConfigInfo extends OidcConfig {
+  /** Whether a secret is on file. Never the secret. */
+  client_secret_set: boolean;
+}
+
+/** `PUT /admin/api/oidc`. The secret is write-only and *optional on update*: omitting it keeps the
+ *  stored one, so an operator can edit the issuer or scopes without re-entering a value the UI is
+ *  never allowed to read back. An empty string explicitly clears it (a public client). */
+export interface SetOidcConfig extends OidcConfig {
+  client_secret?: string;
+}
+
+/** A link between a provider subject and a local account. The key is `(issuer, subject)` — `sub`
+ *  is only unique *within* an issuer. */
+export interface OidcIdentity {
+  issuer: string;
+  subject: string;
+  account_id: string;
+  /** The linked account's current username, denormalised so a list needs no second request. */
+  username: string;
+  linked_at: number;
+}
+
+/** `POST /admin/api/oidc/identities`. No issuer field: it comes from the configured provider, so a
+ *  link can only ever name an issuer this instance actually accepts tokens from. */
+export interface LinkOidcIdentity {
+  subject: string;
+  account_id: string;
+}
+
 // ── error envelope ──────────────────────────────────────────────────────────
 
 export interface ErrorBody {

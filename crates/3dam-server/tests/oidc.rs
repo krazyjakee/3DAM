@@ -854,3 +854,97 @@ async fn an_admin_can_link_a_subject_and_that_subject_can_then_sign_in() {
     assert_eq!(st, StatusCode::OK, "unlink failed: {body}");
     let _ = store;
 }
+
+/// Changing the issuer strands every existing link, and a stranded link must still be removable.
+///
+/// Links are keyed on `(issuer, subject)` while the provider config holds exactly one issuer. Point
+/// the instance at a new issuer and the old rows authenticate nobody — which is correct — but if
+/// unlink could only ever delete under the *configured* issuer they would also be permanently
+/// unremovable, visible in the admin list forever with no way to explain or clear them.
+#[tokio::test]
+async fn a_link_left_behind_by_a_previous_issuer_can_still_be_removed() {
+    let issuer = TestIssuer::start().await;
+    let (app, store, admin) = harness(&issuer, OidcProvisioning::Linked).await;
+
+    let (st, body) = call(
+        &app,
+        "POST",
+        "/admin/api/accounts",
+        Some(&admin),
+        Some(json!({"username": "erin", "password": "correct-horse-battery", "role": "viewer"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let erin = body["account_id"].as_str().unwrap().to_string();
+
+    let (st, _b) = call(
+        &app,
+        "POST",
+        "/admin/api/oidc/identities",
+        Some(&admin),
+        Some(json!({"subject": "subject-erin", "account_id": erin})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let old_issuer = issuer.issuer_url();
+
+    // The operator repoints the instance at a different issuer.
+    store
+        .set_oidc_config(
+            &SetOidcConfig {
+                config: OidcConfig {
+                    issuer: "https://elsewhere.example".into(),
+                    client_id: CLIENT_ID.into(),
+                    redirect_url: REDIRECT_URL.into(),
+                    scopes: vec![],
+                    provisioning: OidcProvisioning::Linked,
+                },
+                client_secret: Some(CLIENT_SECRET.into()),
+            },
+            "test",
+        )
+        .unwrap();
+
+    // The stale row is still listed — and still carries the issuer that explains it.
+    let (st, list) = call(
+        &app,
+        "GET",
+        "/admin/api/oidc/identities",
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    assert_eq!(list[0]["issuer"], old_issuer);
+
+    // Removing it without naming the issuer cannot work — that key is the *new* issuer.
+    let (st, _b) = call(
+        &app,
+        "DELETE",
+        "/admin/api/oidc/identities/subject-erin",
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::NOT_FOUND,
+        "the default key is the configured issuer, which this row is not under"
+    );
+
+    // Naming it does. Without this the row would be unremovable for the life of the instance.
+    let (st, after) = call(
+        &app,
+        "DELETE",
+        &format!(
+            "/admin/api/oidc/identities/subject-erin?issuer={}",
+            urlencode(&old_issuer)
+        ),
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "stale link must be removable: {after}");
+    assert!(after.as_array().unwrap().is_empty());
+}

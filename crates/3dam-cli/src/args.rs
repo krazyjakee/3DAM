@@ -262,6 +262,14 @@ pub(crate) enum AdminCmd {
         #[command(subcommand)]
         cmd: ShareCmd,
     },
+    /// Configure the OIDC login provider and link provider subjects to accounts (issue #41).
+    ///
+    /// Deliberately *not* gated on the `oidc` flag, mirroring the admin routes: an operator
+    /// configures and links first, then switches the exposure-increasing flag on.
+    Oidc {
+        #[command(subcommand)]
+        cmd: OidcCmd,
+    },
     /// Show the audit log (most recent first).
     Audit {
         #[arg(long, default_value_t = 50)]
@@ -416,6 +424,61 @@ pub(crate) enum ShareCmd {
     Remove {
         /// Share id.
         id: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum OidcCmd {
+    /// Show the configured provider. Never prints the client secret — only whether one is on file
+    /// (the read type has no field for it; tech-spec 10 §5).
+    Show,
+    /// Set the provider config (a full replace of the single row).
+    Set {
+        /// Issuer URL — `{issuer}/.well-known/openid-configuration` supplies the rest. Must be
+        /// https (http allowed only for localhost).
+        #[arg(long)]
+        issuer: String,
+        /// The OAuth2 client id registered with the provider.
+        #[arg(long)]
+        client_id: String,
+        /// Where the issuer sends the browser back; must match the provider's registration exactly.
+        #[arg(long)]
+        redirect_url: String,
+        /// Client secret (write-only, never readable back). Omit to keep the stored one; pass an
+        /// empty string to clear it (a public client).
+        #[arg(long)]
+        client_secret: Option<String>,
+        /// Extra scopes beyond `openid`, which is always requested (repeatable or comma-separated).
+        /// `email` and `profile` are the usual additions.
+        #[arg(long, value_delimiter = ',')]
+        scope: Vec<String>,
+        /// What to do with a verified subject no account is linked to: linked (refuse, the default)
+        /// | auto_viewer | auto_editor.
+        #[arg(long, default_value = "linked")]
+        provisioning: String,
+    },
+    /// List provider subjects linked to local accounts.
+    Identities,
+    /// Link a provider subject to an existing account. The issuer comes from the configured
+    /// provider, so a link can only name an issuer this instance accepts tokens from.
+    Link {
+        /// The provider's stable subject claim (`sub`).
+        subject: String,
+        /// The local account id to link it to (see `admin accounts list`).
+        #[arg(long)]
+        account_id: String,
+    },
+    /// Remove a link, revoking the provider's ability to sign in as that account. The account
+    /// itself is untouched.
+    Unlink {
+        /// The provider's subject claim (`sub`), as shown by `admin oidc identities`.
+        subject: String,
+        /// Which issuer's link to drop. Defaults to the configured issuer, which is what an
+        /// ordinary unlink means. Needed only to clear a link left behind by a *previous* issuer:
+        /// links are keyed on (issuer, subject), so changing the issuer strands the old ones, and
+        /// without naming it they could never be removed. `admin oidc identities` prints it.
+        #[arg(long)]
+        issuer: Option<String>,
     },
 }
 

@@ -9,8 +9,9 @@ use dam_api::accounts::{
 };
 use dam_api::admin::{
     AdminStatus, AuditEntry, CacheTarget, ClearAnalysisReport, ClearCacheReport, ClearCacheRequest,
-    ConfirmRequest, FactoryResetReport, FlagInfo, NewToken, NewTokenReply, SetFlag, SetFlagReply,
-    StorageUsage, TokenInfo, VacuumReport, WipeReport,
+    ConfirmRequest, FactoryResetReport, FlagInfo, LinkOidcIdentity, NewToken, NewTokenReply,
+    OidcConfigInfo, OidcIdentity, SetFlag, SetFlagReply, SetOidcConfig, StorageUsage, TokenInfo,
+    VacuumReport, WipeReport,
 };
 use dam_api::dto::*;
 use dam_api::event::EventTopic;
@@ -440,6 +441,59 @@ impl ApiClient {
     /// `DELETE /admin/api/shares/{id}`.
     pub async fn admin_delete_share(&self, id: &str) -> Result<(), LibError> {
         self.delete(&format!("/admin/api/shares/{id}")).await
+    }
+
+    // ── OIDC provider configuration (phase 6, issue #41) ─────────────────────
+    // Unlike the block above, this surface is *not* behind the `user_accounts` (or `oidc`) flag:
+    // an operator configures the provider and links subjects before switching the flag on.
+
+    /// `GET /admin/api/oidc` — the configured provider, or `None` when none is set. The reply type
+    /// has no field for the client secret, so a secret can never come back this way.
+    pub async fn admin_oidc(&self) -> Result<Option<OidcConfigInfo>, LibError> {
+        self.get("/admin/api/oidc").await
+    }
+    /// `PUT /admin/api/oidc` — the secret is write-only, and omitting it keeps the stored one.
+    pub async fn admin_set_oidc(
+        &self,
+        req: &SetOidcConfig,
+    ) -> Result<Option<OidcConfigInfo>, LibError> {
+        self.put("/admin/api/oidc", req).await
+    }
+    /// `GET /admin/api/oidc/identities`.
+    pub async fn admin_oidc_identities(&self) -> Result<Vec<OidcIdentity>, LibError> {
+        self.get("/admin/api/oidc/identities").await
+    }
+    /// `POST /admin/api/oidc/identities` — replies with the whole list, not just the new link.
+    pub async fn admin_link_oidc_identity(
+        &self,
+        req: &LinkOidcIdentity,
+    ) -> Result<Vec<OidcIdentity>, LibError> {
+        self.post("/admin/api/oidc/identities", req).await
+    }
+    /// `DELETE /admin/api/oidc/identities/{subject}` — replies with the whole remaining list.
+    pub async fn admin_unlink_oidc_identity(
+        &self,
+        subject: &str,
+        issuer: Option<&str>,
+    ) -> Result<Vec<OidcIdentity>, LibError> {
+        // The subject is the provider's `sub` claim, not an id we mint: it may legally contain
+        // `/`, `?`, or `#`. Pushed as a path *segment* (which percent-encodes) rather than
+        // formatted into the path, so it can't rewrite the route.
+        let mut url = self.url("/admin/api/oidc/identities")?;
+        url.path_segments_mut()
+            .map_err(|_| LibError::BadRequest("endpoint cannot take a path".into()))?
+            .push(subject);
+        // Names *which* link when the configured issuer is no longer the one it was made under.
+        if let Some(i) = issuer {
+            url.query_pairs_mut().append_pair("issuer", i);
+        }
+        let resp = self
+            .http
+            .delete(url)
+            .send()
+            .await
+            .map_err(|e| LibError::SourceUnavailable(e.to_string()))?;
+        Self::decode(resp).await
     }
 }
 

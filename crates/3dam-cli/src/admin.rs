@@ -141,6 +141,46 @@ async fn run_admin_remote(
                 println!("removed share {id}");
             }
         },
+        AdminCmd::Oidc { cmd } => match cmd {
+            OidcCmd::Show => print_oidc(&client.admin_oidc().await?, json)?,
+            OidcCmd::Set {
+                issuer,
+                client_id,
+                redirect_url,
+                client_secret,
+                scope,
+                provisioning,
+            } => {
+                let req = build_set_oidc(
+                    issuer,
+                    client_id,
+                    redirect_url,
+                    client_secret,
+                    scope,
+                    &provisioning,
+                )?;
+                print_oidc(&client.admin_set_oidc(&req).await?, json)?;
+            }
+            OidcCmd::Identities => {
+                print_oidc_identities(&client.admin_oidc_identities().await?, json)?
+            }
+            OidcCmd::Link {
+                subject,
+                account_id,
+            } => {
+                let req = LinkOidcIdentity {
+                    subject,
+                    account_id,
+                };
+                print_oidc_identities(&client.admin_link_oidc_identity(&req).await?, json)?;
+            }
+            OidcCmd::Unlink { subject, issuer } => print_oidc_identities(
+                &client
+                    .admin_unlink_oidc_identity(&subject, issuer.as_deref())
+                    .await?,
+                json,
+            )?,
+        },
         AdminCmd::Audit { limit } => print_audit(&client.admin_audit(limit).await?, json)?,
         AdminCmd::Maintenance { cmd } => match cmd {
             MaintenanceCmd::Usage => print_usage(&client.admin_storage_usage().await?, json)?,
@@ -289,6 +329,60 @@ async fn run_admin_embedded(
                 }
             }
         }
+        // No flag guard, matching the routes: the accounts gate would hide the surface an operator
+        // needs *before* turning `oidc` on, and the `oidc` flag gates logins, not configuration.
+        AdminCmd::Oidc { cmd } => match cmd {
+            OidcCmd::Show => print_oidc(&store.oidc_config_info()?, json)?,
+            OidcCmd::Set {
+                issuer,
+                client_id,
+                redirect_url,
+                client_secret,
+                scope,
+                provisioning,
+            } => {
+                let req = build_set_oidc(
+                    issuer,
+                    client_id,
+                    redirect_url,
+                    client_secret,
+                    scope,
+                    &provisioning,
+                )?;
+                // Validation lives in the store, so both paths reject the same inputs identically.
+                store.set_oidc_config(&req, "cli")?;
+                print_oidc(&store.oidc_config_info()?, json)?;
+            }
+            OidcCmd::Identities => print_oidc_identities(&store.list_oidc_identities()?, json)?,
+            OidcCmd::Link {
+                subject,
+                account_id,
+            } => {
+                // The issuer is the configured one, never a CLI argument — same rule as the route.
+                let issuer = configured_issuer(
+                    store,
+                    "configure the OIDC provider before linking identities to it",
+                )?;
+                // Resolve the account first so a bad id is a clean not-found, not a FK error.
+                let account = store.get_account(&account_id)?;
+                store.link_oidc_identity(&issuer, subject.trim(), &account.account_id, "cli")?;
+                print_oidc_identities(&store.list_oidc_identities()?, json)?;
+            }
+            OidcCmd::Unlink { subject, issuer } => {
+                // `--issuer` names a link left behind by a previous issuer; without it, the
+                // configured one, which is what an ordinary unlink means. Same rule as the route.
+                let issuer = match issuer {
+                    Some(i) => i,
+                    None => configured_issuer(
+                        store,
+                        "no OIDC provider is configured — pass --issuer to remove a link left \
+                         behind by a previous one",
+                    )?,
+                };
+                store.unlink_oidc_identity(&issuer, &subject, "cli")?;
+                print_oidc_identities(&store.list_oidc_identities()?, json)?;
+            }
+        },
         AdminCmd::Audit { limit } => print_audit(&store.list_audit(limit)?, json)?,
         AdminCmd::Maintenance { cmd } => {
             // Maintenance touches library.db + caches, so the embedded path opens the engine
@@ -428,6 +522,62 @@ fn build_new_share(
             ShareAccess::Read
         },
     })
+}
+
+/// The configured provider's issuer, which is the other half of an identity link's key. Embedded
+/// only: over `--connect` the route reads it server-side. `missing` is the route's own wording for
+/// the unconfigured case, and it is raised as the route's own `LibError` variant rather than a bare
+/// string, so the two paths fail with the same rendered message and not just the same sentence.
+fn configured_issuer(store: &dam_server::ServerStore, missing: &str) -> anyhow::Result<String> {
+    match store.oidc_config_info()? {
+        Some(cfg) => Ok(cfg.config.issuer),
+        None => Err(LibError::BadRequest(missing.to_string()).into()),
+    }
+}
+
+/// Fold the `oidc set` flags into the wire shape. An absent `--client-secret` stays `None`, which
+/// the store reads as "keep the stored one" — the whole reason the field is optional.
+fn build_set_oidc(
+    issuer: String,
+    client_id: String,
+    redirect_url: String,
+    client_secret: Option<String>,
+    scopes: Vec<String>,
+    provisioning: &str,
+) -> anyhow::Result<SetOidcConfig> {
+    Ok(SetOidcConfig {
+        config: OidcConfig {
+            issuer,
+            client_id,
+            redirect_url,
+            scopes: scopes
+                .iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+            provisioning: parse_provisioning(provisioning)?,
+        },
+        client_secret,
+    })
+}
+
+fn parse_provisioning(s: &str) -> anyhow::Result<OidcProvisioning> {
+    Ok(
+        match s.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+            "linked" => OidcProvisioning::Linked,
+            "auto_viewer" | "viewer" => OidcProvisioning::AutoViewer,
+            "auto_editor" | "editor" => OidcProvisioning::AutoEditor,
+            _ => anyhow::bail!("provisioning must be linked|auto_viewer|auto_editor"),
+        },
+    )
+}
+
+fn show_provisioning(p: OidcProvisioning) -> &'static str {
+    match p {
+        OidcProvisioning::Linked => "linked",
+        OidcProvisioning::AutoViewer => "auto_viewer",
+        OidcProvisioning::AutoEditor => "auto_editor",
+    }
 }
 
 fn parse_flag_key(key: &str) -> anyhow::Result<FlagKey> {
@@ -680,6 +830,65 @@ fn print_new_token(t: &NewTokenReply, json: bool) -> anyhow::Result<()> {
     }
     println!("token '{}' created ({})", t.label, t.token_id);
     println!("secret (shown once): {}", t.secret);
+    Ok(())
+}
+
+/// The provider config. `None` — no provider configured — is a normal state, not an error, so it
+/// prints a sentence rather than `None`; `--json` emits the DTO (`null`) verbatim.
+///
+/// There is no client-secret line beyond "is one on file": [`OidcConfigInfo`] has no field to hold
+/// one, so the never-print rule (tech-spec 10 §5) is a property of the type, not of this function.
+fn print_oidc(cfg: &Option<OidcConfigInfo>, json: bool) -> anyhow::Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(cfg)?);
+        return Ok(());
+    }
+    let Some(c) = cfg else {
+        println!("(no OIDC provider configured)");
+        return Ok(());
+    };
+    println!("issuer:        {}", c.config.issuer);
+    println!("client id:     {}", c.config.client_id);
+    println!("redirect url:  {}", c.config.redirect_url);
+    println!(
+        "scopes:        {}",
+        if c.config.scopes.is_empty() {
+            "(openid only)".to_string()
+        } else {
+            c.config.scopes.join(",")
+        }
+    );
+    println!(
+        "provisioning:  {}",
+        show_provisioning(c.config.provisioning)
+    );
+    println!(
+        "client secret: {}",
+        if c.client_secret_set {
+            "set"
+        } else {
+            "not set"
+        }
+    );
+    Ok(())
+}
+
+fn print_oidc_identities(ids: &[OidcIdentity], json: bool) -> anyhow::Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(ids)?);
+        return Ok(());
+    }
+    if ids.is_empty() {
+        println!("(no identities linked)");
+        return Ok(());
+    }
+    for i in ids {
+        // Timestamps stay epoch-ms like the other admin listings — `--json` is the machine surface.
+        println!(
+            "{}  {:<24} {:<20} {}  linked {}",
+            i.account_id, i.subject, i.username, i.issuer, i.linked_at
+        );
+    }
     Ok(())
 }
 

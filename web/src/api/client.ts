@@ -125,6 +125,12 @@ export interface VersionInfo {
    *  view and its nav entry hide rather than offering a drop target whose every request fails.
    *  Absent on older servers — treated as off, which is also this flag's default. */
   upload?: boolean;
+  /** Single sign-on is *usable* (issue #41) — the flag is on, accounts are on, **and** a provider
+   *  is configured. All three, because a "Sign in with…" button that leads to a 404 or a
+   *  "no provider configured" error is worse than no button. Deliberately says nothing about
+   *  *which* provider: this endpoint is unauthenticated and an issuer URL can name an
+   *  organisation. Absent on older servers — treated as off. */
+  oidc?: boolean;
 }
 
 /** Who the current credential (bearer token or session cookie) resolves to, and what it can do

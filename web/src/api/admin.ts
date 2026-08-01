@@ -4,7 +4,13 @@
 // one credential; when it carries the admin scope this surface opens, otherwise it 403s).
 
 import { ApiError } from "./client";
-import type { AccountRole } from "./types";
+import type {
+  AccountRole,
+  LinkOidcIdentity,
+  OidcConfigInfo,
+  OidcIdentity,
+  SetOidcConfig,
+} from "./types";
 import { authHeaders, csrfHeaders, resolveUrl } from "@/lib/server";
 
 const ADMIN = "/admin/api";
@@ -28,7 +34,8 @@ export type FlagKey =
   | "user_accounts"
   | "auto_thumbnail"
   | "auto_analyze"
-  | "upload";
+  | "upload"
+  | "oidc";
 
 export interface FlagInfo {
   key: FlagKey;
@@ -259,6 +266,43 @@ export const admin = {
     decode<void>(
       await fetch(url(`/tokens/${id}`), { method: "DELETE", headers: headers(false) }),
     ),
+  // ── OIDC provider + identity links (issue #41) ─────────────────────────────
+  // `oidc` reads back `null` when nothing is configured, and link/unlink both answer with the
+  // *whole* list so a mutation needs no follow-up read.
+  oidcConfig: async () =>
+    decode<OidcConfigInfo | null>(await fetch(url("/oidc"), { headers: headers(false) })),
+  setOidcConfig: async (req: SetOidcConfig) =>
+    decode<OidcConfigInfo | null>(
+      await fetch(url("/oidc"), {
+        method: "PUT",
+        headers: headers(true),
+        body: JSON.stringify(req),
+      }),
+    ),
+  oidcIdentities: async () =>
+    decode<OidcIdentity[]>(await fetch(url("/oidc/identities"), { headers: headers(false) })),
+  linkOidcIdentity: async (req: LinkOidcIdentity) =>
+    decode<OidcIdentity[]>(
+      await fetch(url("/oidc/identities"), {
+        method: "POST",
+        headers: headers(true),
+        body: JSON.stringify(req),
+      }),
+    ),
+  /** `issuer` names *which* link to drop. Links are keyed on `(issuer, subject)` while the config
+   *  holds one issuer, so a link made under a previous issuer is stale — it authenticates nobody,
+   *  and without naming its issuer it could never be removed either. Omitted ⇒ the configured one. */
+  unlinkOidcIdentity: async (subject: string, issuer?: string) =>
+    decode<OidcIdentity[]>(
+      await fetch(
+        url(
+          `/oidc/identities/${encodeURIComponent(subject)}` +
+            (issuer ? `?issuer=${encodeURIComponent(issuer)}` : ""),
+        ),
+        { method: "DELETE", headers: headers(false) },
+      ),
+    ),
+
   audit: async (limit = 100) =>
     decode<AuditEntry[]>(await fetch(url(`/audit?limit=${limit}`), { headers: headers(false) })),
 

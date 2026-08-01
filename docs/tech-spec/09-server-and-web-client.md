@@ -73,7 +73,7 @@ max_file_mb = 2048
 
 # --- Feature flags: seed values only. Authoritative semantics + reconciliation: file 10. ---
 [flags]
-auth              = "off"        # off | anonymous | token | oidc   (one gate: web/API/MCP/federation)
+auth              = "off"        # off | anonymous | token   (one gate: web/API/MCP/federation)
 remote_access     = false        # exposing beyond localhost gates on this + an auth mode
 network_writes    = false        # implicit-trust callers are read-only to the network; verified write tokens are not capped
 mcp               = "off"        # off | read-only | writes   (mounts/unmounts POST /mcp — file 11)
@@ -81,7 +81,16 @@ inbound_federation= false        # answer federated queries from peers?
 remote_connect    = false        # accept GUI/CLI --connect sessions as a backend?
 accounts          = false        # opt-in user accounts (file 10)
 upload            = false        # accept writes of NEW files into a registered source (file 08 §5.1)
+oidc              = false        # accept OIDC/OAuth2 logins (file 10 §1.5; needs accounts)
 ```
+
+`oidc` is a **flag beside `auth`, not a value of it** (file 10 §1.1). An OIDC login mints an
+ordinary server session, so it composes with password sign-in and bearer tokens rather than
+replacing them — as an `auth` value, switching it on would have switched password login off. The
+provider itself (issuer, client id/secret, redirect, scopes, provisioning policy) is not a flag: it
+lives in `server.db` and is set through `GET/PUT /admin/api/oidc`, the web Settings surface, or
+`3dam admin oidc set`. Configure it *first*, then turn this on — the flag is exposure-increasing
+and needs an explicit confirm.
 
 `upload` is worth a note, because it is the one capability here whose blast radius is the user's
 own files rather than the catalog. Every other write in 3DAM edits catalog rows — tags, notes,

@@ -24,6 +24,18 @@ function hasSessionHint(): boolean {
   return document.cookie.includes("dam_csrf=");
 }
 
+/** Where the "sign in with your identity provider" link points (issue #41).
+ *
+ *  `return_to` carries the path the user was on so the callback lands them back there rather than
+ *  dumping them at the root. It is a *path*, never a URL: the server refuses anything else, because
+ *  a login link a stranger sends must not be able to choose where you end up afterwards. Resolved
+ *  against the configured server for the same reason every other API call is, though the button is
+ *  only offered same-origin. */
+function oidcStartUrl(): string {
+  const returnTo = `${window.location.pathname}${window.location.search}`;
+  return resolveUrl(`/api/v1/auth/oidc/start?return_to=${encodeURIComponent(returnTo)}`);
+}
+
 export function AuthGate({ children }: { children: ReactNode }) {
   const version = useVersion();
   const expired = useAuthExpired();
@@ -31,6 +43,9 @@ export function AuthGate({ children }: { children: ReactNode }) {
   // User accounts (issue #42): the gate becomes a username/password form (token as fallback), and
   // an unclaimed server gets the first-run claim screen. Accounts force auth to at least "token".
   const accounts = version.data?.accounts === true;
+  // Single sign-on (issue #41). The server only reports this true when the flag is on, accounts are
+  // on, *and* a provider is configured — so a button rendered from it always leads somewhere real.
+  const oidc = version.data?.oidc === true;
   const unclaimed = version.data?.unclaimed === true;
   // Zero accounts = a genuinely un-claimed instance. A *re-opened* window (the lost-sole-admin
   // recovery hatch, ADR 0014) also reports `unclaimed`, but every existing user's password still
@@ -70,6 +85,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
         reason={token || hasSessionHint() ? AUTH_COPY.sessionExpired : null}
         allowReadOnly={auth === "anonymous"}
         accounts={accounts}
+        oidc={oidc}
         claimable={claimable}
       />
     );
@@ -89,6 +105,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
           }
           allowReadOnly={auth === "anonymous"}
           accounts={accounts}
+          oidc={oidc}
           claimable={claimable}
         />
       );
@@ -100,6 +117,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
         reason={null}
         allowReadOnly={false}
         accounts={accounts}
+        oidc={oidc}
         claimable={claimable}
       />
     );
@@ -126,11 +144,13 @@ function LoginScreen({
   reason,
   allowReadOnly,
   accounts,
+  oidc = false,
   claimable = false,
 }: {
   reason: string | null;
   allowReadOnly: boolean;
   accounts: boolean;
+  oidc?: boolean;
   claimable?: boolean;
 }) {
   const ref = useFocusTrap<HTMLDivElement>(true);
@@ -160,6 +180,23 @@ function LoginScreen({
           <AccountLoginForm reason={reason} allowReadOnly={allowReadOnly} />
         ) : (
           <TokenLoginForm reason={reason} allowReadOnly={allowReadOnly} />
+        )}
+        {/* Single sign-on (issue #41). Hidden when pointed at a *remote* server for exactly the
+            reason account sign-in is: the callback sets a host-only session cookie on the server's
+            origin, which this origin then cannot use — the button would appear to work and change
+            nothing. A plain link, not a fetch: the whole point is a top-level navigation the
+            browser follows to the provider and back. */}
+        {oidc && !remote && (
+          <>
+            <div className="my-3 flex items-center gap-2 text-[12px] text-fg-dim">
+              <span className="h-px flex-1 bg-border" />
+              or
+              <span className="h-px flex-1 bg-border" />
+            </div>
+            <a className="btn w-full justify-center" href={oidcStartUrl()}>
+              Sign in with your identity provider
+            </a>
+          </>
         )}
         {claimable && (
           <button

@@ -107,12 +107,28 @@ Structured as clap derive would express it. Each row of §3.9 names the owning `
       │     ├── list                 #   all feature flags + state + live/restart marker
       │     ├── get <FLAG>
       │     └── set <FLAG> <on|off|VALUE>   # (writes; --yes on consequential flags; §8)
-      └── user
-            ├── list
-            ├── add <NAME> --role <admin|editor|viewer> [--scope <SOURCE|COLLECTION>...]
-            ├── set <NAME> [--role <…>] [--scope <…>] [--disable]
-            └── remove <NAME>        #   (writes; --yes)
+      ├── user
+      │     ├── list
+      │     ├── add <NAME> --role <admin|editor|viewer> [--scope <SOURCE|COLLECTION>...]
+      │     ├── set <NAME> [--role <…>] [--scope <…>] [--disable]
+      │     └── remove <NAME>        #   (writes; --yes)
+      └── oidc                       # OIDC login provider + identity links ([10](10-auth-accounts-and-flags.md) §1.5)
+            ├── show                 #   the configured provider; never the client secret, only
+            │                        #   whether one is on file (the read DTO has no field for it)
+            ├── set --issuer <URL> --client-id <ID> --redirect-url <URL>
+            │       [--client-secret <SECRET>]   # write-only; omit to keep the stored one
+            │       [--scope <S>...]             # extra scopes beyond `openid`
+            │       [--provisioning <linked|auto_viewer|auto_editor>]   # (writes)
+            ├── identities           #   provider subjects linked to local accounts
+            ├── link <SUBJECT> --account-id <ID>   # issuer comes from the config, never a flag
+            └── unlink <SUBJECT>     #   (writes) revokes the provider's ability to sign in as
+                                     #   that account; the account itself is untouched
 ```
+
+**`admin oidc` is not gated on the `oidc` flag** — matching the admin routes, and for the same
+reason: an operator configures the provider and links subjects *before* switching the
+exposure-increasing flag on, so a gate would hide the surface exactly when it is needed. The flag
+gates the `/api/v1/auth/oidc` login surface, not its configuration.
 
 ### 3.1 Verb → `LibraryService` map
 
@@ -130,6 +146,7 @@ Every non-service verb is a call (or a thin composition) on the `LibraryService`
 | `source add/remove/list` | `add_source` / `remove_source` / `list_sources` | **yes** (add/remove) | n/a |
 | `admin flag …` | flag store admin API ([10](10-auth-accounts-and-flags.md)) via serve | **yes** (set) | n/a |
 | `admin user …` | accounts admin API ([10](10-auth-accounts-and-flags.md)) via serve | **yes** | n/a |
+| `admin oidc …` | `/admin/api/oidc[/identities]` ([10](10-auth-accounts-and-flags.md) §1.5) via serve; embedded, the same `ServerStore` methods those routes call | **yes** (`set`/`link`/`unlink`) | n/a |
 | `serve` | *not a service call* — starts `3dam-server` ([09](09-server-and-web-client.md)) | — | — |
 | `mcp` | *not a service call* — starts stdio MCP ([11](11-mcp-server.md)) over embedded engine | — | — |
 

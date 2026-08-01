@@ -30,6 +30,16 @@ export default defineConfig({
         changeOrigin: true,
         ws: true,
       },
+      // `/admin/api` is a *sibling* of `/api`, not a child, so it needs its own entry — without
+      // it every Settings call 404s against the dev server itself and the whole admin surface
+      // renders as "unsupported on this server", which looks like a server problem rather than a
+      // missing proxy rule. Found while verifying the OIDC settings section (issue #41).
+      // Scoped to `/admin/api`, not `/admin`, so it cannot shadow a future client-side route.
+      // No `ws: true`: the only WebSocket is `/api/v1/ws`, covered by the entry above.
+      "/admin/api": {
+        target: apiTarget,
+        changeOrigin: true,
+      },
     },
   },
 });
