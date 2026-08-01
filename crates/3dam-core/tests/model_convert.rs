@@ -110,6 +110,7 @@ async fn a_model_converts_to_glb_without_touching_the_source() {
                 inputs: vec![model.id],
                 target: ConvertTarget::Model {
                     format: "glb".into(),
+                    optimize: false,
                 },
                 output_dir: into_source.to_string_lossy().into_owned(),
                 dry_run: false,
@@ -134,6 +135,7 @@ async fn a_model_converts_to_glb_without_touching_the_source() {
                 inputs: vec![model.id],
                 target: ConvertTarget::Model {
                     format: "glb".into(),
+                    optimize: false,
                 },
                 output_dir: out.to_string_lossy().into_owned(),
                 dry_run: true,
@@ -153,6 +155,7 @@ async fn a_model_converts_to_glb_without_touching_the_source() {
                 inputs: vec![model.id],
                 target: ConvertTarget::Model {
                     format: "glb".into(),
+                    optimize: false,
                 },
                 output_dir: out.to_string_lossy().into_owned(),
                 dry_run: false,
@@ -192,6 +195,60 @@ async fn a_model_converts_to_glb_without_touching_the_source() {
             "a build without the feature must say so: {err}"
         );
         assert!(!written.exists());
+    }
+
+    // The optimise flag is an *encode* option, so the pipeline's job is only to carry it: the
+    // encoder's own tests prove what it does to the geometry. What is worth proving here is that a
+    // request carrying it still routes, still lands under `output_dir`, and is still refused inside
+    // a source — an option that quietly bypassed §5.1 would be the expensive kind of mistake.
+    let opt_into_source = assets.join("optimised");
+    assert!(
+        lib.convert(
+            &ctx,
+            ConvertRequest {
+                inputs: vec![model.id],
+                target: ConvertTarget::Model {
+                    format: "glb".into(),
+                    optimize: true,
+                },
+                output_dir: opt_into_source.to_string_lossy().into_owned(),
+                dry_run: false,
+                on_collision: CollisionRule::Fail,
+            },
+        )
+        .await
+        .is_err(),
+        "an optimised 3D convert is still non-destructive"
+    );
+    assert!(!opt_into_source.exists());
+
+    let opt_out = tmp.join("out-optimised");
+    let optimised = lib
+        .convert(
+            &ctx,
+            ConvertRequest {
+                inputs: vec![model.id],
+                target: ConvertTarget::Model {
+                    format: "glb".into(),
+                    optimize: true,
+                },
+                output_dir: opt_out.to_string_lossy().into_owned(),
+                dry_run: false,
+                on_collision: CollisionRule::Fail,
+            },
+        )
+        .await
+        .unwrap();
+
+    #[cfg(feature = "model-convert")]
+    {
+        assert_eq!(optimised.done, 1, "the optimised model converts");
+        let glb = std::fs::read(opt_out.join("tri.glb")).unwrap();
+        assert_eq!(&glb[0..4], b"glTF");
+    }
+    #[cfg(not(feature = "model-convert"))]
+    {
+        assert_eq!(optimised.failed, 1, "the item fails; the job does not");
     }
 
     // The source is untouched either way — the whole point of the non-destructive invariant.

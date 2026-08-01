@@ -80,6 +80,7 @@ export function ConvertDialog({
   const [format, setFormat] = useState(defaultFormat(defaultMedia));
   const [maxEdge, setMaxEdge] = useState("");
   const [quality, setQuality] = useState("");
+  const [optimize, setOptimize] = useState(false);
   const [outputDir, setOutputDir] = useState("");
   const [collision, setCollision] = useState<CollisionRule>("fail");
   const [dryRun, setDryRun] = useState(true);
@@ -104,7 +105,7 @@ export function ConvertDialog({
             quality: quality && LOSSY.has(format) ? Number(quality) : null,
           }
         : media === "model"
-          ? { media: "model", format }
+          ? { media: "model", format, optimize }
           : { media: "audio", format };
     run.mutate(
       {
@@ -205,6 +206,26 @@ export function ConvertDialog({
                 </div>
               )}
             </div>
+
+            {/* 3D: mesh optimisation (issue #49). Opt-in, because it collapses the node graph —
+                the geometry is preserved, the names and hierarchy around it may not be. */}
+            {media === "model" && (
+              <div>
+                <label className="flex items-center gap-1.5 text-[11px] text-fg-muted coarse:min-h-11">
+                  <input
+                    type="checkbox"
+                    checked={optimize}
+                    onChange={(e) => setOptimize(e.target.checked)}
+                  />
+                  Optimise mesh
+                </label>
+                <p className="mt-1 text-[10px] text-fg-dim">
+                  Merges redundant materials and meshes, drops degenerate faces, and re-joins shared
+                  vertices — fewer draw calls for the same model. Node names and hierarchy may not
+                  survive; the original is never modified.
+                </p>
+              </div>
+            )}
 
             {/* output dir */}
             <div>

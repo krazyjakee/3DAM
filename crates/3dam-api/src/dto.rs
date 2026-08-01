@@ -876,16 +876,22 @@ pub enum ConvertTarget {
         format: String,
     },
     /// 3D container transcode (issue #49, tech-spec 08 §3.3).
-    ///
-    /// Mesh optimise/compression is deliberately *not* a field here yet: §3.3 separates container
-    /// transcode from optimisation because they are independently useful, and a half-wired knob
-    /// would be worse than none.
     Model {
         /// `glb` in v1. `gltf` and `obj` are named v1 targets but emit sidecars (`.bin`, `.mtl`),
         /// which the single-buffer encode seam cannot write as one output yet — so they are
         /// refused by name rather than silently producing a first part that references a file
         /// nobody wrote.
         format: String,
+        /// Optimise the mesh while transcoding: merge redundant materials and meshes, drop
+        /// degenerate faces, and re-join the vertices a merge duplicates (issue #49, §3.3).
+        ///
+        /// Off by default, and it stays a separate knob from `format` because the two are
+        /// independently useful — a container transcode is expected to preserve what it was given,
+        /// while optimisation is deliberately lossy in *structure*: the node graph is collapsed, so
+        /// names and hierarchy a downstream tool keyed on may not survive. Nothing about it is
+        /// lossy for the original, which convert never touches (§5.1).
+        #[serde(default)]
+        optimize: bool,
     },
 }
 
@@ -902,7 +908,7 @@ impl ConvertTarget {
         match self {
             ConvertTarget::Image { format, .. } => format,
             ConvertTarget::Audio { format } => format,
-            ConvertTarget::Model { format } => format,
+            ConvertTarget::Model { format, .. } => format,
         }
     }
 }
@@ -1396,4 +1402,47 @@ pub struct ExportReport {
     pub assets: u64,
     /// Number of files written (1 for json/csv, N for sidecar).
     pub files_written: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The convert target is the one DTO whose wire shape three independent clients hand-write
+    /// (the CLI, `web/src/api/types.ts`, and MCP's untyped tool arguments), so its tag and its
+    /// defaults are a contract rather than an implementation detail.
+    ///
+    /// `optimize` in particular has to be *absent-tolerant*: every request written before it
+    /// existed omits it, and those must keep meaning "plain transcode" rather than failing to
+    /// deserialise or, worse, silently opting into a structurally lossy encode.
+    #[test]
+    fn a_model_convert_target_defaults_to_no_optimisation_and_round_trips() {
+        let legacy: ConvertTarget =
+            serde_json::from_str(r#"{"media":"model","format":"glb"}"#).expect("older wire form");
+        assert!(
+            matches!(
+                legacy,
+                ConvertTarget::Model {
+                    optimize: false,
+                    ..
+                }
+            ),
+            "a request without the field must not opt in: {legacy:?}"
+        );
+
+        let opted: ConvertTarget =
+            serde_json::from_str(r#"{"media":"model","format":"glb","optimize":true}"#).unwrap();
+        assert!(matches!(opted, ConvertTarget::Model { optimize: true, .. }));
+        assert_eq!(opted.media(), MediaType::Model);
+        assert_eq!(opted.format(), "glb");
+
+        let wire = serde_json::to_value(&opted).unwrap();
+        assert_eq!(
+            wire["media"], "model",
+            "the tag names the media, lowercased"
+        );
+        assert_eq!(wire["optimize"], true);
+        let back: ConvertTarget = serde_json::from_value(wire).unwrap();
+        assert!(matches!(back, ConvertTarget::Model { optimize: true, .. }));
+    }
 }

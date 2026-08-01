@@ -418,6 +418,7 @@ pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             dry_run,
             max_edge,
             quality,
+            optimize,
             on_collision,
         } => {
             let inputs: Vec<AssetId> = ids
@@ -429,6 +430,7 @@ pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 .collect::<anyhow::Result<_>>()?;
             let target = build_convert_target(&to)?;
             let target = apply_image_opts(target, max_edge, quality);
+            let target = apply_model_opts(target, optimize);
             let req = ConvertRequest {
                 inputs,
                 target,

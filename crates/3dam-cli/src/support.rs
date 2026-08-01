@@ -44,7 +44,10 @@ pub(crate) fn build_convert_target(to: &str) -> anyhow::Result<ConvertTarget> {
         // 3D containers (issue #49). Checked against what this *build* can actually write rather
         // than a hardcoded list, so a binary compiled without `model-convert` refuses the request
         // up front instead of starting a job that fails on every item.
-        _ if dam_media::supports_model_target(&to) => Ok(ConvertTarget::Model { format: to }),
+        _ if dam_media::supports_model_target(&to) => Ok(ConvertTarget::Model {
+            format: to,
+            optimize: false,
+        }),
         // `gltf`/`obj` are real v1 targets that need a multi-file output seam; name them
         // specifically so the answer is "not yet" rather than "no such format".
         "gltf" | "obj" => Err(anyhow::anyhow!(
@@ -70,6 +73,16 @@ pub(crate) fn apply_image_opts(
             max_edge,
             quality,
         },
+        other => other,
+    }
+}
+
+/// Fold `--optimize` into a 3D target. Silently ignored for image/audio targets, exactly as
+/// `--max-edge`/`--quality` are for the others: one `convert` verb spans every media type, so a
+/// flag that does not apply is not an error.
+pub(crate) fn apply_model_opts(target: ConvertTarget, optimize: bool) -> ConvertTarget {
+    match target {
+        ConvertTarget::Model { format, .. } => ConvertTarget::Model { format, optimize },
         other => other,
     }
 }

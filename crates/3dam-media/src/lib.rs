@@ -262,6 +262,24 @@ pub fn extract_metadata(path: &Path, det: &Detected) -> MediaAttributes {
     }
 }
 
+/// DEEP tier: exact 3D geometry counts via a full Assimp import (issue #49).
+///
+/// The counterpart to the cheap [`extract_metadata`] path for models, for the **analyse** pass
+/// rather than scan — it decodes geometry, so it is priced like a thumbnail render, not like a
+/// header read. It exists because two of the cheap readers cannot be exact: an FBX with a
+/// deflate-compressed index array and a Collada `<polygons>` block with no `<vcount>` both publish
+/// element counts without publishing polygon grouping, so the cheap tier assumes triangles. `.blend`
+/// has no cheap reader at all.
+///
+/// Behind `model-convert` (it builds Assimp from source); without it this answers `Unsupported` and
+/// the cheap attributes stand, which is a degradation in precision and never in coverage.
+pub fn extract_model_metadata_deep(
+    path: &Path,
+    format: &str,
+) -> Result<dam_api::dto::ModelAttributes, HandlerError> {
+    model::deep_metadata(path, format)
+}
+
 /// EXPENSIVE tier: render a downscaled PNG thumbnail (tech-spec 04 §6.4). Images decode directly;
 /// video produces a poster frame via a discovered ffmpeg (ADR 0015). Audio waveforms and 3D
 /// turntables are interactive WASM islands and documents render an excerpt card in the DOM, so
@@ -334,17 +352,24 @@ pub fn convert_audio(
 
 /// EXPENSIVE tier: transcode a 3D model to a target container (convert pipeline, tech-spec 08 §3.3).
 ///
+/// `optimize` opts into mesh optimisation (merge redundant materials/meshes, drop degenerate faces,
+/// re-join shared vertices) — see `model_convert`'s module docs for what it does and does not do.
+///
 /// Behind the `model-convert` feature, because enabling it compiles Assimp from source. Without it
 /// the surface still exists and answers `Unsupported`, so a build that cannot do this says so
 /// rather than the format quietly vanishing from the target list.
-pub fn convert_model(path: &Path, target_format: &str) -> Result<Vec<u8>, HandlerError> {
+pub fn convert_model(
+    path: &Path,
+    target_format: &str,
+    optimize: bool,
+) -> Result<Vec<u8>, HandlerError> {
     #[cfg(feature = "model-convert")]
     {
-        model_convert::convert(path, target_format)
+        model_convert::convert(path, target_format, optimize)
     }
     #[cfg(not(feature = "model-convert"))]
     {
-        let _ = path;
+        let _ = (path, optimize);
         Err(HandlerError::Unsupported(format!(
             "3D convert to '{target_format}' is not compiled into this build (feature \
              `model-convert`)"

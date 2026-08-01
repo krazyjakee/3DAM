@@ -275,10 +275,23 @@ constrained by `format` and checked at submission.
 or transcode without touching geometry.
 
 > **Status (issue #49).** The **container transcode** stage is implemented, for the single target
-> `glb`, as `ConvertTarget::Model { format }`. Mesh optimisation/compression is the second stage and
-> is **not** implemented — deliberately, per the separation above; the `ModelTarget` fields below
-> (`optimise`, `quantise`, `compression`, `textures`, `flatten`) remain design, and the shipped DTO
-> carries only `format` so there is no half-wired knob.
+> `glb`, as `ConvertTarget::Model { format, optimize }`.
+>
+> **Mesh optimisation** is implemented as the opt-in `optimize` flag on that target — the second
+> stage's *topological* half. It runs a curated set of Assimp post-processing steps at import
+> (`RemoveRedundantMaterials`, `OptimizeGraph`, `OptimizeMeshes`, `FindDegenerates` + `SortByPType`
+> configured to delete rather than demote, `ImproveCacheLocality`), which merges draw calls and
+> re-joins the vertices a merge duplicates. It is off by default because it collapses the node
+> graph: geometry survives, names and hierarchy may not. The steps have to be *import*-time — Assimp
+> orders `OptimizeMeshes` before `JoinIdenticalVertices` in one chain, so the join that recovers the
+> duplicated vertices only happens if the merge ran in the same pass.
+>
+> **Mesh compression is still not implemented.** `KHR_draco_mesh_compression` is unreachable from
+> the current encoder: this tree force-enables Assimp's bundled Draco (ADR 0011), but only Assimp's
+> glTF2 *reader* consults it — the exporter has no Draco path. Draco or `meshopt` encoding means a
+> new encoder dependency, so it stays a later slice. The remaining `ModelTarget` fields below
+> (`quantise`, `compression`, `textures`, `flatten`) likewise remain design; the shipped DTO carries
+> only `format` + `optimize` so there is no half-wired knob.
 >
 > **The encoder is Assimp's own exporter**, reached through `russimp-ng`'s raw FFI. Assimp is
 > already linked for import (thumbnails, ADR 0011) and its exporters are compiled in, so this added
