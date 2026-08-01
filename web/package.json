@@ -11,6 +11,7 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
+    "test": "node --experimental-strip-types --test tests/*.test.ts",
     "typecheck": "tsc -b",
     "lint": "eslint . --max-warnings 0 && pnpm typecheck",
     "wasm": "cargo xtask wasm"

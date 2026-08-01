@@ -9,6 +9,7 @@ import {
   Layers,
   LayoutGrid,
   Loader2,
+  Keyboard,
   Menu,
   Rows3,
   Search,
@@ -18,6 +19,7 @@ import {
 } from "lucide-react";
 import {
   useAnalyze,
+  useAsset,
   useAssets,
   useCan,
   useCollectionMembers,
@@ -36,6 +38,13 @@ import { useDebounced } from "@/lib/use-debounced";
 import { bytes } from "@/lib/format";
 import { DUPLICATE_QUERY_LIMIT } from "@/lib/limits";
 import { requestAutoplay } from "@/lib/audio-intent";
+import {
+  dispatchShortcut,
+  isEditableTarget,
+  shortcutLabel,
+  SHORTCUT_EVENT,
+  type ShortcutId,
+} from "@/lib/shortcuts";
 import { Thumbnail } from "./Thumbnail";
 import { LicenseBadge } from "./LicenseBadge";
 import { MediaBadge } from "./MediaBadge";
@@ -95,7 +104,13 @@ function collapseExactDuplicates(
   return { visible, dupCounts };
 }
 
-export function Browser({ onOpenNav }: { onOpenNav?: () => void }) {
+export function Browser({
+  onOpenNav,
+  onShowShortcuts,
+}: {
+  onOpenNav?: () => void;
+  onShowShortcuts?: () => void;
+}) {
   const { state, patch, request } = useViewState();
   // Debounce the *derived* search text so the field stays instant but `/query` only refetches once
   // typing settles (issue #33). The other facets apply immediately; only free-text is debounced.
@@ -112,6 +127,7 @@ export function Browser({ onOpenNav }: { onOpenNav?: () => void }) {
   // the single Inspector focus (`state.selected`). `anchor` is the pivot for shift-range.
   const [selection, setSelection] = useState<Set<string>>(new Set());
   const [anchor, setAnchor] = useState<string | null>(null);
+  const selectedAsset = useAsset(state.selected);
 
   const items = useMemo(
     () => assets.data?.pages.flatMap((p) => p.items) ?? [],
@@ -222,12 +238,71 @@ export function Browser({ onOpenNav }: { onOpenNav?: () => void }) {
     [selection, byId],
   );
 
+  useEffect(() => {
+    const onShortcut = (event: Event) => {
+      const id = (event as CustomEvent<ShortcutId>).detail;
+      const asset = selectedAsset.data?.summary;
+      if (!asset) return;
+      if (id === "action-menu") {
+        const cell = document.querySelector<HTMLElement>(`[data-asset-id="${CSS.escape(asset.id)}"]`);
+        const rect = cell?.getBoundingClientRect();
+        openMenu(
+          asset,
+          rect ? rect.left + Math.min(24, rect.width / 2) : window.innerWidth / 2,
+          rect ? rect.top + Math.min(24, rect.height / 2) : window.innerHeight / 2,
+        );
+      }
+    };
+    window.addEventListener(SHORTCUT_EVENT, onShortcut);
+    return () => window.removeEventListener(SHORTCUT_EVENT, onShortcut);
+  }, [openMenu, selectedAsset.data?.summary]);
+
+  // Space retains native button activation unless the current selection is playable audio. This
+  // context-sensitive registration avoids swallowing Space while a user is merely browsing cells.
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (document.getElementById("shortcut-help-title")) return;
+      const asset = selectedAsset.data?.summary;
+      const focusedCell =
+        event.target instanceof Element
+          ? event.target.closest<HTMLElement>("[data-asset-id]")
+          : null;
+      const canPlay =
+        asset?.media === "audio" &&
+        (!focusedCell || focusedCell.dataset.assetId === asset.id);
+      const focusedAsset = focusedCell
+        ? byId.get(focusedCell.dataset.assetId ?? "")
+        : undefined;
+      const handled = dispatchShortcut(event, {
+        "play-pause":
+          canPlay
+            ? () =>
+                window.dispatchEvent(
+                  new CustomEvent<ShortcutId>(SHORTCUT_EVENT, { detail: "play-pause" }),
+                )
+            : undefined,
+        "action-menu": focusedAsset
+          ? () => {
+              const rect = focusedCell?.getBoundingClientRect();
+              openMenu(
+                focusedAsset,
+                rect ? rect.left + Math.min(24, rect.width / 2) : window.innerWidth / 2,
+                rect ? rect.top + Math.min(24, rect.height / 2) : window.innerHeight / 2,
+              );
+            }
+          : undefined,
+      });
+      if (handled) event.preventDefault();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [byId, openMenu, selectedAsset.data?.summary]);
+
   // Keyboard: Ctrl/Cmd+A selects all, Escape clears — but never while typing in the search box.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      const el = document.activeElement;
-      if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT"))
-        return;
+      if (document.getElementById("shortcut-help-title")) return;
+      if (isEditableTarget(e.target)) return;
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "a") {
         e.preventDefault();
         selectAll();
@@ -252,8 +327,19 @@ export function Browser({ onOpenNav }: { onOpenNav?: () => void }) {
 
   return (
     // The centre browse region is the page's main landmark (a11y hardening, issue #44).
-    <main className="flex h-full min-w-0 flex-1 flex-col bg-bg" aria-label="Asset browser">
-      <Toolbar count={visible.length} total={total} onOpenNav={onOpenNav} searching={searching} />
+    <main
+      className="flex h-full min-w-0 flex-1 flex-col bg-bg"
+      aria-label="Asset browser"
+      data-shortcut-region="browser"
+      tabIndex={-1}
+    >
+      <Toolbar
+        count={visible.length}
+        total={total}
+        onOpenNav={onOpenNav}
+        onShowShortcuts={onShowShortcuts}
+        searching={searching}
+      />
       <ActiveFilters
         onClearAll={() => {
           clearSelection();
@@ -504,11 +590,13 @@ function Toolbar({
   count,
   total,
   onOpenNav,
+  onShowShortcuts,
   searching,
 }: {
   count: number;
   total: number | null;
   onOpenNav?: () => void;
+  onShowShortcuts?: () => void;
   searching?: boolean;
 }) {
   const { state, patch, request } = useViewState();
@@ -519,17 +607,25 @@ function Toolbar({
       {/* Menu — opens the Navigation drawer once the layout collapses (responsive + touch pass). */}
       <button
         className="btn -ml-1 shrink-0 px-1.5 py-1 lg:hidden coarse:min-h-11 coarse:min-w-11 coarse:justify-center"
-        title="Menu"
+        title={`Menu (${shortcutLabel("focus-navigation")})`}
         aria-label="Open navigation"
+        aria-keyshortcuts="Control+1 Meta+1"
         onClick={onOpenNav}
       >
         <Menu size={16} />
       </button>
-      <div className="relative min-w-0 flex-1">
+      <div className="relative min-w-0 flex-1" role="search" aria-label="Search assets">
+        <label htmlFor="asset-search" className="sr-only">
+          Search assets
+        </label>
         <Search size={13} className="absolute top-1/2 left-2 -translate-y-1/2 text-fg-dim" />
         <input
+          id="asset-search"
           className="field pr-6 pl-7"
           placeholder="Search assets…"
+          aria-label="Search assets"
+          aria-keyshortcuts="/"
+          title={`Search assets (${shortcutLabel("focus-search")})`}
           value={state.q}
           // Searching is a faceted query — it can't compose with a collection view, so typing
           // exits collection mode (mirrors the sidebar's mutual-exclusion).
@@ -634,6 +730,16 @@ function Toolbar({
         </ViewBtn>
       </div>
 
+      <button
+        className="btn shrink-0 px-1.5 py-1 coarse:min-h-11 coarse:min-w-11 coarse:justify-center"
+        onClick={onShowShortcuts}
+        title={`Keyboard shortcuts (${shortcutLabel("show-shortcuts")})`}
+        aria-label="Keyboard shortcuts"
+        aria-keyshortcuts="Shift+/"
+      >
+        <Keyboard size={14} />
+      </button>
+
       {showExport && (
         <ExportDialog
           scope={state.collection ? { collection: state.collection } : { query: request }}
@@ -659,9 +765,10 @@ function ViewBtn({
   return (
     <button
       onClick={onClick}
-      title={label}
+      title={`${label} (${shortcutLabel("toggle-view")})`}
       aria-label={label}
       aria-pressed={active}
+      aria-keyshortcuts="Control+\\ Meta+\\"
       className="flex items-center justify-center px-2 py-1 coarse:min-h-11 coarse:min-w-11"
       style={{
         background: active ? "var(--color-accent)" : "var(--color-surface-2)",
@@ -978,8 +1085,11 @@ function GridCell({
   return (
     <button
       data-index={index}
+      data-asset-id={asset.id}
       aria-pressed={active}
       aria-label={itemAriaLabel(asset, dupCount)}
+      aria-keyshortcuts="Shift+F10"
+      title={`Open actions (${shortcutLabel("action-menu")})`}
       tabIndex={focusable ? 0 : -1}
       onFocus={() => onFocusIndex(index)}
       onClick={(e) => onClick(asset, mods(e))}
@@ -1127,8 +1237,11 @@ function TableRow({
   return (
     <button
       data-index={index}
+      data-asset-id={asset.id}
       aria-pressed={active}
       aria-label={itemAriaLabel(asset, dupCount)}
+      aria-keyshortcuts="Shift+F10"
+      title={`Open actions (${shortcutLabel("action-menu")})`}
       tabIndex={focusable ? 0 : -1}
       onFocus={() => onFocusIndex(index)}
       onClick={(e) => onClick(asset, mods(e))}

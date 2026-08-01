@@ -8,6 +8,7 @@ import { useEffect, useRef, useState } from "react";
 import { Pause, Play } from "lucide-react";
 import { WaveformIsland } from "@/islands/WaveformIsland";
 import { clearAutoplay, useAutoplaySignal } from "@/lib/audio-intent";
+import { shortcutLabel, SHORTCUT_EVENT, type ShortcutId } from "@/lib/shortcuts";
 
 /** m:ss, guarding the NaN/Infinity that HTMLMediaElement reports before metadata loads. */
 function fmtTime(sec: number): string {
@@ -27,6 +28,7 @@ export function AudioPlayer({
   peaks?: number[] | null;
 }) {
   const audioRef = useRef<HTMLAudioElement>(null);
+  const rootRef = useRef<HTMLDivElement>(null);
   const [playing, setPlaying] = useState(false);
   const [time, setTime] = useState(0);
   const [dur, setDur] = useState(0);
@@ -51,6 +53,16 @@ export function AudioPlayer({
     else a.pause();
   };
 
+  useEffect(() => {
+    const onShortcut = (event: Event) => {
+      if ((event as CustomEvent<ShortcutId>).detail !== "play-pause") return;
+      // The rail and responsive drawer are both mounted; only control the player users can see.
+      if (rootRef.current?.getClientRects().length) toggle();
+    };
+    window.addEventListener(SHORTCUT_EVENT, onShortcut);
+    return () => window.removeEventListener(SHORTCUT_EVENT, onShortcut);
+  });
+
   const seekToFraction = (f: number) => {
     const a = audioRef.current;
     if (!a || !Number.isFinite(a.duration)) return;
@@ -59,7 +71,7 @@ export function AudioPlayer({
   };
 
   return (
-    <div className="flex flex-col">
+    <div ref={rootRef} className="flex flex-col">
       {/* waveform doubles as a click-to-seek scrubber */}
       <div
         className="relative h-16 cursor-pointer"
@@ -77,7 +89,8 @@ export function AudioPlayer({
           onClick={toggle}
           disabled={error}
           aria-label={playing ? "Pause" : "Play"}
-          title={playing ? "Pause" : "Play"}
+          aria-keyshortcuts="Space"
+          title={`${playing ? "Pause" : "Play"} (${shortcutLabel("play-pause")})`}
           className="flex items-center justify-center rounded border border-border bg-surface-2 p-1.5 text-fg-muted hover:text-fg disabled:opacity-40 coarse:min-h-11 coarse:min-w-11"
         >
           {playing ? <Pause size={13} /> : <Play size={13} />}

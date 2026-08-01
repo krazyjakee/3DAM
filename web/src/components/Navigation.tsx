@@ -246,7 +246,12 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
   const recentlyAdded = state.sort === "scanned" && state.dir === "desc";
 
   return (
-    <nav className="flex h-full flex-col overflow-y-auto border-r border-border bg-surface">
+    <nav
+      className="flex h-full flex-col overflow-y-auto border-r border-border bg-surface"
+      aria-label="Library navigation"
+      data-shortcut-region="navigation"
+      tabIndex={-1}
+    >
       {/* library header */}
       <div className="flex items-center gap-2 border-b border-border px-3 py-2.5">
         <Library size={16} className="text-accent" />

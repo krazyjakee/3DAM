@@ -46,6 +46,7 @@ import { DUPLICATE_QUERY_LIMIT } from "@/lib/limits";
 import { peerReadOnlyTitle } from "@/lib/origin";
 import { hasInteractive3D } from "@/lib/model-formats";
 import { useViewState } from "@/lib/view-state";
+import { shortcutLabel, SHORTCUT_EVENT, type ShortcutId } from "@/lib/shortcuts";
 import { ModelViewerIsland } from "@/islands/ModelViewerIsland";
 import { AudioPlayer } from "./AudioPlayer";
 import { LicenseBadge } from "./LicenseBadge";
@@ -82,6 +83,25 @@ export function Inspector({
   onExpand: () => void;
 }) {
   const { state } = useViewState();
+  const selectedAsset = useAsset(state.selected);
+  const setFavorite = useSetFavorite();
+  const canWrite = useCan("write");
+
+  useEffect(() => {
+    const onShortcut = (event: Event) => {
+      if ((event as CustomEvent<ShortcutId>).detail !== "toggle-favourite") return;
+      const summary = selectedAsset.data?.summary;
+      if (
+        summary &&
+        canWrite &&
+        !peerReadOnlyTitle(summary.origin) &&
+        !setFavorite.isPending
+      )
+        setFavorite.mutate({ asset: summary.id, favorite: !summary.favorite });
+    };
+    window.addEventListener(SHORTCUT_EVENT, onShortcut);
+    return () => window.removeEventListener(SHORTCUT_EVENT, onShortcut);
+  }, [canWrite, selectedAsset.data?.summary, setFavorite]);
 
   return (
     <>
@@ -142,7 +162,11 @@ function InspectorPanel({
   // The header — and its collapse/close control — is always present, so the rail can be collapsed
   // even with nothing selected (issue #65). The body below swaps placeholder / skeleton / content.
   return (
-    <div className="flex h-full flex-col overflow-y-auto">
+    <div
+      className="flex h-full flex-col overflow-y-auto"
+      data-shortcut-region="inspector"
+      tabIndex={-1}
+    >
       <div className="flex items-center justify-between border-b border-border px-3 py-2">
         <span className="text-[10px] font-semibold tracking-wider text-fg-dim uppercase">
           Inspector
@@ -565,9 +589,10 @@ function FavoriteButton({ asset }: { asset: Asset }) {
       type="button"
       className="flex shrink-0 items-center justify-center transition-colors disabled:cursor-not-allowed disabled:opacity-40 coarse:min-h-11 coarse:min-w-11"
       style={{ color: on ? "var(--color-accent)" : "var(--color-fg-dim)" }}
-      title={peerTitle ?? (!canWrite ? AUTH_COPY.needsWrite : label)}
+      title={peerTitle ?? (!canWrite ? AUTH_COPY.needsWrite : `${label} (${shortcutLabel("toggle-favourite")})`)}
       aria-label={label}
       aria-pressed={on}
+      aria-keyshortcuts="F"
       disabled={setFavorite.isPending || !canWrite || !!peerTitle}
       onClick={() => setFavorite.mutate({ asset: asset.summary.id, favorite: !on })}
     >
@@ -784,58 +809,83 @@ function SimilarSection({ asset }: { asset: Asset }) {
   const analyze = useAnalyze();
   const peerTitle = peerReadOnlyTitle(asset.summary.origin);
   const similar = useSimilar(asset.summary.id, open && analyzed);
+  const sectionRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const onShortcut = (event: Event) => {
+      if ((event as CustomEvent<ShortcutId>).detail !== "find-similar") return;
+      // Inspector content exists twice responsively; act only in the visible rail/drawer instance.
+      if (!sectionRef.current || sectionRef.current.getClientRects().length === 0) return;
+      if (analyzed) setOpen(true);
+      else if (!analyze.isPending && !peerTitle) analyze.mutate({ assets: [asset.summary.id] });
+    };
+    window.addEventListener(SHORTCUT_EVENT, onShortcut);
+    return () => window.removeEventListener(SHORTCUT_EVENT, onShortcut);
+  }, [analyze, analyzed, asset.summary.id, peerTitle]);
 
   if (!analyzed) {
     return (
-      <Group title="Similar">
-        <p className="text-[11px] text-fg-dim italic">
-          Analyze this asset to find visually similar ones.
-        </p>
-        <button
-          className="btn mt-2 disabled:cursor-not-allowed disabled:opacity-40"
-          disabled={analyze.isPending || !!peerTitle}
-          title={peerTitle}
-          onClick={() => analyze.mutate({ assets: [asset.summary.id] })}
-        >
-          <Sparkles size={12} />
-          {analyze.isPending ? "Analyzing…" : "Analyze now"}
-        </button>
-      </Group>
+      <div ref={sectionRef}>
+        <Group title="Similar">
+          <p className="text-[11px] text-fg-dim italic">
+            Analyze this asset to find visually similar ones.
+          </p>
+          <button
+            className="btn mt-2 disabled:cursor-not-allowed disabled:opacity-40"
+            disabled={analyze.isPending || !!peerTitle}
+            title={peerTitle ?? `Analyze and find similar (${shortcutLabel("find-similar")})`}
+            aria-keyshortcuts="S"
+            onClick={() => analyze.mutate({ assets: [asset.summary.id] })}
+          >
+            <Sparkles size={12} />
+            {analyze.isPending ? "Analyzing…" : "Analyze now"}
+          </button>
+        </Group>
+      </div>
     );
   }
 
   if (!open) {
     return (
-      <Group title="Similar">
-        <button className="btn" onClick={() => setOpen(true)}>
-          <Sparkles size={12} />
-          Find similar
-        </button>
-      </Group>
+      <div ref={sectionRef}>
+        <Group title="Similar">
+          <button
+            className="btn"
+            onClick={() => setOpen(true)}
+            title={`Find similar (${shortcutLabel("find-similar")})`}
+            aria-keyshortcuts="S"
+          >
+            <Sparkles size={12} />
+            Find similar
+          </button>
+        </Group>
+      </div>
     );
   }
 
   const hits = similar.data?.items ?? [];
   return (
-    <Group title="Similar">
-      {similar.isLoading ? (
-        <p className="text-[11px] text-fg-dim">Searching…</p>
-      ) : similar.isError ? (
-        <p className="text-[11px] text-danger">Could not search for similar assets.</p>
-      ) : hits.length === 0 ? (
-        <p className="text-[11px] text-fg-dim italic">No similar assets found.</p>
-      ) : (
-        <div className="grid grid-cols-3 gap-1.5">
-          {hits.map((hit) => (
-            <SimilarTile
-              key={hit.asset.id}
-              hit={hit}
-              onOpen={() => patch({ selected: hit.asset.id })}
-            />
-          ))}
-        </div>
-      )}
-    </Group>
+    <div ref={sectionRef}>
+      <Group title="Similar">
+        {similar.isLoading ? (
+          <p className="text-[11px] text-fg-dim">Searching…</p>
+        ) : similar.isError ? (
+          <p className="text-[11px] text-danger">Could not search for similar assets.</p>
+        ) : hits.length === 0 ? (
+          <p className="text-[11px] text-fg-dim italic">No similar assets found.</p>
+        ) : (
+          <div className="grid grid-cols-3 gap-1.5">
+            {hits.map((hit) => (
+              <SimilarTile
+                key={hit.asset.id}
+                hit={hit}
+                onOpen={() => patch({ selected: hit.asset.id })}
+              />
+            ))}
+          </div>
+        )}
+      </Group>
+    </div>
   );
 }
 
@@ -936,6 +986,23 @@ function TagChip({
         background: "color-mix(in srgb, currentColor 10%, transparent)",
       }}
       title={rejected ? `rejected auto tag${confidence}` : `auto tag${confidence} · powers search`}
+      onKeyDown={(event) => {
+        if (
+          event.altKey ||
+          event.ctrlKey ||
+          event.metaKey ||
+          event.shiftKey ||
+          busy ||
+          !canWrite ||
+          peerTitle
+        )
+          return;
+        const key = event.key.toLowerCase();
+        if ((key === "y" && rejected) || (key === "n" && !rejected)) {
+          event.preventDefault();
+          onReview(rejected ? "accept" : "reject");
+        }
+      }}
     >
       <span className={rejected ? "line-through" : ""}>{tag.name}</span>
       {rejected ? (
@@ -943,9 +1010,12 @@ function TagChip({
           className="flex items-center justify-center hover:text-accent disabled:cursor-not-allowed disabled:opacity-40 coarse:min-h-11 coarse:min-w-11"
           title={
             peerTitle ??
-            (!canWrite ? AUTH_COPY.needsWrite : "Restore tag — include it in search again")
+            (!canWrite
+              ? AUTH_COPY.needsWrite
+              : `Restore tag — include it in search again (${shortcutLabel("accept-suggestion")})`)
           }
           aria-label={`Restore tag ${tag.name}`}
+          aria-keyshortcuts="Y"
           disabled={busy || !canWrite || !!peerTitle}
           onClick={() => onReview("accept")}
         >
@@ -954,8 +1024,14 @@ function TagChip({
       ) : (
         <button
           className="flex items-center justify-center hover:text-danger disabled:cursor-not-allowed disabled:opacity-40 coarse:min-h-11 coarse:min-w-11"
-          title={peerTitle ?? (!canWrite ? AUTH_COPY.needsWrite : "Reject tag — hide it from search")}
+          title={
+            peerTitle ??
+            (!canWrite
+              ? AUTH_COPY.needsWrite
+              : `Reject tag — hide it from search (${shortcutLabel("reject-suggestion")})`)
+          }
           aria-label={`Reject tag ${tag.name}`}
+          aria-keyshortcuts="N"
           disabled={busy || !canWrite || !!peerTitle}
           onClick={() => onReview("reject")}
         >

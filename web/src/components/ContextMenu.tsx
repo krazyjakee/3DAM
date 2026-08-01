@@ -117,6 +117,9 @@ export function ContextMenu({
     });
     setSubmenu(false);
     setConfirming(false);
+    requestAnimationFrame(() =>
+      ref.current?.querySelector<HTMLElement>("[role='menuitem']:not(:disabled)")?.focus(),
+    );
   }, [menu]);
 
   if (!menu) return null;
