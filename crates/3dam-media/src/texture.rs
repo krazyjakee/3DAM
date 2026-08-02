@@ -21,12 +21,12 @@
 //! crate parses headers without touching payload bytes and so can never fail on an exotic one.
 //!
 //! The *payload* is decoded for: uncompressed `R8G8B8A8`/`B8G8R8A8` (UNORM and SRGB), and the
-//! block formats **BC1–BC7**. Everything else — **ASTC**, **ETC2/EAC**, and any
-//! **supercompressed** level (Basis/ETC1S/UASTC, Zstd, ZLIB) — gets full metadata and no
-//! thumbnail. That is the "metadata-before-decoder" staging ADR 0009 §8 keeps open, and it is the
-//! honest split: ASTC/ETC2 need block decoders this module does not yet wire up, and Basis needs a
+//! block formats **BC1–BC7**, **ETC2/EAC**, and two-dimensional LDR **ASTC**. Supercompressed
+//! levels (Basis/ETC1S/UASTC, Zstd, ZLIB) still get full metadata and no thumbnail: Basis needs a
 //! transcoder whose only pure-Rust implementation was two weeks old and single-author when this
-//! landed — not a dependency to add to an asset pipeline for the sake of a preview.
+//! landed — not a dependency to add to an asset pipeline for the sake of a preview. ASTC HDR and
+//! 3D blocks are likewise reported but refused because the decoder produces only an 8-bit 2D
+//! surface; silently flattening or clipping either would be worse than an honest unsupported error.
 //!
 //! KTX v1 is a different container with different magic; it is recognised and reported as
 //! undecoded rather than misreported as a corrupt KTX2.
@@ -211,6 +211,12 @@ fn has_alpha_format(f: ktx2::Format) -> Option<bool> {
     if name.starts_with("BC1_RGB") || name.starts_with("BC4") || name.starts_with("BC5") {
         return Some(false);
     }
+    if name.starts_with("ETC2_R8G8B8A") {
+        return Some(true);
+    }
+    if name.starts_with("ETC2_R8G8B8") || name.starts_with("EAC_") {
+        return Some(false);
+    }
     None
 }
 
@@ -313,21 +319,72 @@ fn ktx2_decode(path: &Path) -> Result<RgbaImage, HandlerError> {
     }
 
     let mut bgra = vec![0u32; wu * hu];
-    let decoded = match name.as_str() {
-        n if n.starts_with("BC1") => texture2ddecoder::decode_bc1(&data, wu, hu, &mut bgra),
-        n if n.starts_with("BC2") => texture2ddecoder::decode_bc2(&data, wu, hu, &mut bgra),
-        n if n.starts_with("BC3") => texture2ddecoder::decode_bc3(&data, wu, hu, &mut bgra),
-        n if n.starts_with("BC4") => texture2ddecoder::decode_bc4(&data, wu, hu, &mut bgra),
-        n if n.starts_with("BC5") => texture2ddecoder::decode_bc5(&data, wu, hu, &mut bgra),
-        // BC6H is the HDR format; the decoder tone-maps to 8-bit, which is all a thumbnail needs.
-        // Vulkan spells the signedness into the name, and decoding an SFLOAT block as unsigned
-        // produces garbage rather than a wrong-but-plausible image.
-        n if n.starts_with("BC6H") => {
-            texture2ddecoder::decode_bc6(&data, wu, hu, &mut bgra, n.contains("SFLOAT"))
+    // The block crate is safe Rust but some malformed ASTC modes reach internal `panic!` branches.
+    // A scanned corrupt texture is a per-item error under the handler contract, never permission
+    // to unwind a worker, so contain third-party decode panics at this boundary.
+    let astc_dims = astc_2d_block_dims(&name);
+    let is_known_block = name.starts_with("BC1")
+        || name.starts_with("BC2")
+        || name.starts_with("BC3")
+        || name.starts_with("BC4")
+        || name.starts_with("BC5")
+        || name.starts_with("BC6H")
+        || name.starts_with("BC7")
+        || matches!(
+            name.as_str(),
+            "ETC2_R8G8B8_UNORM_BLOCK"
+                | "ETC2_R8G8B8_SRGB_BLOCK"
+                | "ETC2_R8G8B8A1_UNORM_BLOCK"
+                | "ETC2_R8G8B8A1_SRGB_BLOCK"
+                | "ETC2_R8G8B8A8_UNORM_BLOCK"
+                | "ETC2_R8G8B8A8_SRGB_BLOCK"
+                | "EAC_R11_UNORM_BLOCK"
+                | "EAC_R11_SNORM_BLOCK"
+                | "EAC_R11G11_UNORM_BLOCK"
+                | "EAC_R11G11_SNORM_BLOCK"
+        )
+        || astc_dims.is_some();
+    if !is_known_block {
+        return Err(HandlerError::Unsupported(format!("KTX2 {name}")));
+    }
+
+    let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        match name.as_str() {
+            n if n.starts_with("BC1") => texture2ddecoder::decode_bc1(&data, wu, hu, &mut bgra),
+            n if n.starts_with("BC2") => texture2ddecoder::decode_bc2(&data, wu, hu, &mut bgra),
+            n if n.starts_with("BC3") => texture2ddecoder::decode_bc3(&data, wu, hu, &mut bgra),
+            n if n.starts_with("BC4") => texture2ddecoder::decode_bc4(&data, wu, hu, &mut bgra),
+            n if n.starts_with("BC5") => texture2ddecoder::decode_bc5(&data, wu, hu, &mut bgra),
+            // BC6H is the HDR format; the decoder tone-maps to 8-bit, which is all a thumbnail
+            // needs. Vulkan spells the signedness into the name, and decoding an SFLOAT block as
+            // unsigned produces garbage rather than a wrong-but-plausible image.
+            n if n.starts_with("BC6H") => {
+                texture2ddecoder::decode_bc6(&data, wu, hu, &mut bgra, n.contains("SFLOAT"))
+            }
+            n if n.starts_with("BC7") => texture2ddecoder::decode_bc7(&data, wu, hu, &mut bgra),
+            "ETC2_R8G8B8_UNORM_BLOCK" | "ETC2_R8G8B8_SRGB_BLOCK" => {
+                texture2ddecoder::decode_etc2_rgb(&data, wu, hu, &mut bgra)
+            }
+            "ETC2_R8G8B8A1_UNORM_BLOCK" | "ETC2_R8G8B8A1_SRGB_BLOCK" => {
+                texture2ddecoder::decode_etc2_rgba1(&data, wu, hu, &mut bgra)
+            }
+            "ETC2_R8G8B8A8_UNORM_BLOCK" | "ETC2_R8G8B8A8_SRGB_BLOCK" => {
+                texture2ddecoder::decode_etc2_rgba8(&data, wu, hu, &mut bgra)
+            }
+            "EAC_R11_UNORM_BLOCK" => texture2ddecoder::decode_eacr(&data, wu, hu, &mut bgra),
+            "EAC_R11_SNORM_BLOCK" => texture2ddecoder::decode_eacr_signed(&data, wu, hu, &mut bgra),
+            "EAC_R11G11_UNORM_BLOCK" => texture2ddecoder::decode_eacrg(&data, wu, hu, &mut bgra),
+            "EAC_R11G11_SNORM_BLOCK" => {
+                texture2ddecoder::decode_eacrg_signed(&data, wu, hu, &mut bgra)
+            }
+            _ if astc_dims.is_some() => {
+                let (bw, bh) = astc_dims.expect("matched above");
+                texture2ddecoder::decode_astc(&data, wu, hu, bw, bh, &mut bgra)
+            }
+            _ => unreachable!("known block format must have a decoder"),
         }
-        n if n.starts_with("BC7") => texture2ddecoder::decode_bc7(&data, wu, hu, &mut bgra),
-        _ => return Err(HandlerError::Unsupported(format!("KTX2 {name}"))),
-    };
+    }))
+    .map_err(|_| HandlerError::Corrupt(format!("KTX2 {name} block decoder failed")))?;
     decoded.map_err(|e| HandlerError::Corrupt(e.to_string()))?;
 
     // `texture2ddecoder` packs BGRA into a little-endian u32, so the bytes land as [B,G,R,A].
@@ -338,6 +395,26 @@ fn ktx2_decode(path: &Path) -> Result<RgbaImage, HandlerError> {
     }
     RgbaImage::from_raw(w, h_px, out)
         .ok_or_else(|| HandlerError::Corrupt("decoded buffer did not match its size".into()))
+}
+
+/// `(block_width, block_height)` for a Vulkan 2D LDR ASTC name.
+///
+/// The family has fourteen footprints and both UNORM/SRGB spellings. Parsing the footprint keeps
+/// the routing table from becoming 28 identical match arms while still rejecting HDR (`SFLOAT`)
+/// and 3D footprints, neither of which the 8-bit 2D decoder can represent honestly.
+fn astc_2d_block_dims(name: &str) -> Option<(usize, usize)> {
+    let rest = name.strip_prefix("ASTC_")?;
+    let (footprint, encoding) = rest.split_once('_')?;
+    if !matches!(encoding, "UNORM_BLOCK" | "SRGB_BLOCK") {
+        return None;
+    }
+    let mut dims = footprint.split('x');
+    let width = dims.next()?.parse().ok()?;
+    let height = dims.next()?.parse().ok()?;
+    (dims.next().is_none()
+        && matches!(width, 4 | 5 | 6 | 8 | 10 | 12)
+        && matches!(height, 4 | 5 | 6 | 8 | 10 | 12))
+    .then_some((width, height))
 }
 
 /// Ceiling on a single decoded surface (256 MB of RGBA ≈ 8192×8192). Dimensions come from a header
@@ -578,6 +655,64 @@ mod tests {
             px[0] > 200 && px[2] < 60,
             "expected red; blue here means the BGRA swizzle was dropped: {px:?}"
         );
+    }
+
+    /// ETC2 and EAC are first-class KTX2 formats on mobile GPUs. The decoder dependency already
+    /// carried all four paths; leaving them unrouted meant their metadata existed but the issue's
+    /// promised preview did not.
+    #[test]
+    fn etc2_and_eac_ktx2_formats_decode() {
+        for (format, bytes, alpha) in [
+            (ktx2::Format::ETC2_R8G8B8_UNORM_BLOCK, 8, Some(false)),
+            (ktx2::Format::ETC2_R8G8B8A1_UNORM_BLOCK, 8, Some(true)),
+            (ktx2::Format::ETC2_R8G8B8A8_UNORM_BLOCK, 16, Some(true)),
+            (ktx2::Format::EAC_R11_UNORM_BLOCK, 8, Some(false)),
+            (ktx2::Format::EAC_R11_SNORM_BLOCK, 8, Some(false)),
+            (ktx2::Format::EAC_R11G11_UNORM_BLOCK, 16, Some(false)),
+            (ktx2::Format::EAC_R11G11_SNORM_BLOCK, 16, Some(false)),
+        ] {
+            // An all-zero block is a legal low endpoint/modifier block for these codecs. Pixel
+            // colour is decoder territory; this routing test pins that every Vulkan spelling gets
+            // a complete 4x4 surface and the cheap tier reports alpha from the format.
+            let (_d, p) = write("mobile.ktx2", &ktx2_with_level(format, &vec![0; bytes]));
+            let attrs = metadata(&p, "ktx2").expect("metadata");
+            assert_eq!(attrs.has_alpha, alpha, "{format:?}");
+            let img =
+                decode_rgba(&p, "ktx2").unwrap_or_else(|e| panic!("{format:?} should decode: {e}"));
+            assert_eq!(img.dimensions(), (4, 4), "{format:?}");
+        }
+    }
+
+    /// ASTC constant-colour (void-extent) blocks are useful fixtures because they are valid for
+    /// every 2D footprint and their output is unambiguous. This one is opaque red in a 5x4 block.
+    #[test]
+    fn a_2d_astc_ktx2_decodes_to_real_pixels() {
+        let mut block = [0u8; 16];
+        block[0] = 0xFC; // void-extent marker
+        block[1] = 0xFD; // LDR constant-colour form
+        block[2..8].fill(0xFF); // full void extent
+        block[9] = 255; // high byte of R16
+        block[11] = 0; // G
+        block[13] = 0; // B
+        block[15] = 255; // A
+        let (_d, p) = write(
+            "astc.ktx2",
+            &ktx2_with_level(ktx2::Format::ASTC_5x4_UNORM_BLOCK, &block),
+        );
+
+        let img = decode_rgba(&p, "ktx2").expect("2D LDR ASTC must decode");
+        assert_eq!(img.dimensions(), (4, 4));
+        assert_eq!(img.get_pixel(0, 0).0, [255, 0, 0, 255]);
+        assert_eq!(img.get_pixel(3, 3).0, [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn astc_routing_accepts_only_2d_ldr_footprints() {
+        assert_eq!(astc_2d_block_dims("ASTC_4x4_UNORM_BLOCK"), Some((4, 4)));
+        assert_eq!(astc_2d_block_dims("ASTC_12x10_SRGB_BLOCK"), Some((12, 10)));
+        assert_eq!(astc_2d_block_dims("ASTC_4x4_SFLOAT_BLOCK"), None);
+        assert_eq!(astc_2d_block_dims("ASTC_4x4x4_UNORM_BLOCK"), None);
+        assert_eq!(astc_2d_block_dims("ASTC_7x7_UNORM_BLOCK"), None);
     }
 
     /// Fail-soft, per the handler contract: a truncated or hostile container is a per-item answer,
