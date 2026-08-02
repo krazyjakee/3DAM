@@ -243,10 +243,10 @@ async fn an_unreachable_remote_source_records_an_error_without_aborting() {
                 kind: SourceKind::Sftp,
                 uri: "sftp://user@127.0.0.1:1/assets".into(),
                 name: Some("dead".into()),
-                options: SourceOptions {
-                    password: Some("x".into()),
-                    ..Default::default()
-                },
+                // The connection fails before authentication. Keeping this source secret-free
+                // makes the network failure test deterministic on headless CI runners that have
+                // no desktop credential store.
+                options: SourceOptions::default(),
             },
         )
         .await
