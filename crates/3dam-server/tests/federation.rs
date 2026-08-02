@@ -317,7 +317,11 @@ async fn query_merges_local_and_peer_results() {
 
     let page = local.query(&ctx, query_all(50)).await.unwrap();
     assert!(page.partial.complete, "both sources answered");
-    assert_eq!(page.total, None, "no true total exists under fan-out");
+    assert_eq!(
+        page.total,
+        Some(4),
+        "exact totals from every answering stream are summed under fan-out"
+    );
     let names: Vec<&str> = page.items.iter().map(|a| a.name.as_str()).collect();
     assert_eq!(
         names,
