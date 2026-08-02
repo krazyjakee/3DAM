@@ -181,9 +181,12 @@ mod analysis;
 mod assets;
 mod blocklist;
 mod collections;
+mod export;
 mod helpers;
 mod jobs;
 mod maintenance;
 mod query;
 pub mod search;
 mod sources;
+
+pub use export::{ExportAssetRow, ExportSelection, ExportStreamStats};
