@@ -38,6 +38,7 @@ import type {
   ScanRequest,
   SourceId,
   SuggestionReview,
+  TagEditRequest,
 } from "./types";
 
 /** Stable query-key roots — ws.ts invalidates against these. */
@@ -53,6 +54,7 @@ export const qk = {
   jobs: ["jobs"] as const,
   collections: ["collections"] as const,
   duplicates: ["duplicates"] as const,
+  tags: ["tags"] as const,
   blocklist: ["blocklist"] as const,
   similar: (id: AssetId) => ["similar", id] as const,
   folders: (source: string, prefix: string) => ["folders", source, prefix] as const,
@@ -223,6 +225,7 @@ export function useRemoveSource() {
       qc.invalidateQueries({ queryKey: qk.sources });
       qc.invalidateQueries({ queryKey: qk.assets });
       qc.invalidateQueries({ queryKey: qk.stats });
+      qc.invalidateQueries({ queryKey: qk.tags });
     },
   });
 }
@@ -347,6 +350,28 @@ export function useDeleteComment(id: AssetId) {
     mutationFn: (commentId: string) => api.deleteComment(commentId),
     meta: { errorPrefix: "Couldn’t delete" },
     onSuccess: () => qc.invalidateQueries({ queryKey: qk.comments(id) }),
+  });
+}
+
+export function useEditTags() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (req: TagEditRequest) => api.editTags(req),
+    meta: { errorPrefix: "Couldn’t update tags" },
+    onSuccess: (_result, req) => {
+      if (req.dry_run) return;
+      qc.invalidateQueries({ queryKey: qk.assets });
+      qc.invalidateQueries({ queryKey: ["asset"] });
+      qc.invalidateQueries({ queryKey: qk.stats });
+    },
+  });
+}
+
+export function useTagVocabulary(prefix = "") {
+  return useQuery({
+    queryKey: [...qk.tags, "vocabulary", prefix],
+    queryFn: () => api.listTags(prefix),
+    staleTime: 30_000,
   });
 }
 

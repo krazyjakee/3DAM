@@ -808,6 +808,86 @@ async fn leak_audit_similar_and_duplicates() {
 }
 
 #[tokio::test]
+async fn bulk_tag_edit_warns_for_read_only_and_hidden_targets_without_writing() {
+    let (app, _store, lib) = harness(true).await;
+    let (shared, secret) = seed_two_sources(&lib).await;
+    enable_accounts(&app).await;
+    let admin = claim(&app, "owner").await;
+    let editor_id = create_account(&app, &admin, "tagger", "editor").await;
+    share(
+        &app,
+        &admin,
+        "source",
+        &shared.to_string(),
+        ("account_id", &editor_id),
+        "read",
+    )
+    .await;
+    let editor = login(&app, "tagger", "password123").await;
+    let shared_asset = asset_id_by_name(&app, &admin, "brick_red.png").await;
+    let hidden_asset = asset_id_by_name(&app, &admin, "secret_wall.png").await;
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/api/v1/tags/edit",
+        Some(&editor),
+        Some(json!({
+            "assets": [shared_asset.clone(), hidden_asset],
+            "add": ["curated"],
+            "dry_run": false
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["matched"], 0);
+    assert_eq!(body["changed"], 0);
+    let codes: Vec<&str> = body["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|warning| warning["code"].as_str().unwrap())
+        .collect();
+    assert!(codes.contains(&"target_read_only"));
+    assert!(codes.contains(&"target_unavailable"));
+
+    let (_, detail) = call(
+        &app,
+        "GET",
+        &format!("/api/v1/assets/{shared_asset}"),
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert!(!detail["tags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tag| tag["name"] == "curated"));
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/api/v1/tags/edit",
+        Some(&admin),
+        Some(json!({"assets": [shared_asset], "add": ["Curated"]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, vocabulary) = call(
+        &app,
+        "POST",
+        "/api/v1/tags/list",
+        Some(&admin),
+        Some(json!({"prefix": "cur", "limit": 5000})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(vocabulary.as_array().unwrap().len(), 1);
+    assert_eq!(vocabulary[0]["name"], "curated");
+    assert_eq!(vocabulary[0]["manual"], true);
+    let _ = secret;
+}
+
+#[tokio::test]
 async fn leak_audit_collections_and_shared_collection_grant() {
     let (app, _s, _l, admin, vera, _shared, _secret, vera_id) = leak_world().await;
     let secret_id = asset_id_by_name(&app, &admin, "secret_wall.png").await;

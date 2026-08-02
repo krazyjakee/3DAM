@@ -1363,6 +1363,58 @@ pub struct SuggestionReview {
     pub action: ReviewAction,
 }
 
+/// Add/remove user-authored tags over one explicit or server-resolved selection (issue #121).
+/// Explicit ids take precedence, followed by collection, then query (matching export selection).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct TagEditRequest {
+    #[serde(default)]
+    pub assets: Vec<AssetId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collection: Option<CollectionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<QueryRequest>,
+    #[serde(default)]
+    pub add: Vec<String>,
+    #[serde(default)]
+    pub remove: Vec<String>,
+    /// Calculate the same authorized delta without changing the catalog.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// Summary-shaped bulk result: bounded warnings rather than one response row per target.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct TagEditResult {
+    pub matched: u64,
+    pub changed: u64,
+    pub additions: u64,
+    pub removals: u64,
+    #[serde(default)]
+    pub warnings: Vec<crate::ItemWarning>,
+}
+
+pub const TAG_EDIT_EXPLICIT_MAX: usize = 1_000;
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct TagListRequest {
+    #[serde(default)]
+    pub prefix: Option<String>,
+    #[serde(default = "default_tag_list_limit")]
+    pub limit: u32,
+}
+
+fn default_tag_list_limit() -> u32 {
+    20
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TagInfo {
+    pub name: String,
+    pub count: u64,
+    /// At least one visible assignment was explicitly user-authored.
+    pub manual: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewAction {

@@ -42,6 +42,9 @@ import type {
   ScanRequest,
   SimilarHit,
   SimilarRequest,
+  TagEditRequest,
+  TagEditResult,
+  TagInfo,
   SourceId,
   SourceInfo,
   UploadOutcome,
@@ -183,6 +186,9 @@ export const api = {
   // auto-tag suggestion lifecycle — accept/reject one suggested tag (tech-spec 05 §1.4)
   reviewSuggestion: (req: SuggestionReview) =>
     send<void>("POST", `${API}/suggestions/review`, req),
+  editTags: (req: TagEditRequest) => send<TagEditResult>("POST", `${API}/tags/edit`, req),
+  listTags: (prefix?: string) =>
+    send<TagInfo[]>("POST", `${API}/tags/list`, { prefix: prefix || null, limit: 20 }),
 
   /** Flag/unflag an asset as a favourite (issue #63). */
   setFavorite: (req: FavoriteRequest) => send<void>("POST", `${API}/assets/favorite`, req),

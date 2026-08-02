@@ -50,6 +50,7 @@ test("100k asset events produce one trailing refresh per query family", async ()
     "folders",
     "similar",
     "stats",
+    "tags",
   ]);
   batch.dispose();
 });
@@ -230,6 +231,7 @@ test("lag forces one full resync and dispose suppresses pending work", async () 
     "comments",
     "similar",
     "folders",
+    "tags",
   ]));
 
   const count = invalidations.length;

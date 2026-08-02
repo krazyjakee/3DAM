@@ -31,6 +31,7 @@ test("asset notes save once after a typing pause and flush immediately on blur",
 
   const saves: { id: string; body: unknown }[] = [];
   server.use(
+    http.post("http://localhost/api/v1/tags/list", () => HttpResponse.json([])),
     http.get("http://localhost/api/v1/assets/asset-a/content", () =>
       new HttpResponse(new Uint8Array([1, 2, 3]), {
         headers: { "content-type": "image/png" },

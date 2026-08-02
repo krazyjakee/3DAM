@@ -1100,6 +1100,22 @@ impl LibraryService for ApiClient {
         Self::expect_no_content(resp).await
     }
 
+    async fn edit_tags(
+        &self,
+        _ctx: &AuthContext,
+        req: TagEditRequest,
+    ) -> Result<TagEditResult, LibError> {
+        self.post("/api/v1/tags/edit", &req).await
+    }
+
+    async fn list_tags(
+        &self,
+        _ctx: &AuthContext,
+        req: TagListRequest,
+    ) -> Result<Vec<TagInfo>, LibError> {
+        self.post("/api/v1/tags/list", &req).await
+    }
+
     async fn set_favorite(&self, _ctx: &AuthContext, req: FavoriteRequest) -> Result<(), LibError> {
         let resp = self
             .http

@@ -11,6 +11,7 @@ const ROOTS = {
   comments: ["comments"],
   similar: ["similar"],
   folders: ["folders"],
+  tags: ["tags"],
 } as const satisfies Record<string, QueryKey>;
 
 type Family = keyof typeof ROOTS;
@@ -24,6 +25,7 @@ const ASSET_FAMILIES: readonly Family[] = [
   "comments",
   "similar",
   "folders",
+  "tags",
 ];
 const JOB_BOUNDARY_FAMILIES: readonly Family[] = [...ASSET_FAMILIES, "sources", "jobs"];
 const ALL_FAMILIES = Object.keys(ROOTS) as Family[];

@@ -44,6 +44,12 @@ pub struct NewAsset {
     pub format: String,
 }
 
+/// Committed tag-edit details used by the engine to emit one post-commit event per changed asset.
+pub struct ManualTagEditOutcome {
+    pub result: TagEditResult,
+    pub changed_assets: Vec<(AssetId, Option<SourceId>)>,
+}
+
 /// One asset the analysis pass must (re-)process — enough to locate the file and decode it, plus the
 /// content hash that keys the extractor cache (tech-spec 05 §7.1). Produced by [`Store::list_analysis_targets`].
 pub struct AnalysisTarget {

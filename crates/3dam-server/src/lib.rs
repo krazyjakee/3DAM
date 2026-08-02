@@ -313,6 +313,8 @@ pub(crate) fn build_router(state: AppState) -> Router {
         )
         .route("/api/v1/assets/{id}/duplicates", get(duplicate_group))
         .route("/api/v1/suggestions/review", post(review_suggestion))
+        .route("/api/v1/tags/edit", post(edit_tags))
+        .route("/api/v1/tags/list", post(list_tags))
         .route("/api/v1/assets/favorite", post(set_favorite))
         .route("/api/v1/jobs/analyze", post(submit_analyze))
         .route("/api/v1/thumbnails/regenerate", post(regenerate_thumbnails))
@@ -1665,6 +1667,22 @@ async fn review_suggestion(
 ) -> Result<StatusCode, ApiError> {
     st.lib.review_suggestion(&ctx, req).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn edit_tags(
+    Writer(ctx): Writer,
+    State(st): State<AppState>,
+    Json(req): Json<TagEditRequest>,
+) -> Result<Json<TagEditResult>, ApiError> {
+    Ok(Json(st.lib.edit_tags(&ctx, req).await?))
+}
+
+async fn list_tags(
+    Reader(ctx): Reader,
+    State(st): State<AppState>,
+    Json(req): Json<TagListRequest>,
+) -> Result<Json<Vec<TagInfo>>, ApiError> {
+    Ok(Json(st.lib.list_tags(&ctx, req).await?))
 }
 
 async fn set_favorite(

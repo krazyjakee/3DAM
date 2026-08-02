@@ -180,6 +180,29 @@ export interface SuggestionReview {
   action: ReviewAction;
 }
 
+export interface TagEditRequest {
+  assets?: AssetId[];
+  collection?: CollectionId;
+  query?: QueryRequest;
+  add?: string[];
+  remove?: string[];
+  dry_run?: boolean;
+}
+
+export interface TagEditResult {
+  matched: number;
+  changed: number;
+  additions: number;
+  removals: number;
+  warnings: ItemWarning[];
+}
+
+export interface TagInfo {
+  name: string;
+  count: number;
+  manual: boolean;
+}
+
 /** Flag/unflag an asset as a favourite (issue #63). Backend route: POST /api/v1/assets/favorite. */
 export interface FavoriteRequest {
   asset: AssetId;

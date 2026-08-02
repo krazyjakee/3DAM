@@ -44,7 +44,7 @@ use dam_api::event::{ChangeKind, LibraryEvent, SubscribeRequest};
 use dam_api::id::{AssetId, CollectionId, CommentId, ContentHash, JobId, SourceId};
 use dam_api::page::{Page, PageParams};
 use dam_api::service::{AuthContext, EventStream, LibraryService, Scope, Visibility};
-use dam_api::LibError;
+use dam_api::{ItemWarning, LibError};
 use dam_store::Store;
 use futures::StreamExt;
 use std::collections::{HashMap, HashSet};
@@ -2544,6 +2544,197 @@ impl LibraryService for EmbeddedLibrary {
             kind: ChangeKind::Retagged,
         });
         Ok(())
+    }
+
+    async fn edit_tags(
+        &self,
+        ctx: &AuthContext,
+        mut req: TagEditRequest,
+    ) -> Result<TagEditResult, LibError> {
+        const TAG_NAME_MAX: usize = 64;
+        const TAG_DELTA_MAX: usize = 50;
+        const WARNING_MAX: usize = 50;
+
+        ctx.require(Scope::Write)?;
+        let selectors = usize::from(!req.assets.is_empty())
+            + usize::from(req.collection.is_some())
+            + usize::from(req.query.is_some());
+        if selectors != 1 {
+            return Err(LibError::BadRequest(
+                "tag edit requires exactly one assets, collection, or query selector".into(),
+            ));
+        }
+        if req.assets.len() > TAG_EDIT_EXPLICIT_MAX {
+            return Err(LibError::BadRequest(format!(
+                "tag edit accepts at most {TAG_EDIT_EXPLICIT_MAX} explicit assets"
+            )));
+        }
+        let normalize = |tags: Vec<String>| -> Result<Vec<String>, LibError> {
+            let mut normalized = std::collections::BTreeSet::new();
+            for tag in tags {
+                let tag = tag.trim().to_lowercase();
+                if tag.is_empty() || tag.chars().count() > TAG_NAME_MAX {
+                    return Err(LibError::BadRequest(format!(
+                        "tag names must contain 1–{TAG_NAME_MAX} characters"
+                    )));
+                }
+                normalized.insert(tag);
+            }
+            if normalized.len() > TAG_DELTA_MAX {
+                return Err(LibError::BadRequest(format!(
+                    "tag edit accepts at most {TAG_DELTA_MAX} additions or removals"
+                )));
+            }
+            Ok(normalized.into_iter().collect())
+        };
+        req.add = normalize(std::mem::take(&mut req.add))?;
+        req.remove = normalize(std::mem::take(&mut req.remove))?;
+        if req.add.is_empty() && req.remove.is_empty() {
+            return Err(LibError::BadRequest(
+                "tag edit requires at least one addition or removal".into(),
+            ));
+        }
+        if let Some(tag) = req.add.iter().find(|tag| req.remove.contains(tag)) {
+            return Err(LibError::BadRequest(format!(
+                "tag '{tag}' cannot be added and removed in one edit"
+            )));
+        }
+
+        let read_vis = ctx.visibility.clone();
+        let write_vis = ctx.visibility.write_view();
+        let explicit = !req.assets.is_empty();
+        let selector = req.clone();
+        let (readable, writable) = self
+            .db(move |store| {
+                let candidates = if !selector.assets.is_empty() {
+                    selector.assets.clone()
+                } else if let Some(collection) = selector.collection {
+                    if !store.collection_visible(&collection, &read_vis)? {
+                        return Err(LibError::NotFound(format!("collection {collection}")));
+                    }
+                    let record = store.get_collection(&collection, &read_vis)?;
+                    match record.kind {
+                        CollectionKind::Manual => store.collection_member_ids(&collection)?,
+                        CollectionKind::Smart => {
+                            store.query_asset_ids(&record.query.unwrap_or_default(), &read_vis)?
+                        }
+                    }
+                } else {
+                    store.query_asset_ids(
+                        selector.query.as_ref().expect("selector validated"),
+                        &read_vis,
+                    )?
+                };
+                let filter = |visibility: &Visibility| -> Result<Vec<AssetId>, LibError> {
+                    let mut visible = std::collections::HashSet::new();
+                    for chunk in candidates.chunks(500) {
+                        visible.extend(store.visible_asset_ids(chunk, visibility)?);
+                    }
+                    let mut seen = std::collections::HashSet::new();
+                    Ok(candidates
+                        .iter()
+                        .copied()
+                        .filter(|id| visible.contains(id) && seen.insert(*id))
+                        .collect())
+                };
+                let readable = filter(&read_vis)?;
+                let writable_set: std::collections::HashSet<_> =
+                    filter(&write_vis)?.into_iter().collect();
+                let writable: Vec<AssetId> = readable
+                    .iter()
+                    .copied()
+                    .filter(|id| writable_set.contains(id))
+                    .collect();
+                Ok((readable, writable))
+            })
+            .await?;
+
+        let readable_set: std::collections::HashSet<_> = readable.iter().copied().collect();
+        let writable_set: std::collections::HashSet<_> = writable.iter().copied().collect();
+        let mut warnings = Vec::new();
+        if explicit {
+            for id in &req.assets {
+                let warning = if !readable_set.contains(id) {
+                    Some((
+                        "target_unavailable",
+                        "Asset is unavailable or outside your read scope",
+                    ))
+                } else if !writable_set.contains(id) {
+                    Some((
+                        "target_read_only",
+                        "Asset is readable but requires a write share",
+                    ))
+                } else {
+                    None
+                };
+                if let Some((code, message)) = warning {
+                    if warnings.len() < WARNING_MAX {
+                        warnings.push(ItemWarning {
+                            subject: id.to_string(),
+                            code: code.into(),
+                            message: message.into(),
+                        });
+                    }
+                }
+            }
+            let excluded = req.assets.len().saturating_sub(writable.len());
+            if excluded > warnings.len() {
+                warnings.push(ItemWarning {
+                    subject: "selection".into(),
+                    code: "warnings_truncated".into(),
+                    message: format!(
+                        "{excluded} targets were excluded; individual warning details are capped at {WARNING_MAX}"
+                    ),
+                });
+            }
+        } else if readable.len() > writable.len() {
+            warnings.push(ItemWarning {
+                subject: "selection".into(),
+                code: "targets_excluded".into(),
+                message: format!(
+                    "{} readable local targets were excluded because they require a write share",
+                    readable.len() - writable.len()
+                ),
+            });
+        }
+
+        let add = req.add.clone();
+        let remove = req.remove.clone();
+        let dry_run = req.dry_run;
+        let mut outcome = self
+            .db(move |store| store.edit_manual_tags(&writable, &add, &remove, dry_run))
+            .await?;
+        outcome.result.warnings = warnings;
+        if !dry_run {
+            for (id, source_id) in outcome.changed_assets {
+                let _ = self.events.send(LibraryEvent::AssetChanged {
+                    id,
+                    source_id,
+                    kind: ChangeKind::Retagged,
+                });
+            }
+        }
+        Ok(outcome.result)
+    }
+
+    async fn list_tags(
+        &self,
+        ctx: &AuthContext,
+        mut req: TagListRequest,
+    ) -> Result<Vec<TagInfo>, LibError> {
+        ctx.require(Scope::Read)?;
+        req.prefix = req
+            .prefix
+            .map(|prefix| prefix.trim().to_lowercase())
+            .filter(|prefix| !prefix.is_empty());
+        if req.prefix.as_ref().is_some_and(|prefix| prefix.len() > 64) {
+            return Err(LibError::BadRequest(
+                "tag prefix must be at most 64 bytes".into(),
+            ));
+        }
+        let vis = ctx.visibility.clone();
+        self.db(move |store| store.list_tags(req.prefix.as_deref(), req.limit, &vis))
+            .await
     }
 
     async fn set_favorite(&self, ctx: &AuthContext, req: FavoriteRequest) -> Result<(), LibError> {

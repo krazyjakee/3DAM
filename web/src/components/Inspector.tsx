@@ -19,12 +19,14 @@ import {
   useCollectionMembers,
   useCollections,
   useDuplicateGroup,
+  useEditTags,
   useRegenerateThumbnail,
   useReviewSuggestion,
   useSetFavorite,
   useSetNote,
   useSimilar,
   useSources,
+  useTagVocabulary,
   useVersion,
 } from "@/api/queries";
 import { api, ApiError } from "@/api/client";
@@ -991,26 +993,87 @@ function TagList({
   origin: Origin;
 }) {
   const review = useReviewSuggestion();
+  const edit = useEditTags();
+  const canWrite = useCan("write");
+  const [newTag, setNewTag] = useState("");
+  const vocabulary = useTagVocabulary(newTag.trim());
   // Tag review mutates this instance's catalog — a peer-owned asset's tags are reviewed on the peer.
   const peerTitle = peerReadOnlyTitle(origin);
-  if (tags.length === 0) {
-    return (
-      <p className="text-[11px] text-fg-dim italic">
-        No tags yet — the analysis pass proposes auto-tags that power search. Reject any that are wrong.
-      </p>
+  const manual = tags.filter((tag) => tag.source !== "auto");
+  const automatic = tags.filter((tag) => tag.source === "auto");
+  const disabled = !canWrite || !!peerTitle || edit.isPending;
+  const add = () => {
+    const tag = newTag.trim();
+    if (!tag) return;
+    edit.mutate(
+      { assets: [assetId], add: [tag], dry_run: false },
+      { onSuccess: () => setNewTag("") },
     );
-  }
+  };
   return (
-    <div className="flex flex-wrap gap-1">
-      {tags.map((t) => (
-        <TagChip
-          key={t.name}
-          tag={t}
-          busy={review.isPending && review.variables?.tag === t.name}
-          peerTitle={peerTitle}
-          onReview={(action) => review.mutate({ asset: assetId, tag: t.name, action })}
-        />
-      ))}
+    <div className="flex flex-col gap-2">
+      <div>
+        <p className="mb-1 text-[10px] font-medium tracking-wide text-fg-dim uppercase">Manual</p>
+        <div className="flex flex-wrap gap-1">
+          {manual.length === 0 && <span className="text-[11px] text-fg-dim italic">No manual tags</span>}
+          {manual.map((tag) => (
+            <span key={tag.name} className="inline-flex items-center gap-1 rounded bg-surface-2 px-1.5 py-0.5 text-[10px] text-fg-muted">
+              {tag.name}
+              <button
+                aria-label={`Remove manual tag ${tag.name}`}
+                title={peerTitle ?? (!canWrite ? AUTH_COPY.needsWrite : "Remove manual tag")}
+                disabled={disabled}
+                onClick={() => edit.mutate({ assets: [assetId], remove: [tag.name], dry_run: false })}
+                className="hover:text-danger disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                <X size={10} />
+              </button>
+            </span>
+          ))}
+        </div>
+        <div className="mt-1.5 flex gap-1">
+          <input
+            className="field min-w-0"
+            aria-label="New manual tag"
+            placeholder="Add a manual tag…"
+            list="known-manual-tags"
+            value={newTag}
+            disabled={disabled}
+            onChange={(event) => setNewTag(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.preventDefault();
+                add();
+              }
+            }}
+            title={peerTitle ?? (!canWrite ? AUTH_COPY.needsWrite : undefined)}
+          />
+          <button className="btn" disabled={disabled || !newTag.trim()} onClick={add}>Add</button>
+          <datalist id="known-manual-tags">
+            {(vocabulary.data ?? []).map((tag) => <option key={tag.name} value={tag.name} />)}
+          </datalist>
+        </div>
+      </div>
+      <div>
+        <p className="mb-1 text-[10px] font-medium tracking-wide text-fg-dim uppercase">
+          Automatic suggestions
+        </p>
+        {automatic.length === 0 ? (
+          <p className="text-[11px] text-fg-dim italic">No automatic suggestions</p>
+        ) : (
+          <div className="flex flex-wrap gap-1">
+            {automatic.map((tag) => (
+              <TagChip
+                key={tag.name}
+                tag={tag}
+                busy={review.isPending && review.variables?.tag === tag.name}
+                peerTitle={peerTitle}
+                onReview={(action) => review.mutate({ asset: assetId, tag: tag.name, action })}
+              />
+            ))}
+          </div>
+        )}
+      </div>
     </div>
   );
 }

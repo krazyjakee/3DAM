@@ -674,6 +674,21 @@ pub trait LibraryService: Send + Sync {
         req: SuggestionReview,
     ) -> Result<(), LibError>;
 
+    /// Preview or apply user-authored tag additions/removals. This is intentionally separate from
+    /// the automatic suggestion review lifecycle above.
+    async fn edit_tags(
+        &self,
+        ctx: &AuthContext,
+        req: TagEditRequest,
+    ) -> Result<TagEditResult, LibError>;
+
+    /// Bounded confirmed-tag vocabulary lookup for manual-tag autocomplete.
+    async fn list_tags(
+        &self,
+        ctx: &AuthContext,
+        req: TagListRequest,
+    ) -> Result<Vec<TagInfo>, LibError>;
+
     /// Flag or unflag an asset as a favourite (issue #63). Reversible; persisted in the asset
     /// `flags` bitset so it survives re-scans.
     async fn set_favorite(&self, ctx: &AuthContext, req: FavoriteRequest) -> Result<(), LibError>;
