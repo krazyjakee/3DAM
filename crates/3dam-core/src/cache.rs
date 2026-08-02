@@ -306,7 +306,9 @@ impl Controller {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     state.remove_entry(path);
                 }
-                Err(_) => {}
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), %error, "stale cache cleanup failed");
+                }
             }
             state.counter(tier).misses += 1;
             return None;
@@ -315,7 +317,9 @@ impl Controller {
             Ok(bytes) => {
                 if bytes.len() as u64 > self.budget(tier) {
                     state.remove_entry(path);
-                    let _ = std::fs::remove_file(path);
+                    if let Err(error) = std::fs::remove_file(path) {
+                        tracing::warn!(path = %path.display(), %error, "oversized cache entry cleanup failed");
+                    }
                     state.counter(tier).misses += 1;
                     return None;
                 }
@@ -380,16 +384,21 @@ impl Controller {
         else {
             return;
         };
-        if std::fs::create_dir_all(dir).is_err() {
+        if let Err(error) = std::fs::create_dir_all(dir) {
+            tracing::warn!(path = %dir.display(), %error, "cache directory creation failed");
             return;
         }
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let tmp = dir.join(format!(".{name}.{}.{}.tmp", std::process::id(), sequence));
-        if std::fs::write(&tmp, bytes).is_err() {
+        if let Err(error) = std::fs::write(&tmp, bytes) {
+            tracing::warn!(path = %tmp.display(), %error, "cache temp write failed");
             return;
         }
-        if std::fs::rename(&tmp, path).is_err() {
-            let _ = std::fs::remove_file(&tmp);
+        if let Err(error) = std::fs::rename(&tmp, path) {
+            tracing::warn!(from = %tmp.display(), to = %path.display(), %error, "cache publish failed");
+            if let Err(cleanup) = std::fs::remove_file(&tmp) {
+                tracing::warn!(path = %tmp.display(), error = %cleanup, "cache temp cleanup failed");
+            }
             return;
         }
         state.clock += 1;
@@ -492,14 +501,24 @@ impl Controller {
         self.initialize(&mut state);
         let mut bytes = 0u64;
         let mut files = 0u64;
-        walk_files(dir, &mut |path, metadata| {
-            if std::fs::remove_file(path).is_ok() {
-                state.remove_entry(path);
-                bytes = bytes.saturating_add(metadata.len());
-                files += 1;
+        walk_files(
+            dir,
+            &mut |path, metadata| match std::fs::remove_file(path) {
+                Ok(()) => {
+                    state.remove_entry(path);
+                    bytes = bytes.saturating_add(metadata.len());
+                    files += 1;
+                }
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), %error, "cache tree entry cleanup failed");
+                }
+            },
+        );
+        if let Err(error) = std::fs::remove_dir_all(dir) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(path = %dir.display(), %error, "cache tree cleanup incomplete");
             }
-        });
-        let _ = std::fs::remove_dir_all(dir);
+        }
         (bytes, files)
     }
 

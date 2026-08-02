@@ -142,11 +142,11 @@ impl EmbeddedLibrary {
                 &pool,
                 &governor,
                 &scratch,
-            );
+            )
         })
         .await;
         self.cancels.lock().unwrap().remove(&job);
-        outcome.map_err(|e| LibError::Internal(e.to_string()))
+        outcome.map_err(|e| LibError::Internal(e.to_string()))?
     }
 
     /// Pre-render each ingested asset's thumbnail (at [`PREGEN_THUMB_EDGE`]) and, for models, the

@@ -10,6 +10,7 @@ mod credentials;
 mod export;
 mod federation;
 mod paths;
+mod reliability;
 mod resources;
 mod scan;
 pub mod semantic;
@@ -338,8 +339,20 @@ fn incompatible_smart_query() -> LibError {
 /// Emit a job's current progress as a `JobProgress` event (best-effort; a dropped read is skipped).
 /// Shared by the scan and analyse job loops.
 pub(crate) fn emit_progress(store: &Store, events: &broadcast::Sender<LibraryEvent>, job: &JobId) {
-    if let Ok(js) = store.get_job_summary(job) {
-        let _ = events.send(LibraryEvent::JobProgress(js));
+    match store.get_job_summary(job) {
+        Ok(summary) => {
+            reliability::publish_event(
+                events,
+                LibraryEvent::JobProgress(summary),
+                "publish job progress",
+            );
+        }
+        Err(error) => reliability::retryable_store_write(
+            Err(error),
+            "read job progress for broadcast",
+            Some(job),
+            None,
+        ),
     }
 }
 
@@ -781,11 +794,15 @@ impl EmbeddedLibrary {
             .db(move |s| s.asset_source(&asset))
             .await
             .unwrap_or(None);
-        let _ = self.events.send(LibraryEvent::AssetChanged {
-            id: asset,
-            source_id,
-            kind: ChangeKind::Commented,
-        });
+        reliability::publish_event(
+            &self.events,
+            LibraryEvent::AssetChanged {
+                id: asset,
+                source_id,
+                kind: ChangeKind::Commented,
+            },
+            "publish comment change",
+        );
     }
 
     /// Fill in [`SourceInfo::writable`] — can each of these accept an upload right now (issue #80)?
@@ -1089,7 +1106,11 @@ impl EmbeddedLibrary {
     /// for re-analysis, keeping user-confirmed tags. Emits `CatalogReset` so open grids refresh.
     pub async fn clear_analysis(&self) -> Result<ClearAnalysisReport, LibError> {
         let report = self.db(|s| s.clear_analysis()).await?;
-        let _ = self.events.send(LibraryEvent::CatalogReset);
+        reliability::publish_event(
+            &self.events,
+            LibraryEvent::CatalogReset,
+            "publish analysis reset",
+        );
         Ok(report)
     }
 
@@ -1118,7 +1139,11 @@ impl EmbeddedLibrary {
                 Ok(report)
             })
             .await?;
-        let _ = self.events.send(LibraryEvent::CatalogReset);
+        reliability::publish_event(
+            &self.events,
+            LibraryEvent::CatalogReset,
+            "publish catalog reset",
+        );
         Ok(report)
     }
 }
@@ -1685,12 +1710,17 @@ impl LibraryService for EmbeddedLibrary {
                     if cancel.load(Ordering::Relaxed) {
                         return false;
                     }
-                    let _ = store.update_job_progress(
-                        &job,
-                        JobState::Running,
-                        done,
-                        Some(total),
-                        current,
+                    reliability::retryable_store_write(
+                        store.update_job_progress(
+                            &job,
+                            JobState::Running,
+                            done,
+                            Some(total),
+                            current,
+                        ),
+                        "persist convert progress",
+                        Some(&job),
+                        None,
                     );
                     emit_progress(&store, &events, &job);
                     !cancel.load(Ordering::Relaxed)
@@ -1706,41 +1736,60 @@ impl LibraryService for EmbeddedLibrary {
                         JobState::Done
                     };
                     let summary = convert_summary(&run.report, state);
-                    let finished =
-                        store.finish_job(&job, state, &summary, &warnings, Some(&result));
-                    if state == JobState::Done && matches!(finished, Ok(false)) {
+                    let finished = reliability::required_background_write(
+                        store.finish_job(&job, state, &summary, &warnings, Some(&result)),
+                        "persist convert terminal report",
+                        &job,
+                    );
+                    if state == JobState::Done && matches!(finished, Some(false)) {
                         // Cancellation won the DB race after the worker sampled the flag. Preserve
                         // the itemized partial/full report without changing the Cancelled state.
                         let summary = convert_summary(&run.report, JobState::Cancelled);
-                        let _ = store.finish_job(
+                        reliability::required_background_write(
+                            store.finish_job(
+                                &job,
+                                JobState::Cancelled,
+                                &summary,
+                                &warnings,
+                                Some(&result),
+                            ),
+                            "persist convert cancellation race report",
                             &job,
-                            JobState::Cancelled,
-                            &summary,
-                            &warnings,
-                            Some(&result),
                         );
                     }
                 }
                 Err(error) if cancel.load(Ordering::Relaxed) => {
-                    let _ = store.finish_job(
+                    reliability::required_background_write(
+                        store.finish_job(
+                            &job,
+                            JobState::Cancelled,
+                            "Convert cancelled before completion",
+                            &[],
+                            None,
+                        ),
+                        "persist convert cancellation",
                         &job,
-                        JobState::Cancelled,
-                        "Convert cancelled before completion",
-                        &[],
-                        None,
                     );
                     tracing::debug!(%job, %error, "convert stopped after cancellation");
                 }
                 Err(error) => {
-                    let _ = store.set_job_state(&job, JobState::Failed, Some(&error.to_string()));
+                    reliability::required_background_write(
+                        store.set_job_state(&job, JobState::Failed, Some(&error.to_string())),
+                        "persist convert failure",
+                        &job,
+                    );
                 }
             }
-            let _ = store.set_job_artifacts(
+            reliability::required_background_write(
+                store.set_job_artifacts(
+                    &job,
+                    &[JobArtifact {
+                        label: "Open convert report".into(),
+                        route: Some(format!("/jobs?job={job}")),
+                    }],
+                ),
+                "persist convert report artifact",
                 &job,
-                &[JobArtifact {
-                    label: "Open convert report".into(),
-                    route: Some(format!("/jobs?job={job}")),
-                }],
             );
             emit_progress(&store, &events, &job);
         });
@@ -1932,7 +1981,9 @@ impl LibraryService for EmbeddedLibrary {
                     // list as locked/unavailable and remains recoverable; removing the row here
                     // would turn a possibly committed provider entry into an orphan.
                     if secrets.delete(reference).is_ok() {
-                        let _ = s.remove_source(&id, false);
+                        if let Err(cleanup) = s.remove_source(&id, false) {
+                            tracing::error!(source = %id, error = %cleanup, "source rollback after credential failure failed");
+                        }
                     }
                     return Err(error);
                 }
@@ -2003,9 +2054,11 @@ impl LibraryService for EmbeddedLibrary {
         let source_id = self.db(move |s| s.asset_source(&id)).await?;
         self.db(move |s| s.remove_asset(&id, req.block)).await?;
         // Live update: drop the row from every open grid/inspector (mirrors AssetAdded on scan).
-        let _ = self
-            .events
-            .send(LibraryEvent::AssetRemoved { id, source_id });
+        reliability::publish_event(
+            &self.events,
+            LibraryEvent::AssetRemoved { id, source_id },
+            "publish removed asset",
+        );
         Ok(())
     }
 
@@ -2215,12 +2268,17 @@ impl LibraryService for EmbeddedLibrary {
                 if cancel.load(Ordering::Relaxed) {
                     return Err(LibError::Cancelled);
                 }
-                let _ = store.update_job_progress(
-                    &job,
-                    JobState::Running,
-                    done,
-                    total,
-                    Some("Encoding manifest"),
+                reliability::retryable_store_write(
+                    store.update_job_progress(
+                        &job,
+                        JobState::Running,
+                        done,
+                        total,
+                        Some("Encoding manifest"),
+                    ),
+                    "persist export progress",
+                    Some(&job),
+                    None,
                 );
                 emit_progress(&store, &events, &job);
                 Ok(())
@@ -2244,50 +2302,74 @@ impl LibraryService for EmbeddedLibrary {
                             report.assets, report.files_written
                         )
                     };
-                    let finished = store.finish_job(&job, state, &summary, &[], Some(&result));
-                    if state == JobState::Done && matches!(finished, Ok(false)) {
+                    let finished = reliability::required_background_write(
+                        store.finish_job(&job, state, &summary, &[], Some(&result)),
+                        "persist export terminal report",
+                        &job,
+                    );
+                    if state == JobState::Done && matches!(finished, Some(false)) {
                         let summary = format!(
                             "Cancellation arrived after {} file(s) were committed; output was retained",
                             report.files_written
                         );
-                        let _ = store.finish_job(
+                        reliability::required_background_write(
+                            store.finish_job(
+                                &job,
+                                JobState::Cancelled,
+                                &summary,
+                                &[],
+                                Some(&result),
+                            ),
+                            "persist export cancellation race report",
                             &job,
-                            JobState::Cancelled,
-                            &summary,
-                            &[],
-                            Some(&result),
                         );
                     }
                 }
                 Err(LibError::Cancelled) => {
-                    let _ = store.finish_job(
+                    reliability::required_background_write(
+                        store.finish_job(
+                            &job,
+                            JobState::Cancelled,
+                            "Export cancelled; staged output was removed",
+                            &[],
+                            None,
+                        ),
+                        "persist export cancellation",
                         &job,
-                        JobState::Cancelled,
-                        "Export cancelled; staged output was removed",
-                        &[],
-                        None,
                     );
                 }
                 Err(error) if cancel.load(Ordering::Relaxed) => {
-                    let _ = store.finish_job(
+                    reliability::required_background_write(
+                        store.finish_job(
+                            &job,
+                            JobState::Cancelled,
+                            "Export cancelled; staged output was removed",
+                            &[],
+                            None,
+                        ),
+                        "persist export cancellation after error",
                         &job,
-                        JobState::Cancelled,
-                        "Export cancelled; staged output was removed",
-                        &[],
-                        None,
                     );
                     tracing::debug!(%job, %error, "export stopped after cancellation");
                 }
                 Err(error) => {
-                    let _ = store.set_job_state(&job, JobState::Failed, Some(&error.to_string()));
+                    reliability::required_background_write(
+                        store.set_job_state(&job, JobState::Failed, Some(&error.to_string())),
+                        "persist export failure",
+                        &job,
+                    );
                 }
             }
-            let _ = store.set_job_artifacts(
+            reliability::required_background_write(
+                store.set_job_artifacts(
+                    &job,
+                    &[JobArtifact {
+                        label: "Open export report".into(),
+                        route: Some(format!("/jobs?job={job}")),
+                    }],
+                ),
+                "persist export report artifact",
                 &job,
-                &[JobArtifact {
-                    label: "Open export report".into(),
-                    route: Some(format!("/jobs?job={job}")),
-                }],
             );
             emit_progress(&store, &events, &job);
         });
@@ -2330,9 +2412,11 @@ impl LibraryService for EmbeddedLibrary {
         let governor = self.governor.clone();
         let scratch = self.scratch();
         tokio::task::spawn_blocking(move || {
-            scan::run_scan(
+            if let Err(error) = scan::run_scan(
                 store, secrets, events, job, sources, mode, cancel, &governor, &scratch,
-            );
+            ) {
+                reliability::background_job_failed(&job, "run scan", &error);
+            }
         });
 
         Ok(job)
@@ -2378,7 +2462,7 @@ impl LibraryService for EmbeddedLibrary {
         let governor = self.governor.clone();
         let scratch = self.scratch();
         tokio::task::spawn_blocking(move || {
-            analysis::run_analyze(
+            if let Err(error) = analysis::run_analyze(
                 store,
                 events,
                 job,
@@ -2395,7 +2479,9 @@ impl LibraryService for EmbeddedLibrary {
                 &pool,
                 &governor,
                 &scratch,
-            );
+            ) {
+                reliability::background_job_failed(&job, "run analysis", &error);
+            }
         });
         Ok(job)
     }
@@ -2597,11 +2683,15 @@ impl LibraryService for EmbeddedLibrary {
         let tag = req.tag.clone();
         self.db(move |s| s.set_tag_state(&id, &tag, state)).await?;
         let source_id = self.db(move |s| s.asset_source(&id)).await?;
-        let _ = self.events.send(LibraryEvent::AssetChanged {
-            id: req.asset,
-            source_id,
-            kind: ChangeKind::Retagged,
-        });
+        reliability::publish_event(
+            &self.events,
+            LibraryEvent::AssetChanged {
+                id: req.asset,
+                source_id,
+                kind: ChangeKind::Retagged,
+            },
+            "publish suggestion review",
+        );
         Ok(())
     }
 
@@ -2766,11 +2856,15 @@ impl LibraryService for EmbeddedLibrary {
         outcome.result.warnings = warnings;
         if !dry_run {
             for (id, source_id) in outcome.changed_assets {
-                let _ = self.events.send(LibraryEvent::AssetChanged {
-                    id,
-                    source_id,
-                    kind: ChangeKind::Retagged,
-                });
+                reliability::publish_event(
+                    &self.events,
+                    LibraryEvent::AssetChanged {
+                        id,
+                        source_id,
+                        kind: ChangeKind::Retagged,
+                    },
+                    "publish tag edit",
+                );
             }
         }
         Ok(outcome.result)
@@ -2802,11 +2896,15 @@ impl LibraryService for EmbeddedLibrary {
         let on = req.favorite;
         self.db(move |s| s.set_favorite(&id, on)).await?;
         let source_id = self.db(move |s| s.asset_source(&id)).await?;
-        let _ = self.events.send(LibraryEvent::AssetChanged {
-            id: req.asset,
-            source_id,
-            kind: ChangeKind::Metadata,
-        });
+        reliability::publish_event(
+            &self.events,
+            LibraryEvent::AssetChanged {
+                id: req.asset,
+                source_id,
+                kind: ChangeKind::Metadata,
+            },
+            "publish favourite change",
+        );
         Ok(())
     }
 
@@ -2836,11 +2934,15 @@ impl LibraryService for EmbeddedLibrary {
             .db(move |s| s.set_note(&aid, &req.body, by.as_deref()))
             .await?;
         let source_id = self.db(move |s| s.asset_source(&aid)).await?;
-        let _ = self.events.send(LibraryEvent::AssetChanged {
-            id: aid,
-            source_id,
-            kind: ChangeKind::NoteSet,
-        });
+        reliability::publish_event(
+            &self.events,
+            LibraryEvent::AssetChanged {
+                id: aid,
+                source_id,
+                kind: ChangeKind::NoteSet,
+            },
+            "publish note change",
+        );
         Ok(note)
     }
 

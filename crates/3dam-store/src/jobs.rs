@@ -195,7 +195,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE job SET state = 'done', summary = ?2, warnings = ?3, error = NULL,
-                            updated_at = ?4 WHERE id = ?1",
+                            updated_at = ?4 WHERE id = ?1 AND state <> 'cancelled'",
             params![id.as_bytes().to_vec(), summary, warnings_json, now_ms()],
         )
         .map_err(internal)?;
@@ -465,6 +465,42 @@ mod tests {
         assert!(status.error.is_none());
         assert_eq!(status.initiator.as_deref(), Some("Automation"));
         assert!(status.updated_at >= status.created_at);
+    }
+
+    #[test]
+    fn injected_sqlite_terminal_persistence_failures_are_returned() {
+        let store = Store::open_in_memory().unwrap();
+        let job = store
+            .create_job(JobKind::Analyze, "{}", Some(1), &[])
+            .unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute("DROP TABLE job", [])
+            .unwrap();
+
+        assert!(store
+            .set_job_state(&job, JobState::Failed, Some("analysis failed"))
+            .is_err());
+        assert!(store.complete_job(&job, "finished", &[]).is_err());
+    }
+
+    #[test]
+    fn cancellation_wins_scan_and_analysis_completion_race() {
+        let store = Store::open_in_memory().unwrap();
+        let job = store
+            .create_job(JobKind::Analyze, "{}", Some(1), &[])
+            .unwrap();
+        store
+            .set_job_state(&job, JobState::Cancelled, None)
+            .unwrap();
+
+        store.complete_job(&job, "too late", &[]).unwrap();
+
+        let status = store.get_job(&job).unwrap();
+        assert_eq!(status.state, JobState::Cancelled);
+        assert!(status.summary.is_none());
     }
 
     #[test]

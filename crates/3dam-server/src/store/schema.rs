@@ -253,7 +253,9 @@ fn create_backup(
         secure_and_sync_backup(&backup_path)
     })();
     if let Err(error) = result {
-        let _ = std::fs::remove_file(&backup_path);
+        if let Err(cleanup) = std::fs::remove_file(&backup_path) {
+            tracing::warn!(path = %backup_path.display(), error = %cleanup, "failed migration backup cleanup");
+        }
         return Err(error);
     }
     Ok(backup_path)
@@ -280,7 +282,9 @@ fn reserve_backup_path(parent: &Path, stem: &std::ffi::OsStr) -> Result<PathBuf,
                     Ok(metadata) => metadata,
                     Err(error) => {
                         drop(file);
-                        let _ = std::fs::remove_file(&candidate);
+                        if let Err(cleanup) = std::fs::remove_file(&candidate) {
+                            tracing::warn!(path = %candidate.display(), error = %cleanup, "failed reserved backup cleanup");
+                        }
                         return Err(LibError::Internal(format!(
                             "could not inspect reserved server.db backup {}: {error}",
                             candidate.display()
@@ -289,7 +293,9 @@ fn reserve_backup_path(parent: &Path, stem: &std::ffi::OsStr) -> Result<PathBuf,
                 };
                 if !metadata.file_type().is_file() {
                     drop(file);
-                    let _ = std::fs::remove_file(&candidate);
+                    if let Err(cleanup) = std::fs::remove_file(&candidate) {
+                        tracing::warn!(path = %candidate.display(), error = %cleanup, "failed non-file backup cleanup");
+                    }
                     return Err(LibError::Internal(format!(
                         "refusing non-regular server.db backup path {}",
                         candidate.display()

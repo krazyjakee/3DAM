@@ -116,7 +116,7 @@ async fn upload(
     let destination = match st.lib.get_source(&ctx, &source).await {
         Ok(destination) => destination,
         Err(error) => {
-            audit_refused(&st, &actor, &target, source, 0, &error);
+            audit_refused(&st, &actor, &target, source, 0, &error)?;
             return Err(ApiError(error));
         }
     };
@@ -124,7 +124,7 @@ async fn upload(
         let error = LibError::Forbidden(
             "no write access to this source (a write share is required)".into(),
         );
-        audit_refused(&st, &actor, &target, source, 0, &error);
+        audit_refused(&st, &actor, &target, source, 0, &error)?;
         return Err(ApiError(error));
     }
     if !destination.writable {
@@ -132,7 +132,7 @@ async fn upload(
             "source {:?} cannot accept uploads",
             destination.name
         ));
-        audit_refused(&st, &actor, &target, source, 0, &error);
+        audit_refused(&st, &actor, &target, source, 0, &error)?;
         return Err(ApiError(error));
     }
 
@@ -146,7 +146,9 @@ async fn upload(
         .and_then(|v| v.parse::<u64>().ok())
     {
         if len > ceiling {
-            return Err(ApiError(too_large(len, ceiling)));
+            let error = too_large(len, ceiling);
+            audit_refused(&st, &actor, &target, source, 0, &error)?;
+            return Err(ApiError(error));
         }
     }
 
@@ -169,7 +171,13 @@ async fn upload(
     .map_err(|e| ApiError(LibError::Internal(e.to_string())))?
     .map_err(|e| ApiError(LibError::Internal(format!("stage upload: {e}"))))?;
 
-    let written = stream_to_file(body, staged.path(), ceiling).await?;
+    let written = match stream_to_file(body, staged.path(), ceiling).await {
+        Ok(written) => written,
+        Err(ApiError(error)) => {
+            audit_refused(&st, &actor, &target, source, 0, &error)?;
+            return Err(ApiError(error));
+        }
+    };
 
     let req = UploadRequest {
         source,
@@ -184,14 +192,17 @@ async fn upload(
             // traversal-shaped name or a peer destination is what an audit log is read for after
             // the fact. Recording only successes would leave exactly the attempts worth reviewing
             // invisible.
-            audit_refused(&st, &actor, &target, source, written, &e);
+            audit_refused(&st, &actor, &target, source, written, &e)?;
             return Err(ApiError(e));
         }
     };
 
     // Who wrote what, where. Upload is the only way bytes enter a source through 3DAM, so this is
     // exactly the "exposure risk" class of event `audit_log` exists for (tech-spec 10 §5).
-    let _ = st.store.audit(
+    // The source/catalog mutation and server audit live in separate databases, so rollback cannot
+    // be atomic. Required-audit failure therefore fails the request after mutation; callers can
+    // reconcile the create-only target before retrying.
+    st.store.audit(
         &actor,
         "source.upload",
         Some(&outcome.path),
@@ -201,7 +212,7 @@ async fn upload(
             "skipped": outcome.skipped,
             "asset": outcome.asset.map(|a| a.to_string()),
         })),
-    );
+    )?;
 
     Ok(Json(outcome))
 }
@@ -213,8 +224,8 @@ fn audit_refused(
     source: SourceId,
     bytes: u64,
     error: &LibError,
-) {
-    let _ = st.store.audit(
+) -> Result<(), ApiError> {
+    st.store.audit(
         actor,
         "source.upload.refused",
         Some(target),
@@ -223,7 +234,8 @@ fn audit_refused(
             "bytes": bytes,
             "reason": error.to_string(),
         })),
-    );
+    )?;
+    Ok(())
 }
 
 fn too_large(len: u64, ceiling: u64) -> LibError {

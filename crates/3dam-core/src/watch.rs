@@ -276,7 +276,7 @@ fn trigger_delta(
     let scratch = scratch.clone();
     tokio::task::spawn_blocking(move || {
         let cancel = Arc::new(AtomicBool::new(false));
-        scan::run_scan(
+        if let Err(error) = scan::run_scan(
             store,
             secrets,
             events,
@@ -286,7 +286,9 @@ fn trigger_delta(
             cancel,
             &governor,
             &scratch,
-        );
+        ) {
+            crate::reliability::background_job_failed(&job, "run watched scan", &error);
+        }
         in_flight.lock().unwrap().remove(&id);
     });
 }

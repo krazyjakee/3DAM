@@ -139,7 +139,12 @@ impl EmbeddedLibrary {
                         }
                         Ok(_) => {}
                         Err(error) => {
-                            let _ = s.set_source_error(&info.id, &error.to_string());
+                            crate::reliability::retryable_store_write(
+                                s.set_source_error(&info.id, &error.to_string()),
+                                "record unavailable federated source",
+                                None,
+                                Some(&info.id),
+                            );
                             tracing::warn!(peer = %info.name, "federated peer credentials unavailable: {error}");
                         }
                     }

@@ -437,10 +437,12 @@ impl ServerStore {
             )
             .map_err(internal)?;
             // Opportunistic GC of stale failure rows.
-            let _ = conn.execute(
+            if let Err(error) = conn.execute(
                 "DELETE FROM login_failure WHERE at < ?1",
                 params![now - LOCKOUT_WINDOW_MS],
-            );
+            ) {
+                tracing::warn!(%error, "opportunistic login-failure cleanup failed");
+            }
             return Err(LibError::Unauthorized);
         }
         let (account_id, _, role_s, _) = row.unwrap();
@@ -547,10 +549,11 @@ impl ServerStore {
             return Ok(None);
         }
         if now >= absolute_exp || now - last_seen >= SESSION_IDLE_MS {
-            let _ = conn.execute(
+            conn.execute(
                 "DELETE FROM session WHERE session_id = ?1",
                 params![session_id],
-            );
+            )
+            .map_err(internal)?;
             return Ok(None);
         }
         let acct: Option<(String, String, i64)> = conn
@@ -568,10 +571,12 @@ impl ServerStore {
             return Ok(None);
         }
         if now - last_seen > TOUCH_INTERVAL_MS {
-            let _ = conn.execute(
+            if let Err(error) = conn.execute(
                 "UPDATE session SET last_seen = ?2 WHERE session_id = ?1",
                 params![session_id, now],
-            );
+            ) {
+                tracing::warn!(%error, "session last-seen touch failed");
+            }
         }
         Ok(Some((
             AccountIdentity {

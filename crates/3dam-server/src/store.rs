@@ -184,7 +184,7 @@ impl ServerStore {
     /// Open (creating + migrating) the server store at `path`, loading the flag state into memory.
     pub fn open(path: &Path) -> Result<ServerStore, LibError> {
         if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            std::fs::create_dir_all(parent).map_err(internal)?;
         }
         let conn = Connection::open(path).map_err(internal)?;
         Self::from_conn(conn, Some(path))
@@ -660,6 +660,10 @@ impl ServerStore {
 
     // ── audit (tech-spec 10 §4.5) ────────────────────────────────────────────
 
+    /// Append a required audit record. Callers must propagate failure: most audited mutations live
+    /// in `library.db` or a source backend and cannot join this `server.db` transaction, so the
+    /// defined fallback is fail-after-mutation and explicit client reconciliation, never false
+    /// success or an invented cross-database rollback.
     pub fn audit(
         &self,
         actor: &str,
@@ -742,6 +746,27 @@ impl ServerStore {
             unclaimed: self.unclaimed(),
             account_count: self.count_accounts().unwrap_or(0),
         }
+    }
+}
+
+#[cfg(test)]
+mod audit_failure_tests {
+    use super::*;
+
+    #[test]
+    fn injected_sqlite_audit_failure_is_returned() {
+        let store = ServerStore::open_in_memory().unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute("DROP TABLE audit_log", [])
+            .unwrap();
+
+        let error = store
+            .audit("test", "required.mutation", None, None)
+            .unwrap_err();
+        assert!(error.to_string().contains("audit_log"));
     }
 }
 

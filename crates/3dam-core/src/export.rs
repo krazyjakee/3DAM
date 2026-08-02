@@ -317,7 +317,9 @@ fn replace_directory(stage: tempfile::TempDir, out: &Path) -> Result<(), LibErro
     let stage_path = stage.keep();
     if !out.exists() {
         return std::fs::rename(&stage_path, out).map_err(|error| {
-            let _ = std::fs::remove_dir_all(&stage_path);
+            if let Err(cleanup) = std::fs::remove_dir_all(&stage_path) {
+                tracing::warn!(path = %stage_path.display(), error = %cleanup, "failed export stage cleanup");
+            }
             io_err(error)
         });
     }
@@ -331,8 +333,15 @@ fn replace_directory(stage: tempfile::TempDir, out: &Path) -> Result<(), LibErro
     std::fs::remove_dir(&backup_path).map_err(io_err)?;
     std::fs::rename(out, &backup_path).map_err(io_err)?;
     if let Err(error) = std::fs::rename(&stage_path, out) {
-        let _ = std::fs::rename(&backup_path, out);
-        let _ = std::fs::remove_dir_all(&stage_path);
+        let restore = std::fs::rename(&backup_path, out);
+        if let Err(cleanup) = std::fs::remove_dir_all(&stage_path) {
+            tracing::warn!(path = %stage_path.display(), error = %cleanup, "failed export stage cleanup");
+        }
+        if let Err(restore) = restore {
+            return Err(LibError::Internal(format!(
+                "export io: publish failed: {error}; restoring prior output failed: {restore}"
+            )));
+        }
         return Err(io_err(error));
     }
     std::fs::remove_dir_all(backup_path).map_err(io_err)

@@ -8,7 +8,7 @@
 //! cheap change token (size + mtime) to the stored row and only opens bytes for new/changed files;
 //! either way, files that vanished are marked absent (non-destructive), never deleted.
 
-use crate::emit_progress;
+use crate::{emit_progress, reliability};
 use dam_api::dto::*;
 use dam_api::event::LibraryEvent;
 use dam_api::id::JobId;
@@ -58,13 +58,13 @@ pub(crate) fn run_scan(
     cancel: Arc<AtomicBool>,
     governor: &crate::resources::Governor,
     scratch: &Path,
-) {
+) -> Result<(), LibError> {
     // Use the catalog size as an estimate for either mode. A new/empty source is indeterminate.
     // Walking just to discover an exact denominator doubled local directory work and, worse, every
     // SFTP/SMB listing call. The final update replaces this estimate with the examined count.
     let estimated_total: u64 = sources.iter().map(|source| source.stats.asset_count).sum();
     let total = (estimated_total > 0).then_some(estimated_total);
-    let _ = store.update_job_progress(&job, JobState::Running, 0, total, None);
+    store.update_job_progress(&job, JobState::Running, 0, total, None)?;
     let mut done: u64 = 0;
     let mut examined: u64 = 0;
     let mut skipped: u64 = 0;
@@ -87,7 +87,12 @@ pub(crate) fn run_scan(
         {
             Ok(c) => c,
             Err(e) => {
-                let _ = store.set_source_error(&sid, &e.to_string());
+                reliability::retryable_store_write(
+                    store.set_source_error(&sid, &e.to_string()),
+                    "record scan source open failure",
+                    Some(&job),
+                    Some(&sid),
+                );
                 record_warning(
                     &mut warnings,
                     &mut warning_details,
@@ -99,7 +104,12 @@ pub(crate) fn run_scan(
         let fs = match open_source(&conn, scratch) {
             Ok(fs) => fs,
             Err(e) => {
-                let _ = store.set_source_error(&sid, &e.to_string());
+                reliability::retryable_store_write(
+                    store.set_source_error(&sid, &e.to_string()),
+                    "record unavailable scan source",
+                    Some(&job),
+                    Some(&sid),
+                );
                 tracing::warn!(source = %sid, error = %e, "source unavailable");
                 record_warning(
                     &mut warnings,
@@ -116,7 +126,12 @@ pub(crate) fn run_scan(
         let generation = match store.begin_source_scan(&sid) {
             Ok(generation) => generation,
             Err(error) => {
-                let _ = store.set_source_error(&sid, &error.to_string());
+                reliability::retryable_store_write(
+                    store.set_source_error(&sid, &error.to_string()),
+                    "record scan generation failure",
+                    Some(&job),
+                    Some(&sid),
+                );
                 record_warning(
                     &mut warnings,
                     &mut warning_details,
@@ -164,12 +179,17 @@ pub(crate) fn run_scan(
                     // sitting at 0 the whole time, and the % is against the pre-counted total.
                     examined += 1;
                     if examined.is_multiple_of(PROGRESS_EVERY) {
-                        let _ = store.update_job_progress(
-                            &job,
-                            JobState::Running,
-                            examined,
-                            total,
-                            Some(&fe.rel_path),
+                        reliability::retryable_store_write(
+                            store.update_job_progress(
+                                &job,
+                                JobState::Running,
+                                examined,
+                                total,
+                                Some(&fe.rel_path),
+                            ),
+                            "persist scan progress",
+                            Some(&job),
+                            Some(&sid),
                         );
                         emit_progress(&store, &events, &job);
                     }
@@ -304,7 +324,11 @@ pub(crate) fn run_scan(
                                     // subscribers (issue #42).
                                     source_id: Some(sid),
                                 };
-                                let _ = events.send(LibraryEvent::AssetAdded(summary));
+                                reliability::publish_event(
+                                    &events,
+                                    LibraryEvent::AssetAdded(summary),
+                                    "publish scanned asset",
+                                );
                             }
                         }
                         Err(e) => {
@@ -364,7 +388,12 @@ pub(crate) fn run_scan(
                 }
             }
             Err(e) => {
-                let _ = store.set_source_error(&sid, &e.to_string());
+                reliability::retryable_store_write(
+                    store.set_source_error(&sid, &e.to_string()),
+                    "record source walk failure",
+                    Some(&job),
+                    Some(&sid),
+                );
                 record_warning(
                     &mut warnings,
                     &mut warning_details,
@@ -377,10 +406,10 @@ pub(crate) fn run_scan(
         }
     }
 
-    if cancel.load(Ordering::Relaxed) {
-        let _ = store.set_job_state(&job, JobState::Cancelled, None);
+    let terminal_result = if cancel.load(Ordering::Relaxed) {
+        store.set_job_state(&job, JobState::Cancelled, None)
     } else {
-        let _ = store.update_job_progress(
+        store.update_job_progress(
             &job,
             // Keep the job non-terminal until `complete_job` atomically installs its summary and
             // warnings. Publishing `Done` here lets a polling client observe a terminal row before
@@ -389,7 +418,7 @@ pub(crate) fn run_scan(
             examined,
             Some(examined),
             None,
-        );
+        )?;
         let mut notes = Vec::new();
         if skipped > 0 {
             notes.push(format!("{skipped} unchanged"));
@@ -409,10 +438,11 @@ pub(crate) fn run_scan(
             format!(" ({})", notes.join(", "))
         };
         let summary = format!("Scanned {examined} item(s){suffix}");
-        let _ = store.complete_job(&job, &summary, &warning_details);
-    }
+        store.complete_job(&job, &summary, &warning_details)
+    };
     emit_progress(&store, &events, &job);
     tracing::info!(%job, done, skipped, removed = removed_total, warnings, "scan finished");
+    terminal_result
 }
 
 /// A delta entry is unchanged when its size and mtime both match the stored change token.

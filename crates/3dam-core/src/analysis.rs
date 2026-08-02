@@ -10,7 +10,7 @@
 //! Every stage is fail-soft (DESIGN_GUIDELINES §2): a bad decode degrades that one asset to "no
 //! embedding" and the pass moves on — never an aborted job.
 
-use crate::emit_progress;
+use crate::{emit_progress, reliability};
 use dam_api::dto::*;
 use dam_api::event::{ChangeKind, LibraryEvent};
 use dam_api::id::{AssetId, JobId};
@@ -124,9 +124,9 @@ pub(crate) fn run_analyze(
     pool: &rayon::ThreadPool,
     governor: &crate::resources::Governor,
     scratch: &Path,
-) {
+) -> Result<(), LibError> {
     let total = plan.total;
-    let _ = store.update_job_progress(&job, JobState::Running, 0, Some(total), None);
+    store.update_job_progress(&job, JobState::Running, 0, Some(total), None)?;
     // Shared across the rayon workers: a monotonic completion counter and a skip counter.
     let done = AtomicU64::new(0);
     let warnings = AtomicU64::new(0);
@@ -179,11 +179,15 @@ pub(crate) fn run_analyze(
                     };
                     match outcome {
                         Ok(()) => {
-                            let _ = events.send(LibraryEvent::AssetChanged {
-                                id: target.id,
-                                source_id: Some(target.source_id),
-                                kind: ChangeKind::Reanalyzed,
-                            });
+                            reliability::publish_event(
+                                &events,
+                                LibraryEvent::AssetChanged {
+                                    id: target.id,
+                                    source_id: Some(target.source_id),
+                                    kind: ChangeKind::Reanalyzed,
+                                },
+                                "publish analysed asset",
+                            );
                         }
                         Err(error) => {
                             let prior = warnings.fetch_add(1, Ordering::Relaxed);
@@ -198,12 +202,17 @@ pub(crate) fn run_analyze(
                     }
                     let n = done.fetch_add(1, Ordering::Relaxed) + 1;
                     if n.is_multiple_of(PROGRESS_EVERY) {
-                        let _ = store.update_job_progress(
-                            &job,
-                            JobState::Running,
-                            n,
-                            Some(total),
-                            Some(&target.path),
+                        reliability::retryable_store_write(
+                            store.update_job_progress(
+                                &job,
+                                JobState::Running,
+                                n,
+                                Some(total),
+                                Some(&target.path),
+                            ),
+                            "persist analysis progress",
+                            Some(&job),
+                            Some(&target.source_id),
                         );
                         emit_progress(&store, &events, &job);
                     }
@@ -224,18 +233,19 @@ pub(crate) fn run_analyze(
             "{omitted} additional warning(s) omitted; inspect source status and server logs"
         ));
     }
-    if let Some(error) = planner_error {
-        let _ = store.set_job_state(&job, JobState::Failed, Some(&error));
+    let terminal_result = if let Some(error) = planner_error {
+        store.set_job_state(&job, JobState::Failed, Some(&error))
     } else if cancel.load(Ordering::Relaxed) {
-        let _ = store.set_job_state(&job, JobState::Cancelled, None);
+        store.set_job_state(&job, JobState::Cancelled, None)
     } else {
-        let _ = store.update_job_progress(&job, JobState::Done, done, Some(total), None);
+        store.update_job_progress(&job, JobState::Running, done, Some(total), None)?;
         let analysed = done.saturating_sub(warnings);
         let summary = format!("Analysed {analysed} of {total} item(s)");
-        let _ = store.complete_job(&job, &summary, &warning_details);
-    }
+        store.complete_job(&job, &summary, &warning_details)
+    };
     emit_progress(&store, &events, &job);
     tracing::info!(%job, done, warnings, "analysis finished");
+    terminal_result
 }
 
 /// Rebuild one `FileSource` per distinct source in `targets` (issue #48).
@@ -270,7 +280,12 @@ fn open_batch_backends(
                     .map_err(|error| error.to_string())
             });
         if let Err(error) = &entry {
-            let _ = store.set_source_error(&source.source_id, error);
+            reliability::retryable_store_write(
+                store.set_source_error(&source.source_id, error),
+                "record unavailable analysis source",
+                None,
+                Some(&source.source_id),
+            );
             tracing::warn!(source = %source.source_id, %error, "source unavailable for analysis");
         };
         backends.insert(source.source_id, entry);

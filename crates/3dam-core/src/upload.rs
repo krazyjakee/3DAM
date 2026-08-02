@@ -308,19 +308,23 @@ fn ingest_one(
                     MediaAttributes::Model(m) => m.dependency_bytes.unwrap_or(0).max(0) as u64,
                     _ => 0,
                 };
-                let _ = events.send(LibraryEvent::AssetAdded(AssetSummary {
-                    id,
-                    name: na.filename.clone(),
-                    media: det.media,
-                    format: det.format.clone(),
-                    size: size + dep,
-                    license: LicenseBadge::default(),
-                    top_tags: Vec::new(),
-                    origin: Origin::Local,
-                    key_attrs: crate::scan::key_attrs_of(&attrs),
-                    favorite: false,
-                    source_id: Some(*source),
-                }));
+                crate::reliability::publish_event(
+                    events,
+                    LibraryEvent::AssetAdded(AssetSummary {
+                        id,
+                        name: na.filename.clone(),
+                        media: det.media,
+                        format: det.format.clone(),
+                        size: size + dep,
+                        license: LicenseBadge::default(),
+                        top_tags: Vec::new(),
+                        origin: Origin::Local,
+                        key_attrs: crate::scan::key_attrs_of(&attrs),
+                        favorite: false,
+                        source_id: Some(*source),
+                    }),
+                    "publish uploaded asset",
+                );
             }
             (Some(id), None)
         }

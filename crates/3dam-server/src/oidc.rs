@@ -292,8 +292,7 @@ async fn callback(
         let err = clean(err);
         let detail = clean(q.error_description.unwrap_or_default());
         st.store
-            .audit("oidc", "account.oidc_login_failed", None, None)
-            .ok();
+            .audit("oidc", "account.oidc_login_failed", None, None)?;
         return Err(ApiError(LibError::Forbidden(format!(
             "the identity provider refused the login: {err} {detail}"
         ))));
@@ -323,14 +322,12 @@ async fn callback(
     let pending = match taken {
         TakeLogin::Redeemed(p) => *p,
         TakeLogin::WrongBrowser => {
-            st.store
-                .audit(
-                    "oidc",
-                    "account.oidc_login_failed",
-                    None,
-                    Some(serde_json::json!({ "reason": "state_not_bound_to_this_browser" })),
-                )
-                .ok();
+            st.store.audit(
+                "oidc",
+                "account.oidc_login_failed",
+                None,
+                Some(serde_json::json!({ "reason": "state_not_bound_to_this_browser" })),
+            )?;
             return Err(ApiError(LibError::Forbidden(
                 "this login was not started by this browser".into(),
             )));
@@ -382,14 +379,12 @@ async fn callback(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.chars().take(200).collect::<String>());
     let sess = st.store.mint_session(&account.account_id, ua.as_deref())?;
-    st.store
-        .audit(
-            "oidc",
-            "account.oidc_login",
-            Some(&account.account_id),
-            Some(serde_json::json!({ "issuer": issuer, "username": account.username })),
-        )
-        .ok();
+    st.store.audit(
+        "oidc",
+        "account.oidc_login",
+        Some(&account.account_id),
+        Some(serde_json::json!({ "issuer": issuer, "username": account.username })),
+    )?;
     tracing::info!(username = %account.username, "OIDC login");
 
     // Land on the app, not on JSON: this response is rendered by a browser mid-redirect.
@@ -421,14 +416,12 @@ fn provision(
         // The v1 default (tech-spec 10 §1.5). The message says how to fix it, because from the
         // user's side a refusal here is indistinguishable from a broken provider.
         OidcProvisioning::Linked => {
-            st.store
-                .audit(
-                    "oidc",
-                    "account.oidc_login_failed",
-                    None,
-                    Some(serde_json::json!({ "issuer": issuer, "reason": "unlinked_subject" })),
-                )
-                .ok();
+            st.store.audit(
+                "oidc",
+                "account.oidc_login_failed",
+                None,
+                Some(serde_json::json!({ "issuer": issuer, "reason": "unlinked_subject" })),
+            )?;
             return Err(ApiError(LibError::Forbidden(
                 "this provider identity is not linked to an account on this instance; an \
                  administrator must link it first"

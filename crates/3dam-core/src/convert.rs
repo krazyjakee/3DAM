@@ -126,7 +126,12 @@ fn backend_for<'a>(
             Err(e) => {
                 let msg = e.to_string();
                 // Surface the offline state where a user will see it, not only in the log.
-                let _ = store.set_source_error(source_id, &msg);
+                crate::reliability::retryable_store_write(
+                    store.set_source_error(source_id, &msg),
+                    "record unavailable convert source",
+                    None,
+                    Some(source_id),
+                );
                 Err(msg)
             }
         }
@@ -376,7 +381,9 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let tmp = dir.join(format!(".{file_name}.tmp"));
     std::fs::write(&tmp, bytes).map_err(|e| format!("write temp: {e}"))?;
     std::fs::rename(&tmp, path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
+        if let Err(cleanup) = std::fs::remove_file(&tmp) {
+            tracing::warn!(path = %tmp.display(), error = %cleanup, "convert temp cleanup failed");
+        }
         format!("rename into place: {e}")
     })?;
     Ok(())

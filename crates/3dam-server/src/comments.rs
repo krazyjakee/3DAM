@@ -102,12 +102,15 @@ async fn post_comment(
 ) -> Result<(StatusCode, Json<Comment>), ApiError> {
     let id = parse_asset_id(&id)?;
     let comment = st.lib.post_comment(&ctx, &id, req).await?;
-    let _ = st.store.audit(
+    // library.db and server.db cannot share a SQLite transaction. The mutation is already durable;
+    // if its required audit cannot be written, fail the request instead of claiming unaudited
+    // success. Clients may reconcile by listing the thread before retrying.
+    st.store.audit(
         &actor_of(&ctx),
         "comment.post",
         Some(&comment.id.to_string()),
         Some(serde_json::json!({ "asset": id.to_string() })),
-    );
+    )?;
     Ok((StatusCode::CREATED, Json(resolve_one(&st, comment))))
 }
 
@@ -119,12 +122,12 @@ async fn edit_comment(
 ) -> Result<Json<Comment>, ApiError> {
     let id = parse_comment_id(&id)?;
     let comment = st.lib.edit_comment(&ctx, &id, req).await?;
-    let _ = st.store.audit(
+    st.store.audit(
         &actor_of(&ctx),
         "comment.edit",
         Some(&id.to_string()),
         Some(serde_json::json!({ "asset": comment.asset.to_string() })),
-    );
+    )?;
     Ok(Json(resolve_one(&st, comment)))
 }
 
@@ -135,11 +138,11 @@ async fn delete_comment(
 ) -> Result<StatusCode, ApiError> {
     let id = parse_comment_id(&id)?;
     st.lib.delete_comment(&ctx, &id).await?;
-    let _ = st.store.audit(
+    st.store.audit(
         &actor_of(&ctx),
         "comment.delete",
         Some(&id.to_string()),
         None,
-    );
+    )?;
     Ok(StatusCode::NO_CONTENT)
 }

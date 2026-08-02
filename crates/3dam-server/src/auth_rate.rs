@@ -315,31 +315,35 @@ pub(crate) fn enforce(
     headers: &HeaderMap,
     identity: Option<&str>,
 ) -> Result<(), ApiError> {
-    st.auth_protection
-        .check_at(endpoint, peer, headers, identity, Instant::now())
-        .map_err(|limited| {
-            if limited.signal {
-                tracing::warn!(
-                    endpoint = limited.endpoint.name(),
-                    reason = limited.reason,
-                    retry_after = limited.retry_after,
-                    "unauthenticated auth request rate limited"
-                );
-                let _ = st.store.audit(
-                    "auth-limiter",
-                    "account.auth_rate_limited",
-                    None,
-                    Some(serde_json::json!({
-                        "endpoint": limited.endpoint.name(),
-                        "reason": limited.reason,
-                        "retry_after": limited.retry_after,
-                    })),
-                );
-            }
-            ApiError(LibError::RateLimited {
-                retry_after: limited.retry_after,
-            })
-        })
+    let limited =
+        match st
+            .auth_protection
+            .check_at(endpoint, peer, headers, identity, Instant::now())
+        {
+            Ok(()) => return Ok(()),
+            Err(limited) => limited,
+        };
+    if limited.signal {
+        tracing::warn!(
+            endpoint = limited.endpoint.name(),
+            reason = limited.reason,
+            retry_after = limited.retry_after,
+            "unauthenticated auth request rate limited"
+        );
+        st.store.audit(
+            "auth-limiter",
+            "account.auth_rate_limited",
+            None,
+            Some(serde_json::json!({
+                "endpoint": limited.endpoint.name(),
+                "reason": limited.reason,
+                "retry_after": limited.retry_after,
+            })),
+        )?;
+    }
+    Err(ApiError(LibError::RateLimited {
+        retry_after: limited.retry_after,
+    }))
 }
 
 #[cfg(test)]

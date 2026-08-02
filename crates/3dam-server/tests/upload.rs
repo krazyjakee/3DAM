@@ -83,7 +83,9 @@ async fn harness_flag_off() -> (
         .await
         .unwrap()
     };
-    let store = Arc::new(ServerStore::open_in_memory().unwrap());
+    // Use a real file so fault-injection tests can independently break the audit table while the
+    // router retains its normal ServerStore handle.
+    let store = Arc::new(ServerStore::open(&tmp.join("server.db")).unwrap());
     let app = router(lib.clone(), store.clone(), "127.0.0.1:7878", true);
     (app, store, lib, src, sid.to_string())
 }
@@ -355,6 +357,33 @@ async fn a_hostile_name_is_refused_at_the_route_and_writes_nothing() {
         audit.iter().any(|e| e.action == "source.upload.refused"),
         "expected a source.upload.refused entry, got {:?}",
         audit.iter().map(|e| &e.action).collect::<Vec<_>>()
+    );
+}
+
+/// Required audit is part of the HTTP mutation contract. library.db/source bytes and server.db
+/// cannot share a transaction, so an audit failure after the create returns 500; the caller can
+/// reconcile the create-only target before retrying instead of receiving false unaudited success.
+#[tokio::test]
+async fn successful_upload_reports_http_failure_when_required_audit_cannot_persist() {
+    let (app, _store, _lib, src, sid) = harness().await;
+    rusqlite::Connection::open(src.parent().unwrap().join("server.db"))
+        .unwrap()
+        .execute("DROP TABLE audit_log", [])
+        .unwrap();
+
+    let (status, body) = upload(
+        &app,
+        &format!("source={sid}&name=unaudited.png"),
+        None,
+        png_bytes(8, 8),
+        None,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert!(
+        src.join("unaudited.png").exists(),
+        "the response documents the fail-after-mutation policy rather than pretending rollback"
     );
 }
 

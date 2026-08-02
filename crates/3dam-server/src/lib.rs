@@ -1571,7 +1571,7 @@ async fn submit_analyze(
     Json(req): Json<AnalyzeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let job_id = st.lib.submit_analyze(&ctx, req).await?;
-    let _ = st.lib.set_job_initiator(&job_id, actor_of(&ctx)).await;
+    st.lib.set_job_initiator(&job_id, actor_of(&ctx)).await?;
     Ok(Json(serde_json::json!({ "job_id": job_id })))
 }
 
@@ -1771,12 +1771,13 @@ async fn remove_source(
     let id: SourceId = parse_id(&id, "source")?;
     st.lib.remove_source(&ctx, &id, req).await?;
     // Orphan-GC the cross-database soft references (issue #42): shares of a deleted source are
-    // dead grants. Ids are uuids (never recycled), so a failure here is clutter, not exposure.
-    let _ = st.store.remove_shares_for_resource(
+    // dead grants. This is a required durable cleanup; the resource mutation lives in the other
+    // database, so a cleanup failure fails the request and is safe to retry.
+    st.store.remove_shares_for_resource(
         dam_api::accounts::ShareResource::Source,
         &id.to_string(),
         "system",
-    );
+    )?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1853,11 +1854,11 @@ async fn delete_collection(
     let id: CollectionId = parse_id(&id, "collection")?;
     st.lib.delete_collection(&ctx, &id).await?;
     // Orphan-GC shares pointing at the deleted collection (issue #42; see remove_source).
-    let _ = st.store.remove_shares_for_resource(
+    st.store.remove_shares_for_resource(
         dam_api::accounts::ShareResource::Collection,
         &id.to_string(),
         "system",
-    );
+    )?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1897,10 +1898,9 @@ async fn submit_scan(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let job_id = st.lib.submit_scan(&ctx, req).await?;
     // The engine/store seam intentionally knows nothing about accounts or token labels. Attribute
-    // the durable history row here, where the authenticated actor is available (best-effort: a
-    // completed submission must not be reported as failed solely because attribution could not be
-    // attached).
-    let _ = st.lib.set_job_initiator(&job_id, actor_of(&ctx)).await;
+    // the durable history row here, where the authenticated actor is available. A failure is
+    // returned rather than silently accepting an unattributed job.
+    st.lib.set_job_initiator(&job_id, actor_of(&ctx)).await?;
     Ok(Json(serde_json::json!({ "job_id": job_id })))
 }
 
@@ -1910,7 +1910,7 @@ async fn submit_convert(
     Json(req): Json<ConvertRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     let job_id = st.lib.submit_convert(&ctx, req).await?;
-    let _ = st.lib.set_job_initiator(&job_id, actor_of(&ctx)).await;
+    st.lib.set_job_initiator(&job_id, actor_of(&ctx)).await?;
     Ok((
         StatusCode::ACCEPTED,
         Json(serde_json::json!({ "job_id": job_id })),
@@ -1923,7 +1923,7 @@ async fn submit_export(
     Json(req): Json<ExportRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     let job_id = st.lib.submit_export(&ctx, req).await?;
-    let _ = st.lib.set_job_initiator(&job_id, actor_of(&ctx)).await;
+    st.lib.set_job_initiator(&job_id, actor_of(&ctx)).await?;
     Ok((
         StatusCode::ACCEPTED,
         Json(serde_json::json!({ "job_id": job_id })),
