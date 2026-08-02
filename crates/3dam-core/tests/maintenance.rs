@@ -1,6 +1,5 @@
-//! Storage & maintenance (tech-spec 10 §5): `storage_usage` TTL-caches the cache-tier walk — a
-//! stat per cached file, minutes on a big cold HDD cache — so repeated Settings loads don't
-//! re-pay it, while `clear_caches` invalidates the cached walk so the report goes live again.
+//! Storage & maintenance (tech-spec 10 §5): startup builds one cache inventory off the async
+//! runtime; usage reads and explicit maintenance update it without repeated directory walks.
 
 use dam_api::admin::CacheTarget;
 use dam_core::EmbeddedLibrary;
@@ -22,7 +21,7 @@ fn unique_tmp() -> PathBuf {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn storage_usage_caches_the_walk_and_clear_invalidates() {
+async fn storage_usage_uses_live_inventory_and_clear_is_authoritative() {
     let tmp = unique_tmp();
     let thumbs = tmp.join("cache").join("thumbnails");
     std::fs::create_dir_all(&thumbs).unwrap();
@@ -35,18 +34,18 @@ async fn storage_usage_caches_the_walk_and_clear_invalidates() {
     assert_eq!(first.thumbnails.files, 2);
     assert_eq!(first.thumbnails.bytes, 200);
 
-    // A file added behind the cache's back is invisible within the TTL — the walk is not re-run.
+    // A file added behind the controller's back is invisible — usage never re-walks the tree.
     std::fs::write(thumbs.join("c.webp"), [0u8; 100]).unwrap();
     let cached = lib.storage_usage().await.unwrap();
-    assert_eq!(cached.thumbnails.files, 2, "walk must be TTL-cached");
+    assert_eq!(cached.thumbnails.files, 2, "usage must not rescan the tree");
 
-    // Clearing a tier invalidates the cached walk: the next report is live (and empty).
+    // Explicit clear may walk and also removes out-of-band files, then updates live accounting.
     let report = lib.clear_caches(CacheTarget::Thumbnails).await.unwrap();
     assert_eq!(report.files_deleted, 3);
     let fresh = lib.storage_usage().await.unwrap();
     assert_eq!(
         fresh.thumbnails.files, 0,
-        "clear must invalidate the TTL cache"
+        "clear must update the live inventory"
     );
     assert_eq!(fresh.thumbnails.bytes, 0);
 

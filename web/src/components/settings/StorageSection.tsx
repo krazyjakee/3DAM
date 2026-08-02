@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { admin, type CacheTarget, type StorageUsage } from "@/api/admin";
+import { admin, type CacheTarget, type CacheUsage, type StorageUsage } from "@/api/admin";
 import { useScan } from "@/api/queries";
 import { useDialogs } from "@/lib/dialogs";
 import { binaryBytes } from "@/lib/format";
@@ -38,6 +38,11 @@ function ActionRow({
       </button>
     </div>
   );
+}
+
+function cacheUsage(value: CacheUsage): string {
+  const stale = value.stale_deleted > 0 ? ` · ${value.stale_deleted} stale removed` : "";
+  return `${binaryBytes(value.bytes)} / ${binaryBytes(value.budget_bytes)} · ${value.files} files · ${value.evictions} evictions · ${value.hits}/${value.misses} hit/miss${stale}`;
 }
 
 /** Storage overview + maintenance actions (tech-spec 10 §5). */
@@ -153,12 +158,13 @@ export function StorageSection({
             <AdminField label="Server config (server.db)" value={binaryBytes(usage.server_db_bytes)} />
             <AdminField
               label="Thumbnail cache"
-              value={`${binaryBytes(usage.thumbnails.bytes)} · ${usage.thumbnails.files} files`}
+              value={cacheUsage(usage.thumbnails)}
             />
             <AdminField
               label="3D preview cache"
-              value={`${binaryBytes(usage.previews.bytes)} · ${usage.previews.files} files`}
+              value={cacheUsage(usage.previews)}
             />
+            <AdminField label="Peer derivative cache" value={cacheUsage(usage.peer_previews)} />
             <AdminField label="Assets" value={String(usage.asset_count)} />
             <AdminField label="Sources" value={String(usage.source_count)} />
           </div>

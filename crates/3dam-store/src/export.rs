@@ -60,6 +60,66 @@ const EXPORT_COLUMNS: &str = "asset.id, asset.filename, asset.path, asset.media_
     COALESCE(asset_note.body, '')";
 
 impl Store {
+    /// Resolve source attribution for a large explicit input set without one query per asset.
+    pub fn asset_sources(&self, ids: &[AssetId]) -> Result<Vec<SourceId>, LibError> {
+        let mut sources = std::collections::BTreeSet::new();
+        for ids in ids.chunks(256) {
+            if ids.is_empty() {
+                continue;
+            }
+            let placeholders = (0..ids.len()).map(|_| "?").collect::<Vec<_>>().join(",");
+            let binds = ids
+                .iter()
+                .map(|id| Value::Blob(id.as_bytes().to_vec()))
+                .collect::<Vec<_>>();
+            let sql = format!("SELECT DISTINCT source_id FROM asset WHERE id IN ({placeholders})");
+            let conn = self.conn.lock().unwrap();
+            let mut statement = conn.prepare(&sql).map_err(internal)?;
+            let rows = statement
+                .query_map(rusqlite::params_from_iter(binds.iter()), |row| {
+                    let source: Vec<u8> = row.get(0)?;
+                    Ok(SourceId(uuid_from_slice(&source)))
+                })
+                .map_err(internal)?;
+            for source in rows {
+                sources.insert(source.map_err(internal)?);
+            }
+        }
+        Ok(sources.into_iter().collect())
+    }
+
+    /// Set-based visibility validation for large explicit job inputs. Batches stay below SQLite's
+    /// bind limit and replace the former one async store round-trip per asset.
+    pub fn assets_visible(&self, ids: &[AssetId], vis: &Visibility) -> Result<bool, LibError> {
+        for ids in ids.chunks(256) {
+            if ids.is_empty() {
+                continue;
+            }
+            let values = (0..ids.len()).map(|_| "(?)").collect::<Vec<_>>().join(",");
+            let mut binds: Vec<Value> = ids
+                .iter()
+                .map(|id| Value::Blob(id.as_bytes().to_vec()))
+                .collect();
+            let mut where_sql = " WHERE 1=1".to_string();
+            push_visibility(vis, "asset", &mut where_sql, &mut binds);
+            let sql = format!(
+                "WITH selected(asset_id) AS (VALUES {values})
+                 SELECT COUNT(*) FROM selected JOIN asset ON asset.id = selected.asset_id
+                 {where_sql}"
+            );
+            let conn = self.conn.lock().unwrap();
+            let visible: i64 = conn
+                .query_row(&sql, rusqlite::params_from_iter(binds.iter()), |row| {
+                    row.get(0)
+                })
+                .map_err(internal)?;
+            if visible != ids.len() as i64 {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// Walk an export selection in bounded batches. Each batch is hydrated by one set-based query
     /// and handed to `visit` after the SQLite connection lock is released, so filesystem encoders
     /// never hold the catalog lock. A future background export job can checkpoint cancellation and

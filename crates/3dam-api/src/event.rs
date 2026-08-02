@@ -119,10 +119,12 @@ mod tests {
             summary: None,
             warnings: Vec::new(),
             result_artifacts: Vec::new(),
+            result: None,
             created_at: 0,
             updated_at: 0,
             initiator: None,
             sources: vec![SourceId::new()],
+            collections: Vec::new(),
         }
     }
 

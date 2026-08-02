@@ -62,9 +62,9 @@ impl UploadBlock {
     }
 }
 
-/// `[resources]` — the good-neighbour knobs (tech-spec 14 §5). Unset values fall back to the
-/// `3DAM_BG_THREADS` / `3DAM_MIN_FREE_MEMORY_MB` / `3DAM_MAX_IO_STALL_PCT` environment variables,
-/// then host-derived defaults (cgroup-aware CPU budget, 10% memory floor, 25% I/O-stall ceiling).
+/// `[resources]` — the good-neighbour knobs (tech-spec 14 §5). Unset worker/governor values fall
+/// back to their `3DAM_*` environment variables, then host-derived defaults; unset cache ceilings
+/// derive from current free disk according to ADR 0009.
 /// Plain config, not runtime flags: resource limits are an operator/deployment property, not a
 /// live exposure toggle.
 #[derive(Debug, Default, serde::Deserialize)]
@@ -77,6 +77,10 @@ pub struct ResourcesBlock {
     /// Pause bulk reads (scan hashing) and grind while the disk's PSI full-stall `avg10` exceeds
     /// this percentage. Default 25; ≥ 100 disables the I/O gate.
     pub max_io_stall_pct: Option<f64>,
+    /// Local thumbnail + model-preview cache ceiling (MiB). Default: min(10 GiB, 10% free disk).
+    pub derivative_cache_mb: Option<u64>,
+    /// Federated preview cache ceiling (MiB). Default: min(2 GiB, 10% free disk).
+    pub peer_cache_mb: Option<u64>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -212,5 +216,32 @@ fn parse_mcp(s: &str) -> Option<McpMode> {
         "read_only" | "readonly" | "read" => Some(McpMode::ReadOnly),
         "read_write" | "readwrite" | "writes" => Some(McpMode::ReadWrite),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_derivative_cache_budgets() {
+        let file: ServeFile = toml::from_str(
+            r#"
+                [resources]
+                derivative_cache_mb = 1536
+                peer_cache_mb = 384
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(file.resources.derivative_cache_mb, Some(1536));
+        assert_eq!(file.resources.peer_cache_mb, Some(384));
+    }
+
+    #[test]
+    fn derivative_cache_budgets_are_optional() {
+        let file = ServeFile::default();
+        assert_eq!(file.resources.derivative_cache_mb, None);
+        assert_eq!(file.resources.peer_cache_mb, None);
     }
 }

@@ -153,45 +153,56 @@ impl EmbeddedLibrary {
             return Ok(());
         }
         let data_dir = self.data_dir.clone();
-        let store = self.store.clone();
         let secrets = self.secrets.clone();
         let governor = self.governor.clone();
-        let generated = tokio::task::spawn_blocking(move || {
-            let never_cancelled = AtomicBool::new(false);
-            let mut generated = 0u64;
-            for t in targets {
-                // Good-neighbour pacing (tech-spec 14 §3.4): pre-rendering is pure opportunism — it
-                // parks whenever the host is short on memory or CPU and resumes on recovery.
-                governor.pace(&never_cancelled);
-                let thumb = thumbnail_cache_path(
-                    &data_dir,
-                    &t.id,
-                    t.content_hash,
-                    t.media,
-                    PREGEN_THUMB_EDGE,
-                );
-                let is_model = t.media == MediaType::Model;
-                // An image already in cache is done; models also need the preview blob checked below.
-                if thumb.exists() && !is_model {
-                    continue;
+        let cache = self.cache.clone();
+        let generated = self
+            .run_bg(move |store| {
+                let never_cancelled = AtomicBool::new(false);
+                let mut generated = 0u64;
+                for t in targets {
+                    // Good-neighbour pacing (tech-spec 14 §3.4): pre-rendering is pure opportunism — it
+                    // parks whenever the host is short on memory or CPU and resumes on recovery.
+                    governor.pace(&never_cancelled);
+                    let Ok(asset) = store.get_asset(&t.id) else {
+                        continue; // vanished between listing and read — fail-soft
+                    };
+                    let is_model = asset.summary.media == MediaType::Model;
+                    let key = if is_model {
+                        format!("model-derivatives:{}:{PREGEN_THUMB_EDGE}", t.id)
+                    } else {
+                        format!("thumbnail:{}:{PREGEN_THUMB_EDGE}", t.id)
+                    };
+                    let warmed = cache.singleflight_blocking(key, || {
+                        if is_model {
+                            gen_model_derivatives(
+                                &cache,
+                                &data_dir,
+                                store,
+                                &secrets,
+                                &asset,
+                                PREGEN_THUMB_EDGE,
+                            )
+                            .map(|_| ())
+                        } else {
+                            gen_thumbnail(
+                                &cache,
+                                &data_dir,
+                                store,
+                                &secrets,
+                                &asset,
+                                PREGEN_THUMB_EDGE,
+                            )
+                            .map(|_| ())
+                        }
+                    });
+                    if warmed.is_some_and(|result| result.is_ok()) {
+                        generated += 1;
+                    }
                 }
-                let Ok(asset) = store.get_asset(&t.id) else {
-                    continue; // vanished between listing and read — fail-soft
-                };
-                if !thumb.exists()
-                    && gen_thumbnail(&data_dir, &store, &secrets, &asset, PREGEN_THUMB_EDGE).is_ok()
-                {
-                    generated += 1;
-                }
-                if is_model {
-                    // Idempotent: reads the cached blob if present, renders + caches on miss.
-                    let _ = gen_model_preview(&data_dir, &store, &secrets, &asset);
-                }
-            }
-            generated
-        })
-        .await
-        .map_err(|e| LibError::Internal(e.to_string()))?;
+                Ok(generated)
+            })
+            .await?;
         if generated > 0 {
             tracing::info!(generated, "background pipeline warmed thumbnails");
         }

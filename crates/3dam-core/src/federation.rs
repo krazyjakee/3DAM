@@ -31,9 +31,6 @@ pub(crate) const PROXY_TIMEOUT: Duration = Duration::from_secs(15);
 const PEERS_TTL: Duration = Duration::from_secs(30);
 /// How long an `advertise()` reply is trusted (protocol version + spaces change ~never).
 const ADVERTISE_TTL: Duration = Duration::from_secs(300);
-/// TTL for locally cached peer previews (ADR 0009 §5: federated-preview TTL 7 days). The local
-/// cache mints its own validity from file mtime — a peer `ETag` is not trusted end-to-end.
-const PREVIEW_CACHE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// Advertise handshake bound at `add_source` time (interactive; fail fast on a typo'd endpoint).
 pub(crate) const ADD_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -781,24 +778,32 @@ pub(crate) async fn proxy_thumbnail(
     edge: u32,
     owner: Option<SourceId>,
 ) -> Option<AssetContent> {
-    if let Some(source) = owner {
-        // A removed source must not keep serving its old cached bytes. A stale bookmark skips this
-        // cache and enters the bounded recovery round below.
-        if lib.fed_peer(source).await.is_some() {
-            let name = format!("{source}/{id}-{edge}.png");
-            if let Some(bytes) = peer_cache_read(lib, &name).await {
-                return Some(png_content(bytes));
+    let flight = format!(
+        "peer-thumbnail:{}:{id}:{edge}",
+        owner.map_or_else(|| "legacy".into(), |v| v.to_string())
+    );
+    lib.cache
+        .singleflight(flight, || async move {
+            if let Some(source) = owner {
+                // A removed source must not keep serving its old cached bytes. A stale bookmark
+                // skips this cache and enters the bounded recovery round below.
+                if lib.fed_peer(source).await.is_some() {
+                    let name = format!("{source}/{id}-{edge}.png");
+                    if let Some(bytes) = peer_cache_read(lib, &name).await {
+                        return Some(png_content(bytes));
+                    }
+                }
             }
-        }
-    }
-    let id = *id;
-    let (source, content) = try_peers(lib, owner, |peer| async move {
-        peer.client.read_thumbnail(&ectx(), &id, edge).await
-    })
-    .await?;
-    let name = format!("{source}/{id}-{edge}.png");
-    peer_cache_write(lib, &name, &content.bytes).await;
-    Some(content)
+            let id = *id;
+            let (source, content) = try_peers(lib, owner, |peer| async move {
+                peer.client.read_thumbnail(&ectx(), &id, edge).await
+            })
+            .await?;
+            let name = format!("{source}/{id}-{edge}.png");
+            peer_cache_write(lib, &name, content.bytes.clone()).await;
+            Some(content)
+        })
+        .await
 }
 
 /// Interactive 3D preview blob for a peer asset, cached like the thumbnail tier.
@@ -807,27 +812,35 @@ pub(crate) async fn proxy_model_preview(
     id: &AssetId,
     owner: Option<SourceId>,
 ) -> Option<AssetContent> {
-    if let Some(source) = owner {
-        if lib.fed_peer(source).await.is_some() {
-            let name = format!("{source}/{id}.dmsh");
-            if let Some(bytes) = peer_cache_read(lib, &name).await {
-                return Some(AssetContent {
-                    bytes,
-                    content_type: "model/x-dam-preview".to_string(),
-                    format: "dmsh".to_string(),
-                    media: MediaType::Model,
-                });
+    let flight = format!(
+        "peer-model:{}:{id}",
+        owner.map_or_else(|| "legacy".into(), |v| v.to_string())
+    );
+    lib.cache
+        .singleflight(flight, || async move {
+            if let Some(source) = owner {
+                if lib.fed_peer(source).await.is_some() {
+                    let name = format!("{source}/{id}.dmsh");
+                    if let Some(bytes) = peer_cache_read(lib, &name).await {
+                        return Some(AssetContent {
+                            bytes,
+                            content_type: "model/x-dam-preview".to_string(),
+                            format: "dmsh".to_string(),
+                            media: MediaType::Model,
+                        });
+                    }
+                }
             }
-        }
-    }
-    let id = *id;
-    let (source, content) = try_peers(lib, owner, |peer| async move {
-        peer.client.read_model_preview(&ectx(), &id).await
-    })
-    .await?;
-    let name = format!("{source}/{id}.dmsh");
-    peer_cache_write(lib, &name, &content.bytes).await;
-    Some(content)
+            let id = *id;
+            let (source, content) = try_peers(lib, owner, |peer| async move {
+                peer.client.read_model_preview(&ectx(), &id).await
+            })
+            .await?;
+            let name = format!("{source}/{id}.dmsh");
+            peer_cache_write(lib, &name, content.bytes.clone()).await;
+            Some(content)
+        })
+        .await
 }
 
 fn png_content(bytes: Vec<u8>) -> AssetContent {
@@ -845,25 +858,20 @@ fn peer_cache_dir(lib: &EmbeddedLibrary) -> std::path::PathBuf {
 
 async fn peer_cache_read(lib: &EmbeddedLibrary, name: &str) -> Option<Vec<u8>> {
     let path = peer_cache_dir(lib).join(name);
-    let meta = tokio::fs::metadata(&path).await.ok()?;
-    let age = meta.modified().ok()?.elapsed().ok()?;
-    if age > PREVIEW_CACHE_TTL {
-        return None; // stale — refetch from the owning peer
-    }
-    tokio::fs::read(&path).await.ok()
+    let cache = lib.cache.clone();
+    lib.run_bg(move |_| Ok(cache.read(&path, crate::cache::Tier::Peer)))
+        .await
+        .ok()
+        .flatten()
 }
 
-async fn peer_cache_write(lib: &EmbeddedLibrary, name: &str, bytes: &[u8]) {
+async fn peer_cache_write(lib: &EmbeddedLibrary, name: &str, bytes: Vec<u8>) {
     let path = peer_cache_dir(lib).join(name);
-    let Some(dir) = path.parent() else { return };
-    if tokio::fs::create_dir_all(&dir).await.is_err() {
-        return; // cache is best-effort — the proxied bytes are already in hand
-    }
-    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-        return;
-    };
-    let tmp = dir.join(format!(".{file_name}.tmp"));
-    if tokio::fs::write(&tmp, bytes).await.is_ok() {
-        let _ = tokio::fs::rename(&tmp, path).await;
-    }
+    let cache = lib.cache.clone();
+    let _ = lib
+        .run_bg(move |_| {
+            cache.publish(&path, &bytes, crate::cache::Tier::Peer);
+            Ok(())
+        })
+        .await;
 }

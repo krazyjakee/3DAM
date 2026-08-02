@@ -1,5 +1,5 @@
-// Convert dialog (issue #5). Wires POST /api/v1/convert: pick a media-typed target (image or audio)
-// + format/options + an output directory, run (or dry-run) it, and show the per-item report. One
+// Convert dialog (issues #5/#114). Submits a background job, then closes; progress, cancellation,
+// and the durable per-item report live in the shared status/history surfaces. One
 // target per request — inputs of the other media type come back `unsupported` (fail-soft), so the
 // dialog defaults the target to the media most of the selection is. Non-destructive by construction:
 // outputs go under the chosen dir, never a source (the backend enforces §5.1).
@@ -12,11 +12,8 @@ import { Modal } from "@/lib/dialogs";
 import type {
   AssetSummary,
   CollisionRule,
-  ConvertReport,
   ConvertTarget,
-  Disposition,
 } from "@/api/types";
-import { bytes } from "@/lib/format";
 
 const IMAGE_FORMATS = ["png", "jpg", "webp", "bmp", "tga", "tiff", "gif"];
 const AUDIO_FORMATS = ["wav"];
@@ -43,15 +40,6 @@ const COLLISION: { value: CollisionRule; label: string }[] = [
   { value: "overwrite", label: "Overwrite" },
 ];
 
-const DISPOSITION_COLOR: Record<Disposition, string> = {
-  done: "var(--color-lic-permissive)",
-  write: "var(--color-accent)",
-  skipped: "var(--color-fg-dim)",
-  collision: "var(--color-warn)",
-  unsupported: "var(--color-fg-dim)",
-  failed: "var(--color-danger)",
-};
-
 export function ConvertDialog({
   assets,
   onClose,
@@ -60,7 +48,6 @@ export function ConvertDialog({
   onClose: () => void;
 }) {
   const run = useConvert();
-  const [report, setReport] = useState<ConvertReport | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
   // Default the target media to whichever the selection mostly is.
@@ -116,7 +103,7 @@ export function ConvertDialog({
         on_collision: collision,
       },
       {
-        onSuccess: (r) => setReport(r),
+        onSuccess: onClose,
         onError: (e) => setErr(e instanceof ApiError ? e.message : String(e)),
       },
     );
@@ -131,10 +118,7 @@ export function ConvertDialog({
       wide
       scroll
     >
-      {report ? (
-          <ReportView report={report} onClose={onClose} onAgain={() => setReport(null)} />
-        ) : (
-          <div className="flex flex-col gap-3">
+      <div className="flex flex-col gap-3">
             {/* target media */}
             <div>
               <label className="mb-1 block text-[11px] text-fg-muted">Target media</label>
@@ -280,96 +264,10 @@ export function ConvertDialog({
                 onClick={submit}
                 disabled={run.isPending}
               >
-                {run.isPending ? "Working…" : dryRun ? "Plan" : "Convert"}
+                {run.isPending ? "Submitting…" : dryRun ? "Plan in background" : "Convert in background"}
               </button>
             </div>
-          </div>
-        )}
+      </div>
     </Modal>
-  );
-}
-
-function ReportView({
-  report,
-  onClose,
-  onAgain,
-}: {
-  report: ConvertReport;
-  onClose: () => void;
-  onAgain: () => void;
-}) {
-  return (
-    <div className="flex flex-col gap-3">
-      <div className="rounded border border-border bg-bg p-2.5 text-xs">
-        <p className="text-fg">
-          {report.dry_run ? "Planned" : "Converted"} → {report.output_dir}
-        </p>
-        <div className="mt-1.5 flex flex-wrap gap-x-3 gap-y-1 text-[11px]">
-          <Stat label={report.dry_run ? "would write" : "done"} n={report.done} tone="ok" />
-          {report.collisions > 0 && <Stat label="collisions" n={report.collisions} tone="warn" />}
-          {report.unsupported > 0 && <Stat label="unsupported" n={report.unsupported} />}
-          {report.failed > 0 && <Stat label="failed" n={report.failed} tone="bad" />}
-          {!report.dry_run && report.total_output_bytes > 0 && (
-            <span className="text-fg-dim">
-              {bytes(report.total_input_bytes)} → {bytes(report.total_output_bytes)}
-            </span>
-          )}
-        </div>
-      </div>
-
-      <div className="max-h-56 overflow-y-auto rounded border border-border">
-        {report.items.map((it) => (
-          <div
-            key={it.input}
-            className="flex items-center justify-between gap-2 border-b border-border px-2 py-1 text-[11px] last:border-0"
-          >
-            <span className="min-w-0 flex-1 truncate text-fg-muted" title={it.planned_output}>
-              {it.planned_output.split(/[/\\]/).pop() || it.input_path}
-            </span>
-            {it.error ? (
-              <span className="max-w-[45%] truncate text-danger" title={it.error}>
-                {it.error}
-              </span>
-            ) : (
-              <span
-                className="shrink-0 rounded px-1.5 py-0.5 text-[10px]"
-                style={{
-                  color: DISPOSITION_COLOR[it.disposition],
-                  background: "color-mix(in srgb, currentColor 12%, transparent)",
-                }}
-              >
-                {it.disposition}
-                {it.ratio != null ? ` · ${Math.round(it.ratio * 100)}%` : ""}
-              </span>
-            )}
-          </div>
-        ))}
-      </div>
-
-      <div className="flex justify-end gap-2">
-        <button className="btn" onClick={onAgain}>
-          Back
-        </button>
-        <button className="btn btn-accent" onClick={onClose}>
-          Done
-        </button>
-      </div>
-    </div>
-  );
-}
-
-function Stat({ label, n, tone }: { label: string; n: number; tone?: "ok" | "warn" | "bad" }) {
-  const color =
-    tone === "ok"
-      ? "var(--color-lic-permissive)"
-      : tone === "warn"
-        ? "var(--color-warn)"
-        : tone === "bad"
-          ? "var(--color-danger)"
-          : "var(--color-fg-muted)";
-  return (
-    <span style={{ color }}>
-      <span className="font-semibold tabular-nums">{n}</span> {label}
-    </span>
   );
 }

@@ -320,6 +320,8 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/api/v1/blocklist", get(list_blocklist))
         .route("/api/v1/blocklist/{hash}", delete(unblock))
         .route("/api/v1/jobs/scan", post(submit_scan))
+        .route("/api/v1/jobs/convert", post(submit_convert))
+        .route("/api/v1/jobs/export", post(submit_export))
         .route("/api/v1/jobs/list", post(list_jobs))
         .route("/api/v1/jobs/{id}", get(get_job))
         .route("/api/v1/jobs/{id}/cancel", post(cancel_job))
@@ -487,7 +489,12 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
         min_free_memory_mb: file.resources.min_free_memory_mb,
         max_io_stall_pct: file.resources.max_io_stall_pct,
     };
-    let lib = Arc::new(EmbeddedLibrary::open_with(&cfg.data_dir, resources).await?);
+    let cache_options = dam_core::CacheOptions::from_mebibytes(
+        file.resources.derivative_cache_mb,
+        file.resources.peer_cache_mb,
+    );
+    let lib =
+        Arc::new(EmbeddedLibrary::open_with_cache(&cfg.data_dir, resources, cache_options).await?);
     lib.start_watchers(); // long-running role: resume auto-rescan for watch-enabled sources.
     let store = Arc::new(ServerStore::open(&cfg.data_dir.join("server.db"))?);
     for (key, value) in file.flag_seeds() {
@@ -1825,6 +1832,32 @@ async fn submit_scan(
     // attached).
     let _ = st.lib.set_job_initiator(&job_id, actor_of(&ctx)).await;
     Ok(Json(serde_json::json!({ "job_id": job_id })))
+}
+
+async fn submit_convert(
+    Writer(ctx): Writer,
+    State(st): State<AppState>,
+    Json(req): Json<ConvertRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    let job_id = st.lib.submit_convert(&ctx, req).await?;
+    let _ = st.lib.set_job_initiator(&job_id, actor_of(&ctx)).await;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "job_id": job_id })),
+    ))
+}
+
+async fn submit_export(
+    Writer(ctx): Writer,
+    State(st): State<AppState>,
+    Json(req): Json<ExportRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    let job_id = st.lib.submit_export(&ctx, req).await?;
+    let _ = st.lib.set_job_initiator(&job_id, actor_of(&ctx)).await;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "job_id": job_id })),
+    ))
 }
 
 async fn get_job(

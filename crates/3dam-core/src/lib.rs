@@ -4,6 +4,7 @@
 
 mod analysis;
 mod background;
+mod cache;
 mod convert;
 mod credentials;
 mod export;
@@ -16,6 +17,7 @@ mod upload;
 mod watch;
 
 pub use background::PipelinePolicy;
+pub use cache::CacheOptions;
 /// Re-exported so a transport can stage an upload under a name the engine's scratch sweep knows
 /// (issue #80). The server stages the request body itself but must not depend on `dam-sources`
 /// directly — frontends reach the engine, not around it.
@@ -35,8 +37,7 @@ pub fn video_probe_available() -> bool {
 
 use async_trait::async_trait;
 use dam_api::admin::{
-    CacheTarget, CacheUsage, ClearAnalysisReport, ClearCacheReport, StorageUsage, VacuumReport,
-    WipeReport,
+    CacheTarget, ClearAnalysisReport, ClearCacheReport, StorageUsage, VacuumReport, WipeReport,
 };
 use dam_api::dto::*;
 use dam_api::event::{ChangeKind, LibraryEvent, SubscribeRequest};
@@ -46,9 +47,9 @@ use dam_api::service::{AuthContext, EventStream, LibraryService, Scope, Visibili
 use dam_api::LibError;
 use dam_store::Store;
 use futures::StreamExt;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
@@ -58,6 +59,13 @@ const EVENT_CHANNEL_CAPACITY: usize = 1024;
 /// and the cache stays compact; large enough for a crisp inspector preview.
 const THUMB_MIN_EDGE: u32 = 16;
 const THUMB_MAX_EDGE: u32 = 1024;
+/// One hint can enqueue at most this many distinct derivatives. The larger scan cap prevents a
+/// duplicate-only request from consuming unbounded CPU while still allowing useful deduplication.
+const PREFETCH_INPUT_CAP: usize = 512;
+const PREFETCH_INPUT_SCAN_CAP: usize = PREFETCH_INPUT_CAP * 4;
+/// Pending work across overlapping hints is bounded independently of the number of callers.
+const PREFETCH_QUEUE_CAP: usize = 1024;
+const PREFETCH_PEER_CAP: usize = 16;
 
 /// Content-keyed cache path for an asset's thumbnail derivative. The cache lives under
 /// `<data_dir>/cache/thumbnails/<key>-<edge>[<variant>].png`, keyed by content hash (falling back to
@@ -94,9 +102,17 @@ pub(crate) fn thumbnail_cache_path(
 
 /// A cheap thumbnail cache probe — a plain file read, no source access. `Some` is the fast path
 /// that lets an already-rendered thumbnail skip the bounded background pool entirely.
-fn thumb_cache_lookup(data_dir: &Path, asset: &Asset, max_edge: u32) -> Option<AssetContent> {
-    std::fs::read(thumb_cache_path(data_dir, asset, max_edge))
-        .ok()
+fn thumb_cache_lookup(
+    cache: &cache::Controller,
+    data_dir: &Path,
+    asset: &Asset,
+    max_edge: u32,
+) -> Option<AssetContent> {
+    cache
+        .read(
+            &thumb_cache_path(data_dir, asset, max_edge),
+            cache::Tier::Thumbnail,
+        )
         .map(png_content)
 }
 
@@ -104,13 +120,14 @@ fn thumb_cache_lookup(data_dir: &Path, asset: &Asset, max_edge: u32) -> Option<A
 /// images, a wgpu turntable render for 3D models (when the `render` feature is on). Pure/blocking —
 /// runs inside a blocking closure (the bounded `bg_pool` on a cache miss).
 fn gen_thumbnail(
+    cache: &cache::Controller,
     data_dir: &Path,
     store: &Store,
     secrets: &credentials::SecretVault,
     asset: &Asset,
     max_edge: u32,
 ) -> Result<AssetContent, LibError> {
-    if let Some(hit) = thumb_cache_lookup(data_dir, asset, max_edge) {
+    if let Some(hit) = thumb_cache_lookup(cache, data_dir, asset, max_edge) {
         return Ok(hit); // cache hit → no source access at all
     }
     let cache_path = thumb_cache_path(data_dir, asset, max_edge);
@@ -124,7 +141,7 @@ fn gen_thumbnail(
     };
     let bytes = render_thumbnail_bytes(fetched.path(), &det, max_edge)?;
 
-    cache_write_atomic(&cache_path, &bytes);
+    cache.publish(&cache_path, &bytes, cache::Tier::Thumbnail);
     Ok(png_content(bytes))
 }
 
@@ -194,26 +211,6 @@ fn render_model_thumbnail(
     )))
 }
 
-/// Read (generating + caching on miss) the interactive 3D preview blob for a **model** asset — the
-/// self-contained `DMSH` mesh (geometry + PBR materials + downscaled textures) the browser island
-/// uploads directly (tech-spec 09 §B.3). Mirrors [`gen_thumbnail`]'s content-keyed cache, but the
-/// blob is CPU-decoded (no GPU), so it works on GPU-less hosts. Fail-soft: non-models and (in a
-/// build without the `render` feature) every model map to `Unsupported`, a 415 the UI degrades on.
-fn gen_model_preview(
-    data_dir: &Path,
-    store: &Store,
-    secrets: &credentials::SecretVault,
-    asset: &Asset,
-) -> Result<AssetContent, LibError> {
-    if asset.summary.media != MediaType::Model {
-        return Err(LibError::Unsupported(
-            "3D preview is only available for model assets".to_string(),
-        ));
-    }
-    gen_model_preview_impl(data_dir, store, secrets, asset)
-}
-
-#[cfg(feature = "render")]
 fn preview_content(bytes: Vec<u8>) -> AssetContent {
     AssetContent {
         bytes,
@@ -223,48 +220,103 @@ fn preview_content(bytes: Vec<u8>) -> AssetContent {
     }
 }
 
-/// Decode + cache the `DMSH` blob. Split out so the `render`-off build can short-circuit *before*
-/// any (possibly remote) fetch instead of downloading only to fail the decode.
+struct ModelDerivativeContent {
+    thumbnail: Option<Vec<u8>>,
+    preview: Vec<u8>,
+}
+
 #[cfg(feature = "render")]
-fn gen_model_preview_impl(
-    data_dir: &Path,
-    store: &Store,
-    secrets: &credentials::SecretVault,
-    asset: &Asset,
-) -> Result<AssetContent, LibError> {
+fn model_preview_cache_path(data_dir: &Path, asset: &Asset) -> PathBuf {
     let key = asset
         .hash
         .map(|h| h.to_hex())
         .unwrap_or_else(|| asset.summary.id.to_string());
-    let cache_dir = data_dir.join("cache").join("previews");
-    // Suffix carries the blob-format version so a serializer bump invalidates only this slice.
-    let cache_path = cache_dir.join(format!("{key}-p{}.dmsh", dam_render::PREVIEW_VERSION));
-    if let Ok(bytes) = std::fs::read(&cache_path) {
-        return Ok(preview_content(bytes)); // cache hit → no source access at all
-    }
+    data_dir
+        .join("cache")
+        .join("previews")
+        .join(format!("{key}-p{}.dmsh", dam_render::PREVIEW_VERSION))
+}
 
-    let fetched = fetch_asset(store, secrets, asset, &paths::scratch_dir(data_dir))?;
-    let bytes =
-        dam_render::model_preview_blob(fetched.path(), &asset.summary.format).map_err(|e| {
-            if matches!(e, dam_render::RenderError::Decode(_)) {
-                tracing::warn!("3D preview decode failed: {e}");
-            }
-            LibError::Unsupported(e.to_string())
-        })?;
-
-    cache_write_atomic(&cache_path, &bytes);
-    Ok(preview_content(bytes))
+#[cfg(feature = "render")]
+fn model_preview_cache_lookup(
+    cache: &cache::Controller,
+    data_dir: &Path,
+    asset: &Asset,
+) -> Option<AssetContent> {
+    cache
+        .read(
+            &model_preview_cache_path(data_dir, asset),
+            cache::Tier::Preview,
+        )
+        .map(preview_content)
 }
 
 #[cfg(not(feature = "render"))]
-fn gen_model_preview_impl(
+fn model_preview_cache_lookup(
+    _cache: &cache::Controller,
+    _data_dir: &Path,
+    _asset: &Asset,
+) -> Option<AssetContent> {
+    None
+}
+
+/// Generate both model derivatives from one fetch + Assimp decode. Interactive requests,
+/// prefetch, and hosted warming share the same keyed flight around this function.
+#[cfg(feature = "render")]
+fn gen_model_derivatives(
+    cache: &cache::Controller,
+    data_dir: &Path,
+    store: &Store,
+    secrets: &credentials::SecretVault,
+    asset: &Asset,
+    edge: u32,
+) -> Result<ModelDerivativeContent, LibError> {
+    let thumbnail_path = thumb_cache_path(data_dir, asset, edge);
+    let preview_path = model_preview_cache_path(data_dir, asset);
+    let thumbnail_hit = cache.read(&thumbnail_path, cache::Tier::Thumbnail);
+    let preview_hit = cache.read(&preview_path, cache::Tier::Preview);
+    if let (Some(thumbnail), Some(preview)) = (thumbnail_hit.as_ref(), preview_hit.as_ref()) {
+        return Ok(ModelDerivativeContent {
+            thumbnail: Some(thumbnail.clone()),
+            preview: preview.clone(),
+        });
+    }
+    cache.record_model_derivative_generation();
+    let fetched = fetch_asset(store, secrets, asset, &paths::scratch_dir(data_dir))?;
+    let derivatives = dam_render::model_derivatives(fetched.path(), &asset.summary.format, edge)
+        .map_err(|error| LibError::Unsupported(error.to_string()))?;
+    if preview_hit.is_none() {
+        cache.publish(&preview_path, &derivatives.preview, cache::Tier::Preview);
+    }
+    let generated_thumbnail = match derivatives.thumbnail {
+        Ok(bytes) => {
+            if thumbnail_hit.is_none() {
+                cache.publish(&thumbnail_path, &bytes, cache::Tier::Thumbnail);
+            }
+            Some(bytes)
+        }
+        Err(error) => {
+            tracing::warn!(%error, "3D thumbnail warm failed; preview remains available");
+            None
+        }
+    };
+    Ok(ModelDerivativeContent {
+        thumbnail: thumbnail_hit.or(generated_thumbnail),
+        preview: preview_hit.unwrap_or(derivatives.preview),
+    })
+}
+
+#[cfg(not(feature = "render"))]
+fn gen_model_derivatives(
+    _cache: &cache::Controller,
     _data_dir: &Path,
     _store: &Store,
     _secrets: &credentials::SecretVault,
     _asset: &Asset,
-) -> Result<AssetContent, LibError> {
+    _edge: u32,
+) -> Result<ModelDerivativeContent, LibError> {
     Err(LibError::Unsupported(
-        "interactive 3D preview needs the server `render` feature".to_string(),
+        "model derivatives need the server `render` feature".into(),
     ))
 }
 
@@ -274,24 +326,6 @@ fn serialize_opt_query(q: &Option<QueryRequest>) -> Result<Option<String>, LibEr
         .map(serde_json::to_string)
         .transpose()
         .map_err(|e| LibError::Internal(e.to_string()))
-}
-
-/// Best-effort atomic cache write: create the parent dir, write to a sibling temp file, then rename
-/// into place. A cold cache is a slow path, not an error, so every failure is silently ignored. The
-/// temp name is derived from the final filename (`.{name}.tmp`), keeping it on the same filesystem.
-fn cache_write_atomic(cache_path: &Path, bytes: &[u8]) {
-    let (Some(dir), Some(name)) = (
-        cache_path.parent(),
-        cache_path.file_name().and_then(|n| n.to_str()),
-    ) else {
-        return;
-    };
-    if std::fs::create_dir_all(dir).is_ok() {
-        let tmp = dir.join(format!(".{name}.tmp"));
-        if std::fs::write(&tmp, bytes).is_ok() {
-            let _ = std::fs::rename(&tmp, cache_path);
-        }
-    }
 }
 
 /// The distinct sources an analyse run will touch — the job's visibility attribution (issue #42).
@@ -304,8 +338,42 @@ pub(crate) fn distinct_sources(targets: &[dam_store::AnalysisTarget]) -> Vec<Sou
 /// Emit a job's current progress as a `JobProgress` event (best-effort; a dropped read is skipped).
 /// Shared by the scan and analyse job loops.
 pub(crate) fn emit_progress(store: &Store, events: &broadcast::Sender<LibraryEvent>, job: &JobId) {
-    if let Ok(js) = store.get_job(job) {
+    if let Ok(js) = store.get_job_summary(job) {
         let _ = events.send(LibraryEvent::JobProgress(js));
+    }
+}
+
+fn convert_warnings(report: &ConvertReport) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if report.failed > 0 {
+        warnings.push(format!(
+            "{} item(s) failed; inspect the itemized report",
+            report.failed
+        ));
+    }
+    if report.collisions > 0 {
+        warnings.push(format!("{} output collision(s)", report.collisions));
+    }
+    if report.unsupported > 0 {
+        warnings.push(format!("{} unsupported item(s)", report.unsupported));
+    }
+    warnings
+}
+
+fn convert_summary(report: &ConvertReport, state: JobState) -> String {
+    if state == JobState::Cancelled {
+        format!(
+            "Convert cancelled after processing {} item(s)",
+            report.items.len()
+        )
+    } else if report.dry_run {
+        format!("Planned {} item(s)", report.items.len())
+    } else {
+        format!(
+            "Converted {} of {} item(s)",
+            report.done,
+            report.items.len()
+        )
     }
 }
 
@@ -542,10 +610,15 @@ pub struct EmbeddedLibrary {
     /// whole-library pass yields when the host runs short on memory or CPU, or its disks are
     /// stalled under bulk I/O.
     governor: Arc<resources::Governor>,
-    /// TTL-cached cache-tier footprints for [`Self::storage_usage`]. The walk stats every file
-    /// under `cache/` — tens of thousands of inodes on a large library, minutes on a cold HDD —
-    /// so the Settings screen must not pay it on every load. Invalidated on [`Self::clear_caches`].
-    usage_cache: Mutex<Option<(std::time::Instant, CacheUsage, CacheUsage)>>,
+    /// Byte-bounded derivative cache, O(1) accounting, LRU eviction, and keyed flights.
+    cache: Arc<cache::Controller>,
+    /// One bounded/deduplicated queue feeds the background pool for all prefetch calls.
+    prefetch_pending: Arc<Mutex<HashSet<(AssetId, u32)>>>,
+    prefetch_running: Arc<AtomicBool>,
+    prefetch_max_pending: Arc<AtomicUsize>,
+    /// At most one sequential federation fan-out task per library; hints are optional and may be
+    /// coalesced while it is busy.
+    prefetch_peer_running: Arc<AtomicBool>,
     /// Wake handle for the background pipeline's drain worker (issue #71).
     ///
     /// Held on the engine rather than owned privately by `start_background_pipeline` so that an
@@ -570,6 +643,15 @@ impl EmbeddedLibrary {
     pub async fn open_with(
         data_dir: &Path,
         resources: ResourceOptions,
+    ) -> Result<EmbeddedLibrary, LibError> {
+        Self::open_with_cache(data_dir, resources, CacheOptions::default()).await
+    }
+
+    /// Open with explicit resource and derivative-cache budgets.
+    pub async fn open_with_cache(
+        data_dir: &Path,
+        resources: ResourceOptions,
+        cache_options: CacheOptions,
     ) -> Result<EmbeddedLibrary, LibError> {
         let resources = resources.or_env();
         // Scratch for fetched byte copies (issue #87). Created up front so `temp_sink` never has to,
@@ -630,6 +712,19 @@ impl EmbeddedLibrary {
             .start_handler(|_| resources::deprioritize_current_thread())
             .build()
             .map_err(|e| LibError::Internal(e.to_string()))?;
+        let cache = cache::Controller::new(data_dir, cache_options);
+        // Build the one-time cache inventory on the bounded worker pool before request handlers can
+        // reach it. A cold admin/media request therefore never recursively walks a large tree on a
+        // Tokio runtime worker, while all later accounting remains O(1).
+        let inventory_cache = cache.clone();
+        let (inventory_tx, inventory_rx) = tokio::sync::oneshot::channel();
+        bg_pool.spawn(move || {
+            inventory_cache.initialize_now();
+            let _ = inventory_tx.send(());
+        });
+        inventory_rx
+            .await
+            .map_err(|error| LibError::Internal(error.to_string()))?;
         Ok(EmbeddedLibrary {
             store,
             secrets,
@@ -641,7 +736,11 @@ impl EmbeddedLibrary {
             semantic,
             fed: federation::PeerRegistry::new(),
             governor,
-            usage_cache: Mutex::new(None),
+            cache,
+            prefetch_pending: Arc::new(Mutex::new(HashSet::new())),
+            prefetch_running: Arc::new(AtomicBool::new(false)),
+            prefetch_max_pending: Arc::new(AtomicUsize::new(0)),
+            prefetch_peer_running: Arc::new(AtomicBool::new(false)),
             pipeline_wake: Arc::new(tokio::sync::Notify::new()),
         })
     }
@@ -891,6 +990,21 @@ impl EmbeddedLibrary {
         spaces
     }
 
+    /// Diagnostic counter used by cache stress tests and operator troubleshooting. One increment
+    /// represents one shared source fetch + model decode for a thumbnail/preview pair.
+    #[doc(hidden)]
+    pub fn model_derivative_generation_count(&self) -> u64 {
+        self.cache.model_derivative_generations()
+    }
+
+    /// `(maximum pending derivatives, maximum local worker tasks)`. The latter is one by
+    /// construction; exposing it keeps the prefetch stress contract observable.
+    #[doc(hidden)]
+    pub fn prefetch_bound_diagnostics(&self) -> (usize, usize) {
+        let pending = self.prefetch_max_pending.load(Ordering::Relaxed);
+        (pending, usize::from(pending > 0))
+    }
+
     /// Like [`Self::db`], but runs the closure on the bounded background pool (`bg_pool`) instead of
     /// the unbounded blocking pool. Use for heavy *background* generation (thumbnails) so a burst
     /// can't saturate every core — interactive inspector reads stay on `db()` and preempt it. The
@@ -914,37 +1028,14 @@ impl EmbeddedLibrary {
     // (not on the `LibraryService` seam) because maintenance is admin-plane — the CLI reaches these
     // through the audited admin surface, not the generic frontend trait.
 
-    /// Report on-disk usage: `library.db` + `server.db` sizes, both cache tiers, and catalog counts.
-    /// Read-only. File sizing runs off the async runtime. The cache-tier walk (a stat per cached
-    /// file — tens of thousands on a big library, and seek-bound on an HDD) is TTL-cached so
-    /// repeated Settings loads don't re-pay it; DB sizes and catalog counts are always live.
+    /// Report on-disk usage: DB sizes, local/peer cache tiers, metrics, and catalog counts.
+    /// Read-only. Cache footprints/counters come from the controller's live inventory (no directory
+    /// walk); DB sizes and catalog counts are always live.
     pub async fn storage_usage(&self) -> Result<StorageUsage, LibError> {
-        const CACHE_WALK_TTL: std::time::Duration = std::time::Duration::from_secs(30);
         let stats = self.db(|s| s.stats(None, &Visibility::Full)).await?;
-        let cached = self
-            .usage_cache
-            .lock()
-            .unwrap()
-            .as_ref()
-            .filter(|(at, ..)| at.elapsed() < CACHE_WALK_TTL)
-            .map(|(_, t, p)| (*t, *p));
-        let (thumbnails, previews) = match cached {
-            Some(tiers) => tiers,
-            None => {
-                let cache_dir = self.data_dir.join("cache");
-                let tiers = tokio::task::spawn_blocking(move || {
-                    (
-                        dir_usage(&cache_dir.join("thumbnails")),
-                        dir_usage(&cache_dir.join("previews")),
-                    )
-                })
-                .await
-                .map_err(|e| LibError::Internal(e.to_string()))?;
-                *self.usage_cache.lock().unwrap() =
-                    Some((std::time::Instant::now(), tiers.0, tiers.1));
-                tiers
-            }
-        };
+        let thumbnails = self.cache.usage(cache::Tier::Thumbnail);
+        let previews = self.cache.usage(cache::Tier::Preview);
+        let peer_previews = self.cache.usage(cache::Tier::Peer);
         let data_dir = self.data_dir.clone();
         tokio::task::spawn_blocking(move || {
             let file_len = |p: PathBuf| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
@@ -954,6 +1045,7 @@ impl EmbeddedLibrary {
                 server_db_bytes: file_len(data_dir.join("server.db")),
                 thumbnails,
                 previews,
+                peer_previews,
                 asset_count: stats.total,
                 source_count: stats.sources,
             })
@@ -966,31 +1058,25 @@ impl EmbeddedLibrary {
     /// every file is content-keyed and re-generated on the next thumbnail/preview read, so this
     /// emits no event.
     pub async fn clear_caches(&self, target: CacheTarget) -> Result<ClearCacheReport, LibError> {
-        let data_dir = self.data_dir.clone();
-        let report = tokio::task::spawn_blocking(move || {
-            let cache = data_dir.join("cache");
-            let mut freed = CacheUsage { bytes: 0, files: 0 };
-            if matches!(target, CacheTarget::Thumbnails | CacheTarget::All) {
-                let u = clear_dir(&cache.join("thumbnails"));
-                freed.bytes += u.bytes;
-                freed.files += u.files;
-            }
-            if matches!(target, CacheTarget::Previews | CacheTarget::All) {
-                let u = clear_dir(&cache.join("previews"));
-                freed.bytes += u.bytes;
-                freed.files += u.files;
-            }
+        let cache = self.cache.clone();
+        tokio::task::spawn_blocking(move || {
+            let tiers: &[cache::Tier] = match target {
+                CacheTarget::Thumbnails => &[cache::Tier::Thumbnail],
+                CacheTarget::Previews => &[cache::Tier::Preview],
+                CacheTarget::All => &[
+                    cache::Tier::Thumbnail,
+                    cache::Tier::Preview,
+                    cache::Tier::Peer,
+                ],
+            };
+            let (bytes_freed, files_deleted) = cache.clear(tiers);
             ClearCacheReport {
-                bytes_freed: freed.bytes,
-                files_deleted: freed.files,
+                bytes_freed,
+                files_deleted,
             }
         })
         .await
-        .map_err(|e| LibError::Internal(e.to_string()))?;
-        // The tier footprints just changed — drop the TTL cache so the next `storage_usage`
-        // re-walks (the cleared dirs are empty, so that walk is cheap).
-        *self.usage_cache.lock().unwrap() = None;
-        Ok(report)
+        .map_err(|e| LibError::Internal(e.to_string()))
     }
 
     /// Drop the analysis layer (suggestions + embeddings + derived attrs) and mark every asset due
@@ -1031,62 +1117,14 @@ impl EmbeddedLibrary {
     }
 }
 
-/// Sum the size + count of the regular files directly under `dir` (the cache tiers are flat). A
-/// missing/unreadable dir reads as empty — a cold cache is zero usage, not an error.
-fn dir_usage(dir: &Path) -> CacheUsage {
-    let mut usage = CacheUsage { bytes: 0, files: 0 };
-    if let Ok(rd) = std::fs::read_dir(dir) {
-        for entry in rd.flatten() {
-            if let Ok(m) = entry.metadata() {
-                if m.is_file() {
-                    usage.bytes += m.len();
-                    usage.files += 1;
-                }
-            }
-        }
-    }
-    usage
-}
-
-/// Best-effort delete of every regular file directly under `dir`, returning what was freed. Leaves
-/// the directory itself (it is recreated lazily on the next cache write). A file that fails to
-/// delete is skipped, not counted — fail-soft (DESIGN_GUIDELINES §2).
-fn clear_dir(dir: &Path) -> CacheUsage {
-    let mut freed = CacheUsage { bytes: 0, files: 0 };
-    if let Ok(rd) = std::fs::read_dir(dir) {
-        for entry in rd.flatten() {
-            let Ok(m) = entry.metadata() else { continue };
-            if m.is_file() && std::fs::remove_file(entry.path()).is_ok() {
-                freed.bytes += m.len();
-                freed.files += 1;
-            }
-        }
-    }
-    freed
-}
-
 /// Delete every cached derivative keyed to one asset — its thumbnail PNGs (across edges + renderer
 /// variants) and its 3D preview blob — returning how many files were removed. Both cache tiers are
 /// flat and every entry is named `{key}-…`, so a prefix match cleanly scopes deletion to this asset's
 /// slice without disturbing others. Best-effort per file (fail-soft, DESIGN_GUIDELINES §2).
-fn purge_asset_cache(data_dir: &Path, key: &str) -> u64 {
+fn purge_asset_cache(cache: &cache::Controller, key: &str) -> u64 {
     let prefix = format!("{key}-");
-    let mut removed = 0u64;
-    for tier in ["thumbnails", "previews"] {
-        let dir = data_dir.join("cache").join(tier);
-        let Ok(rd) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in rd.flatten() {
-            if entry.file_name().to_string_lossy().starts_with(&prefix)
-                && entry.metadata().map(|m| m.is_file()).unwrap_or(false)
-                && std::fs::remove_file(entry.path()).is_ok()
-            {
-                removed += 1;
-            }
-        }
-    }
-    removed
+    cache.remove_prefix(cache::Tier::Thumbnail, &prefix)
+        + cache.remove_prefix(cache::Tier::Preview, &prefix)
 }
 
 #[async_trait]
@@ -1313,6 +1351,7 @@ impl LibraryService for EmbeddedLibrary {
         let id = *id;
         let edge = max_edge.clamp(THUMB_MIN_EDGE, THUMB_MAX_EDGE);
         let data_dir = self.data_dir.clone();
+        let cache = self.cache.clone();
         let secrets = self.secrets.clone();
         // Fast path: a cheap cache probe on the unbounded pool, so an already-rendered thumbnail is
         // never stuck behind background generation.
@@ -1320,12 +1359,15 @@ impl LibraryService for EmbeddedLibrary {
         let probe = self
             .db(move |s| {
                 let asset = s.get_asset(&id)?;
-                Ok(thumb_cache_lookup(&probe_dir, &asset, edge))
+                Ok((
+                    thumb_cache_lookup(&cache, &probe_dir, &asset, edge),
+                    asset.summary.media == MediaType::Model,
+                ))
             })
             .await;
-        match probe {
-            Ok(Some(hit)) => return Ok(hit),
-            Ok(None) => {}
+        let is_model = match probe {
+            Ok((Some(hit), _)) => return Ok(hit),
+            Ok((None, is_model)) => is_model,
             // Peer-owned asset: fetch its remote-owned preview — the one sanctioned federated byte
             // transfer (tech-spec 07 §4) — through the 7-day local peer cache. Full-visibility only.
             Err(LibError::NotFound(_)) if ctx.visibility.is_full() => {
@@ -1334,14 +1376,32 @@ impl LibraryService for EmbeddedLibrary {
                     .ok_or_else(|| LibError::NotFound(format!("asset {id}")))
             }
             Err(e) => return Err(e),
-        }
+        };
         // Cache miss: the expensive render/decode runs on the bounded background pool so a grid
         // burst can't starve an interactive inspector read (preview / waveform / detail).
-        self.run_bg(move |s| {
-            let asset = s.get_asset(&id)?;
-            gen_thumbnail(&data_dir, s, &secrets, &asset, edge)
-        })
-        .await
+        let key = if is_model {
+            format!("model-derivatives:{id}:{edge}")
+        } else {
+            format!("thumbnail:{id}:{edge}")
+        };
+        let cache = self.cache.clone();
+        self.cache
+            .singleflight(key, || async move {
+                self.run_bg(move |s| {
+                    let asset = s.get_asset(&id)?;
+                    if is_model {
+                        let derivatives =
+                            gen_model_derivatives(&cache, &data_dir, s, &secrets, &asset, edge)?;
+                        derivatives.thumbnail.map(png_content).ok_or_else(|| {
+                            LibError::Unsupported("3D thumbnail generation failed".into())
+                        })
+                    } else {
+                        gen_thumbnail(&cache, &data_dir, s, &secrets, &asset, edge)
+                    }
+                })
+                .await
+            })
+            .await
     }
 
     async fn read_model_preview(
@@ -1361,21 +1421,44 @@ impl LibraryService for EmbeddedLibrary {
         self.require_asset_visible(ctx, id).await?;
         let id = *id;
         let data_dir = self.data_dir.clone();
+        let cache = self.cache.clone();
         let secrets = self.secrets.clone();
-        let local = self
+        let probe_dir = data_dir.clone();
+        let probe = self
             .db(move |s| {
                 let asset = s.get_asset(&id)?;
-                gen_model_preview(&data_dir, s, &secrets, &asset)
+                if asset.summary.media != MediaType::Model {
+                    return Err(LibError::Unsupported(
+                        "3D preview is only available for model assets".into(),
+                    ));
+                }
+                Ok(model_preview_cache_lookup(&cache, &probe_dir, &asset))
             })
             .await;
-        match local {
+        match probe {
+            Ok(Some(hit)) => return Ok(hit),
+            Ok(None) => {}
             Err(LibError::NotFound(_)) if ctx.visibility.is_full() => {
-                federation::proxy_model_preview(self, &id, source)
+                return federation::proxy_model_preview(self, &id, source)
                     .await
-                    .ok_or_else(|| LibError::NotFound(format!("asset {id}")))
+                    .ok_or_else(|| LibError::NotFound(format!("asset {id}")));
             }
-            r => r,
+            Err(error) => return Err(error),
         }
+        let edge = background::PREGEN_THUMB_EDGE;
+        let key = format!("model-derivatives:{id}:{edge}");
+        let cache = self.cache.clone();
+        self.cache
+            .singleflight(key, || async move {
+                self.run_bg(move |store| {
+                    let asset = store.get_asset(&id)?;
+                    let derivatives =
+                        gen_model_derivatives(&cache, &data_dir, store, &secrets, &asset, edge)?;
+                    Ok(preview_content(derivatives.preview))
+                })
+                .await
+            })
+            .await
     }
 
     async fn prefetch(&self, ctx: &AuthContext, req: PrefetchRequest) -> Result<(), LibError> {
@@ -1385,38 +1468,105 @@ impl LibraryService for EmbeddedLibrary {
             return Ok(());
         }
         // Warm the exact thumbnail edge the client will request (the grid uses a variable edge the
-        // background pipeline can't all pre-render), plus model preview meshes. Runs off the request
-        // path on the blocking pool; fire-and-forget so the caller returns immediately (issue #72).
+        // hosted pipeline can't all pre-render). Input, queue, task, and CPU concurrency are all
+        // bounded: overlapping calls feed one deduplicated queue and at most one bg-pool worker.
         let edge = req
             .edge
             .unwrap_or(background::PREGEN_THUMB_EDGE)
             .clamp(THUMB_MIN_EDGE, THUMB_MAX_EDGE);
-        let store = self.store.clone();
-        let secrets = self.secrets.clone();
-        let data_dir = self.data_dir.clone();
-        let assets = req.assets.clone();
-        tokio::task::spawn_blocking(move || {
-            for id in assets {
-                let Ok(asset) = store.get_asset(&id) else {
-                    continue; // vanished (or peer-owned) — fail-soft
-                };
-                let _ = gen_thumbnail(&data_dir, &store, &secrets, &asset, edge);
-                if asset.summary.media == MediaType::Model {
-                    let _ = gen_model_preview(&data_dir, &store, &secrets, &asset);
-                }
+        let mut unique = HashSet::new();
+        for id in req.assets.into_iter().take(PREFETCH_INPUT_SCAN_CAP) {
+            unique.insert(id);
+            if unique.len() == PREFETCH_INPUT_CAP {
+                break;
             }
-        });
-        // Merged grids can hold peer assets: forward the same hint so each peer warms its own
-        // derivatives (phase 6). Fire-and-forget, same as the local pass — ids a peer doesn't own
-        // are its no-ops.
-        for peer in self.fed_peers().await.iter() {
-            let peer = peer.clone();
-            let req = req.clone();
+        }
+        let peer_assets: Vec<_> = unique.iter().copied().collect();
+        let relay = req.relay;
+        {
+            let mut pending = self.prefetch_pending.lock().unwrap();
+            for id in unique {
+                if pending.len() == PREFETCH_QUEUE_CAP {
+                    break;
+                }
+                pending.insert((id, edge));
+            }
+            self.prefetch_max_pending
+                .fetch_max(pending.len(), Ordering::Relaxed);
+        }
+        if self
+            .prefetch_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let store = self.store.clone();
+            let secrets = self.secrets.clone();
+            let data_dir = self.data_dir.clone();
+            let cache = self.cache.clone();
+            let pending = self.prefetch_pending.clone();
+            let running = self.prefetch_running.clone();
+            self.bg_pool.spawn(move || {
+                loop {
+                    let work = {
+                        let mut pending = pending.lock().unwrap();
+                        let Some(item) = pending.iter().next().copied() else {
+                            // Publish idle while holding the queue lock. A concurrent producer either
+                            // already sees `true`, or inserts after this and starts the next worker.
+                            running.store(false, Ordering::Release);
+                            break;
+                        };
+                        pending.remove(&item);
+                        item
+                    };
+                    let (id, edge) = work;
+                    let Ok(asset) = store.get_asset(&id) else {
+                        continue; // vanished (or peer-owned) — fail-soft
+                    };
+                    let key = if asset.summary.media == MediaType::Model {
+                        format!("model-derivatives:{id}:{edge}")
+                    } else {
+                        format!("thumbnail:{id}:{edge}")
+                    };
+                    let _ = cache.singleflight_blocking(key, || {
+                        if asset.summary.media == MediaType::Model {
+                            let _ = gen_model_derivatives(
+                                &cache, &data_dir, &store, &secrets, &asset, edge,
+                            );
+                        } else {
+                            let _ =
+                                gen_thumbnail(&cache, &data_dir, &store, &secrets, &asset, edge);
+                        }
+                    });
+                }
+            });
+        }
+
+        // Preserve merged-grid warming without spawning one task per peer. One sequential fan-out
+        // task is admitted per library, peers and ids are capped/deduplicated, and the relay bit
+        // prevents mutually registered libraries from bouncing hints forever.
+        if !relay
+            && self
+                .prefetch_peer_running
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            let peers = self.fed_peers().await;
+            let running = self.prefetch_peer_running.clone();
             tokio::spawn(async move {
-                let _ = peer
-                    .client
-                    .prefetch(&dam_api::service::AuthContext::embedded(), req)
+                let request = PrefetchRequest {
+                    assets: peer_assets,
+                    edge: Some(edge),
+                    relay: true,
+                };
+                for peer in peers.iter().take(PREFETCH_PEER_CAP) {
+                    let _ = tokio::time::timeout(
+                        federation::QUERY_DEADLINE,
+                        peer.client
+                            .prefetch(&AuthContext::embedded(), request.clone()),
+                    )
                     .await;
+                }
+                running.store(false, Ordering::Release);
             });
         }
         Ok(())
@@ -1470,6 +1620,125 @@ impl LibraryService for EmbeddedLibrary {
         let secrets = self.secrets.clone();
         self.db(move |s| convert::run_convert(s, &secrets, req, &scratch))
             .await
+    }
+
+    async fn submit_convert(
+        &self,
+        ctx: &AuthContext,
+        req: ConvertRequest,
+    ) -> Result<JobId, LibError> {
+        if !ctx.visibility.is_full() {
+            let inputs = req.inputs.clone();
+            let visibility = ctx.visibility.clone();
+            let visible = self
+                .db(move |store| store.assets_visible(&inputs, &visibility))
+                .await?;
+            if !visible {
+                return Err(LibError::NotFound(
+                    "one or more convert inputs are unavailable".into(),
+                ));
+            }
+        }
+        let total = req.inputs.len() as u64;
+        let params = serde_json::to_string(&req).unwrap_or_else(|_| "{}".into());
+        let (sources, collections): (Vec<SourceId>, Vec<CollectionId>) =
+            if let Some(scope) = ctx.visibility.restricted() {
+                (
+                    scope.sources.iter().copied().collect(),
+                    scope.collections.iter().copied().collect(),
+                )
+            } else {
+                let inputs = req.inputs.clone();
+                let sources = self.db(move |store| store.asset_sources(&inputs)).await?;
+                (sources, Vec::new())
+            };
+        let job = self
+            .db(move |store| {
+                store.create_job_scoped(
+                    JobKind::Convert,
+                    &params,
+                    Some(total),
+                    &sources,
+                    &collections,
+                )
+            })
+            .await?;
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.cancels.lock().unwrap().insert(job, cancel.clone());
+        let store = self.store.clone();
+        let events = self.events.clone();
+        let secrets = self.secrets.clone();
+        let scratch = self.scratch();
+        tokio::task::spawn_blocking(move || {
+            let run = convert::run_convert_with_checkpoint(
+                &store,
+                &secrets,
+                req,
+                &scratch,
+                |done, total, current| {
+                    if cancel.load(Ordering::Relaxed) {
+                        return false;
+                    }
+                    let _ = store.update_job_progress(
+                        &job,
+                        JobState::Running,
+                        done,
+                        Some(total),
+                        current,
+                    );
+                    emit_progress(&store, &events, &job);
+                    !cancel.load(Ordering::Relaxed)
+                },
+            );
+            match run {
+                Ok(run) => {
+                    let result = JobResult::Convert(run.report.clone());
+                    let warnings = convert_warnings(&run.report);
+                    let state = if run.cancelled || cancel.load(Ordering::Relaxed) {
+                        JobState::Cancelled
+                    } else {
+                        JobState::Done
+                    };
+                    let summary = convert_summary(&run.report, state);
+                    let finished =
+                        store.finish_job(&job, state, &summary, &warnings, Some(&result));
+                    if state == JobState::Done && matches!(finished, Ok(false)) {
+                        // Cancellation won the DB race after the worker sampled the flag. Preserve
+                        // the itemized partial/full report without changing the Cancelled state.
+                        let summary = convert_summary(&run.report, JobState::Cancelled);
+                        let _ = store.finish_job(
+                            &job,
+                            JobState::Cancelled,
+                            &summary,
+                            &warnings,
+                            Some(&result),
+                        );
+                    }
+                }
+                Err(error) if cancel.load(Ordering::Relaxed) => {
+                    let _ = store.finish_job(
+                        &job,
+                        JobState::Cancelled,
+                        "Convert cancelled before completion",
+                        &[],
+                        None,
+                    );
+                    tracing::debug!(%job, %error, "convert stopped after cancellation");
+                }
+                Err(error) => {
+                    let _ = store.set_job_state(&job, JobState::Failed, Some(&error.to_string()));
+                }
+            }
+            let _ = store.set_job_artifacts(
+                &job,
+                &[JobArtifact {
+                    label: "Open convert report".into(),
+                    route: Some(format!("/jobs?job={job}")),
+                }],
+            );
+            emit_progress(&store, &events, &job);
+        });
+        Ok(job)
     }
 
     async fn upload(
@@ -1673,6 +1942,19 @@ impl LibraryService for EmbeddedLibrary {
         })
         .await?;
         self.fed.invalidate().await;
+        // Peer derivatives are owner-scoped. Once the source is gone they must not linger until
+        // their TTL; lifecycle cleanup is an explicit bounded-pool maintenance walk.
+        let cache = self.cache.clone();
+        let peer_dir = self
+            .data_dir
+            .join("cache")
+            .join("peer")
+            .join(id.to_string());
+        self.run_bg(move |_| {
+            cache.remove_tree(&peer_dir);
+            Ok(())
+        })
+        .await?;
         Ok(())
     }
 
@@ -1851,6 +2133,125 @@ impl LibraryService for EmbeddedLibrary {
         self.db(move |s| export::run_export(s, req, &vis)).await
     }
 
+    async fn submit_export(
+        &self,
+        ctx: &AuthContext,
+        req: ExportRequest,
+    ) -> Result<JobId, LibError> {
+        let total = (!req.assets.is_empty()).then_some(req.assets.len() as u64);
+        let params = serde_json::to_string(&req).unwrap_or_else(|_| "{}".into());
+        let (sources, collections): (Vec<SourceId>, Vec<CollectionId>) =
+            if let Some(scope) = ctx.visibility.restricted() {
+                (
+                    scope.sources.iter().copied().collect(),
+                    scope.collections.iter().copied().collect(),
+                )
+            } else {
+                let sources = self
+                    .db(|store| {
+                        Ok(store
+                            .list_sources()?
+                            .into_iter()
+                            .map(|s| s.id)
+                            .collect::<Vec<_>>())
+                    })
+                    .await?;
+                (sources, Vec::new())
+            };
+        let job = self
+            .db(move |store| {
+                store.create_job_scoped(JobKind::Export, &params, total, &sources, &collections)
+            })
+            .await?;
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.cancels.lock().unwrap().insert(job, cancel.clone());
+        let store = self.store.clone();
+        let events = self.events.clone();
+        let vis = ctx.visibility.clone();
+        tokio::task::spawn_blocking(move || {
+            let outcome = export::run_export_with_checkpoint(&store, req, &vis, |done| {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(LibError::Cancelled);
+                }
+                let _ = store.update_job_progress(
+                    &job,
+                    JobState::Running,
+                    done,
+                    total,
+                    Some("Encoding manifest"),
+                );
+                emit_progress(&store, &events, &job);
+                Ok(())
+            });
+            match outcome {
+                Ok(report) => {
+                    let result = JobResult::Export(report.clone());
+                    let state = if cancel.load(Ordering::Relaxed) {
+                        JobState::Cancelled
+                    } else {
+                        JobState::Done
+                    };
+                    let summary = if state == JobState::Cancelled {
+                        format!(
+                            "Cancellation arrived after {} file(s) were committed; output was retained",
+                            report.files_written
+                        )
+                    } else {
+                        format!(
+                            "Exported {} asset(s) to {} file(s)",
+                            report.assets, report.files_written
+                        )
+                    };
+                    let finished = store.finish_job(&job, state, &summary, &[], Some(&result));
+                    if state == JobState::Done && matches!(finished, Ok(false)) {
+                        let summary = format!(
+                            "Cancellation arrived after {} file(s) were committed; output was retained",
+                            report.files_written
+                        );
+                        let _ = store.finish_job(
+                            &job,
+                            JobState::Cancelled,
+                            &summary,
+                            &[],
+                            Some(&result),
+                        );
+                    }
+                }
+                Err(LibError::Cancelled) => {
+                    let _ = store.finish_job(
+                        &job,
+                        JobState::Cancelled,
+                        "Export cancelled; staged output was removed",
+                        &[],
+                        None,
+                    );
+                }
+                Err(error) if cancel.load(Ordering::Relaxed) => {
+                    let _ = store.finish_job(
+                        &job,
+                        JobState::Cancelled,
+                        "Export cancelled; staged output was removed",
+                        &[],
+                        None,
+                    );
+                    tracing::debug!(%job, %error, "export stopped after cancellation");
+                }
+                Err(error) => {
+                    let _ = store.set_job_state(&job, JobState::Failed, Some(&error.to_string()));
+                }
+            }
+            let _ = store.set_job_artifacts(
+                &job,
+                &[JobArtifact {
+                    label: "Open export report".into(),
+                    route: Some(format!("/jobs?job={job}")),
+                }],
+            );
+            emit_progress(&store, &events, &job);
+        });
+        Ok(job)
+    }
+
     async fn submit_scan(&self, ctx: &AuthContext, req: ScanRequest) -> Result<JobId, LibError> {
         Self::require_full_visibility(ctx, "scanning")?;
         // Resolve target sources (all file sources when none specified; federated peers excluded).
@@ -1955,7 +2356,7 @@ impl LibraryService for EmbeddedLibrary {
                 self.require_asset_writable(ctx, id).await?;
             }
         }
-        let data_dir = self.data_dir.clone();
+        let cache = self.cache.clone();
         // Resolve each asset's content key inside the store lock, then purge its cache slice; the
         // next thumbnail read re-renders from source. A missing asset fails the whole request (the
         // caller passed a bad id) — per-item fail-soft applies to the file deletes, not the lookup.
@@ -1967,7 +2368,7 @@ impl LibraryService for EmbeddedLibrary {
                     .hash
                     .map(|h| h.to_hex())
                     .unwrap_or_else(|| asset.summary.id.to_string());
-                report.files_deleted += purge_asset_cache(&data_dir, &key);
+                report.files_deleted += purge_asset_cache(&cache, &key);
                 report.assets += 1;
             }
             Ok(report)

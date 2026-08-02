@@ -167,6 +167,11 @@ export interface ShareInfo {
 export interface CacheUsage {
   bytes: number;
   files: number;
+  budget_bytes: number;
+  hits: number;
+  misses: number;
+  evictions: number;
+  stale_deleted: number;
 }
 
 export interface StorageUsage {
@@ -175,6 +180,7 @@ export interface StorageUsage {
   server_db_bytes: number;
   thumbnails: CacheUsage;
   previews: CacheUsage;
+  peer_previews: CacheUsage;
   asset_count: number;
   source_count: number;
 }

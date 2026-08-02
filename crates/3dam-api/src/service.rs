@@ -184,7 +184,9 @@ impl Visibility {
         if self.is_full() {
             return true;
         }
-        !job.sources.is_empty() && job.sources.iter().all(|s| self.allows_source(s))
+        (!job.sources.is_empty() || !job.collections.is_empty())
+            && job.sources.iter().all(|s| self.allows_source(s))
+            && job.collections.iter().all(|c| self.allows_collection(c))
     }
 
     /// Whether a live event may be delivered to a subscriber holding this ceiling (issue #42).
@@ -500,6 +502,12 @@ pub trait LibraryService: Send + Sync {
         req: ConvertRequest,
     ) -> Result<ConvertReport, LibError>;
 
+    async fn submit_convert(
+        &self,
+        ctx: &AuthContext,
+        req: ConvertRequest,
+    ) -> Result<JobId, LibError>;
+
     // ── upload (issue #80, tech-spec 08 §5.1) ────────────────────────────────
     /// Write one file into a registered source and catalogue it.
     ///
@@ -725,6 +733,9 @@ pub trait LibraryService: Send + Sync {
     async fn export(&self, ctx: &AuthContext, req: ExportRequest)
         -> Result<ExportReport, LibError>;
 
+    async fn submit_export(&self, ctx: &AuthContext, req: ExportRequest)
+        -> Result<JobId, LibError>;
+
     // ── jobs: scan ───────────────────────────────────────────────────────────
     async fn submit_scan(&self, ctx: &AuthContext, req: ScanRequest) -> Result<JobId, LibError>;
 
@@ -744,4 +755,49 @@ pub trait LibraryService: Send + Sync {
         ctx: &AuthContext,
         req: SubscribeRequest,
     ) -> Result<EventStream<LibraryEvent>, LibError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn job(sources: Vec<SourceId>, collections: Vec<CollectionId>) -> JobStatus {
+        JobStatus {
+            id: JobId::new(),
+            kind: JobKind::Export,
+            state: JobState::Queued,
+            progress: Progress::default(),
+            error: None,
+            summary: None,
+            warnings: Vec::new(),
+            result_artifacts: Vec::new(),
+            result: None,
+            created_at: 0,
+            updated_at: 0,
+            initiator: None,
+            sources,
+            collections,
+        }
+    }
+
+    #[test]
+    fn restricted_job_visibility_requires_all_source_and_collection_attribution() {
+        let shared_source = SourceId::new();
+        let hidden_source = SourceId::new();
+        let shared_collection = CollectionId::new();
+        let hidden_collection = CollectionId::new();
+        let visibility = Visibility::Restricted(VisibilityScope {
+            sources: [shared_source].into_iter().collect(),
+            collections: [shared_collection].into_iter().collect(),
+            ..VisibilityScope::default()
+        });
+
+        assert!(visibility.allows_job(&job(vec![shared_source], vec![shared_collection])));
+        assert!(!visibility.allows_job(&job(
+            vec![shared_source, hidden_source],
+            vec![shared_collection]
+        )));
+        assert!(!visibility.allows_job(&job(vec![shared_source], vec![hidden_collection])));
+        assert!(!visibility.allows_job(&job(Vec::new(), Vec::new())));
+    }
 }

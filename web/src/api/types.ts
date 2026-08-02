@@ -88,6 +88,8 @@ export interface AudioAttributes {
 export interface PrefetchRequest {
   assets: AssetId[];
   edge?: number | null;
+  /** Set only by a server relaying a federation hint; prevents relay cycles. */
+  relay?: boolean;
 }
 export interface ImageAttributes {
   width: number | null;
@@ -681,6 +683,7 @@ export interface JobStatus {
   summary?: string | null;
   warnings?: string[];
   result_artifacts?: JobArtifact[];
+  result?: JobResult | null;
   created_at?: number;
   updated_at?: number;
   initiator?: string | null;
@@ -688,7 +691,11 @@ export interface JobStatus {
    *  visibility-restricted session is shown a job only when all of these are within its ceiling —
    *  jobs outside it are simply absent from `/jobs` and from the event stream (issue #42). */
   sources: SourceId[];
+  collections?: CollectionId[];
 }
+export type JobResult =
+  | { kind: "convert"; report: ConvertReport }
+  | { kind: "export"; report: ExportReport };
 export interface JobListRequest {
   kinds?: JobKind[];
   state?: JobState | null;

@@ -6,8 +6,7 @@
 //!   3DAM never writes over a catalogued original.
 //! - **Fail-soft (§1.1):** one unreadable/unencodable input fails its own item; the batch continues.
 //!
-//! CLI-first in v1: this returns the full `ConvertReport` synchronously (run on the blocking pool by
-//! the caller). The job/progress-streamed model layers on later without changing these types.
+//! The same runner serves synchronous CLI compatibility and cancellable background jobs.
 
 use dam_api::dto::*;
 use dam_api::id::{AssetId, SourceId};
@@ -24,6 +23,23 @@ pub(crate) fn run_convert(
     req: ConvertRequest,
     scratch: &Path,
 ) -> Result<ConvertReport, LibError> {
+    Ok(run_convert_with_checkpoint(store, secrets, req, scratch, |_, _, _| true)?.report)
+}
+
+pub(crate) struct ConvertRun {
+    pub report: ConvertReport,
+    pub cancelled: bool,
+}
+
+/// Run with an item-boundary checkpoint. Returning false cancels before the next input; outputs and
+/// per-item reports already completed are retained in the returned partial report.
+pub(crate) fn run_convert_with_checkpoint(
+    store: &Store,
+    secrets: &crate::credentials::SecretVault,
+    req: ConvertRequest,
+    scratch: &Path,
+    mut checkpoint: impl FnMut(u64, u64, Option<&str>) -> bool,
+) -> Result<ConvertRun, LibError> {
     if req.output_dir.trim().is_empty() {
         return Err(LibError::BadRequest("output_dir is required".into()));
     }
@@ -52,7 +68,15 @@ pub(crate) fn run_convert(
     // ten files off one SFTP host must not mean ten SSH handshakes.
     let mut backends: Backends = HashMap::new();
 
+    let total = req.inputs.len() as u64;
     for input in &req.inputs {
+        let current = input.to_string();
+        if !checkpoint(report.items.len() as u64, total, Some(&current)) {
+            return Ok(ConvertRun {
+                report,
+                cancelled: true,
+            });
+        }
         let item = plan_and_maybe_encode(
             store,
             secrets,
@@ -67,7 +91,17 @@ pub(crate) fn run_convert(
         tally(&mut report, &item);
         report.items.push(item);
     }
-    Ok(report)
+    let current = report.items.last().map(|item| item.input_path.as_str());
+    if !checkpoint(report.items.len() as u64, total, current) {
+        return Ok(ConvertRun {
+            report,
+            cancelled: true,
+        });
+    }
+    Ok(ConvertRun {
+        report,
+        cancelled: false,
+    })
 }
 
 /// Lazily-opened `FileSource` per source id, including the failure — a host that is down should
@@ -435,4 +469,82 @@ fn normalise(p: &Path) -> PathBuf {
 /// True if `path` is equal to or nested under `root`.
 fn path_within(path: &Path, root: &Path) -> bool {
     path == root || path.starts_with(root)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dam_api::id::ContentHash;
+    use dam_sources::SourceConnection;
+
+    #[test]
+    fn cancellation_returns_completed_and_failed_item_detail() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_root = temp.path().join("source");
+        let output = temp.path().join("output");
+        std::fs::create_dir(&source_root).unwrap();
+        std::fs::write(
+            source_root.join("quad.png"),
+            include_bytes!("../../3dam-render/tests/fixtures/quad.png"),
+        )
+        .unwrap();
+
+        let store = Store::open_in_memory().unwrap();
+        let source = store
+            .add_source(
+                &SourceConnection::LocalFs {
+                    root: source_root.to_string_lossy().into_owned(),
+                },
+                "fixture",
+                false,
+            )
+            .unwrap();
+        let (valid, _) = store
+            .upsert_asset(&dam_store::NewAsset {
+                source_id: source,
+                path: "quad.png".into(),
+                filename: "quad.png".into(),
+                content_hash: Some(ContentHash([7; 32])),
+                size_bytes: Some(
+                    std::fs::metadata(source_root.join("quad.png"))
+                        .unwrap()
+                        .len() as i64,
+                ),
+                source_modified_at: None,
+                scanned_at: dam_store::now_ms(),
+                media_type: MediaType::Image,
+                format: "png".into(),
+            })
+            .unwrap();
+        let missing = AssetId::new();
+        let never_started = AssetId::new();
+
+        let run = run_convert_with_checkpoint(
+            &store,
+            &crate::credentials::SecretVault::memory(),
+            ConvertRequest {
+                inputs: vec![valid, missing, never_started],
+                target: ConvertTarget::Image {
+                    format: "png".into(),
+                    max_edge: None,
+                    quality: None,
+                },
+                output_dir: output.to_string_lossy().into_owned(),
+                dry_run: false,
+                on_collision: CollisionRule::Fail,
+            },
+            temp.path(),
+            |done, _, _| done < 2,
+        )
+        .unwrap();
+
+        assert!(run.cancelled);
+        assert_eq!(run.report.items.len(), 2, "the third item never started");
+        assert_eq!(run.report.items[0].disposition, Disposition::Done);
+        assert_eq!(run.report.items[1].disposition, Disposition::Failed);
+        assert!(run.report.items[1].error.is_some());
+        assert_eq!(run.report.done, 1);
+        assert_eq!(run.report.failed, 1);
+        assert!(output.join("quad.png").exists());
+    }
 }

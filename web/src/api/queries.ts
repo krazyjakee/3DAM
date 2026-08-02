@@ -30,6 +30,7 @@ import type {
   DupRequest,
   ExportRequest,
   FavoriteRequest,
+  JobId,
   JobListRequest,
   NewCollection,
   QueryRequest,
@@ -191,6 +192,16 @@ export function useJobHistory() {
       api.listJobs({ page: { limit: 50, after: pageParam } }),
     initialPageParam: null as string | null,
     getNextPageParam: (last) => last.cursor ?? undefined,
+  });
+}
+
+/** Fetch the selected job's durable detail separately; list/event summaries intentionally omit
+ * potentially large convert/export item reports. */
+export function useJob(id: JobId | null) {
+  return useQuery({
+    queryKey: [...qk.jobs, "detail", id],
+    queryFn: () => api.getJob(id as JobId),
+    enabled: id != null,
   });
 }
 
@@ -437,8 +448,10 @@ export function useCollectionMembers() {
 /** Export a manifest (json/csv/sidecar). Read-only w.r.t. the catalog, so no cache invalidation;
  *  the caller shows the returned report (path + counts). */
 export function useExport() {
+  const qc = useQueryClient();
   return useMutation({
-    mutationFn: (req: ExportRequest) => api.exportAssets(req),
+    mutationFn: async (req: ExportRequest) => (await api.submitExport(req)).job_id,
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.jobs }),
     meta: { errorPrefix: "Export failed" },
   });
 }
@@ -446,8 +459,10 @@ export function useExport() {
 /** Convert assets to a target format. Writes to an output dir outside any source, so the catalog is
  *  unchanged — no invalidation; the caller shows the per-item report. */
 export function useConvert() {
+  const qc = useQueryClient();
   return useMutation({
-    mutationFn: (req: ConvertRequest) => api.convert(req),
+    mutationFn: async (req: ConvertRequest) => (await api.submitConvert(req)).job_id,
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.jobs }),
     meta: { errorPrefix: "Convert failed" },
   });
 }

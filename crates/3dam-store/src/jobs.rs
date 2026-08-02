@@ -16,9 +16,21 @@ impl Store {
         total: Option<u64>,
         sources: &[SourceId],
     ) -> Result<JobId, LibError> {
+        self.create_job_scoped(kind, params_json, total, sources, &[])
+    }
+
+    pub fn create_job_scoped(
+        &self,
+        kind: JobKind,
+        params_json: &str,
+        total: Option<u64>,
+        sources: &[SourceId],
+        collections: &[CollectionId],
+    ) -> Result<JobId, LibError> {
         let id = JobId::new();
         let now = now_ms();
         let sources_json = encode_job_sources(sources);
+        let collections_json = encode_job_collections(collections);
         // Automated callers are attributable from their stable internal request marker. Manual
         // callers currently have no identity at this storage seam, so remain honestly unknown.
         let initiator = if params_json.contains("\"watch\":true") {
@@ -31,8 +43,8 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO job (id, kind, state, params, progress, done, total, created_at, updated_at,
-                              sources, initiator)
-             VALUES (?1, ?2, 'queued', ?3, 0, 0, ?4, ?5, ?5, ?6, ?7)",
+                              sources, initiator, collections)
+             VALUES (?1, ?2, 'queued', ?3, 0, 0, ?4, ?5, ?5, ?6, ?7, ?8)",
             params![
                 id.as_bytes().to_vec(),
                 job_kind_str(kind),
@@ -41,10 +53,48 @@ impl Store {
                 now,
                 sources_json,
                 initiator,
+                collections_json,
             ],
         )
         .map_err(internal)?;
         Ok(id)
+    }
+
+    /// Persist a terminal structured report. Completing is conditional so a cancellation accepted
+    /// concurrently with worker completion can never be overwritten by `Done`.
+    pub fn finish_job(
+        &self,
+        id: &JobId,
+        state: JobState,
+        summary: &str,
+        warnings: &[String],
+        result: Option<&JobResult>,
+    ) -> Result<bool, LibError> {
+        if !matches!(state, JobState::Done | JobState::Cancelled) {
+            return Err(LibError::BadRequest("invalid terminal result state".into()));
+        }
+        let warnings = serde_json::to_string(warnings).map_err(internal)?;
+        let result = result
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(internal)?;
+        let conn = self.conn.lock().unwrap();
+        let changed = conn
+            .execute(
+                "UPDATE job SET state = ?2, summary = ?3, warnings = ?4, result = ?5,
+                                error = NULL, current = NULL, updated_at = ?6
+                 WHERE id = ?1 AND (?2 = 'cancelled' OR state <> 'cancelled')",
+                params![
+                    id.as_bytes().to_vec(),
+                    job_state_str(state),
+                    summary,
+                    warnings,
+                    result,
+                    now_ms(),
+                ],
+            )
+            .map_err(internal)?;
+        Ok(changed != 0)
     }
 
     pub fn update_job_progress(
@@ -62,7 +112,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE job SET state = ?2, done = ?3, total = ?4, current = ?5, progress = ?6, updated_at = ?7
-             WHERE id = ?1",
+             WHERE id = ?1 AND (?2 <> 'running' OR state <> 'cancelled')",
             params![
                 id.as_bytes().to_vec(),
                 job_state_str(state),
@@ -85,7 +135,8 @@ impl Store {
     ) -> Result<(), LibError> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE job SET state = ?2, error = ?3, updated_at = ?4 WHERE id = ?1",
+            "UPDATE job SET state = ?2, error = ?3, updated_at = ?4
+             WHERE id = ?1 AND (?2 NOT IN ('done', 'failed') OR state <> 'cancelled')",
             params![
                 id.as_bytes().to_vec(),
                 job_state_str(state),
@@ -155,7 +206,24 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
             "SELECT id, kind, state, done, total, current, error, sources, created_at, updated_at,
-                    summary, warnings, initiator, result_artifacts FROM job WHERE id = ?1",
+                    summary, warnings, initiator, result_artifacts, result, collections
+             FROM job WHERE id = ?1",
+            params![id.as_bytes().to_vec()],
+            Self::row_to_job,
+        )
+        .optional()
+        .map_err(internal)?
+        .ok_or_else(|| LibError::NotFound(format!("job {id}")))
+    }
+
+    /// Lightweight event/list shape. The full structured result is intentionally fetched only by
+    /// `get_job` when a caller opens one history detail.
+    pub fn get_job_summary(&self, id: &JobId) -> Result<JobStatus, LibError> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id, kind, state, done, total, current, error, sources, created_at, updated_at,
+                    summary, warnings, initiator, result_artifacts, NULL AS result, collections
+             FROM job WHERE id = ?1",
             params![id.as_bytes().to_vec()],
             Self::row_to_job,
         )
@@ -177,7 +245,7 @@ impl Store {
         let mut stmt = conn
             .prepare(
                 "SELECT id, kind, state, done, total, current, error, sources, created_at, updated_at,
-                        summary, warnings, initiator, result_artifacts FROM job
+                        summary, warnings, initiator, result_artifacts, NULL AS result, collections FROM job
                  ORDER BY created_at DESC, rowid DESC",
             )
             .map_err(internal)?;
@@ -228,6 +296,8 @@ impl Store {
         let warnings: Option<String> = r.get(11)?;
         let initiator: Option<String> = r.get(12)?;
         let result_artifacts: Option<String> = r.get(13)?;
+        let result: Option<String> = r.get(14)?;
+        let collections: Option<String> = r.get(15)?;
         let mut decoded_warnings = decode_job_warnings(warnings.as_deref());
         let mut hard_error = error;
         // Before V16 completed scan/analyse notes occupied `error`. Preserve those reports while
@@ -251,10 +321,12 @@ impl Store {
             summary,
             warnings: decoded_warnings,
             result_artifacts: decode_job_artifacts(result_artifacts.as_deref()),
+            result: result.and_then(|value| serde_json::from_str(&value).ok()),
             created_at,
             updated_at,
             initiator,
             sources: decode_job_sources(sources.as_deref()),
+            collections: decode_job_collections(collections.as_deref()),
         })
     }
 }
@@ -298,6 +370,11 @@ fn encode_job_sources(sources: &[SourceId]) -> String {
     serde_json::to_string(&ids).unwrap_or_else(|_| "[]".into())
 }
 
+fn encode_job_collections(collections: &[CollectionId]) -> String {
+    let ids: Vec<String> = collections.iter().map(|id| id.to_string()).collect();
+    serde_json::to_string(&ids).unwrap_or_else(|_| "[]".into())
+}
+
 /// Decode `job.sources`. NULL (a pre-V9 row) and anything unparseable read back as empty — the
 /// unattributed case, which `Visibility::allows_job` treats as observable only at `Full`.
 fn decode_job_sources(raw: Option<&str>) -> Vec<SourceId> {
@@ -308,6 +385,14 @@ fn decode_job_sources(raw: Option<&str>) -> Vec<SourceId> {
         .unwrap_or_default()
         .iter()
         .filter_map(|s| s.parse().ok())
+        .collect()
+}
+
+fn decode_job_collections(raw: Option<&str>) -> Vec<CollectionId> {
+    raw.and_then(|value| serde_json::from_str::<Vec<String>>(value).ok())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|id| id.parse().ok())
         .collect()
 }
 
@@ -380,6 +465,59 @@ mod tests {
         assert!(status.error.is_none());
         assert_eq!(status.initiator.as_deref(), Some("Automation"));
         assert!(status.updated_at >= status.created_at);
+    }
+
+    #[test]
+    fn structured_result_survives_reload_and_cancel_wins_completion_race() {
+        let data = std::env::temp_dir().join(format!("3dam-job-result-{}", JobId::new()));
+        std::fs::create_dir_all(&data).unwrap();
+        let collection = CollectionId::new();
+        let job;
+        let result = JobResult::Export(ExportReport {
+            format: ExportFormat::Csv,
+            output: "/tmp/manifest.csv".into(),
+            assets: 12,
+            files_written: 1,
+        });
+        {
+            let store = Store::open(&data).unwrap();
+            job = store
+                .create_job_scoped(JobKind::Export, "{}", None, &[], &[collection])
+                .unwrap();
+            store
+                .set_job_state(&job, JobState::Cancelled, None)
+                .unwrap();
+            assert!(!store
+                .finish_job(&job, JobState::Done, "too late", &[], Some(&result))
+                .unwrap());
+            store
+                .finish_job(
+                    &job,
+                    JobState::Cancelled,
+                    "cancelled after output completed",
+                    &[],
+                    Some(&result),
+                )
+                .unwrap();
+        }
+
+        let store = Store::open(&data).unwrap();
+        let status = store.get_job(&job).unwrap();
+        assert_eq!(status.state, JobState::Cancelled);
+        assert_eq!(status.collections, vec![collection]);
+        match status.result.as_deref() {
+            Some(JobResult::Export(report)) => assert_eq!(report.assets, 12),
+            other => panic!("structured export result was not persisted: {other:?}"),
+        }
+        let listed = store
+            .list_jobs(&JobListRequest::default(), &Visibility::Full)
+            .unwrap();
+        assert!(
+            listed.items[0].result.is_none(),
+            "history summaries must not eagerly hydrate large reports"
+        );
+        drop(store);
+        std::fs::remove_dir_all(data).unwrap();
     }
 
     #[test]

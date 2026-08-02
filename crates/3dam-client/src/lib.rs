@@ -895,6 +895,15 @@ impl LibraryService for ApiClient {
         self.post("/api/v1/convert", &req).await
     }
 
+    async fn submit_convert(
+        &self,
+        _ctx: &AuthContext,
+        req: ConvertRequest,
+    ) -> Result<JobId, LibError> {
+        let reply: JobIdReply = self.post("/api/v1/jobs/convert", &req).await?;
+        Ok(reply.job_id)
+    }
+
     /// Forward the staged bytes to the server's upload route.
     ///
     /// The body is the file *handle*, not its contents: a connected CLI or desktop shell pushing a
@@ -1217,6 +1226,15 @@ impl LibraryService for ApiClient {
         req: ExportRequest,
     ) -> Result<ExportReport, LibError> {
         self.post("/api/v1/export", &req).await
+    }
+
+    async fn submit_export(
+        &self,
+        _ctx: &AuthContext,
+        req: ExportRequest,
+    ) -> Result<JobId, LibError> {
+        let reply: JobIdReply = self.post("/api/v1/jobs/export", &req).await?;
+        Ok(reply.job_id)
     }
 
     async fn submit_scan(&self, _ctx: &AuthContext, req: ScanRequest) -> Result<JobId, LibError> {

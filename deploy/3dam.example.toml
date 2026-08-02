@@ -90,3 +90,7 @@ federation = false
 #background_threads = 2
 #min_free_memory_mb = 2048
 #max_io_stall_pct = 25
+# Local thumbnails + 3D previews: default min(10 GiB, 10% of current free disk).
+#derivative_cache_mb = 10240
+# Federated thumbnails + previews: default min(2 GiB, 10% free disk), stale after 7 days.
+#peer_cache_mb = 2048

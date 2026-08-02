@@ -133,6 +133,36 @@ pub fn model_preview_blob(path: &Path, format: &str) -> Result<Vec<u8>, RenderEr
     Ok(preview::serialize(&model))
 }
 
+/// Both model derivatives from one Assimp import. Background warming asks for the thumbnail and
+/// interactive preview together; decoding independently would double the dominant CPU/I/O work.
+/// A GPU thumbnail failure is isolated so the CPU-only preview can still be published.
+pub struct ModelDerivatives {
+    pub thumbnail: Result<Vec<u8>, RenderError>,
+    pub preview: Vec<u8>,
+}
+
+pub fn model_derivatives(
+    path: &Path,
+    format: &str,
+    size: u32,
+) -> Result<ModelDerivatives, RenderError> {
+    if !supports_format(format) {
+        return Err(RenderError::UnsupportedFormat(format.to_string()));
+    }
+    let model = model::load(path)
+        .map_err(RenderError::Decode)?
+        .ok_or(RenderError::EmptyMesh)?;
+    let preview = preview::serialize(&model);
+    let thumbnail = if format.eq_ignore_ascii_case("blend") {
+        blend::embedded_thumbnail_png(path)
+            .map(Ok)
+            .unwrap_or_else(|| shared().and_then(|renderer| renderer.render_png(&model, size)))
+    } else {
+        shared().and_then(|renderer| renderer.render_png(&model, size))
+    };
+    Ok(ModelDerivatives { thumbnail, preview })
+}
+
 /// Bump when the `DMSH` blob layout or its texture handling changes, so cached previews from an
 /// older serializer are invalidated (the engine folds this into the preview cache key). v2: FlipUVs
 /// in the shared decode — corrects the vertically-flipped textures in the interactive viewer. v3:

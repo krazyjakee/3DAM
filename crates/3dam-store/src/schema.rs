@@ -581,6 +581,11 @@ pub const MIGRATIONS: &[&str] = &[
         auth_ref TEXT PRIMARY KEY
     ) STRICT;
     "#,
+    // ── V18: durable structured long-operation reports (issue #114) ─────────────────────────────
+    r#"
+    ALTER TABLE job ADD COLUMN result TEXT;
+    ALTER TABLE job ADD COLUMN collections TEXT;
+    "#,
 ];
 
 #[cfg(test)]

@@ -1,6 +1,7 @@
 //! Prefetch hint (issue #72): `LibraryService::prefetch` warms an asset's thumbnail cache ahead of
 //! any client read — so the grid's later HTTP GET is a cache hit. Verified at the engine level:
-//! scan, then prefetch, then assert the derivative exists *without ever calling read_thumbnail*.
+//! seed the catalog, then prefetch, then assert the derivative exists *without ever calling
+//! read_thumbnail*.
 
 use dam_api::dto::*;
 use dam_api::service::{AuthContext, LibraryService};
@@ -25,19 +26,6 @@ fn unique_tmp() -> PathBuf {
         nanos,
         n
     ))
-}
-
-async fn wait_job(lib: &EmbeddedLibrary, ctx: &AuthContext, job: &dam_api::id::JobId) {
-    loop {
-        let j = lib.get_job(ctx, job).await.unwrap();
-        if matches!(
-            j.state,
-            JobState::Done | JobState::Failed | JobState::Cancelled
-        ) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -68,17 +56,23 @@ async fn prefetch_warms_the_thumbnail_cache() {
         )
         .await
         .unwrap();
-    let job = lib
-        .submit_scan(
-            &ctx,
-            ScanRequest {
-                sources: vec![sid],
-                mode: ScanMode::Full,
-            },
-        )
-        .await
+    // Seed the one catalog row directly. This test exercises prefetch bounds, not scan pacing;
+    // bypassing scan keeps it deterministic when the host's load governor is intentionally active.
+    let store = dam_store::Store::open(&data_dir).unwrap();
+    store
+        .upsert_asset(&dam_store::NewAsset {
+            source_id: sid,
+            path: "tile.png".into(),
+            filename: "tile.png".into(),
+            content_hash: None,
+            size_bytes: Some(std::fs::metadata(src.join("tile.png")).unwrap().len() as i64),
+            source_modified_at: None,
+            scanned_at: dam_store::now_ms(),
+            media_type: MediaType::Image,
+            format: "png".into(),
+        })
         .unwrap();
-    wait_job(&lib, &ctx, &job).await;
+    drop(store);
 
     let ids: Vec<_> = lib
         .query(&ctx, QueryRequest::default())
@@ -97,16 +91,44 @@ async fn prefetch_warms_the_thumbnail_cache() {
         "no thumbnail should exist before prefetch"
     );
 
-    // Prefetch at edge 128 — fire-and-forget; the warm happens off-thread.
+    // A burst of duplicate-heavy hints must return promptly and collapse to one bounded worker +
+    // one derivative. This exercises input/queue/task bounds without relying on timing CPU work.
+    let id = ids[0];
+    let mut synthetic = Vec::with_capacity(120_001);
+    synthetic.push(id);
+    let synthetic_id = dam_api::id::AssetId::new();
+    synthetic.extend(std::iter::repeat_n(synthetic_id, 120_000));
+    let started = Instant::now();
     lib.prefetch(
         &ctx,
         PrefetchRequest {
-            assets: ids,
+            assets: synthetic,
             edge: Some(128),
+            relay: false,
         },
     )
     .await
     .unwrap();
+    let calls = (0..64).map(|_| {
+        lib.prefetch(
+            &ctx,
+            PrefetchRequest {
+                assets: vec![id; 1_000],
+                edge: Some(128),
+                relay: false,
+            },
+        )
+    });
+    for result in futures::future::join_all(calls).await {
+        result.unwrap();
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "prefetch hints must enqueue rather than perform decode work inline"
+    );
+    let (max_pending, max_workers) = lib.prefetch_bound_diagnostics();
+    assert!(max_pending <= 1_024, "pending queue exceeded its hard cap");
+    assert_eq!(max_workers, 1, "all hints must share one local worker task");
 
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut warmed = false;
@@ -127,6 +149,11 @@ async fn prefetch_warms_the_thumbnail_cache() {
     assert!(
         warmed,
         "prefetch warmed the 128px thumbnail before any read"
+    );
+    assert_eq!(
+        std::fs::read_dir(&thumb_dir).unwrap().flatten().count(),
+        1,
+        "duplicate bursts publish exactly one derivative"
     );
 
     let _ = std::fs::remove_dir_all(&tmp);

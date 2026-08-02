@@ -1,8 +1,9 @@
-import { useEffect, useMemo } from "react";
+import { useMemo } from "react";
 import { AlertTriangle, Ban, CheckCircle2, CircleX, Clock3, History } from "lucide-react";
 import { Link, useSearchParams } from "react-router";
-import { useJobHistory, useSources } from "@/api/queries";
-import type { JobStatus } from "@/api/types";
+import { useCancelJob, useJob, useJobHistory, useSources } from "@/api/queries";
+import type { ConvertReport, JobStatus } from "@/api/types";
+import { bytes } from "@/lib/format";
 import { CenteredCard } from "@/lib/ui";
 
 /** Persisted job list + terminal report. The server performs visibility filtering before returning
@@ -13,19 +14,11 @@ export function JobHistory() {
   const [params, setParams] = useSearchParams();
   const jobs = useMemo(() => history.data?.pages.flatMap((page) => page.items) ?? [], [history.data]);
   const selectedId = params.get("job");
-  const selected = jobs.find((job) => job.id === selectedId) ?? null;
-  const { fetchNextPage, hasNextPage, isFetchingNextPage } = history;
+  const selected = useJob(selectedId);
   const sourceNames = useMemo(
     () => new Map((sources.data ?? []).map((source) => [source.id, source.name])),
     [sources.data],
   );
-
-  // A notification can deep-link to an older page. Fetch sequentially until it is found or the
-  // caller's visible history is exhausted; the detail therefore survives both reload and navigation.
-  useEffect(() => {
-    if (!selectedId || selected || !hasNextPage || isFetchingNextPage) return;
-    void fetchNextPage();
-  }, [fetchNextPage, hasNextPage, isFetchingNextPage, selected, selectedId]);
 
   return (
     <div className="mx-auto flex min-h-dvh max-w-5xl flex-col gap-5 p-6 text-sm">
@@ -99,10 +92,10 @@ export function JobHistory() {
           </section>
 
           <section aria-label="Job details">
-            {selected ? (
-              <JobDetails job={selected} sources={sourceNames} />
-            ) : selectedId && history.hasNextPage ? (
-              <CenteredCard>Finding job…</CenteredCard>
+            {selectedId && selected.isLoading ? (
+              <CenteredCard>Loading job report…</CenteredCard>
+            ) : selected.data ? (
+              <JobDetails job={selected.data} sources={sourceNames} />
             ) : selectedId ? (
               <CenteredCard tone="danger">
                 This job is unavailable or outside your library visibility.
@@ -118,6 +111,7 @@ export function JobHistory() {
 }
 
 function JobDetails({ job, sources }: { job: JobStatus; sources: Map<string, string> }) {
+  const cancel = useCancelJob();
   const warnings = job.warnings ?? [];
   const artifacts = job.result_artifacts ?? [];
   return (
@@ -139,6 +133,17 @@ function JobDetails({ job, sources }: { job: JobStatus; sources: Map<string, str
           <OutcomeIcon job={job} /> {outcomeLabel(job)}
         </span>
       </div>
+
+      {(job.state === "queued" || job.state === "running") && (
+        <button
+          type="button"
+          className="btn mt-3 text-danger"
+          disabled={cancel.isPending}
+          onClick={() => cancel.mutate(job.id)}
+        >
+          {cancel.isPending ? "Cancelling…" : "Cancel job"}
+        </button>
+      )}
 
       <dl className="mt-4 grid grid-cols-[max-content_1fr] gap-x-4 gap-y-2 text-xs">
         <dt className="text-fg-dim">Started</dt>
@@ -203,7 +208,48 @@ function JobDetails({ job, sources }: { job: JobStatus; sources: Map<string, str
           </ul>
         </section>
       )}
+      {job.result?.kind === "convert" && <ConvertResult report={job.result.report} />}
+      {job.result?.kind === "export" && (
+        <section className="mt-4 border-t border-border pt-3 text-xs">
+          <h3 className="font-medium text-fg-muted">Export report</h3>
+          <p className="mt-1 text-fg">
+            {job.result.report.assets.toLocaleString()} asset(s) ·{" "}
+            {job.result.report.files_written.toLocaleString()} file(s)
+          </p>
+          <p className="mt-1 break-all font-mono text-[10px] text-fg-dim">
+            {job.result.report.output}
+          </p>
+        </section>
+      )}
     </article>
+  );
+}
+
+function ConvertResult({ report }: { report: ConvertReport }) {
+  return (
+    <section className="mt-4 border-t border-border pt-3 text-xs">
+      <h3 className="font-medium text-fg-muted">Convert report</h3>
+      <p className="mt-1 break-all text-fg">{report.output_dir}</p>
+      <p className="mt-1 text-fg-dim">
+        {report.dry_run ? "Plan" : "Output"}: {report.done} ready/done · {report.failed} failed ·{" "}
+        {report.collisions} collisions · {report.unsupported} unsupported
+        {!report.dry_run && report.total_output_bytes > 0
+          ? ` · ${bytes(report.total_input_bytes)} → ${bytes(report.total_output_bytes)}`
+          : ""}
+      </p>
+      <div className="mt-2 max-h-64 overflow-y-auto rounded border border-border">
+        {report.items.map((item) => (
+          <div key={item.input} className="border-b border-border px-2 py-1.5 last:border-0">
+            <p className="truncate text-fg" title={item.planned_output || item.input_path}>
+              {item.planned_output || item.input_path || item.input}
+            </p>
+            <p className={item.error ? "text-danger" : "text-fg-dim"}>
+              {item.error ?? item.disposition}
+            </p>
+          </div>
+        ))}
+      </div>
+    </section>
   );
 }
 

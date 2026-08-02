@@ -233,3 +233,49 @@ async fn model_preview_serves_dmsh_blob_and_caches() {
 
     std::fs::remove_dir_all(&tmp).ok();
 }
+
+#[tokio::test]
+async fn simultaneous_thumbnail_and_preview_share_one_fetch_and_decode() {
+    let tmp = unique_tmp();
+    let assets = tmp.join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    std::fs::write(assets.join("cube.gltf"), cube_gltf()).unwrap();
+
+    let lib =
+        EmbeddedLibrary::open_with(&tmp.join("data"), dam_core::ResourceOptions::ungoverned())
+            .await
+            .unwrap();
+    let ctx = AuthContext::embedded();
+    let sid = lib
+        .add_source(
+            &ctx,
+            AddSource {
+                kind: SourceKind::LocalFs,
+                uri: assets.to_string_lossy().into_owned(),
+                name: Some("m".into()),
+                options: SourceOptions::default(),
+            },
+        )
+        .await
+        .unwrap();
+    scan_to_done(&lib, &ctx, sid).await;
+    let cube = asset_by_format(&lib, &ctx, "gltf").await;
+
+    let before = lib.model_derivative_generation_count();
+    let (thumbnail, preview) = tokio::join!(
+        lib.read_thumbnail(&ctx, &cube.id, 256),
+        lib.read_model_preview(&ctx, &cube.id),
+    );
+    let preview = preview.expect("shared CPU decode still publishes the DMSH preview");
+    assert!(preview.bytes.starts_with(b"DMSH"));
+    if let Ok(thumbnail) = thumbnail {
+        assert!(thumbnail.bytes.starts_with(b"\x89PNG"));
+    }
+    assert_eq!(
+        lib.model_derivative_generation_count() - before,
+        1,
+        "the shared keyed flight must perform one source fetch/model decode"
+    );
+
+    std::fs::remove_dir_all(&tmp).ok();
+}

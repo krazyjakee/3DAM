@@ -138,6 +138,7 @@ fn emit_json(
     })?;
     writer.write_all(b"]}").map_err(io_err)?;
     writer.flush().map_err(io_err)?;
+    checkpoint(processed)?;
     let temp = writer.into_inner().map_err(|e| io_err(e.into_error()))?;
     persist_file(temp, out)?;
     Ok((emitted, 1))
@@ -172,6 +173,7 @@ fn emit_csv(
         checkpoint(processed)
     })?;
     writer.flush().map_err(io_err)?;
+    checkpoint(processed)?;
     let temp = writer
         .into_inner()
         .map_err(|e| LibError::Internal(format!("finish csv: {}", e.error())))?;
@@ -214,6 +216,7 @@ fn emit_sidecars(
         processed += batch.len() as u64;
         checkpoint(processed)
     })?;
+    checkpoint(processed)?;
     replace_directory(stage, out)?;
     Ok((emitted, emitted))
 }
@@ -348,7 +351,7 @@ fn io_err(error: std::io::Error) -> LibError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dam_api::id::ContentHash;
+    use dam_api::id::{AssetId, ContentHash};
     use dam_sources::SourceConnection;
 
     fn large_store(count: usize) -> Store {
@@ -400,6 +403,52 @@ mod tests {
         assert_eq!(stats.rows, 1_003);
         assert_eq!(stats.max_batch_rows, 37);
         assert!(stats.queries <= 29, "queries were batch-bounded: {stats:?}");
+    }
+
+    #[test]
+    fn source_attribution_resolves_large_input_sets_in_batches() {
+        let store = Store::open_in_memory().unwrap();
+        let first = store
+            .add_source(
+                &SourceConnection::LocalFs {
+                    root: "/tmp/first".into(),
+                },
+                "first",
+                false,
+            )
+            .unwrap();
+        let second = store
+            .add_source(
+                &SourceConnection::LocalFs {
+                    root: "/tmp/second".into(),
+                },
+                "second",
+                false,
+            )
+            .unwrap();
+        let mut ids = Vec::new();
+        for n in 0..600 {
+            let (id, _) = store
+                .upsert_asset(&dam_store::NewAsset {
+                    source_id: if n % 2 == 0 { first } else { second },
+                    path: format!("asset-{n}.png"),
+                    filename: format!("asset-{n}.png"),
+                    content_hash: None,
+                    size_bytes: Some(1),
+                    source_modified_at: None,
+                    scanned_at: dam_store::now_ms(),
+                    media_type: MediaType::Image,
+                    format: "png".into(),
+                })
+                .unwrap();
+            ids.push(id);
+        }
+        ids.push(ids[0]);
+        ids.push(AssetId::new());
+
+        let mut expected = vec![first, second];
+        expected.sort();
+        assert_eq!(store.asset_sources(&ids).unwrap(), expected);
     }
 
     #[test]

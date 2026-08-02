@@ -205,9 +205,13 @@ export const api = {
 
   /** Export a manifest (json/csv/sidecar) for a selection / collection / query to a server path. */
   exportAssets: (req: ExportRequest) => send<ExportReport>("POST", `${API}/export`, req),
+  submitExport: (req: ExportRequest) =>
+    send<{ job_id: JobId }>("POST", `${API}/jobs/export`, req),
 
   /** Convert assets to a target format into a server output dir (source-safe, atomic; tech-spec 08). */
   convert: (req: ConvertRequest) => send<ConvertReport>("POST", `${API}/convert`, req),
+  submitConvert: (req: ConvertRequest) =>
+    send<{ job_id: JobId }>("POST", `${API}/jobs/convert`, req),
 
   /** URL for an asset's raw bytes — fed to the WASM viewer islands (tech-spec 09 §B.3). The DOM
    *  fetches this and hands it across the wasm-bindgen boundary; the island does no networking. */
@@ -310,5 +314,6 @@ export const api = {
   regenerateThumbnails: (req: ThumbnailRegenRequest) =>
     send<ThumbnailRegenReport>("POST", `${API}/thumbnails/regenerate`, req),
   listJobs: (req: JobListRequest = {}) => send<Page<JobStatus>>("POST", `${API}/jobs/list`, req),
+  getJob: (id: JobId) => get<JobStatus>(`${API}/jobs/${id}`),
   cancelJob: (id: JobId) => send<void>("POST", `${API}/jobs/${id}/cancel`),
 };

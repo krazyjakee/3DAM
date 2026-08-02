@@ -276,13 +276,24 @@ pub struct AuditEntry {
 // only 3DAM's own SQLite DBs and its `<data_dir>/cache/` derivatives are ever touched.
 
 /// One cache tier's on-disk footprint (the image thumbnails or the 3D preview meshes).
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct CacheUsage {
     pub bytes: u64,
     pub files: u64,
+    /// Configured byte ceiling for this tier/budget group.
+    #[serde(default)]
+    pub budget_bytes: u64,
+    #[serde(default)]
+    pub hits: u64,
+    #[serde(default)]
+    pub misses: u64,
+    #[serde(default)]
+    pub evictions: u64,
+    #[serde(default)]
+    pub stale_deleted: u64,
 }
 
-/// Storage report for the Settings surface: DB sizes, both cache tiers, and catalog counts.
+/// Storage report for the Settings surface: DB sizes, local/peer cache tiers, and catalog counts.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StorageUsage {
     /// The data directory the report is for (shown so the operator knows what they're clearing).
@@ -293,6 +304,9 @@ pub struct StorageUsage {
     pub server_db_bytes: u64,
     pub thumbnails: CacheUsage,
     pub previews: CacheUsage,
+    /// Federated derivatives, separately budgeted and owner-scoped.
+    #[serde(default)]
+    pub peer_previews: CacheUsage,
     pub asset_count: u64,
     pub source_count: u64,
 }
@@ -305,7 +319,7 @@ pub enum CacheTarget {
     Thumbnails,
     /// The 3D preview-mesh cache (`<data_dir>/cache/previews`).
     Previews,
-    /// Both tiers.
+    /// Every local and federated derivative tier.
     All,
 }
 

@@ -935,6 +935,9 @@ pub struct JobStatus {
     pub warnings: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub result_artifacts: Vec<JobArtifact>,
+    /// Structured terminal output, persisted so history can reopen the complete report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<Box<JobResult>>,
     /// Millisecond Unix timestamps persisted with the job row.
     #[serde(default)]
     pub created_at: i64,
@@ -952,6 +955,16 @@ pub struct JobStatus {
     /// is therefore reachable only at `Visibility::Full`.
     #[serde(default)]
     pub sources: Vec<SourceId>,
+    /// Collection grants used by a restricted job.
+    #[serde(default)]
+    pub collections: Vec<CollectionId>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "report", rename_all = "snake_case")]
+pub enum JobResult {
+    Convert(ConvertReport),
+    Export(ExportReport),
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -1218,6 +1231,14 @@ pub struct PrefetchRequest {
     /// Thumbnail long-edge to warm. `None` → the server's default grid edge.
     #[serde(default)]
     pub edge: Option<u32>,
+    /// Internal federation hop marker. A receiving peer warms its local matches but does not relay
+    /// the hint again, preventing cycles between mutually registered libraries.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub relay: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// A "find similar" query. By-asset-id in v1 ("more like this"); the upload-a-reference entry point
