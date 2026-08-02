@@ -122,7 +122,7 @@ impl Verifier {
             cache.fetched_at = Some(Instant::now());
             cache.generation = cache.generation.wrapping_add(1);
         }
-        cache.metadata.clone().ok_or_else(|| LibError::Unauthorized)
+        cache.metadata.clone().ok_or(LibError::Unauthorized)
     }
 }
 
