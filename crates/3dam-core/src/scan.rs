@@ -12,9 +12,9 @@ use crate::emit_progress;
 use dam_api::dto::*;
 use dam_api::event::LibraryEvent;
 use dam_api::id::JobId;
+use dam_api::LibError;
 use dam_sources::{open_source, FileEntry};
 use dam_store::{NewAsset, Store};
-use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -30,6 +30,23 @@ fn record_warning(total: &mut u64, details: &mut Vec<String>, message: String) {
     }
 }
 
+fn reconciliation_is_authoritative(
+    cancelled: bool,
+    markers_complete: bool,
+    listing_incomplete: bool,
+) -> bool {
+    !cancelled && markers_complete && !listing_incomplete
+}
+
+/// The one and only source enumeration call for a scan pass. Kept as a narrow seam so remote
+/// backends have a regression test proving progress planning never adds a second network walk.
+fn enumerate_source(
+    source: &dyn dam_sources::FileSource,
+    sink: &mut dyn FnMut(Result<FileEntry, LibError>) -> bool,
+) -> Result<(), LibError> {
+    source.walk(sink)
+}
+
 #[allow(clippy::too_many_arguments)] // the job runner's full context; a struct would just rename it
 pub(crate) fn run_scan(
     store: Arc<Store>,
@@ -42,21 +59,11 @@ pub(crate) fn run_scan(
     governor: &crate::resources::Governor,
     scratch: &Path,
 ) {
-    // Establish the progress denominator up front so the job shows a real percentage + ETA rather
-    // than an indeterminate bar. A **full** scan re-reads every file (and new files matter), so we
-    // do a cheap metadata-only pre-walk to count exactly. A **delta** scan only opens bytes for
-    // files whose size/mtime changed, so re-walking the whole tree just to count would double the
-    // traversal — a second full network listing for SFTP/SMB — for no benefit. Instead we estimate
-    // the total from the catalog's existing row count (already computed when the sources were
-    // listed): off only by files added/removed since the last scan, and the bar clamps at 100%.
-    // `None` ⇒ nothing countable ⇒ indeterminate bar, which still works.
-    let total = match mode {
-        ScanMode::Full => count_total(&store, &secrets, &sources, &cancel, scratch),
-        ScanMode::Delta => {
-            let n: u64 = sources.iter().map(|s| s.stats.asset_count).sum();
-            (n > 0).then_some(n)
-        }
-    };
+    // Use the catalog size as an estimate for either mode. A new/empty source is indeterminate.
+    // Walking just to discover an exact denominator doubled local directory work and, worse, every
+    // SFTP/SMB listing call. The final update replaces this estimate with the examined count.
+    let estimated_total: u64 = sources.iter().map(|source| source.stats.asset_count).sum();
+    let total = (estimated_total > 0).then_some(estimated_total);
     let _ = store.update_job_progress(&job, JobState::Running, 0, total, None);
     let mut done: u64 = 0;
     let mut examined: u64 = 0;
@@ -103,18 +110,51 @@ pub(crate) fn run_scan(
             }
         };
 
-        // Snapshot existing paths for delta short-circuiting + removal detection (§2.2).
-        let index = store.source_path_index(&sid).unwrap_or_default();
-        let mut seen: HashSet<String> = HashSet::with_capacity(index.len());
+        // The database owns reconciliation state. Each streamed path is an indexed point lookup +
+        // generation stamp; only an exhaustively completed walk finalises unseen rows as missing.
+        // No catalog-sized path map/set exists in this process.
+        let generation = match store.begin_source_scan(&sid) {
+            Ok(generation) => generation,
+            Err(error) => {
+                let _ = store.set_source_error(&sid, &error.to_string());
+                record_warning(
+                    &mut warnings,
+                    &mut warning_details,
+                    format!("Source “{source_label}” scan state could not be started"),
+                );
+                continue;
+            }
+        };
+        let mut reconciliation_safe = true;
+        let mut listing_incomplete = false;
         let scanned_at = dam_store::now_ms();
 
-        let walk_result = fs.walk(&mut |entry| {
+        let walk_result = enumerate_source(fs.as_ref(), &mut |entry| {
             if cancel.load(Ordering::Relaxed) {
                 return false;
             }
             match entry {
                 Ok(fe) => {
-                    seen.insert(fe.rel_path.clone());
+                    let stored_token = match store.observe_source_path(
+                        &sid,
+                        &fe.rel_path,
+                        generation,
+                    ) {
+                        Ok(token) => token,
+                        Err(error) => {
+                            reconciliation_safe = false;
+                            record_warning(
+                                &mut warnings,
+                                &mut warning_details,
+                                format!(
+                                    "“{}” was listed but its scan marker could not be saved",
+                                    fe.rel_path
+                                ),
+                            );
+                            tracing::warn!(path = %fe.rel_path, error = %error, "scan marker failed");
+                            None
+                        }
+                    };
                     // Detect by the logical path's extension (a remote temp file has a random name).
                     let Some(det) = dam_media::detect_for_ingest(Path::new(&fe.rel_path)) else {
                         return true; // unhandled type: skip (fail-soft, DG §6)
@@ -134,7 +174,7 @@ pub(crate) fn run_scan(
                         emit_progress(&store, &events, &job);
                     }
                     // Delta: unchanged (same size + mtime) → never open bytes (§2.2).
-                    if mode == ScanMode::Delta && unchanged(&index, &fe) {
+                    if mode == ScanMode::Delta && unchanged(stored_token, &fe) {
                         skipped += 1;
                         return true;
                     }
@@ -174,7 +214,10 @@ pub(crate) fn run_scan(
                             record_warning(
                                 &mut warnings,
                                 &mut warning_details,
-                                format!("“{}” could not be hashed; check file readability", fe.rel_path),
+                                format!(
+                                    "“{}” could not be hashed; check file readability",
+                                    fe.rel_path
+                                ),
                             );
                             return true;
                         }
@@ -200,6 +243,28 @@ pub(crate) fn run_scan(
                     };
                     match store.upsert_asset(&na) {
                         Ok((id, inserted)) => {
+                            if inserted {
+                                match store.observe_source_path(&sid, &fe.rel_path, generation) {
+                                    Ok(Some(_)) => {}
+                                    Ok(None) => {
+                                        // A newer concurrent scan superseded this generation. Its
+                                        // guarded finish owns missing reconciliation.
+                                        reconciliation_safe = false;
+                                    }
+                                    Err(error) => {
+                                        reconciliation_safe = false;
+                                        record_warning(
+                                            &mut warnings,
+                                            &mut warning_details,
+                                            format!(
+                                                "“{}” was catalogued but its scan marker could not be saved",
+                                                fe.rel_path
+                                            ),
+                                        );
+                                        tracing::warn!(path = %fe.rel_path, error = %error, "new asset scan marker failed");
+                                    }
+                                }
+                            }
                             done += 1;
                             // CHEAP tier (tech-spec 04 §4): header-only media attributes.
                             let attrs = dam_media::extract_metadata(abs, &det);
@@ -254,6 +319,9 @@ pub(crate) fn run_scan(
                     true
                 }
                 Err(e) => {
+                    // The backend continued after a per-entry listing error, but its enumeration is
+                    // not authoritative enough to infer that any unseen catalog path disappeared.
+                    listing_incomplete = true;
                     record_warning(
                         &mut warnings,
                         &mut warning_details,
@@ -267,15 +335,17 @@ pub(crate) fn run_scan(
 
         match walk_result {
             Ok(()) => {
-                // Rows we didn't see this pass have vanished from the source → mark absent (§2.2).
-                if !cancel.load(Ordering::Relaxed) {
-                    let removed: Vec<String> = index
-                        .keys()
-                        .filter(|p| !seen.contains(*p))
-                        .cloned()
-                        .collect();
-                    match store.mark_paths_missing(&sid, &removed) {
-                        Ok(n) => removed_total += n,
+                let cancelled = cancel.load(Ordering::Relaxed);
+                if reconciliation_is_authoritative(
+                    cancelled,
+                    reconciliation_safe,
+                    listing_incomplete,
+                ) {
+                    match store.finish_source_scan(&sid, generation, dam_store::now_ms()) {
+                        Ok(Some(n)) => removed_total += n,
+                        Ok(None) => {
+                            tracing::debug!(source = %sid, generation, "scan superseded before reconciliation");
+                        }
                         Err(e) => {
                             record_warning(
                                 &mut warnings,
@@ -287,8 +357,11 @@ pub(crate) fn run_scan(
                             tracing::warn!(source = %sid, error = %e, "mark-missing failed");
                         }
                     }
+                } else if !cancelled {
+                    // Preserve fail-soft partial ingest, but neither infer removals nor publish a
+                    // successful source timestamp for an incomplete/unstamped enumeration.
+                    tracing::debug!(source = %sid, generation, "partial scan skipped reconciliation");
                 }
-                let _ = store.set_source_scanned(&sid, dam_store::now_ms());
             }
             Err(e) => {
                 let _ = store.set_source_error(&sid, &e.to_string());
@@ -314,7 +387,7 @@ pub(crate) fn run_scan(
             // the report fields are written.
             JobState::Running,
             examined,
-            total.or(Some(examined)),
+            Some(examined),
             None,
         );
         let mut notes = Vec::new();
@@ -343,13 +416,10 @@ pub(crate) fn run_scan(
 }
 
 /// A delta entry is unchanged when its size and mtime both match the stored change token.
-fn unchanged(
-    index: &std::collections::HashMap<String, (Option<i64>, Option<i64>)>,
-    fe: &FileEntry,
-) -> bool {
-    match index.get(&fe.rel_path) {
+fn unchanged(stored: Option<dam_store::SourceChangeToken>, fe: &FileEntry) -> bool {
+    match stored {
         Some((size, modified)) => {
-            *size == Some(fe.size as i64) && *modified == fe.modified_ms && fe.modified_ms.is_some()
+            size == Some(fe.size as i64) && modified == fe.modified_ms && fe.modified_ms.is_some()
         }
         None => false,
     }
@@ -404,56 +474,6 @@ pub(crate) fn key_attrs_of(attrs: &MediaAttributes) -> SmallMap {
     m
 }
 
-/// Cheap metadata-only pre-pass: count detectable files across all scannable sources so the scan
-/// job can show a real percentage + ETA. Best-effort — a source that can't be opened or walked here
-/// is simply left out of the estimate (the main pass reports its actual error); if nothing can be
-/// counted we return `None` and the job falls back to an indeterminate bar. Walks only list metadata
-/// (no byte fetch/hash), so this is far cheaper than the main pass it precedes.
-fn count_total(
-    store: &Store,
-    secrets: &crate::credentials::SecretVault,
-    sources: &[SourceInfo],
-    cancel: &AtomicBool,
-    scratch: &Path,
-) -> Option<u64> {
-    let mut total: u64 = 0;
-    let mut counted_any = false;
-    for src in sources {
-        if src.kind == SourceKind::Federated {
-            continue; // federated peers yield catalog rows, not bytes — not scanned here (phase 6)
-        }
-        if cancel.load(Ordering::Relaxed) {
-            return None;
-        }
-        let Ok(conn) = store
-            .get_source_connection(&src.id)
-            .and_then(|connection| secrets.resolve(connection))
-        else {
-            continue;
-        };
-        let Ok(fs) = open_source(&conn, scratch) else {
-            continue;
-        };
-        let mut n: u64 = 0;
-        let walked = fs.walk(&mut |entry| {
-            if cancel.load(Ordering::Relaxed) {
-                return false;
-            }
-            if let Ok(fe) = entry {
-                if dam_media::detect_for_ingest(Path::new(&fe.rel_path)).is_some() {
-                    n += 1;
-                }
-            }
-            true
-        });
-        if walked.is_ok() {
-            total += n;
-            counted_any = true;
-        }
-    }
-    (counted_any && total > 0).then_some(total)
-}
-
 pub(crate) fn hash_file(path: &Path) -> Option<dam_api::id::ContentHash> {
     let mut hasher = blake3::Hasher::new();
     let file = std::fs::File::open(path).ok()?;
@@ -469,4 +489,71 @@ pub(crate) fn file_name(rel_path: &str) -> String {
         .next()
         .unwrap_or(rel_path)
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dam_sources::{Fetched, FileSource};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct RemoteListingFixture {
+        entries: usize,
+        walks: AtomicUsize,
+    }
+
+    impl FileSource for RemoteListingFixture {
+        fn walk(
+            &self,
+            sink: &mut dyn FnMut(Result<FileEntry, LibError>) -> bool,
+        ) -> Result<(), LibError> {
+            self.walks.fetch_add(1, Ordering::Relaxed);
+            for index in 0..self.entries {
+                if !sink(Ok(FileEntry {
+                    rel_path: format!("remote/item_{index:07}.png"),
+                    size: 1,
+                    modified_ms: Some(1),
+                })) {
+                    break;
+                }
+            }
+            Ok(())
+        }
+
+        fn fetch(&self, _rel_path: &str) -> Result<Fetched, LibError> {
+            Err(LibError::SourceUnavailable(
+                "listing fixture has no content channel".into(),
+            ))
+        }
+    }
+
+    #[test]
+    fn remote_listing_is_enumerated_once_and_streamed() {
+        let source = RemoteListingFixture {
+            entries: 100_000,
+            walks: AtomicUsize::new(0),
+        };
+        let mut visited = 0usize;
+        enumerate_source(&source, &mut |entry| {
+            let entry = entry.unwrap();
+            assert!(entry.rel_path.starts_with("remote/item_"));
+            visited += 1;
+            true
+        })
+        .unwrap();
+        assert_eq!(visited, source.entries);
+        assert_eq!(
+            source.walks.load(Ordering::Relaxed),
+            1,
+            "remote scan regressed to a count prewalk plus ingest walk"
+        );
+    }
+
+    #[test]
+    fn cancel_or_partial_listing_never_authorizes_missing_reconciliation() {
+        assert!(!reconciliation_is_authoritative(true, true, false));
+        assert!(!reconciliation_is_authoritative(false, true, true));
+        assert!(!reconciliation_is_authoritative(false, false, false));
+        assert!(reconciliation_is_authoritative(false, true, false));
+    }
 }

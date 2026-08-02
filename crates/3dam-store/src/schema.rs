@@ -793,6 +793,22 @@ pub const MIGRATIONS: &[&str] = &[
          );
     END;
     "#,
+    // ── V21: streamed scan generations (issue #139) ─────────────────────────────────────────
+    // A scan stamps each observed asset as it streams from the source. Only an exhaustively walked
+    // source advances missing status, in one indexed database-side update. This replaces the two
+    // catalog-sized Rust path collections and makes cancellation/failure safe: an unfinished walk
+    // simply never runs the generation-finalisation statement.
+    r#"
+    ALTER TABLE source ADD COLUMN scan_generation INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE asset ADD COLUMN seen_generation INTEGER NOT NULL DEFAULT 0;
+    CREATE INDEX idx_asset_source_seen_generation
+        ON asset(source_id, seen_generation);
+    CREATE TRIGGER asset_seen_generation_ai AFTER INSERT ON asset BEGIN
+        UPDATE asset
+           SET seen_generation = (SELECT scan_generation FROM source WHERE id = new.source_id)
+         WHERE rowid = new.rowid;
+    END;
+    "#,
 ];
 
 #[cfg(test)]

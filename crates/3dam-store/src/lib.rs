@@ -28,9 +28,6 @@ const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 use dam_api::internal;
 pub use dam_api::now_ms;
 
-/// A source's `path -> (size_bytes, source_modified_at)` change-token index for delta re-scan.
-pub type PathIndex = std::collections::HashMap<String, (Option<i64>, Option<i64>)>;
-
 /// A row to insert/reconcile during a scan.
 pub struct NewAsset {
     pub source_id: SourceId,
@@ -43,6 +40,9 @@ pub struct NewAsset {
     pub media_type: MediaType,
     pub format: String,
 }
+
+/// Cheap source metadata used to decide whether a streamed delta-scan entry needs reopening.
+pub type SourceChangeToken = (Option<i64>, Option<i64>);
 
 /// Committed tag-edit details used by the engine to emit one post-commit event per changed asset.
 pub struct ManualTagEditOutcome {

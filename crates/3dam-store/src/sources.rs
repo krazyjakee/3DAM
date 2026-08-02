@@ -377,28 +377,98 @@ impl Store {
         Ok(())
     }
 
-    /// `path -> (size_bytes, source_modified_at)` for every asset of a source. The delta re-scan
-    /// compares each walked entry's cheap change token (size+mtime) against this to decide whether
-    /// to re-open bytes at all (tech-spec 07 §2.2).
-    pub fn source_path_index(&self, source_id: &SourceId) -> Result<PathIndex, LibError> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT path, size_bytes, source_modified_at FROM asset WHERE source_id = ?1")
+    /// Start one streamed enumeration and return its source-local generation. The increment is a
+    /// transaction so two concurrent scans cannot receive the same generation.
+    pub fn begin_source_scan(&self, source_id: &SourceId) -> Result<i64, LibError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(internal)?;
-        let rows = stmt
-            .query_map(params![source_id.as_bytes().to_vec()], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    (r.get::<_, Option<i64>>(1)?, r.get::<_, Option<i64>>(2)?),
-                ))
-            })
+        let changed = tx
+            .execute(
+                "UPDATE source SET scan_generation = scan_generation + 1 WHERE id = ?1",
+                params![source_id.as_bytes().to_vec()],
+            )
             .map_err(internal)?;
-        let mut map = std::collections::HashMap::new();
-        for r in rows {
-            let (p, tok) = r.map_err(internal)?;
-            map.insert(p, tok);
+        if changed == 0 {
+            return Err(LibError::NotFound(format!("source {source_id}")));
         }
-        Ok(map)
+        let generation = tx
+            .query_row(
+                "SELECT scan_generation FROM source WHERE id = ?1",
+                params![source_id.as_bytes().to_vec()],
+                |row| row.get(0),
+            )
+            .map_err(internal)?;
+        tx.commit().map_err(internal)?;
+        Ok(generation)
+    }
+
+    /// Stamp one enumerated path and return its prior delta change token. The unique
+    /// `(source_id,path)` index makes this constant-space point work. Stamps are monotonic and are
+    /// accepted only for the source's current generation, so a superseded older walk cannot erase
+    /// a newer walk's observation. Seeing a formerly-missing path also restores it immediately.
+    pub fn observe_source_path(
+        &self,
+        source_id: &SourceId,
+        path: &str,
+        generation: i64,
+    ) -> Result<Option<SourceChangeToken>, LibError> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "UPDATE asset
+                SET seen_generation = max(seen_generation, ?3), flags = flags & -2
+              WHERE source_id = ?1 AND path = ?2
+                AND ?3 = (SELECT scan_generation FROM source WHERE id = ?1)
+              RETURNING size_bytes, source_modified_at",
+            params![source_id.as_bytes().to_vec(), path, generation],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(internal)
+    }
+
+    /// Finish an exhaustively enumerated generation. The missing transition and source-success
+    /// marker commit together. `None` means a newer scan began first; the older scan is deliberately
+    /// barred from marking anything missing. Callers must never invoke this after cancellation or
+    /// any whole-walk/per-entry listing failure.
+    pub fn finish_source_scan(
+        &self,
+        source_id: &SourceId,
+        generation: i64,
+        scanned_at: i64,
+    ) -> Result<Option<u64>, LibError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(internal)?;
+        let current = tx
+            .query_row(
+                "SELECT scan_generation FROM source WHERE id = ?1",
+                params![source_id.as_bytes().to_vec()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(internal)?
+            .ok_or_else(|| LibError::NotFound(format!("source {source_id}")))?;
+        if current != generation {
+            tx.commit().map_err(internal)?;
+            return Ok(None);
+        }
+        let missing = tx
+            .execute(
+                "UPDATE asset SET flags = flags | 1, updated_at = ?3
+                  WHERE source_id = ?1 AND seen_generation <> ?2 AND (flags & 1) = 0",
+                params![source_id.as_bytes().to_vec(), generation, scanned_at],
+            )
+            .map_err(internal)? as u64;
+        tx.execute(
+            "UPDATE source
+                SET last_scanned_at = ?2, last_error = NULL, online = 1, updated_at = ?2
+              WHERE id = ?1",
+            params![source_id.as_bytes().to_vec(), scanned_at],
+        )
+        .map_err(internal)?;
+        tx.commit().map_err(internal)?;
+        Ok(Some(missing))
     }
 
     /// Mark a source's rows at these paths **missing** (asset `flags` bit 0) without deleting them —
@@ -427,5 +497,258 @@ impl Store {
         }
         tx.commit().map_err(internal)?;
         Ok(n)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scanned(source_id: SourceId, path: &str) -> NewAsset {
+        NewAsset {
+            source_id,
+            path: path.into(),
+            filename: path.rsplit('/').next().unwrap().into(),
+            content_hash: None,
+            size_bytes: Some(10),
+            source_modified_at: Some(20),
+            scanned_at: now_ms(),
+            media_type: MediaType::Image,
+            format: "png".into(),
+        }
+    }
+
+    fn fixture() -> (Store, SourceId) {
+        let store = Store::open_in_memory().unwrap();
+        let source = store
+            .add_source(
+                &SourceConnection::LocalFs {
+                    root: "/scan-generation".into(),
+                },
+                "scan-generation",
+                false,
+            )
+            .unwrap();
+        for path in ["a.png", "b.png", "c.png"] {
+            store.upsert_asset(&scanned(source, path)).unwrap();
+        }
+        (store, source)
+    }
+
+    fn missing(store: &Store, source: SourceId, path: &str) -> bool {
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT (flags & 1) <> 0 FROM asset WHERE source_id = ?1 AND path = ?2",
+                params![source.as_bytes().to_vec(), path],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn scan_generation_marks_only_unseen_rows_after_successful_finish() {
+        let (store, source) = fixture();
+        let generation = store.begin_source_scan(&source).unwrap();
+        assert_eq!(
+            store
+                .observe_source_path(&source, "a.png", generation)
+                .unwrap(),
+            Some((Some(10), Some(20)))
+        );
+        assert_eq!(
+            store
+                .finish_source_scan(&source, generation, now_ms())
+                .unwrap(),
+            Some(2)
+        );
+        assert!(!missing(&store, source, "a.png"));
+        assert!(missing(&store, source, "b.png"));
+        assert!(missing(&store, source, "c.png"));
+    }
+
+    #[test]
+    fn unfinished_and_superseded_generations_cannot_mark_unseen_rows_missing() {
+        let (store, source) = fixture();
+
+        // Cancellation/failure abandons the generation without calling finish. Observations may
+        // restore paths actually seen, but unseen rows remain untouched.
+        let abandoned = store.begin_source_scan(&source).unwrap();
+        store
+            .observe_source_path(&source, "a.png", abandoned)
+            .unwrap();
+        assert!(!missing(&store, source, "b.png"));
+
+        let older = store.begin_source_scan(&source).unwrap();
+        store.observe_source_path(&source, "a.png", older).unwrap();
+        let newer = store.begin_source_scan(&source).unwrap();
+        store.observe_source_path(&source, "b.png", newer).unwrap();
+        // This late old-generation stamp must not overwrite the newer stamp on the same row.
+        assert_eq!(
+            store.observe_source_path(&source, "b.png", older).unwrap(),
+            None
+        );
+        let b_seen: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT seen_generation FROM asset WHERE source_id = ?1 AND path = 'b.png'",
+                params![source.as_bytes().to_vec()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(b_seen, newer);
+        assert_eq!(
+            store.finish_source_scan(&source, older, now_ms()).unwrap(),
+            None
+        );
+        let last_scanned: Option<i64> = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT last_scanned_at FROM source WHERE id = ?1",
+                params![source.as_bytes().to_vec()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            last_scanned, None,
+            "a superseded finish changed the source success timestamp"
+        );
+        assert!(
+            ["a.png", "b.png", "c.png"]
+                .into_iter()
+                .all(|path| !missing(&store, source, path)),
+            "a superseded finish changed missing flags"
+        );
+        assert_eq!(
+            store.finish_source_scan(&source, newer, now_ms()).unwrap(),
+            Some(2)
+        );
+        assert!(missing(&store, source, "a.png"));
+        assert!(!missing(&store, source, "b.png"));
+        assert!(missing(&store, source, "c.png"));
+    }
+
+    #[test]
+    fn observing_an_unchanged_missing_row_restores_it_immediately() {
+        let (store, source) = fixture();
+        store
+            .mark_paths_missing(&source, &["b.png".to_string()])
+            .unwrap();
+        assert!(missing(&store, source, "b.png"));
+
+        let generation = store.begin_source_scan(&source).unwrap();
+        let token = store
+            .observe_source_path(&source, "b.png", generation)
+            .unwrap();
+        assert_eq!(token, Some((Some(10), Some(20))));
+        assert!(
+            !missing(&store, source, "b.png"),
+            "a listed delta-unchanged asset stayed missing"
+        );
+        // Simulate cancellation: no finish call, and unrelated unseen rows remain present.
+        assert!(!missing(&store, source, "a.png"));
+        assert!(!missing(&store, source, "c.png"));
+    }
+
+    #[test]
+    fn asset_insert_during_a_scan_is_stamped_before_finish() {
+        let (store, source) = fixture();
+        let generation = store.begin_source_scan(&source).unwrap();
+        store.upsert_asset(&scanned(source, "new.png")).unwrap();
+        let seen: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT seen_generation FROM asset WHERE source_id = ?1 AND path = 'new.png'",
+                params![source.as_bytes().to_vec()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(seen, generation);
+        assert_eq!(
+            store
+                .finish_source_scan(&source, generation, now_ms())
+                .unwrap(),
+            Some(3)
+        );
+        assert!(!missing(&store, source, "new.png"));
+    }
+
+    fn streamed_reconciliation_fixture(rows: usize) -> std::time::Duration {
+        let store = Store::open_in_memory().unwrap();
+        let source = store
+            .add_source(
+                &SourceConnection::LocalFs {
+                    root: "/streamed-reconciliation".into(),
+                },
+                "streamed-reconciliation",
+                false,
+            )
+            .unwrap();
+        {
+            let mut connection = store.conn.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            let mut insert = transaction
+                .prepare_cached(
+                    "INSERT INTO asset(
+                        id, source_id, path, filename, size_bytes, source_modified_at, scanned_at,
+                        media_type, format, created_at, updated_at
+                     ) VALUES (?1, ?2, ?3, ?3, 10, 20, 0, 'image', 'png', 0, 0)",
+                )
+                .unwrap();
+            for index in 0..rows {
+                let path = format!("asset_{index:07}.png");
+                insert
+                    .execute(params![
+                        AssetId::new().as_bytes().to_vec(),
+                        source.as_bytes().to_vec(),
+                        path
+                    ])
+                    .unwrap();
+            }
+            drop(insert);
+            transaction.commit().unwrap();
+        }
+
+        let started = std::time::Instant::now();
+        let generation = store.begin_source_scan(&source).unwrap();
+        // Produce and discard one path at a time: the API cannot retain a catalog-sized path set.
+        for index in (0..rows).step_by(2) {
+            let path = format!("asset_{index:07}.png");
+            assert!(store
+                .observe_source_path(&source, &path, generation)
+                .unwrap()
+                .is_some());
+        }
+        assert_eq!(
+            store
+                .finish_source_scan(&source, generation, now_ms())
+                .unwrap(),
+            Some((rows / 2) as u64)
+        );
+        started.elapsed()
+    }
+
+    #[test]
+    fn scaled_streamed_reconciliation_has_constant_path_memory() {
+        let elapsed = streamed_reconciliation_fixture(20_000);
+        eprintln!("20k streamed reconciliation: {elapsed:?}");
+        assert!(elapsed < std::time::Duration::from_secs(10));
+    }
+
+    /// Explicit product-scale wall-time/RSS fixture. Observe peak RSS externally while running:
+    /// `cargo test -p dam-store million_asset_streamed_reconciliation -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "builds the explicit 1M-asset reconciliation fixture"]
+    fn million_asset_streamed_reconciliation() {
+        let elapsed = streamed_reconciliation_fixture(1_000_000);
+        eprintln!("1M streamed reconciliation: {elapsed:?}");
     }
 }
