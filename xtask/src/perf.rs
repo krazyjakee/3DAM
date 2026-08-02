@@ -639,9 +639,16 @@ fn benchmark_store(store: &Store, profile: &Profile) -> Result<BTreeMap<String, 
         vec![initial_payload],
     )?;
 
+    // Derive the near-end boundary through the same opaque keyset cursors a client receives. The
+    // old harness fabricated a numeric OFFSET cursor, which both bypassed the production path and
+    // became invalid when browse pagination moved to versioned keysets in issue #133. Walking in
+    // untimed 500-row pages keeps setup bounded (2,000 cheap index probes for the 1M profile), then
+    // uses a short final step to position the measured page exactly 100 rows from the end.
+    let late_after = cursor_near_end(store, profile.asset_count, &visibility)?;
     let late_request = QueryRequest {
+        include_total: Some(false),
         page: PageParams {
-            after: Some(Cursor(profile.asset_count.saturating_sub(100).to_string())),
+            after: late_after,
             limit: 100,
         },
         ..QueryRequest::default()
@@ -773,6 +780,44 @@ fn benchmark_store(store: &Store, profile: &Profile) -> Result<BTreeMap<String, 
         vec![rss],
     )?;
     Ok(metrics)
+}
+
+fn cursor_near_end(
+    store: &Store,
+    asset_count: usize,
+    visibility: &Visibility,
+) -> Result<Option<Cursor>, String> {
+    const WALK_LIMIT: usize = 500;
+    let target = asset_count.saturating_sub(100);
+    let mut consumed = 0_usize;
+    let mut after = None;
+    while consumed < target {
+        let limit = (target - consumed).min(WALK_LIMIT) as u32;
+        let request = QueryRequest {
+            include_total: Some(false),
+            page: PageParams {
+                after: after.clone(),
+                limit,
+            },
+            ..QueryRequest::default()
+        };
+        let page = store
+            .query_assets_semantic(&request, None, visibility)
+            .map_err(|error| error.to_string())?;
+        if page.items.is_empty() {
+            return Err(format!(
+                "catalog ended after {consumed} rows while positioning late-page benchmark at {target}"
+            ));
+        }
+        consumed += page.items.len();
+        after = page.cursor;
+        if consumed < target && after.is_none() {
+            return Err(format!(
+                "catalog ended after {consumed} rows while positioning late-page benchmark at {target}"
+            ));
+        }
+    }
+    Ok(after)
 }
 
 fn media(index: usize) -> (dam_api::dto::MediaType, &'static str) {
