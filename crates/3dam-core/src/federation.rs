@@ -6,10 +6,12 @@
 //! rows, never bytes for processing; the only byte transfer here is proxying remote-owned previews.
 //!
 //! Frozen semantics (ADR 0009 §5): a **2.5 s fixed deadline** per query round — peers past it are
-//! dropped from the round and the page is flagged `partial`; `total` is always `None` under
-//! fan-out; cursor drift across pages is accepted (no snapshot isolation).
+//! dropped from the round and the page is flagged `partial`; exact per-stream totals are summed on
+//! the first page or explicit request (and remain explicitly partial when a peer drops); cursor
+//! drift across pages is accepted (no snapshot isolation).
 
 use crate::EmbeddedLibrary;
+use base64::Engine as _;
 use dam_api::dto::*;
 use dam_api::id::{AssetId, SourceId};
 use dam_api::page::{Cursor, ItemWarning, Page, PageParams, PartialStatus};
@@ -203,29 +205,62 @@ struct StreamPos {
     d: bool,
 }
 
-#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 struct FedCursor {
+    v: u8,
+    field: SortField,
+    direction: SortDir,
     l: StreamPos,
     /// Keyed by the peer's source id string.
     p: BTreeMap<String, StreamPos>,
 }
 
-const FED_CURSOR_PREFIX: &str = "fed:";
+const FED_CURSOR_PREFIX: &str = "fed1.";
 
-fn decode_fed_cursor(after: &Option<Cursor>) -> FedCursor {
-    after
-        .as_ref()
-        .and_then(|c| c.0.strip_prefix(FED_CURSOR_PREFIX))
-        .and_then(|s| serde_json::from_str(s).ok())
-        // An unrecognised cursor (e.g. fan-out just became active mid-listing) restarts the
-        // listing — drift accepted rather than erroring the page (ADR 0009 §5).
-        .unwrap_or_default()
+fn new_fed_cursor(sort: &Sort) -> FedCursor {
+    FedCursor {
+        v: 1,
+        field: sort.field,
+        direction: sort.dir,
+        l: StreamPos::default(),
+        p: BTreeMap::new(),
+    }
 }
 
-fn encode_fed_cursor(fc: &FedCursor) -> Option<Cursor> {
-    serde_json::to_string(fc)
-        .ok()
-        .map(|s| Cursor(format!("{FED_CURSOR_PREFIX}{s}")))
+fn decode_fed_cursor(after: &Option<Cursor>, sort: &Sort) -> Result<FedCursor, LibError> {
+    let Some(Cursor(raw)) = after else {
+        return Ok(new_fed_cursor(sort));
+    };
+    if raw.len() > 262_144 {
+        return Err(LibError::BadRequest("federated cursor is too large".into()));
+    }
+    let encoded = raw
+        .strip_prefix(FED_CURSOR_PREFIX)
+        .ok_or_else(|| LibError::BadRequest("invalid federated cursor version".into()))?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| LibError::BadRequest("invalid federated cursor encoding".into()))?;
+    let decoded: FedCursor = serde_json::from_slice(&bytes)
+        .map_err(|_| LibError::BadRequest("invalid federated cursor payload".into()))?;
+    if decoded.v != 1 {
+        return Err(LibError::BadRequest(
+            "unsupported federated cursor version".into(),
+        ));
+    }
+    if decoded.field != sort.field || decoded.direction != sort.dir {
+        return Err(LibError::BadRequest(
+            "federated cursor does not match the active sort".into(),
+        ));
+    }
+    Ok(decoded)
+}
+
+fn encode_fed_cursor(fc: &FedCursor) -> Result<Cursor, LibError> {
+    let bytes = serde_json::to_vec(fc).map_err(dam_api::internal)?;
+    Ok(Cursor(format!(
+        "{FED_CURSOR_PREFIX}{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    )))
 }
 
 /// One source's fetched page, positioned for the merge.
@@ -235,22 +270,34 @@ struct StreamPage {
     pos: StreamPos,
     /// The continuation the source handed back for this page.
     next: Option<String>,
+    /// Exact count reported by this stream when the fan-out requested one.
+    total: Option<u64>,
 }
 
 /// Fetch one source's page at `pos`, honouring its consumed-prefix skip. When a previous merge
 /// consumed a whole fetched page, this advances through continuations until real items surface.
 async fn fetch_stream<Fut>(
     mut pos: StreamPos,
+    include_total: bool,
     fetch: impl Fn(Option<Cursor>) -> Fut,
 ) -> Result<StreamPage, LibError>
 where
     Fut: std::future::Future<Output = Result<Page<AssetSummary>, LibError>>,
 {
     if pos.d {
+        // An explicit count request on a later federated page must include streams exhausted by an
+        // earlier merge. Refresh their first page solely for its exact total, without reviving the
+        // stream or returning its items again.
+        let total = if include_total {
+            fetch(None).await?.total
+        } else {
+            None
+        };
         return Ok(StreamPage {
             items: Vec::new(),
             pos,
             next: None,
+            total,
         });
     }
     loop {
@@ -263,11 +310,17 @@ where
             continue;
         }
         let next = page.cursor.map(|c| c.0);
+        let total = page.total;
         let items: Vec<AssetSummary> = page.items.into_iter().skip(pos.s).collect();
         if items.is_empty() && next.is_none() {
             pos.d = true;
         }
-        return Ok(StreamPage { items, pos, next });
+        return Ok(StreamPage {
+            items,
+            pos,
+            next,
+            total,
+        });
     }
 }
 
@@ -375,6 +428,13 @@ fn peer_warning(name: &str, code: &str, message: String) -> ItemWarning {
     }
 }
 
+fn sum_stream_totals(
+    include_total: bool,
+    totals: impl Iterator<Item = Option<u64>>,
+) -> Option<u64> {
+    include_total.then(|| totals.sum::<Option<u64>>()).flatten()
+}
+
 // ── the fan-out entry points ─────────────────────────────────────────────────────────────────
 
 /// Fan a query out across the local index and every federated peer, and merge one page.
@@ -410,12 +470,14 @@ pub(crate) async fn federated_query(
     }
 
     let limit = req.page.clamped(500);
-    let mut fc = decode_fed_cursor(&req.page.after);
+    let mut fc = decode_fed_cursor(&req.page.after, &req.sort)?;
+    let include_total = req.include_total.unwrap_or(req.page.after.is_none());
 
     // The request peers answer: their own catalog only (federation is one hop, never transitive).
     let mut fwd = req.clone();
     fwd.local_only = true;
     fwd.include_facets = false;
+    fwd.include_total = Some(include_total);
     if peer_target.is_some() {
         fwd.filters.retain(|f| f.field != FacetField::Source);
     }
@@ -431,9 +493,10 @@ pub(crate) async fn federated_query(
         if peer_target.is_some() {
             return None;
         }
-        let base = req.clone();
+        let mut base = req.clone();
+        base.include_total = Some(include_total);
         Some(
-            fetch_stream(fc.l.clone(), |after| {
+            fetch_stream(fc.l.clone(), include_total, |after| {
                 let mut r = base.clone();
                 r.local_only = true;
                 r.include_facets = false;
@@ -459,13 +522,16 @@ pub(crate) async fn federated_query(
                 let client = &peer.client;
                 async move { client.query(&ectx(), r).await }
             };
-            let res = match tokio::time::timeout(QUERY_DEADLINE, fetch_stream(pos, fetch)).await {
-                Ok(r) => r,
-                Err(_) => Err(LibError::SourceUnavailable(format!(
-                    "no answer within the {}ms federated deadline",
-                    QUERY_DEADLINE.as_millis()
-                ))),
-            };
+            let res =
+                match tokio::time::timeout(QUERY_DEADLINE, fetch_stream(pos, include_total, fetch))
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(_) => Err(LibError::SourceUnavailable(format!(
+                        "no answer within the {}ms federated deadline",
+                        QUERY_DEADLINE.as_millis()
+                    ))),
+                };
             (peer, res)
         }
     });
@@ -527,14 +593,18 @@ pub(crate) async fn federated_query(
     let cursor = if answered_exhausted && !dropped_any {
         None
     } else {
-        encode_fed_cursor(&fc)
+        Some(encode_fed_cursor(&fc)?)
     };
+
+    // Counts are exact per answering stream. When a peer drops, the subtotal remains useful and
+    // `partial.complete = false` makes its incompleteness explicit; if an answering endpoint cannot
+    // provide a count, omit the aggregate rather than inventing one.
+    let total = sum_stream_totals(include_total, pages.iter().map(|(_, _, page)| page.total));
 
     Ok(Some(Page {
         items,
         cursor,
-        // No true cross-peer count exists under fan-out — always None (UI renders "N+").
-        total: None,
+        total,
         partial,
     }))
 }
@@ -874,4 +944,84 @@ async fn peer_cache_write(lib: &EmbeddedLibrary, name: &str, bytes: Vec<u8>) {
             Ok(())
         })
         .await;
+}
+
+#[cfg(test)]
+mod keyset_cursor_tests {
+    use super::*;
+
+    #[test]
+    fn federated_cursor_is_versioned_and_bound_to_the_effective_sort() {
+        let sort = Sort {
+            field: SortField::Size,
+            dir: SortDir::Desc,
+        };
+        let mut cursor = new_fed_cursor(&sort);
+        cursor.l.c = Some("b1.local".into());
+        cursor.p.insert(
+            SourceId::new().to_string(),
+            StreamPos {
+                c: Some("b1.peer".into()),
+                s: 3,
+                d: false,
+            },
+        );
+        let encoded = encode_fed_cursor(&cursor).unwrap();
+        let decoded = decode_fed_cursor(&Some(encoded.clone()), &sort).unwrap();
+        assert_eq!(decoded.l.c.as_deref(), Some("b1.local"));
+        assert_eq!(decoded.p.len(), 1);
+        assert!(decode_fed_cursor(
+            &Some(encoded),
+            &Sort {
+                field: SortField::Name,
+                dir: SortDir::Desc,
+            }
+        )
+        .is_err());
+        assert!(decode_fed_cursor(
+            &Some(Cursor(format!("fed1.{}", "a".repeat(262_145)))),
+            &sort
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn federated_totals_sum_answering_streams_without_inventing_missing_counts() {
+        assert_eq!(
+            sum_stream_totals(true, [Some(7), Some(11)].into_iter()),
+            Some(18)
+        );
+        assert_eq!(sum_stream_totals(true, [Some(7), None].into_iter()), None);
+        assert_eq!(
+            sum_stream_totals(false, [Some(7), Some(11)].into_iter()),
+            None
+        );
+        // If every requested peer dropped, zero is the exact subtotal for the empty answering set;
+        // the page's PartialStatus is what prevents callers from treating it as a complete total.
+        assert_eq!(sum_stream_totals(true, [].into_iter()), Some(0));
+    }
+
+    #[tokio::test]
+    async fn explicit_total_refreshes_an_exhausted_stream_without_replaying_items() {
+        let page = fetch_stream(
+            StreamPos {
+                d: true,
+                ..Default::default()
+            },
+            true,
+            |_| async {
+                Ok(Page {
+                    items: Vec::new(),
+                    cursor: None,
+                    total: Some(9),
+                    partial: PartialStatus::default(),
+                })
+            },
+        )
+        .await
+        .unwrap();
+        assert!(page.items.is_empty());
+        assert!(page.pos.d);
+        assert_eq!(page.total, Some(9));
+    }
 }

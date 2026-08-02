@@ -191,6 +191,7 @@ export const API_V1_REPRESENTATIVES = {
     sort: { field: "relevance", dir: "desc" },
     page: { after: "next-page", limit: 24 },
     include_facets: true,
+    include_total: true,
     mode: "hybrid",
     local_only: true,
   } satisfies QueryRequest,

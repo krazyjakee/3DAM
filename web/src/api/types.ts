@@ -360,6 +360,8 @@ export interface QueryRequest {
   page?: PageParams;
   /** Ask the server to include facet counts with the query response. */
   include_facets?: boolean;
+  /** Exact total policy: omitted auto-counts page one, true forces, false suppresses. */
+  include_total?: boolean;
   mode?: SearchMode;
   /** Federation (phase 6): skip the peer fan-out and answer from this instance's catalog only. */
   local_only?: boolean;

@@ -809,6 +809,46 @@ pub const MIGRATIONS: &[&str] = &[
          WHERE rowid = new.rowid;
     END;
     "#,
+    // ── V22: keyset browse keys and indexes (issue #133) ─────────────────────────────────────
+    // Size shown in the grid includes model companions, which cannot be indexed as a cross-table
+    // expression. Materialize that one browse key and keep it synchronized at both write seams.
+    // SQLite can traverse each `(key,id)` B-tree forward or backward, serving both directions with
+    // the id as the deterministic keyset tie-breaker.
+    r#"
+    ALTER TABLE asset ADD COLUMN browse_size_bytes INTEGER;
+    UPDATE asset
+       SET browse_size_bytes = size_bytes + COALESCE(
+           (SELECT dependency_bytes FROM model_attr WHERE asset_id = asset.id), 0
+       );
+
+    CREATE INDEX idx_asset_browse_name ON asset(filename, id);
+    CREATE INDEX idx_asset_browse_scanned ON asset(scanned_at, id);
+    CREATE INDEX idx_asset_browse_size ON asset(browse_size_bytes, id);
+
+    CREATE TRIGGER asset_browse_size_ai AFTER INSERT ON asset BEGIN
+        UPDATE asset SET browse_size_bytes = new.size_bytes WHERE rowid = new.rowid;
+    END;
+    CREATE TRIGGER asset_browse_size_au AFTER UPDATE OF size_bytes ON asset BEGIN
+        UPDATE asset
+           SET browse_size_bytes = new.size_bytes + COALESCE(
+               (SELECT dependency_bytes FROM model_attr WHERE asset_id = new.id), 0
+           )
+         WHERE rowid = new.rowid;
+    END;
+    CREATE TRIGGER model_browse_size_ai AFTER INSERT ON model_attr BEGIN
+        UPDATE asset
+           SET browse_size_bytes = size_bytes + COALESCE(new.dependency_bytes, 0)
+         WHERE id = new.asset_id;
+    END;
+    CREATE TRIGGER model_browse_size_au AFTER UPDATE OF dependency_bytes ON model_attr BEGIN
+        UPDATE asset
+           SET browse_size_bytes = size_bytes + COALESCE(new.dependency_bytes, 0)
+         WHERE id = new.asset_id;
+    END;
+    CREATE TRIGGER model_browse_size_ad AFTER DELETE ON model_attr BEGIN
+        UPDATE asset SET browse_size_bytes = size_bytes WHERE id = old.asset_id;
+    END;
+    "#,
 ];
 
 #[cfg(test)]
@@ -1061,5 +1101,70 @@ mod tests {
             .query_row("SELECT count(*) FROM folder", [], |row| row.get(0))
             .unwrap();
         assert_eq!(rows, 0, "source cascade left hierarchy rows behind");
+    }
+
+    #[test]
+    fn browse_key_migration_backfills_and_tracks_model_dependency_size() {
+        let conn = db_at(21);
+        conn.execute_batch(
+            "INSERT INTO source (id, name, kind, connection, created_at, updated_at)
+                VALUES (x'01', 's', 'local_fs', '{}', 0, 0);
+             INSERT INTO asset (id, source_id, path, filename, size_bytes, scanned_at, media_type,
+                                format, created_at, updated_at) VALUES
+                (x'02', x'01', 'old.glb', 'old.glb', 10, 1, 'model', 'glb', 0, 0),
+                (x'03', x'01', 'unknown.glb', 'unknown.glb', NULL, 2, 'model', 'glb', 0, 0);
+             INSERT INTO model_attr (asset_id, dependency_bytes) VALUES (x'02', 5), (x'03', 7);",
+        )
+        .unwrap();
+
+        conn.execute_batch(MIGRATIONS[21]).unwrap();
+        let browse_size = |id: u8| -> Option<i64> {
+            conn.query_row(
+                "SELECT browse_size_bytes FROM asset WHERE id = ?1",
+                [vec![id]],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            browse_size(2),
+            Some(15),
+            "existing model was not backfilled"
+        );
+        assert_eq!(
+            browse_size(3),
+            None,
+            "unknown base size must remain unknown"
+        );
+
+        conn.execute_batch(
+            "INSERT INTO asset (id, source_id, path, filename, size_bytes, scanned_at, media_type,
+                                format, created_at, updated_at)
+                VALUES (x'04', x'01', 'new.glb', 'new.glb', 20, 3, 'model', 'glb', 0, 0);
+             INSERT INTO model_attr (asset_id, dependency_bytes) VALUES (x'04', 7);",
+        )
+        .unwrap();
+        assert_eq!(browse_size(4), Some(27));
+        conn.execute(
+            "UPDATE model_attr SET dependency_bytes = 8 WHERE asset_id = x'04'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(browse_size(4), Some(28));
+        conn.execute("UPDATE asset SET size_bytes = 30 WHERE id = x'04'", [])
+            .unwrap();
+        assert_eq!(browse_size(4), Some(38));
+        conn.execute("DELETE FROM model_attr WHERE asset_id = x'04'", [])
+            .unwrap();
+        assert_eq!(browse_size(4), Some(30));
+
+        let indexes = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_asset_browse_%'")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(indexes.len(), 3);
     }
 }

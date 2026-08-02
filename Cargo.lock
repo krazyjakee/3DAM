@@ -1800,6 +1800,7 @@ name = "dam-core"
 version = "0.1.1"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "blake3",
  "candle-core",
  "candle-nn",
@@ -1955,10 +1956,12 @@ dependencies = [
 name = "dam-store"
 version = "0.1.1"
 dependencies = [
+ "base64 0.22.1",
  "dam-api",
  "dam-sources",
  "instant-distance",
  "rusqlite",
+ "serde",
  "serde_json",
  "tracing",
  "uuid",

@@ -1,6 +1,8 @@
 //! Shared free helpers for the `Store` submodules: SQL filter building, blob↔id
 //! conversions, cursor decoding, and small row-attribute shaping.
 use super::*;
+use base64::Engine as _;
+use serde::{Deserialize, Serialize};
 
 /// Deserialize a persisted `source.connection` blob into the typed connection model.
 pub(crate) fn parse_connection(blob: &str) -> Result<SourceConnection, LibError> {
@@ -15,7 +17,7 @@ pub(crate) fn parse_connection(blob: &str) -> Result<SourceConnection, LibError>
 /// columns: a video's `1920×1080` and `1:30` mean exactly what an image's and an audio clip's do,
 /// and only one of the joined rows can be non-NULL for a given asset (media type is exclusive).
 pub(crate) const GRID_SELECT: &str = "SELECT asset.id, filename, media_type, format,
-        size_bytes + COALESCE(model_attr.dependency_bytes, 0), license_id, license_status,
+        browse_size_bytes, license_id, license_status,
         COALESCE(image_attr.width, video_attr.width),
         COALESCE(image_attr.height, video_attr.height),
         COALESCE(audio_attr.duration_ms, video_attr.duration_ms),
@@ -175,13 +177,225 @@ pub(crate) fn uuid_from_slice(b: &[u8]) -> Uuid {
         .unwrap_or(Uuid::nil())
 }
 
+const BROWSE_CURSOR_PREFIX: &str = "b1.";
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub(crate) enum BrowseKey {
+    Text(String),
+    Integer(Option<i64>),
+    Relevance {
+        tier: i64,
+        rank: f64,
+        length: i64,
+        name: String,
+    },
+    Hybrid {
+        score: f64,
+        name: String,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+struct BrowseCursor {
+    version: u8,
+    order: BrowseOrder,
+    key: BrowseKey,
+    id: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum BrowseOrder {
+    Field {
+        field: SortField,
+        direction: SortDir,
+    },
+    /// Hybrid and semantic search have one effective order regardless of the display-sort fields
+    /// in the request: fused score descending, then filename and asset id ascending.
+    Hybrid,
+}
+
+impl BrowseOrder {
+    pub(crate) fn field(field: SortField, direction: SortDir) -> Self {
+        Self::Field { field, direction }
+    }
+}
+
+pub(crate) fn encode_browse_cursor(
+    order: BrowseOrder,
+    key: BrowseKey,
+    id: AssetId,
+) -> Result<Cursor, LibError> {
+    let payload = serde_json::to_vec(&BrowseCursor {
+        version: 1,
+        order,
+        key,
+        id: id.to_string(),
+    })
+    .map_err(internal)?;
+    Ok(Cursor(format!(
+        "{BROWSE_CURSOR_PREFIX}{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload)
+    )))
+}
+
+pub(crate) fn decode_browse_cursor(
+    cursor: Option<&Cursor>,
+    order: BrowseOrder,
+) -> Result<Option<(BrowseKey, AssetId)>, LibError> {
+    let Some(Cursor(raw)) = cursor else {
+        return Ok(None);
+    };
+    if raw.len() > 4_096 {
+        return Err(LibError::BadRequest("browse cursor is too large".into()));
+    }
+    let encoded = raw
+        .strip_prefix(BROWSE_CURSOR_PREFIX)
+        .ok_or_else(|| LibError::BadRequest("invalid browse cursor version".into()))?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| LibError::BadRequest("invalid browse cursor encoding".into()))?;
+    if bytes.len() > 3_072 {
+        return Err(LibError::BadRequest(
+            "browse cursor payload is too large".into(),
+        ));
+    }
+    let decoded: BrowseCursor = serde_json::from_slice(&bytes)
+        .map_err(|_| LibError::BadRequest("invalid browse cursor payload".into()))?;
+    if decoded.version != 1 {
+        return Err(LibError::BadRequest(
+            "unsupported browse cursor version".into(),
+        ));
+    }
+    if decoded.order != order {
+        return Err(LibError::BadRequest(
+            "browse cursor does not match the active sort".into(),
+        ));
+    }
+    let id: AssetId = decoded
+        .id
+        .parse()
+        .map_err(|_| LibError::BadRequest("invalid browse cursor asset id".into()))?;
+    if decoded.id != id.to_string() {
+        return Err(LibError::BadRequest(
+            "browse cursor asset id is not canonical".into(),
+        ));
+    }
+    let key_matches = matches!(
+        (&order, &decoded.key),
+        (
+            BrowseOrder::Field {
+                field: SortField::Name,
+                ..
+            },
+            BrowseKey::Text(_),
+        ) | (
+            BrowseOrder::Field {
+                field: SortField::Size | SortField::Scanned,
+                ..
+            },
+            BrowseKey::Integer(_),
+        ) | (
+            BrowseOrder::Field {
+                field: SortField::Relevance,
+                ..
+            },
+            BrowseKey::Text(_) | BrowseKey::Relevance { .. },
+        ) | (BrowseOrder::Hybrid, BrowseKey::Hybrid { .. })
+    );
+    if !key_matches {
+        return Err(LibError::BadRequest(
+            "browse cursor key does not match the declared sort field".into(),
+        ));
+    }
+    let finite = match &decoded.key {
+        BrowseKey::Relevance { rank, .. } => rank.is_finite(),
+        BrowseKey::Hybrid { score, .. } => score.is_finite(),
+        _ => true,
+    };
+    if !finite {
+        return Err(LibError::BadRequest(
+            "browse cursor contains a non-finite rank".into(),
+        ));
+    }
+    Ok(Some((decoded.key, id)))
+}
+
+/// Legacy numeric cursor for non-browse bounded histories (currently job history). Browse queries
+/// never call this seam and reject numeric cursors in [`decode_browse_cursor`].
 pub(crate) fn decode_offset(c: Option<&Cursor>) -> Result<usize, LibError> {
     match c {
         None => Ok(0),
-        Some(Cursor(s)) => s
-            .parse::<usize>()
-            .map_err(|_| LibError::BadRequest("invalid cursor".into())),
+        Some(Cursor(value)) => value
+            .parse()
+            .map_err(|_| LibError::BadRequest("invalid offset cursor".into())),
     }
+}
+
+pub(crate) fn push_keyset_predicate(
+    where_sql: &mut String,
+    binds: &mut Vec<Value>,
+    expression: &str,
+    key: Option<Value>,
+    id: AssetId,
+    direction: SortDir,
+    nullable: bool,
+) {
+    let comparison = match direction {
+        SortDir::Asc => ">",
+        SortDir::Desc => "<",
+    };
+    match key {
+        Some(key) => {
+            where_sql.push_str(&format!(
+                " AND (({expression}, asset.id) {comparison} (?, ?)"
+            ));
+            binds.push(key);
+            binds.push(Value::Blob(id.as_bytes().to_vec()));
+            if direction == SortDir::Desc && nullable {
+                // SQLite sorts NULL first ascending and last descending.
+                where_sql.push_str(&format!(" OR {expression} IS NULL"));
+            }
+            where_sql.push(')');
+        }
+        None if direction == SortDir::Asc => {
+            where_sql.push_str(&format!(
+                " AND (({expression} IS NULL AND asset.id > ?) OR {expression} IS NOT NULL)"
+            ));
+            binds.push(Value::Blob(id.as_bytes().to_vec()));
+        }
+        None => {
+            where_sql.push_str(&format!(" AND {expression} IS NULL AND asset.id < ?"));
+            binds.push(Value::Blob(id.as_bytes().to_vec()));
+        }
+    }
+}
+
+pub(crate) struct RelevancePosition<'a> {
+    pub(crate) tier: i64,
+    pub(crate) rank: f64,
+    pub(crate) length: i64,
+    pub(crate) name: &'a str,
+    pub(crate) id: AssetId,
+}
+
+pub(crate) fn push_relevance_keyset(
+    where_sql: &mut String,
+    binds: &mut Vec<Value>,
+    position: RelevancePosition<'_>,
+    direction: SortDir,
+) {
+    let comparison = if direction == SortDir::Asc { ">" } else { "<" };
+    where_sql.push_str(&format!(
+        " AND (text_matches.tier, text_matches.rank, LENGTH(filename), filename, asset.id) \
+         {comparison} (?, ?, ?, ?, ?)"
+    ));
+    binds.push(Value::Integer(position.tier));
+    binds.push(Value::Real(position.rank));
+    binds.push(Value::Integer(position.length));
+    binds.push(Value::Text(position.name.to_string()));
+    binds.push(Value::Blob(position.id.as_bytes().to_vec()));
 }
 
 pub(crate) fn escape_like(s: &str) -> String {

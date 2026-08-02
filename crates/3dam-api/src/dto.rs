@@ -504,6 +504,11 @@ pub struct QueryRequest {
     pub page: PageParams,
     #[serde(default)]
     pub include_facets: bool,
+    /// Request an exact filtered total even on a continuation page. First pages include the exact
+    /// total automatically when omitted; `false` lets internal fan-out/refetch callers suppress
+    /// even that count, and `true` explicitly requests it on any page.
+    #[serde(default)]
+    pub include_total: Option<bool>,
     /// How the `text` query is matched (semantic-search M5). Defaults to `Lexical` so existing
     /// callers and stored queries are unchanged; `Hybrid`/`Semantic` widen results with embedding
     /// neighbours of the lexical hits.

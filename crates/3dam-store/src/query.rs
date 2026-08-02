@@ -3,8 +3,9 @@ use super::*;
 use crate::helpers::*;
 
 impl Store {
-    /// Faceted query → a page of summaries. Cursor is an offset (slice-simple; keyset later). The
-    /// caller always names a ceiling — there is deliberately no `Full`-forwarding convenience
+    /// Faceted query → a page of summaries. Continuations are opaque keyset cursors bound to the
+    /// active sort and deterministic asset-id tie-breaker; no page performs offset work.
+    /// The caller always names a ceiling — there is deliberately no `Full`-forwarding convenience
     /// wrapper, because such a wrapper is exactly how a read path forgets to filter (issue #42).
     /// The engine's entry point is this, with `ctx.visibility`.
     ///
@@ -20,16 +21,21 @@ impl Store {
         vis: &Visibility,
     ) -> Result<Page<AssetSummary>, LibError> {
         let limit = req.page.clamped(QUERY_MAX_LIMIT);
-        let offset = decode_offset(req.page.after.as_ref())?;
 
         // Semantic-search M5: a Hybrid/Semantic query with text widens the lexical hits with their
         // embedding neighbours. Falls back to the lexical path below when there's no text.
         if req.mode != SearchMode::Lexical && req.text.as_ref().is_some_and(|t| !t.is_empty()) {
-            return self.query_hybrid(req, limit, offset, text_vec, vis);
+            return self.query_hybrid(req, limit, text_vec, vis);
         }
 
         let (count_where, count_binds) = build_where(req, &self.synonyms, vis)?;
         let text = req.text.as_ref().filter(|text| !text.is_empty());
+        if req.sort.field == SortField::Relevance && text.is_some() && req.sort.dir == SortDir::Desc
+        {
+            return Err(LibError::BadRequest(
+                "descending relevance order is not supported".into(),
+            ));
+        }
 
         let dir = match req.sort.dir {
             SortDir::Asc => "ASC",
@@ -37,38 +43,45 @@ impl Store {
         };
         // Text matches are materialized once and carry their tier + bm25 rank into ORDER BY. A
         // relevance sort without text has nothing to rank, so it degrades to name order.
-        let order_clause = match req.sort.field {
-            SortField::Relevance if text.is_some() => {
-                "text_matches.tier ASC, text_matches.rank ASC, LENGTH(filename) ASC, filename ASC"
-                    .into()
+        let (order_clause, key_select) = match req.sort.field {
+            SortField::Relevance if text.is_some() => (
+                "text_matches.tier ASC, text_matches.rank ASC, LENGTH(filename) ASC, \
+                     filename ASC, asset.id ASC"
+                    .into(),
+                ", text_matches.tier, text_matches.rank, LENGTH(filename), filename",
+            ),
+            SortField::Relevance | SortField::Name => {
+                (format!("filename {dir}, asset.id {dir}"), ", filename")
             }
-            SortField::Relevance | SortField::Name => format!("filename {dir}, asset.id ASC"),
-            SortField::Size => {
-                // Sort on the whole-asset size (mesh + external companion files), matching what the
-                // grid shows; COALESCE keeps non-models (no model_attr row) on their own size.
-                format!(
-                    "(size_bytes + COALESCE(model_attr.dependency_bytes, 0)) {dir}, asset.id ASC"
-                )
-            }
-            SortField::Scanned => format!("scanned_at {dir}, asset.id ASC"),
+            SortField::Size => (
+                format!("browse_size_bytes {dir}, asset.id {dir}"),
+                ", browse_size_bytes",
+            ),
+            SortField::Scanned => (format!("scanned_at {dir}, asset.id {dir}"), ", scanned_at"),
         };
 
         let conn = self.conn.lock().unwrap();
 
-        // Total for this filter (best-effort; cheap enough at slice scale).
-        let count_sql = format!("SELECT COUNT(*) FROM asset{count_where}");
-        let total: i64 = conn
-            .query_row(
-                &count_sql,
-                rusqlite::params_from_iter(count_binds.iter()),
-                |r| r.get(0),
+        // The first page establishes an exact selection count. Infinite-scroll continuations omit
+        // it unless explicitly requested, avoiding the old full filtered recount on every page.
+        let total = if req.include_total.unwrap_or(req.page.after.is_none()) {
+            let count_sql = format!("SELECT COUNT(*) FROM asset{count_where}");
+            Some(
+                conn.query_row(
+                    &count_sql,
+                    rusqlite::params_from_iter(count_binds.iter()),
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(internal)? as u64,
             )
-            .map_err(internal)?;
+        } else {
+            None
+        };
 
         // LEFT JOIN the per-type attr tables so each grid row carries a couple of cheap key
         // attributes (dimensions / duration / triangles) without an N+1 fetch. Column names stay
         // unambiguous across the joined tables, so the bare-name filters above keep working.
-        let (cte, from, page_where, mut page_binds) = if let Some(text) = text {
+        let (cte, from, mut page_where, mut page_binds) = if let Some(text) = text {
             let ranked = ranked_text_matches(text, &self.synonyms);
             let (where_sql, filter_binds) = build_where_without_text(req, vis)?;
             let mut binds = ranked.binds;
@@ -82,33 +95,123 @@ impl Store {
         } else {
             (String::new(), "asset", count_where, count_binds)
         };
+
+        let cursor = decode_browse_cursor(
+            req.page.after.as_ref(),
+            BrowseOrder::field(req.sort.field, req.sort.dir),
+        )?;
+        if let Some((key, id)) = cursor {
+            match (req.sort.field, text.is_some(), key) {
+                (
+                    SortField::Relevance,
+                    true,
+                    BrowseKey::Relevance {
+                        tier,
+                        rank,
+                        length,
+                        name,
+                    },
+                ) => {
+                    push_relevance_keyset(
+                        &mut page_where,
+                        &mut page_binds,
+                        RelevancePosition {
+                            tier,
+                            rank,
+                            length,
+                            name: &name,
+                            id,
+                        },
+                        SortDir::Asc,
+                    );
+                }
+                (SortField::Relevance | SortField::Name, false, BrowseKey::Text(key))
+                | (SortField::Name, true, BrowseKey::Text(key)) => push_keyset_predicate(
+                    &mut page_where,
+                    &mut page_binds,
+                    "filename",
+                    Some(Value::Text(key)),
+                    id,
+                    req.sort.dir,
+                    false,
+                ),
+                (SortField::Size, _, BrowseKey::Integer(key)) => push_keyset_predicate(
+                    &mut page_where,
+                    &mut page_binds,
+                    "browse_size_bytes",
+                    key.map(Value::Integer),
+                    id,
+                    req.sort.dir,
+                    true,
+                ),
+                (SortField::Scanned, _, BrowseKey::Integer(key)) => push_keyset_predicate(
+                    &mut page_where,
+                    &mut page_binds,
+                    "scanned_at",
+                    key.map(Value::Integer),
+                    id,
+                    req.sort.dir,
+                    false,
+                ),
+                _ => {
+                    return Err(LibError::BadRequest(
+                        "browse cursor key does not match the active sort".into(),
+                    ));
+                }
+            }
+        }
         let sql = format!(
-            "{cte} {GRID_SELECT} FROM {from} {ATTR_JOINS} {page_where} \
-             ORDER BY {order_clause} LIMIT ? OFFSET ?"
+            "{cte} {GRID_SELECT}{key_select} FROM {from} {ATTR_JOINS} {page_where} \
+             ORDER BY {order_clause} LIMIT ?"
         );
-        page_binds.push(Value::Integer(limit as i64));
-        page_binds.push(Value::Integer(offset as i64));
+        page_binds.push(Value::Integer(limit as i64 + 1));
 
         let mut stmt = conn.prepare(&sql).map_err(internal)?;
         let rows = stmt
-            .query_map(
-                rusqlite::params_from_iter(page_binds.iter()),
-                row_to_summary,
-            )
+            .query_map(rusqlite::params_from_iter(page_binds.iter()), |row| {
+                let summary = row_to_summary(row)?;
+                let key = match (req.sort.field, text.is_some()) {
+                    (SortField::Relevance, true) => BrowseKey::Relevance {
+                        tier: row.get(16)?,
+                        rank: row.get(17)?,
+                        length: row.get(18)?,
+                        name: row.get(19)?,
+                    },
+                    (SortField::Relevance | SortField::Name, _) => BrowseKey::Text(row.get(16)?),
+                    (SortField::Size, _) | (SortField::Scanned, _) => {
+                        BrowseKey::Integer(row.get(16)?)
+                    }
+                };
+                Ok((summary, key))
+            })
             .map_err(internal)?;
-        let items = rows
+        let mut keyed_items = rows
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(internal)?;
 
-        let next = if (offset + items.len()) < total as usize {
-            Some(Cursor((offset + items.len()).to_string()))
+        let has_more = keyed_items.len() > limit as usize;
+        if has_more {
+            keyed_items.pop();
+        }
+        let next = if has_more {
+            keyed_items
+                .last()
+                .map(|(item, key)| {
+                    encode_browse_cursor(
+                        BrowseOrder::field(req.sort.field, req.sort.dir),
+                        key.clone(),
+                        item.id,
+                    )
+                })
+                .transpose()?
         } else {
             None
         };
+        let items = keyed_items.into_iter().map(|(item, _)| item).collect();
         Ok(Page {
             items,
             cursor: next,
-            total: Some(total as u64),
+            total,
             partial: Default::default(),
         })
     }
@@ -122,7 +225,6 @@ impl Store {
         &self,
         req: &QueryRequest,
         limit: u32,
-        offset: usize,
         text_vec: Option<(String, Vec<f32>)>,
         vis: &Visibility,
     ) -> Result<Page<AssetSummary>, LibError> {
@@ -209,24 +311,68 @@ impl Store {
                     let nb = summaries.get(&b.0).map(|s| s.name.as_str()).unwrap_or("");
                     na.cmp(nb)
                 })
+                .then_with(|| a.0.cmp(&b.0))
         });
 
-        let total = ranked.len();
-        let items: Vec<AssetSummary> = ranked
-            .into_iter()
-            .skip(offset)
-            .take(limit as usize)
-            .filter_map(|(id, _)| summaries.get(&id).cloned())
-            .collect();
-        let next = if (offset + items.len()) < total {
-            Some(Cursor((offset + items.len()).to_string()))
+        let total = req
+            .include_total
+            .unwrap_or(req.page.after.is_none())
+            .then_some(ranked.len() as u64);
+        if let Some((key, cursor_id)) =
+            decode_browse_cursor(req.page.after.as_ref(), BrowseOrder::Hybrid)?
+        {
+            let BrowseKey::Hybrid { score, name } = key else {
+                return Err(LibError::BadRequest(
+                    "browse cursor key does not match hybrid ranking".into(),
+                ));
+            };
+            if !score.is_finite() {
+                return Err(LibError::BadRequest(
+                    "hybrid browse cursor score is not finite".into(),
+                ));
+            }
+            ranked.retain(|(id, candidate_score)| {
+                let candidate_name = summaries.get(id).map(|s| s.name.as_str()).unwrap_or("");
+                *candidate_score < score
+                    || (*candidate_score == score
+                        && (candidate_name > name.as_str()
+                            || (candidate_name == name && *id > cursor_id)))
+            });
+        }
+        ranked.truncate(limit as usize + 1);
+        let has_more = ranked.len() > limit as usize;
+        if has_more {
+            ranked.pop();
+        }
+        let next = if has_more {
+            ranked
+                .last()
+                .map(|(id, score)| {
+                    let name = summaries
+                        .get(id)
+                        .map(|summary| summary.name.clone())
+                        .unwrap_or_default();
+                    encode_browse_cursor(
+                        BrowseOrder::Hybrid,
+                        BrowseKey::Hybrid {
+                            score: *score,
+                            name,
+                        },
+                        *id,
+                    )
+                })
+                .transpose()?
         } else {
             None
         };
+        let items = ranked
+            .into_iter()
+            .filter_map(|(id, _)| summaries.get(&id).cloned())
+            .collect();
         Ok(Page {
             items,
             cursor: next,
-            total: Some(total as u64),
+            total,
             partial: Default::default(),
         })
     }
@@ -1621,5 +1767,433 @@ mod tests {
             names[0], "bravo.png",
             "nearest to the query vector ranks first: {names:?}"
         );
+    }
+
+    fn page_names(store: &Store, mut req: QueryRequest) -> (Vec<String>, Vec<Option<u64>>) {
+        let mut names = Vec::new();
+        let mut totals = Vec::new();
+        loop {
+            let page = query_all(store, &req).unwrap();
+            names.extend(page.items.into_iter().map(|item| item.name));
+            totals.push(page.total);
+            let Some(after) = page.cursor else { break };
+            req.page.after = Some(after);
+        }
+        (names, totals)
+    }
+
+    fn browse_fixture(specs: &[(&str, Option<i64>, i64)]) -> Store {
+        let store = Store::open_in_memory().unwrap();
+        let source = store
+            .add_source(
+                &SourceConnection::LocalFs {
+                    root: "/browse".into(),
+                },
+                "browse",
+                false,
+            )
+            .unwrap();
+        for (name, size, scanned_at) in specs {
+            store
+                .upsert_asset(&NewAsset {
+                    source_id: source,
+                    path: (*name).into(),
+                    filename: (*name).into(),
+                    content_hash: None,
+                    size_bytes: *size,
+                    source_modified_at: None,
+                    scanned_at: *scanned_at,
+                    media_type: MediaType::Image,
+                    format: "png".into(),
+                })
+                .unwrap();
+        }
+        store
+    }
+
+    #[test]
+    fn keyset_pages_cross_null_and_tied_keys_in_both_directions() {
+        let specs = [
+            ("null-a.png", None, 10),
+            ("null-b.png", None, 10),
+            ("one.png", Some(1), 20),
+            ("two-a.png", Some(2), 20),
+            ("two-b.png", Some(2), 20),
+        ];
+        let store = browse_fixture(&specs);
+        for field in [SortField::Size, SortField::Scanned] {
+            for dir in [SortDir::Asc, SortDir::Desc] {
+                let request = QueryRequest {
+                    sort: Sort { field, dir },
+                    page: PageParams {
+                        after: None,
+                        limit: 2,
+                    },
+                    ..Default::default()
+                };
+                let (paged, totals) = page_names(&store, request.clone());
+                let expected = query_all(
+                    &store,
+                    &QueryRequest {
+                        page: PageParams {
+                            after: None,
+                            limit: 100,
+                        },
+                        ..request
+                    },
+                )
+                .unwrap()
+                .items
+                .into_iter()
+                .map(|item| item.name)
+                .collect::<Vec<_>>();
+                assert_eq!(
+                    paged, expected,
+                    "{field:?}/{dir:?} skipped or repeated a row"
+                );
+                assert_eq!(totals[0], Some(specs.len() as u64));
+                assert!(totals.iter().skip(1).all(Option::is_none));
+            }
+        }
+
+        let suppressed = query_all(
+            &store,
+            &QueryRequest {
+                include_total: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            suppressed.total, None,
+            "explicit opt-out recounted page one"
+        );
+        let first = query_all(
+            &store,
+            &QueryRequest {
+                page: PageParams {
+                    after: None,
+                    limit: 2,
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let forced = query_all(
+            &store,
+            &QueryRequest {
+                include_total: Some(true),
+                page: PageParams {
+                    after: first.cursor,
+                    limit: 2,
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(forced.total, Some(specs.len() as u64));
+    }
+
+    #[test]
+    fn inserts_and_deletes_before_a_cursor_do_not_shift_the_next_page() {
+        for dir in [SortDir::Asc, SortDir::Desc] {
+            let store = browse_fixture(&[
+                ("a.png", Some(1), 1),
+                ("b.png", Some(1), 1),
+                ("c.png", Some(1), 1),
+                ("d.png", Some(1), 1),
+            ]);
+            let mut request = QueryRequest {
+                sort: Sort {
+                    field: SortField::Name,
+                    dir,
+                },
+                page: PageParams {
+                    after: None,
+                    limit: 2,
+                },
+                ..Default::default()
+            };
+            let first = query_all(&store, &request).unwrap();
+            request.page.after = first.cursor;
+
+            // Add a row on the already-consumed side and delete a previously returned row. OFFSET
+            // would shift here; the keyset boundary must remain fixed.
+            let inserted = if dir == SortDir::Asc {
+                "aa.png"
+            } else {
+                "z.png"
+            };
+            let source = store.list_sources().unwrap()[0].id;
+            store
+                .upsert_asset(&NewAsset {
+                    source_id: source,
+                    path: inserted.into(),
+                    filename: inserted.into(),
+                    content_hash: None,
+                    size_bytes: Some(1),
+                    source_modified_at: None,
+                    scanned_at: 1,
+                    media_type: MediaType::Image,
+                    format: "png".into(),
+                })
+                .unwrap();
+            store
+                .conn
+                .lock()
+                .unwrap()
+                .execute(
+                    "DELETE FROM asset WHERE id = ?1",
+                    [first.items[0].id.as_bytes().as_slice()],
+                )
+                .unwrap();
+
+            let second = query_all(&store, &request).unwrap();
+            let names = second
+                .items
+                .into_iter()
+                .map(|item| item.name)
+                .collect::<Vec<_>>();
+            let expected = if dir == SortDir::Asc {
+                vec!["c.png", "d.png"]
+            } else {
+                vec!["b.png", "a.png"]
+            };
+            assert_eq!(names, expected, "mutation shifted {dir:?} continuation");
+        }
+    }
+
+    #[test]
+    fn relevance_and_default_hybrid_continue_with_their_exact_effective_order() {
+        let store = browse_fixture(&[
+            ("kick_a.png", Some(1), 1),
+            ("kick_b.png", Some(1), 1),
+            ("kick_c.png", Some(1), 1),
+        ]);
+        for mode in [SearchMode::Lexical, SearchMode::Hybrid] {
+            let sort = if mode == SearchMode::Lexical {
+                Sort {
+                    field: SortField::Relevance,
+                    dir: SortDir::Asc,
+                }
+            } else {
+                Sort::default() // regression: hybrid ranking is independent of this Name/Asc sort
+            };
+            let (names, _) = page_names(
+                &store,
+                QueryRequest {
+                    text: Some("kick".into()),
+                    mode,
+                    sort,
+                    page: PageParams {
+                        after: None,
+                        limit: 1,
+                    },
+                    ..Default::default()
+                },
+            );
+            assert_eq!(names.len(), 3, "{mode:?} page 2 failed");
+            let unique = names.iter().collect::<std::collections::HashSet<_>>();
+            assert_eq!(unique.len(), 3, "{mode:?} repeated a continuation row");
+        }
+
+        let descending = query_all(
+            &store,
+            &QueryRequest {
+                text: Some("kick".into()),
+                sort: Sort {
+                    field: SortField::Relevance,
+                    dir: SortDir::Desc,
+                },
+                ..Default::default()
+            },
+        );
+        assert!(
+            descending.is_err(),
+            "mixed-direction relevance must be rejected"
+        );
+    }
+
+    #[test]
+    fn browse_cursor_rejects_hostile_mismatched_and_noncanonical_payloads() {
+        use base64::Engine as _;
+
+        let id = AssetId::new();
+        let cursor = encode_browse_cursor(
+            BrowseOrder::field(SortField::Name, SortDir::Asc),
+            BrowseKey::Text("a.png".into()),
+            id,
+        )
+        .unwrap();
+        assert!(decode_browse_cursor(
+            Some(&cursor),
+            BrowseOrder::field(SortField::Name, SortDir::Desc)
+        )
+        .is_err());
+        assert!(decode_browse_cursor(
+            Some(&Cursor(format!("b1.{}", "a".repeat(4_097)))),
+            BrowseOrder::field(SortField::Name, SortDir::Asc)
+        )
+        .is_err());
+
+        let Cursor(raw) = cursor;
+        let encoded = raw.strip_prefix("b1.").unwrap();
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded)
+            .unwrap();
+        let mut payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        payload["id"] = serde_json::Value::String(id.to_string().to_uppercase());
+        let hostile = Cursor(format!(
+            "b1.{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(serde_json::to_vec(&payload).unwrap())
+        ));
+        assert!(decode_browse_cursor(
+            Some(&hostile),
+            BrowseOrder::field(SortField::Name, SortDir::Asc)
+        )
+        .is_err());
+
+        let wrong_key = encode_browse_cursor(
+            BrowseOrder::field(SortField::Name, SortDir::Asc),
+            BrowseKey::Integer(Some(1)),
+            id,
+        )
+        .unwrap();
+        assert!(decode_browse_cursor(
+            Some(&wrong_key),
+            BrowseOrder::field(SortField::Name, SortDir::Asc)
+        )
+        .is_err());
+
+        payload["version"] = serde_json::json!(9);
+        let bad_version = Cursor(format!(
+            "b1.{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(serde_json::to_vec(&payload).unwrap())
+        ));
+        assert!(decode_browse_cursor(
+            Some(&bad_version),
+            BrowseOrder::field(SortField::Name, SortDir::Asc)
+        )
+        .is_err());
+
+        let non_finite_json = format!(
+            r#"{{"version":1,"order":{{"kind":"hybrid"}},"key":{{"kind":"hybrid","value":{{"score":1e400,"name":"a.png"}}}},"id":"{id}"}}"#
+        );
+        let non_finite = Cursor(format!(
+            "b1.{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(non_finite_json)
+        ));
+        assert!(decode_browse_cursor(Some(&non_finite), BrowseOrder::Hybrid).is_err());
+    }
+
+    #[test]
+    fn browse_sort_plans_use_composite_indexes_without_temp_ordering() {
+        let store = browse_fixture(&[("a.png", Some(1), 1)]);
+        let conn = store.conn.lock().unwrap();
+        for (order, index) in [
+            ("filename ASC, id ASC", "idx_asset_browse_name"),
+            ("filename DESC, id DESC", "idx_asset_browse_name"),
+            ("scanned_at ASC, id ASC", "idx_asset_browse_scanned"),
+            ("scanned_at DESC, id DESC", "idx_asset_browse_scanned"),
+            ("browse_size_bytes ASC, id ASC", "idx_asset_browse_size"),
+            ("browse_size_bytes DESC, id DESC", "idx_asset_browse_size"),
+        ] {
+            let sql = format!(
+                "EXPLAIN QUERY PLAN {GRID_SELECT} FROM asset {ATTR_JOINS} ORDER BY {order} LIMIT 25"
+            );
+            let plan = conn
+                .prepare(&sql)
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+                .join("\n");
+            assert!(plan.contains(index), "missing {index}: {plan}");
+            assert!(!plan.contains("TEMP B-TREE"), "temporary ordering: {plan}");
+        }
+    }
+
+    fn browse_edge_p95(rows: usize, samples: usize) -> (std::time::Duration, std::time::Duration) {
+        let store = large_search_fixture(rows);
+        let mut target_index = rows.saturating_sub(50);
+        while target_index.is_multiple_of(997) {
+            target_index = target_index.saturating_sub(1);
+        }
+        let target_name = format!("catalog_asset_{target_index:07}.png");
+        let (id, filename): (Vec<u8>, String) = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT id, filename FROM asset WHERE filename = ?1",
+                [target_name],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let after = encode_browse_cursor(
+            BrowseOrder::field(SortField::Name, SortDir::Asc),
+            BrowseKey::Text(filename),
+            blob_to_asset_id(&id),
+        )
+        .unwrap();
+        let late_request = QueryRequest {
+            include_total: Some(false),
+            page: PageParams {
+                after: Some(after),
+                limit: 24,
+            },
+            ..Default::default()
+        };
+        let first_request = QueryRequest {
+            include_total: Some(false),
+            page: PageParams {
+                after: None,
+                limit: 24,
+            },
+            ..Default::default()
+        };
+        let p95 = |request: &QueryRequest| {
+            let mut timings = Vec::with_capacity(samples);
+            for _ in 0..samples {
+                let started = std::time::Instant::now();
+                std::hint::black_box(query_all(&store, request).unwrap());
+                timings.push(started.elapsed());
+            }
+            timings.sort_unstable();
+            timings[(samples * 95 / 100).min(samples - 1)]
+        };
+        (p95(&first_request), p95(&late_request))
+    }
+
+    fn assert_flat_browse_edges(first: std::time::Duration, late: std::time::Duration) {
+        // Both probes execute the same indexed query shape. Fixed slack absorbs scheduler and timer
+        // noise when the actual work is measured in microseconds.
+        let ceiling = first.saturating_mul(5) + std::time::Duration::from_millis(5);
+        assert!(
+            late <= ceiling,
+            "late page {late:?} is not flat vs first {first:?} (ceiling {ceiling:?})"
+        );
+    }
+
+    #[test]
+    fn scaled_20k_late_keyset_page_p95_stays_bounded() {
+        let (first, late) = browse_edge_p95(20_000, 20);
+        eprintln!("20k keyset browse p95: first={first:?}, late={late:?}");
+        assert_flat_browse_edges(first, late);
+        assert!(
+            late < std::time::Duration::from_secs(2),
+            "late p95: {late:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "builds the explicit 1M-asset browse fixture"]
+    fn million_asset_late_keyset_page_p95() {
+        let (first, late) = browse_edge_p95(1_000_000, 40);
+        eprintln!("1M keyset browse p95: first={first:?}, late={late:?}");
+        assert_flat_browse_edges(first, late);
     }
 }
