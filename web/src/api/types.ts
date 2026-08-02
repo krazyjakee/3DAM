@@ -72,6 +72,8 @@ export interface AudioAttributes {
   channels: number | null;
   codec?: string | null;
   container?: string | null;
+  /** Auto-category guess (`one_shot` | `loop` | `music` | `sfx`). */
+  class?: string | null;
   // ── derived by the analysis pass (null until `analyze` runs), issue #61 ──
   /** Integrated loudness in dBFS (an RMS approximation of LUFS). Negative. */
   loudness_lufs?: number | null;
@@ -129,6 +131,8 @@ export interface ModelAttributes {
   has_rig?: boolean | null;
   has_animation?: boolean | null;
   has_uvs?: boolean | null;
+  /** Auto-category guess (`prop` | `character` | `environment` | …). */
+  class?: string | null;
 }
 
 /**
@@ -316,8 +320,6 @@ export interface Sort {
   dir: SortDir;
 }
 
-export type QueryScope = "local" | "federated" | { sources: SourceId[] };
-
 export interface PageParams {
   after?: string | null;
   limit: number;
@@ -332,8 +334,9 @@ export interface QueryRequest {
   text?: string | null;
   filters?: Filter[];
   sort?: Sort;
-  scope?: QueryScope;
   page?: PageParams;
+  /** Ask the server to include facet counts with the query response. */
+  include_facets?: boolean;
   mode?: SearchMode;
   /** Federation (phase 6): skip the peer fan-out and answer from this instance's catalog only. */
   local_only?: boolean;
@@ -684,14 +687,14 @@ export interface JobStatus {
   warnings?: string[];
   result_artifacts?: JobArtifact[];
   result?: JobResult | null;
-  created_at?: number;
-  updated_at?: number;
+  created_at: number;
+  updated_at: number;
   initiator?: string | null;
   /** Every source this job touches. `progress.current` names a live file path, so a
    *  visibility-restricted session is shown a job only when all of these are within its ceiling —
    *  jobs outside it are simply absent from `/jobs` and from the event stream (issue #42). */
   sources: SourceId[];
-  collections?: CollectionId[];
+  collections: CollectionId[];
 }
 export type JobResult =
   | { kind: "convert"; report: ConvertReport }

@@ -1907,6 +1907,7 @@ dependencies = [
  "brotli",
  "chrono",
  "dam-api",
+ "dam-client",
  "dam-core",
  "flate2",
  "futures",

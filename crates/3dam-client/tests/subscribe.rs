@@ -16,7 +16,57 @@ use dam_api::service::{AuthContext, LibraryService};
 use dam_client::ApiClient;
 use futures::{SinkExt, StreamExt};
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_tungstenite::tungstenite::Message;
+
+// Tungstenite fixes this callback's error to an HTTP response; the test only returns `Ok`, so the
+// large, uninhabited-in-practice error path cannot be boxed or replaced at this boundary.
+#[allow(clippy::result_large_err)]
+async fn accept_ticketed_ws(
+    listener: &tokio::net::TcpListener,
+    expected_authorization: Option<&str>,
+) -> tokio_tungstenite::WebSocketStream<tokio::net::TcpStream> {
+    let (mut http, _) = listener.accept().await.unwrap();
+    let mut request = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+        let read = http.read(&mut chunk).await.unwrap();
+        assert!(read > 0, "ticket request ended before its headers");
+        request.extend_from_slice(&chunk[..read]);
+    }
+    let request = String::from_utf8(request).unwrap();
+    assert!(request.starts_with("POST /api/v1/ws-ticket HTTP/1.1\r\n"));
+    let authorization = request.lines().find_map(|line| {
+        line.split_once(':')
+            .filter(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+            .map(|(_, value)| value.trim())
+    });
+    assert_eq!(authorization, expected_authorization);
+    let body = r#"{"ticket":"dam_ws_test","expires_in":30}"#;
+    http.write_all(
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    drop(http);
+
+    let (stream, _) = listener.accept().await.unwrap();
+    tokio_tungstenite::accept_hdr_async(
+        stream,
+        |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+         response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+            assert_eq!(request.uri().query(), Some("ticket=dam_ws_test"));
+            assert!(request.headers().get("authorization").is_none());
+            Ok(response)
+        },
+    )
+    .await
+    .unwrap()
+}
 
 /// Spawn a one-shot WS server on an ephemeral port that emits `events` (JSON text frames, like the
 /// server's `ws_loop`) to the first client, then holds the socket open briefly. Returns the port.
@@ -24,8 +74,7 @@ async fn spawn_ws_server(events: Vec<LibraryEvent>) -> u16 {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let mut ws = accept_ticketed_ws(&listener, None).await;
         for ev in &events {
             let json = serde_json::to_string(ev).unwrap();
             ws.send(Message::Text(json.into())).await.unwrap();
@@ -42,8 +91,7 @@ async fn spawn_burst_ws_server(count: usize) -> u16 {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let mut ws = accept_ticketed_ws(&listener, None).await;
         for _ in 0..count {
             let event = LibraryEvent::AssetChanged {
                 id: AssetId::new(),
@@ -62,6 +110,36 @@ async fn spawn_burst_ws_server(count: usize) -> u16 {
 async fn client_for(port: u16) -> ApiClient {
     let base = format!("http://127.0.0.1:{port}").parse().unwrap();
     ApiClient::connect(base).await.unwrap()
+}
+
+#[tokio::test]
+async fn bearer_authenticates_ticket_mint_but_not_websocket_upgrade() {
+    let id = AssetId::new();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let mut ws = accept_ticketed_ws(&listener, Some("Bearer native-secret")).await;
+        let event = LibraryEvent::AssetChanged {
+            id,
+            source_id: None,
+            kind: ChangeKind::Metadata,
+        };
+        ws.send(Message::Text(serde_json::to_string(&event).unwrap().into()))
+            .await
+            .unwrap();
+    });
+    let base = format!("http://127.0.0.1:{port}").parse().unwrap();
+    let client = ApiClient::connect_with_token(base, Some("native-secret".into()))
+        .await
+        .unwrap();
+    let mut stream = client
+        .subscribe(&AuthContext::embedded(), SubscribeRequest::default())
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_event(&mut stream).await,
+        LibraryEvent::AssetChanged { id: received, .. } if received == id
+    ));
 }
 
 async fn next_event(stream: &mut dam_api::service::EventStream<LibraryEvent>) -> LibraryEvent {

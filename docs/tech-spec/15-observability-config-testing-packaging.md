@@ -269,7 +269,31 @@ CI guards.
 | **Service/API** | `LibraryService` end-to-end over a temp SQLite library — scan a fixture tree, search, tag, similar, convert dry-run; then the same operations over the HTTP/WS API to prove embedded/connected parity ([03](03-library-service-and-api.md)). | `tests/` in the service + server crates | every push |
 | **Scale / perf fixtures** | Large, messy, realistic libraries (below) exercising 100k–1M asset paths, out-of-core datasets, and the fail-soft tail. The "tested at scale" bar and the input for benchmarks/regression guards. | dedicated `xtask`/harness, generated or curated corpora, kept out of the git tree | nightly / pre-release, not per-push |
 
-### 15.4.2 Fixtures
+### 15.4.2 Wire and service parity contracts
+
+The API boundary has two complementary executable contracts:
+
+- `contracts/api-v1.json` is the machine-readable Rust/TypeScript wire fixture. It enumerates all
+  browser-facing enum and tagged-union variants and carries representative minimal/full DTOs.
+  Rust serde tests and TypeScript compile-time union assertions consume the same fixture, so a
+  renamed variant, changed tag, required field, omission/default change, or hand-written client
+  drift fails a normal test/type-check run.
+- `crates/3dam-server/tests/service_parity.rs` runs one normalized semantic transcript against an
+  in-process `EmbeddedLibrary` and a real ephemeral Axum server through `ApiClient`. Generated IDs
+  and timestamps are deliberately normalized away; source CRUD, scan/job polling, browse/detail,
+  content, stats, favourites, notes, collections, similarity/duplicates, and error categories must
+  otherwise agree.
+- WebSocket transport tests cover topic filtering, bounded lag, and reconnect. Because v1 has no
+  resume cursor, reconnect emits one `stream_lagged` marker and the consumer refreshes its visible
+  cache before applying subsequent events. Every native connection/reconnect first mints a
+  short-lived, one-use ticket through authenticated HTTP; bearer credentials never enter the
+  upgrade request or URL.
+
+A wire change updates the Rust DTO/serde definition, TypeScript mirror, committed JSON fixture, and
+both language tests atomically. There is no drift allowlist: both public surfaces converge in the
+same change.
+
+### 15.4.3 Fixtures
 
 - **Small format fixtures** (checked in): one-or-a-few files per supported audio/image/3D
   format, plus deliberately **corrupt/truncated/wrong-extension** files to exercise detection
@@ -278,7 +302,7 @@ CI guards.
   is actually a `.fbx`, a glTF referencing a missing buffer — each must degrade one asset, per
   §15.2.4.
 
-### 15.4.3 Scale / perf fixtures (the "tested at scale" bar)
+### 15.4.4 Scale / perf fixtures (the "tested at scale" bar)
 
 The `1M+ assets` design target (PRODUCT_SPEC §8) is only real if it is exercised:
 
@@ -294,7 +318,7 @@ The `1M+ assets` design target (PRODUCT_SPEC §8) is only real if it is exercise
   developer-controlled location), referenced by the benchmark/scale harness. No corpus is
   fetched during a normal build — consistent with the no-unsolicited-network rule (§15.1.5).
 
-### 15.4.4 Benchmark & regression guards
+### 15.4.5 Benchmark & regression guards
 
 The **performance *targets*** (60 fps at 100k visible, instant search, cores saturated, 1M
 out-of-core) belong to [14](14-concurrency-performance-reliability.md); this file owns the
@@ -309,7 +333,7 @@ out-of-core) belong to [14](14-concurrency-performance-reliability.md); this fil
   regresses past a threshold** against the committed baseline. The thresholds trace directly
   to the `14` targets, so a perf regression is caught as a build failure, not in the field.
 
-### 15.4.5 CI dependency and feature guards
+### 15.4.6 CI dependency and feature guards
 
 [ADR 0002](../adr/0002-3d-render-crate-boundary.md) permits GPU rendering only through the
 optional `dam-core/render → dam-render → wgpu` path; a default/lean core must remain GPU- and

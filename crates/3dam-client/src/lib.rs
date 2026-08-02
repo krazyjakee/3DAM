@@ -42,9 +42,6 @@ struct JobIdReply {
 pub struct ApiClient {
     base: Url,
     http: reqwest::Client,
-    /// Bearer token, kept alongside the reqwest default header so the WebSocket handshake
-    /// (`subscribe`, tech-spec 09 §A.3) can present the same credential (issue #36).
-    token: Option<String>,
 }
 
 /// Recover `(media, format)` from a `Content-Type` — the inverse of `dam_api::dto::content_type_for`.
@@ -91,28 +88,36 @@ fn media_from_content_type(ct: &str) -> (MediaType, String) {
     }
 }
 
-/// Open the WebSocket, presenting the bearer token on the handshake when the peer is token-gated.
+#[derive(serde::Deserialize)]
+struct WsTicketReply {
+    ticket: String,
+}
+
+/// Mint a short-lived, one-use ticket over authenticated HTTP, then open the WebSocket with only
+/// that ticket in the query. Browser and native clients therefore share the same handshake and a
+/// long-lived bearer credential never enters an upgrade request, URL, or proxy log.
 async fn connect_ws(
+    http: &reqwest::Client,
+    base: &Url,
     url: &Url,
-    token: Option<&str>,
 ) -> Result<
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     LibError,
 > {
-    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-    let mut request = url
-        .as_str()
-        .into_client_request()
-        .map_err(|e| LibError::BadRequest(format!("bad ws url: {e}")))?;
-    if let Some(t) = token {
-        let value = format!("Bearer {t}")
-            .parse()
-            .map_err(|e| LibError::BadRequest(format!("invalid token: {e}")))?;
-        request
-            .headers_mut()
-            .insert(reqwest::header::AUTHORIZATION.as_str(), value);
-    }
-    let (ws, _resp) = tokio_tungstenite::connect_async(request)
+    let ticket_url = base
+        .join("/api/v1/ws-ticket")
+        .map_err(|e| LibError::BadRequest(e.to_string()))?;
+    let response = http
+        .post(ticket_url)
+        .send()
+        .await
+        .map_err(|e| LibError::SourceUnavailable(e.to_string()))?;
+    let ticket: WsTicketReply = ApiClient::decode(response).await?;
+    let mut ticketed = url.clone();
+    ticketed
+        .query_pairs_mut()
+        .append_pair("ticket", &ticket.ticket);
+    let (ws, _resp) = tokio_tungstenite::connect_async(ticketed.as_str())
         .await
         .map_err(|e| LibError::SourceUnavailable(e.to_string()))?;
     Ok(ws)
@@ -145,8 +150,9 @@ impl ApiClient {
         Self::connect_with_token(endpoint, None).await
     }
 
-    /// Connect presenting a bearer `token` on every request (required for a Token-mode peer). The
-    /// credential is set as a default header on the reqwest client so it rides every call uniformly.
+    /// Connect presenting a bearer `token` on authenticated HTTP requests (required for a
+    /// Token-mode peer). WebSocket subscriptions use that client to mint a one-use ticket; the
+    /// bearer itself is never copied into the upgrade request.
     pub async fn connect_with_token(
         endpoint: Url,
         token: Option<String>,
@@ -165,7 +171,6 @@ impl ApiClient {
         Ok(ApiClient {
             base: endpoint,
             http,
-            token,
         })
     }
 
@@ -1275,7 +1280,8 @@ impl LibraryService for ApiClient {
         // `LibraryEvent` stream into a channel, reconnecting with backoff so a connected frontend's
         // live updates survive a transient drop (mirrors the web client's ws.ts — issue #36, #25).
         let ws_url = self.ws_url()?;
-        let token = self.token.clone();
+        let base = self.base.clone();
+        let http = self.http.clone();
         let topics = req.topics;
         const DELIVERY_CAPACITY: usize = 256;
         let (mut tx, rx) = futures::channel::mpsc::channel::<LibraryEvent>(DELIVERY_CAPACITY);
@@ -1284,7 +1290,7 @@ impl LibraryService for ApiClient {
             let mut backoff = Duration::from_millis(500);
             let mut needs_resync = false;
             loop {
-                match connect_ws(&ws_url, token.as_deref()).await {
+                match connect_ws(&http, &base, &ws_url).await {
                     Ok(mut ws) => {
                         // A reconnect has an unknowable event gap even if the local queue never
                         // filled. Make the resync contract explicit before accepting fresh frames.
