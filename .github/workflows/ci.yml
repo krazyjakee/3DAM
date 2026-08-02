@@ -11,6 +11,10 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # The full workspace links several native-heavy test binaries. GitHub's
+  # hosted runners can exhaust their ephemeral disk when Cargo emits complete
+  # debug information for each one; symbols are not required for this gate.
+  CARGO_PROFILE_TEST_DEBUG: 0
 
 jobs:
   msrv:
