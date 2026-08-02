@@ -14,12 +14,12 @@ fn main() -> ExitCode {
             build_web()
                 && check_deps()
                 && run("cargo", &["fmt", "--all", "--check"])
-                && run(
-                    "cargo",
-                    &["clippy", "--all-targets", "--", "-D", "warnings"],
-                )
+                && feature_matrix(None)
                 && run("cargo", &["test", "--workspace"])
         }
+        // Strict Clippy coverage for every supported Cargo/target profile. Passing one of the
+        // documented profile names runs only that group; no name runs the complete matrix.
+        "feature-matrix" => feature_matrix(std::env::args().nth(2).as_deref()),
         "web" => build_web(),
         // Build just the WASM viewer islands (tech-spec 09 §B.3) into web/src/wasm/.
         "wasm" => build_wasm(),
@@ -33,7 +33,8 @@ fn main() -> ExitCode {
         "check-deps" => check_deps(),
         other => {
             eprintln!(
-                "unknown xtask '{other}'. try: ci | web | wasm | bundle | packaging | check-deps"
+                "unknown xtask '{other}'. try: ci | feature-matrix | web | wasm | bundle | \
+                 packaging | check-deps"
             );
             false
         }
@@ -43,6 +44,241 @@ fn main() -> ExitCode {
     } else {
         ExitCode::FAILURE
     }
+}
+
+struct FeatureProfile {
+    name: &'static str,
+    commands: &'static [&'static [&'static str]],
+}
+
+/// The supported compile profiles, kept here so hosted CI and the local pre-push gate execute the
+/// exact same commands. Individual features are isolated with `--no-default-features`; the final
+/// all-feature workspace pass covers the additive combination because none of the owning crates has
+/// a cfg expression that depends on a particular pair of features.
+const FEATURE_PROFILES: &[FeatureProfile] = &[
+    FeatureProfile {
+        name: "sources",
+        commands: &[
+            &[
+                "clippy",
+                "-p",
+                "dam-sources",
+                "--no-default-features",
+                "--all-targets",
+                "--locked",
+                "--",
+                "-D",
+                "warnings",
+            ],
+            &[
+                "clippy",
+                "-p",
+                "dam-sources",
+                "--no-default-features",
+                "--features",
+                "sftp",
+                "--all-targets",
+                "--locked",
+                "--",
+                "-D",
+                "warnings",
+            ],
+            &[
+                "clippy",
+                "-p",
+                "dam-sources",
+                "--no-default-features",
+                "--features",
+                "smb",
+                "--all-targets",
+                "--locked",
+                "--",
+                "-D",
+                "warnings",
+            ],
+        ],
+    },
+    FeatureProfile {
+        name: "media",
+        commands: &[
+            &[
+                "clippy",
+                "-p",
+                "dam-media",
+                "--no-default-features",
+                "--all-targets",
+                "--locked",
+                "--",
+                "-D",
+                "warnings",
+            ],
+            &[
+                "clippy",
+                "-p",
+                "dam-media",
+                "--no-default-features",
+                "--features",
+                "model-convert",
+                "--all-targets",
+                "--locked",
+                "--",
+                "-D",
+                "warnings",
+            ],
+        ],
+    },
+    FeatureProfile {
+        name: "core",
+        commands: &[
+            &[
+                "clippy",
+                "-p",
+                "dam-core",
+                "--no-default-features",
+                "--all-targets",
+                "--locked",
+                "--",
+                "-D",
+                "warnings",
+            ],
+            &[
+                "clippy",
+                "-p",
+                "dam-core",
+                "--no-default-features",
+                "--features",
+                "render",
+                "--all-targets",
+                "--locked",
+                "--",
+                "-D",
+                "warnings",
+            ],
+            &[
+                "clippy",
+                "-p",
+                "dam-core",
+                "--no-default-features",
+                "--features",
+                "model-convert",
+                "--all-targets",
+                "--locked",
+                "--",
+                "-D",
+                "warnings",
+            ],
+            &[
+                "clippy",
+                "-p",
+                "dam-core",
+                "--no-default-features",
+                "--features",
+                "semantic",
+                "--all-targets",
+                "--locked",
+                "--",
+                "-D",
+                "warnings",
+            ],
+        ],
+    },
+    FeatureProfile {
+        name: "viewer",
+        commands: &[
+            &[
+                "clippy",
+                "-p",
+                "dam-viewer",
+                "--all-targets",
+                "--locked",
+                "--",
+                "-D",
+                "warnings",
+            ],
+            &[
+                "clippy",
+                "-p",
+                "dam-viewer",
+                "--target",
+                "wasm32-unknown-unknown",
+                "--all-targets",
+                "--locked",
+                "--",
+                "-D",
+                "warnings",
+            ],
+        ],
+    },
+    FeatureProfile {
+        name: "binary",
+        commands: &[&[
+            "clippy",
+            "-p",
+            "dam",
+            "--all-targets",
+            "--locked",
+            "--",
+            "-D",
+            "warnings",
+        ]],
+    },
+    FeatureProfile {
+        name: "workspace-all",
+        commands: &[&[
+            "clippy",
+            "--workspace",
+            "--all-targets",
+            "--all-features",
+            "--locked",
+            "--",
+            "-D",
+            "warnings",
+        ]],
+    },
+];
+
+fn feature_matrix(requested: Option<&str>) -> bool {
+    if let Some(name) = requested {
+        if !FEATURE_PROFILES.iter().any(|profile| profile.name == name) {
+            eprintln!(
+                "unknown feature profile {name:?}; expected one of: {}",
+                FEATURE_PROFILES
+                    .iter()
+                    .map(|profile| profile.name)
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            );
+            return false;
+        }
+    }
+
+    FEATURE_PROFILES
+        .iter()
+        .filter(|profile| requested.is_none_or(|name| name == profile.name))
+        .all(|profile| {
+            eprintln!("feature-matrix: {}", profile.name);
+            prepare_feature_profile(profile.name)
+                && profile.commands.iter().all(|args| run("cargo", args))
+        })
+}
+
+/// `rust-embed` accepts an empty web bundle (the server then serves its documented build hint) but
+/// its derive macro still requires the ignored directory to exist. A clean checkout has no empty
+/// directories, so lint-only binary/workspace profiles create the directory without manufacturing
+/// an artifact. The web/release gates separately require the real `index.html` and assets.
+fn prepare_feature_profile(name: &str) -> bool {
+    if !matches!(name, "binary" | "workspace-all") {
+        return true;
+    }
+    let dist = Path::new(env!("CARGO_MANIFEST_DIR")).join("../web/dist");
+    std::fs::create_dir_all(&dist)
+        .map_err(|error| {
+            eprintln!(
+                "feature-matrix: cannot create rust-embed prerequisite {}: {error}",
+                dist.display()
+            );
+        })
+        .is_ok()
 }
 
 /// Package the desktop app into OS bundles (tech-spec 15 §15.5). The layout is unusual and the
@@ -535,6 +771,51 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn feature_profiles_are_strict_and_the_binary_matches_release() {
+        assert_eq!(
+            FEATURE_PROFILES
+                .iter()
+                .map(|profile| profile.name)
+                .collect::<Vec<_>>(),
+            [
+                "sources",
+                "media",
+                "core",
+                "viewer",
+                "binary",
+                "workspace-all"
+            ]
+        );
+        for command in FEATURE_PROFILES.iter().flat_map(|profile| profile.commands) {
+            assert_eq!(command.first(), Some(&"clippy"));
+            assert!(command.contains(&"--all-targets"));
+            assert!(command.contains(&"--locked"));
+            assert!(command.ends_with(&["--", "-D", "warnings"]));
+        }
+
+        // Release builds `cargo build -p dam --release --locked` with no feature selection. The
+        // lint profile must keep that exact package/feature surface (Clippy adds only target/lint
+        // flags), rather than accidentally using workspace feature unification or all-features.
+        let binary = FEATURE_PROFILES
+            .iter()
+            .find(|profile| profile.name == "binary")
+            .unwrap();
+        assert_eq!(
+            binary.commands,
+            &[&[
+                "clippy",
+                "-p",
+                "dam",
+                "--all-targets",
+                "--locked",
+                "--",
+                "-D",
+                "warnings"
+            ][..]]
+        );
     }
 
     #[test]

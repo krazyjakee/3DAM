@@ -326,6 +326,27 @@ window-free. The push/PR workflow enforces the current architecture at three com
   `dam-sources --no-default-features` excludes SFTP/SMB transports. These absence checks protect
   feature boundaries that a whole-workspace graph cannot express.
 
+`cargo xtask feature-matrix` is the executable inventory of supported compile profiles. Every
+entry uses Clippy with `-D warnings`, `--all-targets`, and a locked dependency graph:
+
+| Profile | Supported configurations |
+|---|---|
+| `sources` | local-only (`--no-default-features`), SFTP-only, SMB-only; the default/all-feature pass covers SFTP+SMB |
+| `media` | metadata/decode-only and the individual `model-convert` capability |
+| `core` | lean plus each individual capability: `render`, `model-convert`, and `semantic` |
+| `viewer` | the native stub and the real `wasm32-unknown-unknown` browser implementation |
+| `binary` | the shipped `dam`/`3dam` package exactly as release builds it |
+| `workspace-all` | every workspace feature enabled together, including combined additive capabilities |
+
+The owning crates intentionally expose only additive, orthogonal Cargo features. Pairwise subsets
+of core capabilities are not separate release profiles because the source has no pair-dependent
+`cfg`: lean, each individual feature, and all-features exercise every conditional branch. The
+shipped `dam` package deliberately exposes no selectable Cargo features—its one supported build is
+the complete four-role binary. Viewer native/WASM selection is target-driven, not a feature flag.
+Binary/workspace linting creates an empty ignored `web/dist/` when needed because `rust-embed`
+requires the folder to exist; this exercises the server's documented bundle-missing fallback and
+does not satisfy the separate web/release artifact checks, which require real HTML and assets.
+
 ### 15.4.6 Push/pull-request quality matrix
 
 `.github/workflows/ci.yml` runs on every push and every pull request. It keeps a stable
@@ -336,11 +357,13 @@ window-free. The push/PR workflow enforces the current architecture at three com
 | MSRV | Rust 1.91, default workspace, locked `cargo check` |
 | Format | `cargo fmt --all --check` |
 | Tests | default workspace, locked unit/integration/doc tests |
-| Feature matrix | all features + all targets under Clippy `-D warnings`; lean core/media/sources |
+| Feature matrix | the full `cargo xtask feature-matrix` inventory above, all under Clippy `-D warnings` |
 | Dependency hygiene | current lockfile, exact internal edges, cargo-deny advisories/licenses/bans/sources |
 | Web | frozen pnpm install via `xtask web`, WASM/Vite build, ESLint, and TypeScript |
 
-Native matrix commands and the xtask entry point use `--locked`; pnpm uses the frozen lockfile
+Hosted CI runs the six named profile groups in parallel while `cargo xtask ci` runs all six locally;
+both call the same `feature-matrix` implementation, preventing the commands from drifting. Native
+matrix commands use `--locked`; pnpm uses the frozen lockfile
 inside `cargo xtask web`. A separate locked metadata gate catches any stale Cargo lockfile before
 the aggregate result can pass. Caches key compiled/downloaded inputs only and do not make a missing
 lockfile, generated WASM/Vite artifact, test failure, lint warning, or type error soft. Release

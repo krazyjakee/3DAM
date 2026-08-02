@@ -69,31 +69,24 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - profile: all features + Clippy
-            command: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-            tree: ""
-            forbidden: ""
+          - profile: sources
+            native: false
+          - profile: media
             native: true
-          - profile: lean core
-            command: cargo check -p dam-core --no-default-features --locked
-            tree: cargo tree --locked -p dam-core --no-default-features --edges normal --prefix none
-            forbidden: "^(ash|glow|gpu-alloc|gpu-allocator|naga|tao|tauri|winit|wgpu|wry)( |-)|^dam-render "
+          - profile: core
+            native: true
+          - profile: viewer
             native: false
-          - profile: lean media
-            command: cargo check -p dam-media --no-default-features --locked
-            tree: cargo tree --locked -p dam-media --no-default-features --edges normal --prefix none
-            forbidden: "^russimp(-| )"
-            native: false
-          - profile: local sources
-            command: cargo check -p dam-sources --no-default-features --locked
-            tree: cargo tree --locked -p dam-sources --no-default-features --edges normal --prefix none
-            forbidden: "^(russh|russh-sftp|smb)( |-)"
-            native: false
+          - profile: binary
+            native: true
+          - profile: workspace-all
+            native: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
           key: feature-${{ matrix.profile }}
@@ -104,17 +97,29 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             clang cmake libclang-dev libgtk-3-dev librsvg2-dev \
             libssl-dev libwebkit2gtk-4.1-dev pkg-config
-      - name: Compile profile
-        run: ${{ matrix.command }}
-      - name: Assert lean dependency boundary
-        if: matrix.forbidden != ''
+      - name: Clippy every supported profile
+        run: cargo run --locked --package xtask -- feature-matrix ${{ matrix.profile }}
+      - name: Assert lean dependency boundaries
+        if: matrix.profile == 'sources'
         shell: bash
         run: |
           set -euo pipefail
-          if ${{ matrix.tree }} | grep -E '${{ matrix.forbidden }}'; then
-            echo "::error::${{ matrix.profile }} contains a dependency outside its lean boundary"
-            exit 1
-          fi
+          assert_absent() {
+            local profile="$1" command="$2" forbidden="$3"
+            if eval "${command}" | grep -E "${forbidden}"; then
+              echo "::error::${profile} contains a dependency outside its lean boundary"
+              exit 1
+            fi
+          }
+          assert_absent "lean core" \
+            "cargo tree --locked -p dam-core --no-default-features --edges normal --prefix none" \
+            "^(ash|glow|gpu-alloc|gpu-allocator|naga|tao|tauri|winit|wgpu|wry)( |-)|^dam-render "
+          assert_absent "lean media" \
+            "cargo tree --locked -p dam-media --no-default-features --edges normal --prefix none" \
+            "^russimp(-| )"
+          assert_absent "local sources" \
+            "cargo tree --locked -p dam-sources --no-default-features --edges normal --prefix none" \
+            "^(russh|russh-sftp|smb)( |-)"
 
   dependencies:
     name: Dependency hygiene

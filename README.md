@@ -206,7 +206,8 @@ cargo test --workspace                        # integration + unit tests
 cargo fmt --all --check                       # format check
 cargo clippy --all-targets -- -D warnings     # lint
 
-cargo xtask ci                                # the canonical pre-push gate (fmt + clippy + tests + web build)
+cargo xtask feature-matrix                    # strict Clippy for every supported Cargo/target profile
+cargo xtask ci                                # canonical pre-push gate (includes the full feature matrix)
 cargo xtask check-deps                        # enforce the exact direct internal crate graph
 cargo xtask web                               # build the React client → web/dist/
 cargo install wasm-pack --version 0.13.1 --locked # pinned WASM/Binaryen release toolchain

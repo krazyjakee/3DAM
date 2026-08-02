@@ -32,3 +32,16 @@ pub fn clip_planes(radius: f32, distance: f32) -> (f32, f32) {
         distance + radius * 2.0,
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_view_uses_the_default_orbit() {
+        assert_eq!(
+            canonical_direction(),
+            orbit_direction(DEFAULT_YAW, DEFAULT_PITCH)
+        );
+    }
+}

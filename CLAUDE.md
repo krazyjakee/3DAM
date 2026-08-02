@@ -106,6 +106,7 @@ Key CLI verbs (verb-noun, per tech-spec 13): `scan`, `search`, `get`, `stats`, `
 cargo test --workspace                  # integration tests live in crates/3dam-core/tests and crates/3dam-server/tests
 cargo fmt --all --check                 # format check (use without --check to apply)
 cargo clippy --all-targets -- -D warnings
+cargo xtask feature-matrix # strict Clippy for lean/individual/all features + native/WASM viewer
 ```
 
 Server tests exercise the axum router in-process via `ServiceExt::oneshot` (no socket bind). Core tests cover scan / media_depth / automation / reach.
@@ -113,7 +114,7 @@ Server tests exercise the axum router in-process via `ServiceExt::oneshot` (no s
 ### `xtask` (dev automation)
 
 ```bash
-cargo xtask ci          # fmt --check + clippy -D warnings + tests + web build (the canonical pre-push gate)
+cargo xtask ci          # web + dependency/format + full feature matrix + tests (canonical pre-push gate)
 cargo xtask web         # build React → web/dist/; skips if pnpm is absent, otherwise requires wasm-pack
 cargo xtask wasm        # wasm-pack build dam-viewer → web/src/wasm/; missing wasm-pack is an error
 cargo xtask packaging   # render shell completions + man pages → packaging/ by *running* the

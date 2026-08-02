@@ -387,9 +387,11 @@ impl ModelRenderer {
             .iter()
             .map(|s| BatchItem {
                 // Invalid slots all use the one fallback material and can share a batch.
-                material: (s.material < model.materials.len())
-                    .then_some(s.material)
-                    .unwrap_or(usize::MAX),
+                material: if s.material < model.materials.len() {
+                    s.material
+                } else {
+                    usize::MAX
+                },
                 blended: model
                     .materials
                     .get(s.material)
