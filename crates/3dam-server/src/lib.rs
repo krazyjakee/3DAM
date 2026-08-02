@@ -17,6 +17,7 @@ mod comments;
 mod config;
 mod mcp;
 mod oidc;
+mod oidc_bearer;
 mod store;
 mod upload;
 
@@ -95,6 +96,8 @@ pub(crate) struct AppState {
     pub require_claim_token: bool,
     /// Process-local request and expensive-work bounds for the unauthenticated auth surfaces.
     pub auth_protection: Arc<auth_rate::AuthProtection>,
+    /// Single-entry, bounded OIDC metadata/JWKS cache for stateless bearer verification.
+    pub oidc_bearer: Arc<oidc_bearer::Verifier>,
     /// Flips `false → true` once when shutdown begins, so long-lived handlers (the `/api/v1/ws`
     /// loop) can stop awaiting and close cleanly instead of pinning the graceful drain open.
     pub shutdown: watch::Receiver<bool>,
@@ -137,22 +140,36 @@ fn empty_media_tickets() -> Arc<std::sync::Mutex<HashMap<[u8; 32], MediaTicket>>
     Arc::new(std::sync::Mutex::new(HashMap::new()))
 }
 
-/// The audit actor string for a request (tech-spec 10 §4.5). A signed-in account records as
-/// `account:<username>`; a store-verified token as `token:<label>`; an unauthenticated localhost
-/// owner (under `Authentication = Off`) as `local-owner`. The prefixes keep attribution
-/// unambiguous — the bootstrap token is *labelled* "owner", so a bare name couldn't tell the
-/// no-credential local owner from the holder of that token.
+/// The audit actor string for a request (tech-spec 10 §4.5). A session records as
+/// `account:<username>`, a stateless provider credential as `oidc-bearer:<username>`, a
+/// store-verified token as `token:<label>`, and an unauthenticated localhost owner (under
+/// `Authentication = Off`) as `local-owner`. The prefixes keep attribution unambiguous without
+/// retaining a token, session id, or OIDC subject.
 ///
 /// Lives here rather than in one route module because every module that audits needs the identical
 /// string: the log's value is that an actor is greppable across `admin.*`, `comment.*`, and
 /// `source.upload` alike, which stops being true the moment two copies disagree.
 pub(crate) fn actor_of(ctx: &dam_api::service::AuthContext) -> String {
-    if let Some(acct) = &ctx.account {
-        return format!("account:{}", acct.username);
-    }
-    match &ctx.identity {
-        Some(label) => format!("token:{label}"),
-        None => "local-owner".to_string(),
+    use dam_api::service::AuthSource;
+    match ctx.auth_source {
+        AuthSource::Session => ctx
+            .account
+            .as_ref()
+            .map(|account| format!("account:{}", account.username))
+            .unwrap_or_else(|| "account:unknown".into()),
+        AuthSource::OidcBearer => ctx
+            .account
+            .as_ref()
+            .map(|account| format!("oidc-bearer:{}", account.username))
+            .unwrap_or_else(|| "oidc-bearer:unknown".into()),
+        AuthSource::ApiToken => ctx
+            .identity
+            .as_ref()
+            .map(|label| format!("token:{label}"))
+            .unwrap_or_else(|| "token:unknown".into()),
+        AuthSource::Embedded => "embedded".into(),
+        AuthSource::LocalOwner => "local-owner".into(),
+        AuthSource::Anonymous => "anonymous".into(),
     }
 }
 
@@ -289,6 +306,14 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/api/v1/advertise", get(advertise))
         .route("/api/v1/similar-by-vector", post(similar_by_vector))
         .route("/api/v1/duplicates", post(list_duplicates))
+        .route(
+            "/api/v1/duplicates/membership",
+            post(duplicate_membership),
+        )
+        .route(
+            "/api/v1/assets/{id}/duplicates",
+            get(duplicate_group),
+        )
         .route("/api/v1/suggestions/review", post(review_suggestion))
         .route("/api/v1/assets/favorite", post(set_favorite))
         .route("/api/v1/jobs/analyze", post(submit_analyze))
@@ -439,6 +464,7 @@ pub fn router(
         secure_cookies: false,
         require_claim_token: false,
         auth_protection: Arc::new(auth_rate::AuthProtection::new([])),
+        oidc_bearer: Arc::new(oidc_bearer::Verifier::new()),
         shutdown,
         // The test seam is ready the moment it's built (no async pipeline warm-up to await).
         ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
@@ -532,6 +558,7 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
         auth_protection: Arc::new(auth_rate::AuthProtection::new(
             file.server.trusted_proxies.iter().copied(),
         )),
+        oidc_bearer: Arc::new(oidc_bearer::Verifier::new()),
         shutdown: shutdown_rx,
         ready: ready.clone(),
         max_upload_bytes: file.upload.max_bytes(),
@@ -800,6 +827,7 @@ async fn desktop_setup(
         secure_cookies: false,
         require_claim_token: false,
         auth_protection: Arc::new(auth_rate::AuthProtection::new([])),
+        oidc_bearer: Arc::new(oidc_bearer::Verifier::new()),
         shutdown,
         ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         // The desktop shell reads no serve config file, so the built-in ceiling stands. A local
@@ -1140,11 +1168,12 @@ async fn whoami(
     State(st): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<dam_api::WhoAmI>, ApiError> {
-    let resolved = auth::resolve(
-        &st.store,
+    let resolved = auth::resolve_request(
+        &st,
         auth::bearer_header(&headers),
         auth::cookie_value(&headers, auth::SESSION_COOKIE),
-    )?;
+    )
+    .await?;
     Ok(Json(resolved.ctx.whoami()))
 }
 
@@ -1602,8 +1631,25 @@ async fn list_duplicates(
     Reader(ctx): Reader,
     State(st): State<AppState>,
     Json(req): Json<DupRequest>,
-) -> Result<Json<Vec<DupGroup>>, ApiError> {
+) -> Result<Json<dam_api::Page<DupGroup>>, ApiError> {
     Ok(Json(st.lib.list_duplicates(&ctx, req).await?))
+}
+
+async fn duplicate_membership(
+    Reader(ctx): Reader,
+    State(st): State<AppState>,
+    Json(req): Json<DupMembershipRequest>,
+) -> Result<Json<Vec<DupMembership>>, ApiError> {
+    Ok(Json(st.lib.duplicate_membership(&ctx, req).await?))
+}
+
+async fn duplicate_group(
+    Reader(ctx): Reader,
+    State(st): State<AppState>,
+    AxPath(id): AxPath<String>,
+) -> Result<Json<Option<DupGroup>>, ApiError> {
+    let id = parse_id(&id, "asset")?;
+    Ok(Json(st.lib.duplicate_group(&ctx, &id).await?))
 }
 
 async fn review_suggestion(
@@ -1941,7 +1987,7 @@ struct TicketReply {
 }
 
 async fn mint_ws_ticket(headers: HeaderMap, State(st): State<AppState>) -> Response {
-    let resolved = match auth::resolve_ws(&st.store, &headers) {
+    let resolved = match auth::resolve_ws(&st, &headers).await {
         Ok(value) => value,
         Err(error) => return ApiError(error).into_response(),
     };
@@ -2022,7 +2068,7 @@ async fn mint_media_ticket(
     if !allowed_media_target(&request.target) {
         return ApiError(LibError::BadRequest("invalid media target".into())).into_response();
     }
-    let resolved = match auth::resolve_ws(&st.store, &headers) {
+    let resolved = match auth::resolve_ws(&st, &headers).await {
         Ok(value) => value,
         Err(error) => return ApiError(error).into_response(),
     };
@@ -2066,7 +2112,7 @@ async fn mint_media_ticket(
 /// Resolve a media ticket only for the exact path+query it was minted for. Unlike a WebSocket
 /// ticket it is replayable until expiry because browsers issue multiple Range GETs while seeking.
 /// The parent credential is re-verified on every use, so revocation takes effect immediately.
-pub(crate) fn resolve_media_ticket(
+pub(crate) async fn resolve_media_ticket(
     st: &AppState,
     parts: &axum::http::request::Parts,
 ) -> Option<Result<dam_api::service::AuthContext, LibError>> {
@@ -2100,7 +2146,9 @@ pub(crate) fn resolve_media_ticket(
         return Some(Err(LibError::Unauthorized));
     }
     let resolved = if ticket.token.is_some() || ticket.cookie.is_some() {
-        auth::resolve(&st.store, ticket.token, ticket.cookie).map(|value| value.ctx)
+        auth::resolve_request(st, ticket.token, ticket.cookie)
+            .await
+            .map(|value| value.ctx)
     } else {
         Ok(ticket.ctx)
     };
@@ -2133,7 +2181,7 @@ async fn ws_handler(
         return ApiError(LibError::Unauthorized).into_response();
     };
     let ctx = if ticket.token.is_some() || ticket.cookie.is_some() {
-        match auth::resolve(&st.store, ticket.token.clone(), ticket.cookie.clone()) {
+        match auth::resolve_request(&st, ticket.token.clone(), ticket.cookie.clone()).await {
             Ok(resolved) if resolved.ctx.scopes.has(dam_api::service::Scope::Read) => resolved.ctx,
             _ => return ApiError(LibError::Unauthorized).into_response(),
         }
@@ -2169,7 +2217,7 @@ async fn ws_loop(
             _ = auth_check.tick(), if token.is_some() || cookie.is_some() => {
                 // Revoking the parent token/session closes an already-open socket within one
                 // ticket TTL, independently of catalog traffic or visibility mutations.
-                match auth::resolve(&st.store, token.clone(), cookie.clone()) {
+                match auth::resolve_request(&st, token.clone(), cookie.clone()).await {
                     Ok(resolved) if resolved.ctx.scopes.has(dam_api::service::Scope::Read) => {}
                     _ => {
                         let _ = socket.send(Message::Close(None)).await;
@@ -2184,7 +2232,7 @@ async fn ws_loop(
                 let gen_now = st.store.visibility_generation();
                 if gen_now != vis_gen {
                     vis_gen = gen_now;
-                    match auth::resolve(&st.store, token.clone(), cookie.clone()) {
+                    match auth::resolve_request(&st, token.clone(), cookie.clone()).await {
                         Ok(r) if r.ctx.scopes.has(dam_api::service::Scope::Read) => {
                             match st.lib.subscribe(&r.ctx, SubscribeRequest::default()).await {
                                 Ok(s) => stream = s,
@@ -2225,11 +2273,13 @@ async fn mcp_http(State(st): State<AppState>, headers: HeaderMap, body: Body) ->
     if matches!(mcp, McpMode::Off) {
         return ApiError(LibError::NotFound("mcp is disabled".into())).into_response();
     }
-    let resolved = match auth::resolve(
-        &st.store,
+    let resolved = match auth::resolve_request(
+        &st,
         auth::bearer_header(&headers),
         auth::cookie_value(&headers, auth::SESSION_COOKIE),
-    ) {
+    )
+    .await
+    {
         Ok(r) => r,
         Err(e) => return ApiError(e).into_response(),
     };

@@ -270,6 +270,22 @@ pub struct AuthContext {
     /// The signed-in account behind a session credential, if any (issue #42) — used for audit
     /// attribution and `whoami`; guards still check scopes, never roles.
     pub account: Option<AccountIdentity>,
+    /// How the server authenticated this caller. This is deliberately process-local rather than
+    /// part of `WhoAmI`: it exists so audit attribution can distinguish a browser session from a
+    /// stateless OIDC bearer for the same account without recording either credential or the
+    /// provider subject.
+    pub auth_source: AuthSource,
+}
+
+/// Credential provenance retained after authentication for safe audit attribution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthSource {
+    Embedded,
+    LocalOwner,
+    Anonymous,
+    ApiToken,
+    Session,
+    OidcBearer,
 }
 
 impl AuthContext {
@@ -281,6 +297,7 @@ impl AuthContext {
             scopes: Scopes::all(),
             visibility: Visibility::Full,
             account: None,
+            auth_source: AuthSource::Embedded,
         }
     }
     /// A connected caller with a resolved identity, granted scopes, and — **required, never
@@ -294,11 +311,17 @@ impl AuthContext {
             scopes,
             visibility,
             account: None,
+            auth_source: AuthSource::ApiToken,
         }
     }
     /// Attach the signed-in account identity (builder-style; server auth layer).
     pub fn with_account(mut self, a: AccountIdentity) -> Self {
         self.account = Some(a);
+        self
+    }
+    /// Record which front-door credential populated this context.
+    pub fn with_auth_source(mut self, source: AuthSource) -> Self {
+        self.auth_source = source;
         self
     }
     /// Guard: succeed iff this context holds `scope` (the embedded engine always does), else `403`
@@ -617,7 +640,23 @@ pub trait LibraryService: Send + Sync {
         &self,
         ctx: &AuthContext,
         req: DupRequest,
-    ) -> Result<Vec<DupGroup>, LibError>;
+    ) -> Result<Page<DupGroup>, LibError>;
+
+    /// Exact-duplicate membership/count for a bounded set of browse rows. This deliberately omits
+    /// member summaries so ordinary browsing does not hydrate the duplicate-review catalogue.
+    async fn duplicate_membership(
+        &self,
+        ctx: &AuthContext,
+        req: DupMembershipRequest,
+    ) -> Result<Vec<DupMembership>, LibError>;
+
+    /// The exact duplicate group containing one asset, if it has a visible twin. Member summaries
+    /// are capped by [`DUP_GROUP_MEMBER_MAX`] while `total_members` remains the complete count.
+    async fn duplicate_group(
+        &self,
+        ctx: &AuthContext,
+        asset: &AssetId,
+    ) -> Result<Option<DupGroup>, LibError>;
 
     /// Accept or reject one auto-suggested tag (§1.4). Reversible; a reject is remembered so the same
     /// extractor version won't re-suggest it.

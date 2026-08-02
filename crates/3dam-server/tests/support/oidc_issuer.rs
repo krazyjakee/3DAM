@@ -41,6 +41,7 @@
 #![allow(dead_code)] // a shared support module is used piecemeal by each test binary
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::extract::{Form, Query, State};
@@ -50,16 +51,25 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine as _;
 use openidconnect::core::{
-    CoreClientAuthMethod, CoreIdToken, CoreIdTokenClaims, CoreIdTokenFields, CoreJsonWebKeySet,
-    CoreJwsSigningAlgorithm, CoreProviderMetadata, CoreResponseType, CoreRsaPrivateSigningKey,
-    CoreSubjectIdentifierType, CoreTokenResponse, CoreTokenType,
+    CoreClientAuthMethod, CoreGenderClaim, CoreIdToken, CoreIdTokenClaims, CoreIdTokenFields,
+    CoreJsonWebKeySet, CoreJweContentEncryptionAlgorithm, CoreJwsSigningAlgorithm,
+    CoreProviderMetadata, CoreResponseType, CoreRsaPrivateSigningKey, CoreSubjectIdentifierType,
+    CoreTokenResponse, CoreTokenType,
 };
 use openidconnect::{
-    AccessToken, Audience, AuthUrl, EmptyAdditionalClaims, EmptyAdditionalProviderMetadata,
-    EmptyExtraTokenFields, EndUserEmail, EndUserName, EndUserUsername, IssuerUrl, JsonWebKeyId,
-    JsonWebKeySetUrl, LocalizedClaim, Nonce, PkceCodeChallenge, PkceCodeVerifier,
-    PrivateSigningKey, ResponseTypes, Scope, StandardClaims, SubjectIdentifier, TokenUrl,
+    AccessToken, AdditionalClaims, Audience, AuthUrl, EmptyAdditionalClaims,
+    EmptyAdditionalProviderMetadata, EmptyExtraTokenFields, EndUserEmail, EndUserName,
+    EndUserUsername, IdToken, IdTokenClaims, IssuerUrl, JsonWebKeyId, JsonWebKeySetUrl,
+    LocalizedClaim, Nonce, PkceCodeChallenge, PkceCodeVerifier, PrivateSigningKey, ResponseTypes,
+    Scope, StandardClaims, SubjectIdentifier, TokenUrl,
 };
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct NotBeforeClaims {
+    nbf: i64,
+}
+
+impl AdditionalClaims for NotBeforeClaims {}
 
 /// The issuer's ordinary signing key: signs ID tokens *and* is published at `/jwks`.
 pub const SIGNING_KEY_PEM: &str = include_str!("oidc_signing_key.pem");
@@ -73,6 +83,7 @@ pub const FOREIGN_KEY_PEM: &str = include_str!("oidc_foreign_key.pem");
 /// *selects* the forged token's key and then rejects it on the signature, rather than bailing out
 /// early with "no key matches this kid". The stricter of the two failures to test.
 const KEY_ID: &str = "3dam-test-key";
+const ROTATED_KEY_ID: &str = "3dam-test-rotated-key";
 
 /// How long a minted ID token is valid. Long enough that a slow debug-build test cannot expire it.
 const TOKEN_TTL_SECS: i64 = 300;
@@ -155,7 +166,9 @@ struct Inner {
     /// the URL it was fetched from, so these must not drift.
     base: String,
     signing_key: CoreRsaPrivateSigningKey,
-    jwks: CoreJsonWebKeySet,
+    jwks: Mutex<CoreJsonWebKeySet>,
+    jwks_requests: AtomicUsize,
+    fail_jwks: AtomicBool,
     /// Authorization requests seen at `/authorize`, keyed by `state` (unique per login).
     seen: Mutex<HashMap<String, AuthRequest>>,
     /// Codes minted by [`TestIssuer::grant`], removed as they are redeemed (single-use, like a real
@@ -205,7 +218,9 @@ impl TestIssuer {
         let inner = Arc::new(Inner {
             base: base.clone(),
             signing_key,
-            jwks,
+            jwks: Mutex::new(jwks),
+            jwks_requests: AtomicUsize::new(0),
+            fail_jwks: AtomicBool::new(false),
             seen: Mutex::new(HashMap::new()),
             codes: Mutex::new(HashMap::new()),
         });
@@ -283,6 +298,170 @@ impl TestIssuer {
         self.inner.codes.lock().unwrap().insert(code.clone(), grant);
         code
     }
+
+    /// Mint a stateless bearer JWT for the configured audience and issuer.
+    pub fn bearer_token(&self, subject: &str, audience: &str) -> String {
+        self.mint_bearer(
+            subject,
+            audience,
+            &self.inner.base,
+            TOKEN_TTL_SECS,
+            SIGNING_KEY_PEM,
+            KEY_ID,
+        )
+    }
+
+    pub fn bearer_token_with_audience(&self, subject: &str, audience: &str) -> String {
+        self.bearer_token(subject, audience)
+    }
+
+    pub fn bearer_token_with_issuer(&self, subject: &str, audience: &str, issuer: &str) -> String {
+        self.mint_bearer(
+            subject,
+            audience,
+            issuer,
+            TOKEN_TTL_SECS,
+            SIGNING_KEY_PEM,
+            KEY_ID,
+        )
+    }
+
+    pub fn expired_bearer_token(&self, subject: &str, audience: &str) -> String {
+        self.mint_bearer(
+            subject,
+            audience,
+            &self.inner.base,
+            -60,
+            SIGNING_KEY_PEM,
+            KEY_ID,
+        )
+    }
+
+    pub fn future_bearer_token(&self, subject: &str, audience: &str) -> String {
+        let signing_key = CoreRsaPrivateSigningKey::from_pem(
+            SIGNING_KEY_PEM,
+            Some(JsonWebKeyId::new(KEY_ID.to_string())),
+        )
+        .expect("parse bearer signing key");
+        let now = chrono::Utc::now();
+        let claims = IdTokenClaims::<NotBeforeClaims, CoreGenderClaim>::new(
+            IssuerUrl::new(self.inner.base.clone()).expect("issuer url"),
+            vec![Audience::new(audience.to_string())],
+            now + chrono::Duration::seconds(TOKEN_TTL_SECS),
+            now,
+            StandardClaims::new(SubjectIdentifier::new(subject.to_string())),
+            NotBeforeClaims {
+                nbf: now.timestamp() + 60,
+            },
+        );
+        let token: IdToken<
+            NotBeforeClaims,
+            CoreGenderClaim,
+            CoreJweContentEncryptionAlgorithm,
+            CoreJwsSigningAlgorithm,
+        > = IdToken::new(
+            claims,
+            &signing_key,
+            CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha256,
+            None,
+            None,
+        )
+        .expect("sign future bearer token");
+        token.to_string()
+    }
+
+    /// A valid-shaped token signed by an unpublished key with the published key's `kid`.
+    pub fn bad_signature_bearer_token(&self, subject: &str, audience: &str) -> String {
+        self.mint_bearer(
+            subject,
+            audience,
+            &self.inner.base,
+            TOKEN_TTL_SECS,
+            FOREIGN_KEY_PEM,
+            KEY_ID,
+        )
+    }
+
+    /// Publish a second key while retaining the first, modelling a safe overlap rotation.
+    pub fn publish_rotated_key(&self) {
+        let primary = CoreRsaPrivateSigningKey::from_pem(
+            SIGNING_KEY_PEM,
+            Some(JsonWebKeyId::new(KEY_ID.into())),
+        )
+        .expect("parse primary key");
+        let rotated = CoreRsaPrivateSigningKey::from_pem(
+            FOREIGN_KEY_PEM,
+            Some(JsonWebKeyId::new(ROTATED_KEY_ID.into())),
+        )
+        .expect("parse rotated key");
+        *self.inner.jwks.lock().unwrap() = CoreJsonWebKeySet::new(vec![
+            primary.as_verification_key(),
+            rotated.as_verification_key(),
+        ]);
+    }
+
+    pub fn rotated_bearer_token(&self, subject: &str, audience: &str) -> String {
+        self.mint_bearer(
+            subject,
+            audience,
+            &self.inner.base,
+            TOKEN_TTL_SECS,
+            FOREIGN_KEY_PEM,
+            ROTATED_KEY_ID,
+        )
+    }
+
+    /// Mint a token whose key id is absent from the JWKS, for refresh-bound tests.
+    pub fn unknown_key_bearer_token(&self, subject: &str, audience: &str) -> String {
+        self.mint_bearer(
+            subject,
+            audience,
+            &self.inner.base,
+            TOKEN_TTL_SECS,
+            FOREIGN_KEY_PEM,
+            "3dam-never-published-key",
+        )
+    }
+
+    pub fn jwks_requests(&self) -> usize {
+        self.inner.jwks_requests.load(Ordering::Relaxed)
+    }
+
+    pub fn fail_jwks(&self, fail: bool) {
+        self.inner.fail_jwks.store(fail, Ordering::Relaxed);
+    }
+
+    fn mint_bearer(
+        &self,
+        subject: &str,
+        audience: &str,
+        issuer: &str,
+        ttl_secs: i64,
+        pem: &str,
+        kid: &str,
+    ) -> String {
+        let signing_key =
+            CoreRsaPrivateSigningKey::from_pem(pem, Some(JsonWebKeyId::new(kid.to_string())))
+                .expect("parse bearer signing key");
+        let now = chrono::Utc::now();
+        let claims = CoreIdTokenClaims::new(
+            IssuerUrl::new(issuer.to_string()).expect("issuer url"),
+            vec![Audience::new(audience.to_string())],
+            now + chrono::Duration::seconds(ttl_secs),
+            now,
+            StandardClaims::new(SubjectIdentifier::new(subject.to_string())),
+            EmptyAdditionalClaims {},
+        );
+        CoreIdToken::new(
+            claims,
+            &signing_key,
+            CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha256,
+            None,
+            None,
+        )
+        .expect("sign bearer token")
+        .to_string()
+    }
 }
 
 // ── handlers ─────────────────────────────────────────────────────────────────
@@ -313,8 +492,16 @@ async fn discovery(State(st): State<Arc<Inner>>) -> Json<CoreProviderMetadata> {
     Json(md)
 }
 
-async fn jwks_handler(State(st): State<Arc<Inner>>) -> Json<CoreJsonWebKeySet> {
-    Json(st.jwks.clone())
+async fn jwks_handler(State(st): State<Arc<Inner>>) -> Response {
+    st.jwks_requests.fetch_add(1, Ordering::Relaxed);
+    if st.fail_jwks.load(Ordering::Relaxed) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "JWKS temporarily unavailable",
+        )
+            .into_response();
+    }
+    Json(st.jwks.lock().unwrap().clone()).into_response()
 }
 
 /// `GET /authorize` — record the request and hand back its `state`.

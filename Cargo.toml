@@ -68,6 +68,7 @@ rusqlite = { version = "0.39", features = ["backup", "bundled"] }
 # argon2id password hashing for user accounts (phase 6, issue #42; ADR 0009 §4). API-token secrets
 # stay on blake3 (high-entropy keys need no KDF); argon2 is for low-entropy user passwords only.
 argon2 = "0.5"
+base64 = "0.22"
 
 # http / server / client
 axum = { version = "0.8", features = ["ws"] }

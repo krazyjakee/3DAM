@@ -92,7 +92,9 @@ async fn gate(
 /// The HTTP client refuses redirects deliberately: `openidconnect` documents this as an SSRF guard,
 /// since without it a hostile or compromised issuer could bounce these server-side requests at
 /// anything reachable from the server, including its own loopback services.
-async fn discover(cfg: &StoredOidc) -> Result<(CoreProviderMetadata, reqwest::Client), LibError> {
+pub(crate) async fn discover(
+    cfg: &StoredOidc,
+) -> Result<(CoreProviderMetadata, reqwest::Client), LibError> {
     let http = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         // Timeouts, because `/start` is unauthenticated and every call here is an outbound request
@@ -129,7 +131,7 @@ macro_rules! build_client {
     };
 }
 
-fn provider(st: &AppState) -> Result<StoredOidc, LibError> {
+pub(crate) fn provider(st: &AppState) -> Result<StoredOidc, LibError> {
     st.store.oidc_provider()?.ok_or_else(|| {
         LibError::BadRequest(
             "no OIDC provider is configured — set one with PUT /admin/api/oidc".into(),

@@ -20,7 +20,7 @@ use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 use axum::http::HeaderMap;
 use dam_api::admin::AuthMode;
-use dam_api::service::{AuthContext, Scope, Scopes, Visibility};
+use dam_api::service::{AuthContext, AuthSource, Scope, Scopes, Visibility};
 use dam_api::LibError;
 
 /// The session cookie name. `HttpOnly`; value `<session_id>.<secret>`.
@@ -71,11 +71,36 @@ fn bearer(parts: &Parts) -> Option<String> {
 /// Resolve auth for a live-event WebSocket ticket mint, which needs `Read`. The mint is an ordinary
 /// fetch and therefore uses the Authorization header or same-origin session cookie. The long-lived
 /// credential is never accepted from a URI (issue #128).
-pub fn resolve_ws(store: &ServerStore, headers: &HeaderMap) -> Result<Resolved, LibError> {
+pub async fn resolve_ws(st: &AppState, headers: &HeaderMap) -> Result<Resolved, LibError> {
     let token = bearer_header(headers);
-    let resolved = resolve(store, token, cookie_value(headers, SESSION_COOKIE))?;
+    let resolved = resolve_request(st, token, cookie_value(headers, SESSION_COOKIE)).await?;
     resolved.ctx.require(Scope::Read)?;
     Ok(resolved)
+}
+
+/// Resolve the credentials carried by an HTTP request.
+///
+/// Native `dam_…` API keys have explicit precedence and are never interpreted as JWTs, including
+/// when invalid. Only a three-segment non-native bearer reaches the OIDC verifier; opaque legacy
+/// API keys still use the native store lookup. This keeps the existing token contract deterministic
+/// and prevents a bad native key from causing outbound issuer traffic.
+pub async fn resolve_request(
+    st: &AppState,
+    token: Option<String>,
+    session_cookie: Option<String>,
+) -> Result<Resolved, LibError> {
+    if matches!(st.store.effective_auth_mode(), AuthMode::Off) {
+        return resolve(&st.store, None, None);
+    }
+    let Some(secret) = token else {
+        return resolve(&st.store, None, session_cookie);
+    };
+    if secret.starts_with("dam_") || secret.split('.').count() != 3 {
+        return resolve(&st.store, Some(secret), None);
+    }
+
+    let ctx = crate::oidc_bearer::verify(st, &secret).await?;
+    Ok(Resolved { ctx, session: None })
 }
 
 /// Resolve a request to its [`AuthContext`] under the current auth mode (tech-spec 10 §1.2).
@@ -110,7 +135,8 @@ pub fn resolve(
         };
         let vis = store.resolve_visibility(&ident)?;
         let ctx = AuthContext::connected(Some(ident.username.clone()), ident.role.scopes(), vis)
-            .with_account(ident.clone());
+            .with_account(ident.clone())
+            .with_auth_source(AuthSource::Session);
         Ok(Some(Resolved {
             ctx,
             session: Some(SessionAuth {
@@ -124,7 +150,8 @@ pub fn resolve(
         // Off: no credential inspected; the unauthenticated caller is the local owner (full trust),
         // so a localhost operator is never locked out of their own admin surface.
         AuthMode::Off => Ok(Resolved {
-            ctx: AuthContext::connected(None, Scopes::owner(), Visibility::Full),
+            ctx: AuthContext::connected(None, Scopes::owner(), Visibility::Full)
+                .with_auth_source(AuthSource::LocalOwner),
             session: None,
         }),
         // Anonymous: a valid credential elevates; otherwise the fixed anonymous scope set.
@@ -138,7 +165,8 @@ pub fn resolve(
                 }
             }
             Ok(Resolved {
-                ctx: AuthContext::connected(None, Scopes::anonymous(), Visibility::Full),
+                ctx: AuthContext::connected(None, Scopes::anonymous(), Visibility::Full)
+                    .with_auth_source(AuthSource::Anonymous),
                 session: None,
             })
         }
@@ -178,16 +206,17 @@ pub struct Reader(pub AuthContext);
 impl FromRequestParts<AppState> for Reader {
     type Rejection = ApiError;
     async fn from_request_parts(parts: &mut Parts, st: &AppState) -> Result<Self, ApiError> {
-        if let Some(ticket) = crate::resolve_media_ticket(st, parts) {
+        if let Some(ticket) = crate::resolve_media_ticket(st, parts).await {
             return Ok(Reader(ticket?));
         }
         // Browser media is fetched with this same header and converted to a local blob URL; raw
         // bearer query credentials are deliberately not supported (issue #128).
-        let resolved = resolve(
-            &st.store,
+        let resolved = resolve_request(
+            st,
             bearer(parts),
             cookie_value(&parts.headers, SESSION_COOKIE),
-        )?;
+        )
+        .await?;
         resolved.ctx.require(Scope::Read)?;
         Ok(Reader(resolved.ctx))
     }
@@ -203,11 +232,12 @@ pub struct Writer(pub AuthContext);
 impl FromRequestParts<AppState> for Writer {
     type Rejection = ApiError;
     async fn from_request_parts(parts: &mut Parts, st: &AppState) -> Result<Self, ApiError> {
-        let resolved = resolve(
-            &st.store,
+        let resolved = resolve_request(
+            st,
             bearer(parts),
             cookie_value(&parts.headers, SESSION_COOKIE),
-        )?;
+        )
+        .await?;
         resolved.ctx.require(Scope::Write)?;
         enforce_csrf(parts, &resolved)?;
         // identity is Some exactly for store-verified credentials (see `resolve`).
@@ -232,11 +262,12 @@ pub struct Commenter(pub AuthContext);
 impl FromRequestParts<AppState> for Commenter {
     type Rejection = ApiError;
     async fn from_request_parts(parts: &mut Parts, st: &AppState) -> Result<Self, ApiError> {
-        let resolved = resolve(
-            &st.store,
+        let resolved = resolve_request(
+            st,
             bearer(parts),
             cookie_value(&parts.headers, SESSION_COOKIE),
-        )?;
+        )
+        .await?;
         resolved.ctx.require(Scope::Read)?;
         if parts.method != axum::http::Method::GET {
             enforce_csrf(parts, &resolved)?;
@@ -253,11 +284,12 @@ pub struct AdminAuth(pub AuthContext);
 impl FromRequestParts<AppState> for AdminAuth {
     type Rejection = ApiError;
     async fn from_request_parts(parts: &mut Parts, st: &AppState) -> Result<Self, ApiError> {
-        let resolved = resolve(
-            &st.store,
+        let resolved = resolve_request(
+            st,
             bearer(parts),
             cookie_value(&parts.headers, SESSION_COOKIE),
-        )?;
+        )
+        .await?;
         resolved.ctx.require(Scope::Admin)?;
         if parts.method != axum::http::Method::GET {
             enforce_csrf(parts, &resolved)?;

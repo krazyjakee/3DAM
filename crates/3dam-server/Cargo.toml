@@ -36,6 +36,9 @@ argon2.workspace = true
 toml.workspace = true
 # OIDC/OAuth2 login (issue #41): discovery, PKCE, and ID-token validation against the issuer's JWKS.
 openidconnect.workspace = true
+# Decode the two bounded JWT header/payload segments before cryptographic verification so an
+# unknown issuer/algorithm can be rejected without an outbound JWKS request.
+base64.workspace = true
 # Outbound HTTP for the OIDC discovery/token/JWKS calls (the same client dam-client already uses).
 reqwest.workspace = true
 # Validating the issuer/redirect URLs an operator configures, before a user meets the failure.
@@ -57,7 +60,6 @@ futures.workspace = true
 # read back the HTTP Basic client credential the token exchange authenticates with. Both versions
 # are already in the tree via openidconnect itself, so this adds no packages.
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-base64 = "0.22"
 # Decode negotiated responses in the compression integration tests and power the dependency-free
 # transfer-size/CPU benchmark under `benches/compression.rs`.
 brotli = "8"
