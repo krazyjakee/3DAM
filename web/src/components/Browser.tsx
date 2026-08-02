@@ -375,7 +375,7 @@ export function Browser({
   return (
     // The centre browse region is the page's main landmark (a11y hardening, issue #44).
     <main
-      className="flex h-full min-w-0 flex-1 flex-col bg-bg"
+      className="browser-shell flex h-full min-w-0 flex-1 flex-col bg-bg"
       aria-label="Asset browser"
       data-shortcut-region="browser"
       tabIndex={-1}
@@ -555,76 +555,83 @@ function SelectionBar({
   const peerOnly = locals.length === 0;
 
   return (
-    <div className="flex items-center gap-2 border-b border-border bg-surface px-3 py-1.5 text-xs">
-      <span className="font-medium text-fg tabular-nums">{assets.length} selected</span>
-      {peerCount > 0 && (
-        <span className="text-fg-dim" title={PEER_READONLY_SET}>
-          {peerCount} federated (read-only)
-        </span>
-      )}
-      <button
-        className="btn disabled:cursor-not-allowed disabled:opacity-40"
-        onClick={() => analyze.mutate({ assets: localIds })}
-        {...gate({
-          disabled: analyze.isPending || peerOnly,
-          title: peerOnly ? PEER_READONLY_SET : undefined,
-        })}
-      >
-        <Sparkles size={12} /> Analyze
-      </button>
-      <button
-        className="btn disabled:cursor-not-allowed disabled:opacity-40"
-        onClick={() => setShowConvert(true)}
-        {...gate({ disabled: peerOnly, title: peerOnly ? PEER_READONLY_SET : undefined })}
-      >
-        <FileCog size={12} /> Convert
-      </button>
-      <button
-        className="btn disabled:cursor-not-allowed disabled:opacity-40"
-        onClick={() => setShowExport(true)}
-        {...gate({ disabled: peerOnly, title: peerOnly ? PEER_READONLY_SET : undefined })}
-      >
-        <FileDown size={12} /> Export
-      </button>
-      {showConvert && (
-        <ConvertDialog assets={locals} onClose={() => setShowConvert(false)} />
-      )}
-      {showExport && (
-        <ExportDialog scope={{ assets: localIds }} onClose={() => setShowExport(false)} />
-      )}
-      <select
-        className="field w-auto disabled:cursor-not-allowed disabled:opacity-40"
-        aria-label="Add selection to collection"
-        value=""
-        disabled={manual.length === 0 || members.isPending || !canWrite || peerOnly}
-        onChange={(e) => {
-          if (e.target.value) members.mutate({ id: e.target.value, members: { add: localIds } });
-          e.currentTarget.value = "";
-        }}
-        title={
-          peerOnly
-            ? PEER_READONLY_SET
-            : !canWrite
-              ? AUTH_COPY.needsWrite
-              : manual.length === 0
-                ? "No manual collections yet"
-                : "Add selection to a collection"
-        }
-      >
-        <option value="" disabled>
-          Add to collection…
-        </option>
-        {manual.map((c) => (
-          <option key={c.id} value={c.id}>
-            {c.name}
+    <div className="browser-selection-bar border-b border-border bg-surface px-3 py-1.5 text-xs">
+      <div className="browser-selection-summary flex min-w-0 items-center gap-2">
+        <span className="shrink-0 font-medium text-fg tabular-nums">{assets.length} selected</span>
+        {peerCount > 0 && (
+          <span className="truncate text-fg-dim" title={PEER_READONLY_SET}>
+            {peerCount} federated (read-only)
+          </span>
+        )}
+      </div>
+      <div className="browser-selection-actions flex min-w-0 flex-wrap items-center gap-2">
+        <button
+          className="btn disabled:cursor-not-allowed disabled:opacity-40"
+          onClick={() => analyze.mutate({ assets: localIds })}
+          {...gate({
+            disabled: analyze.isPending || peerOnly,
+            title: peerOnly ? PEER_READONLY_SET : undefined,
+          })}
+        >
+          <Sparkles size={12} /> Analyze
+        </button>
+        <button
+          className="btn disabled:cursor-not-allowed disabled:opacity-40"
+          onClick={() => setShowConvert(true)}
+          {...gate({ disabled: peerOnly, title: peerOnly ? PEER_READONLY_SET : undefined })}
+        >
+          <FileCog size={12} /> Convert
+        </button>
+        <button
+          className="btn disabled:cursor-not-allowed disabled:opacity-40"
+          onClick={() => setShowExport(true)}
+          {...gate({ disabled: peerOnly, title: peerOnly ? PEER_READONLY_SET : undefined })}
+        >
+          <FileDown size={12} /> Export
+        </button>
+        {showConvert && (
+          <ConvertDialog assets={locals} onClose={() => setShowConvert(false)} />
+        )}
+        {showExport && (
+          <ExportDialog scope={{ assets: localIds }} onClose={() => setShowExport(false)} />
+        )}
+        <select
+          className="field max-w-full w-auto disabled:cursor-not-allowed disabled:opacity-40"
+          aria-label="Add selection to collection"
+          value=""
+          disabled={manual.length === 0 || members.isPending || !canWrite || peerOnly}
+          onChange={(e) => {
+            if (e.target.value) members.mutate({ id: e.target.value, members: { add: localIds } });
+            e.currentTarget.value = "";
+          }}
+          title={
+            peerOnly
+              ? PEER_READONLY_SET
+              : !canWrite
+                ? AUTH_COPY.needsWrite
+                : manual.length === 0
+                  ? "No manual collections yet"
+                  : "Add selection to a collection"
+          }
+        >
+          <option value="" disabled>
+            Add to collection…
           </option>
-        ))}
-      </select>
-      <button className="text-fg-dim hover:text-fg" onClick={onSelectAll}>
-        Select all
-      </button>
+          {manual.map((c) => (
+            <option key={c.id} value={c.id}>
+              {c.name}
+            </option>
+          ))}
+        </select>
+        <button
+          className="text-fg-dim hover:text-fg coarse:min-h-11"
+          onClick={onSelectAll}
+        >
+          Select all
+        </button>
+      </div>
       <button
-        className="ml-auto flex items-center gap-1 text-fg-dim hover:text-fg coarse:min-h-11"
+        className="browser-selection-clear flex shrink-0 items-center gap-1 text-fg-dim hover:text-fg coarse:min-h-11"
         onClick={onClear}
       >
         <X size={13} /> Clear
@@ -650,7 +657,9 @@ function Toolbar({
   const { gate } = useWriteGate();
   const [showExport, setShowExport] = useState(false);
   return (
-    <div className="flex items-center gap-2 border-b border-border px-3 py-2">
+    <>
+    <div className="browser-toolbar border-b border-border px-3 py-2">
+      <div className="browser-toolbar-primary flex min-w-0 items-center gap-2">
       {/* Menu — opens the Navigation drawer once the layout collapses (responsive + touch pass). */}
       <button
         className="btn -ml-1 shrink-0 px-1.5 py-1 lg:hidden coarse:min-h-11 coarse:min-w-11 coarse:justify-center"
@@ -661,7 +670,7 @@ function Toolbar({
       >
         <Menu size={16} />
       </button>
-      <div className="relative min-w-0 flex-1" role="search" aria-label="Search assets">
+      <div className="browser-toolbar-search relative min-w-0 flex-1" role="search" aria-label="Search assets">
         <label htmlFor="asset-search" className="sr-only">
           Search assets
         </label>
@@ -698,13 +707,16 @@ function Toolbar({
           )
         )}
       </div>
+      </div>
+
+      <div className="browser-toolbar-secondary flex min-w-0 flex-wrap items-center gap-2">
 
       {/* Search-mode selector (semantic-search M5): only meaningful with a text query, so it appears
           alongside the box when one is active. Hybrid/Semantic widen results with embedding
           neighbours of the matches. */}
       {state.q && (
         <select
-          className="field w-auto"
+          className="field max-w-full w-auto"
           value={state.mode}
           title="How the search text is matched"
           aria-label="Search mode"
@@ -721,7 +733,7 @@ function Toolbar({
       <AdvancedSearch />
 
       <select
-        className="field w-auto"
+        className="field max-w-full w-auto"
         aria-label="Sort order"
         title="Sort order"
         value={`${state.sort}:${state.dir}`}
@@ -745,7 +757,7 @@ function Toolbar({
         <option value="scanned:asc">Oldest</option>
       </select>
 
-      <span className="hidden text-[11px] whitespace-nowrap text-fg-dim tabular-nums sm:inline">
+      <span className="browser-toolbar-count hidden text-[11px] whitespace-nowrap text-fg-dim tabular-nums sm:inline">
         {count.toLocaleString()}
         {total != null && total > count ? ` / ${total.toLocaleString()}` : ""}
       </span>
@@ -786,6 +798,8 @@ function Toolbar({
       >
         <Keyboard size={14} />
       </button>
+      </div>
+    </div>
 
       {showExport && (
         <ExportDialog
@@ -793,7 +807,7 @@ function Toolbar({
           onClose={() => setShowExport(false)}
         />
       )}
-    </div>
+    </>
   );
 }
 
@@ -1078,17 +1092,17 @@ function GridSkeleton() {
 function TableSkeleton() {
   return (
     <div className="h-full overflow-hidden">
-      <div className="grid grid-cols-[1fr_64px_104px_112px_84px] gap-2 border-b border-border bg-surface px-3 py-1.5 text-[10px] font-semibold tracking-wider text-fg-dim uppercase">
+      <div className="asset-table-columns grid gap-2 border-b border-border bg-surface px-3 py-1.5 text-[10px] font-semibold tracking-wider text-fg-dim uppercase">
         <span>Name</span>
         <span>Format</span>
-        <span>License</span>
-        <span>Detail</span>
+        <span className="asset-table-license">License</span>
+        <span className="asset-table-detail">Detail</span>
         <span className="text-right">Size</span>
       </div>
       {Array.from({ length: 16 }).map((_, i) => (
         <div
           key={i}
-          className="grid grid-cols-[1fr_64px_104px_112px_84px] items-center gap-2 px-3"
+          className="asset-table-columns grid items-center gap-2 px-3"
           style={{ height: ROW_H }}
         >
           <div className="flex items-center gap-2">
@@ -1096,8 +1110,8 @@ function TableSkeleton() {
             <div className="h-2.5 w-40 animate-pulse rounded bg-surface-2" />
           </div>
           <div className="h-2.5 w-8 animate-pulse rounded bg-surface-2" />
-          <div className="h-2.5 w-14 animate-pulse rounded bg-surface-2" />
-          <div className="h-2.5 w-16 animate-pulse rounded bg-surface-2" />
+          <div className="asset-table-license h-2.5 w-14 animate-pulse rounded bg-surface-2" />
+          <div className="asset-table-detail h-2.5 w-16 animate-pulse rounded bg-surface-2" />
           <div className="ml-auto h-2.5 w-10 animate-pulse rounded bg-surface-2" />
         </div>
       ))}
@@ -1268,7 +1282,7 @@ function Table({
   return (
     <div
       ref={parentRef}
-      className="h-full overflow-y-auto"
+      className="h-full overflow-x-hidden overflow-y-auto"
       role="group"
       aria-label="Assets"
       onKeyDown={onKeyDown}
@@ -1278,12 +1292,12 @@ function Table({
           triggers aria-required-parent/children (a11y, issue #44). */}
       <div
         aria-hidden="true"
-        className="sticky top-0 z-10 grid grid-cols-[1fr_64px_104px_112px_84px] gap-2 border-b border-border bg-surface px-3 py-1.5 text-[10px] font-semibold tracking-wider text-fg-dim uppercase"
+        className="asset-table-columns sticky top-0 z-10 grid gap-2 border-b border-border bg-surface px-3 py-1.5 text-[10px] font-semibold tracking-wider text-fg-dim uppercase"
       >
         <span>Name</span>
         <span>Format</span>
-        <span>License</span>
-        <span>Detail</span>
+        <span className="asset-table-license">License</span>
+        <span className="asset-table-detail">Detail</span>
         <span className="text-right">Size</span>
       </div>
       <div style={{ height: virt.getTotalSize(), position: "relative" }}>
@@ -1363,7 +1377,7 @@ function TableRow({
         onContext(asset, e.clientX, e.clientY);
       }}
       {...longPress}
-      className="group absolute top-0 left-0 grid w-full grid-cols-[1fr_64px_104px_112px_84px] items-center gap-2 px-3 text-left text-xs"
+      className="asset-table-columns group absolute top-0 left-0 grid w-full items-center gap-2 px-3 text-left text-xs"
       style={{
         height: ROW_H,
         transform: `translateY(${top}px)`,
@@ -1383,8 +1397,10 @@ function TableRow({
         <FavoriteStar asset={asset} />
       </span>
       <span className="truncate uppercase">{asset.format}</span>
-      <LicenseBadge badge={asset.license} />
-      <span className="truncate tabular-nums text-fg-dim" title={detailAttr(asset) ?? undefined}>
+      <span className="asset-table-license min-w-0">
+        <LicenseBadge badge={asset.license} />
+      </span>
+      <span className="asset-table-detail truncate tabular-nums text-fg-dim" title={detailAttr(asset) ?? undefined}>
         {detailAttr(asset) ?? "—"}
       </span>
       <span className="text-right tabular-nums">{bytes(asset.size)}</span>

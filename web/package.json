@@ -13,6 +13,7 @@
     "bundle:check": "node scripts/check-bundle-budgets.mjs",
     "preview": "vite preview",
     "test": "node --experimental-strip-types --test tests/*.test.ts",
+    "visual:responsive": "node scripts/capture-responsive-workspace.mjs",
     "typecheck": "tsc -b",
     "lint": "eslint . --max-warnings 0 && pnpm typecheck",
     "wasm": "cargo xtask wasm"

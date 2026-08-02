@@ -151,6 +151,88 @@
   }
 }
 
+/* The Browser is often narrower than the viewport because both desktop rails are resizable. Base
+   chrome decisions on the centre pane itself, not global breakpoints, so a 500px pane at 1440px
+   receives the same intentional treatment as a small tablet. */
+.browser-shell {
+  container-name: browser;
+  container-type: inline-size;
+}
+
+.browser-toolbar {
+  display: grid;
+  grid-template-columns: minmax(12rem, 1fr) auto;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.browser-toolbar-secondary {
+  justify-content: flex-end;
+}
+
+.browser-selection-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.browser-selection-clear {
+  margin-left: auto;
+}
+
+.asset-table-columns {
+  grid-template-columns: minmax(8rem, 1fr) 4rem 6.5rem 7rem 5.25rem;
+}
+
+@container browser (max-width: 48rem) {
+  .browser-toolbar {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .browser-toolbar-secondary {
+    justify-content: flex-start;
+  }
+
+  .browser-toolbar-count {
+    display: none !important;
+  }
+}
+
+@container browser (max-width: 40rem) {
+  .browser-selection-bar {
+    flex-wrap: wrap;
+  }
+
+  .browser-selection-summary {
+    flex: 1 1 auto;
+  }
+
+  .browser-selection-actions {
+    order: 3;
+    flex-basis: 100%;
+  }
+}
+
+@container browser (max-width: 42rem) {
+  .asset-table-columns {
+    grid-template-columns: minmax(7rem, 1fr) 4rem 6.5rem 5.25rem;
+  }
+
+  .asset-table-detail {
+    display: none;
+  }
+}
+
+@container browser (max-width: 28rem) {
+  .asset-table-columns {
+    grid-template-columns: minmax(0, 1fr) 3.5rem 4.5rem;
+  }
+
+  .asset-table-license {
+    display: none;
+  }
+}
+
 /* Reduced-motion (a11y hardening, issue #44): honour the OS "reduce motion" setting by collapsing
    every animation/transition to near-instant — the drawer still opens and spinners still convey
    "busy", just without the slide/pulse/spin that can trigger vestibular discomfort. Global by design

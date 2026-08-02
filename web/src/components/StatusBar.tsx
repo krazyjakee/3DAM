@@ -50,34 +50,37 @@ export function StatusBar() {
   };
 
   return (
-    <footer className="flex h-7 shrink-0 items-center gap-3 border-t border-border bg-surface px-3 text-[11px] text-fg-dim coarse:h-auto coarse:min-h-11">
-      {active.length === 0 ? (
-        <span className="flex-1">Idle</span>
-      ) : active.length === 1 ? (
-        <div className="flex min-w-0 flex-1 items-center">
+    <footer className="flex min-h-7 min-w-0 shrink-0 flex-wrap items-center gap-x-2 gap-y-1 border-t border-border bg-surface px-3 py-1 text-[11px] text-fg-dim lg:flex-nowrap lg:py-0 coarse:min-h-11 coarse:py-1">
+      <div className="flex min-w-0 basis-full items-center lg:basis-auto lg:flex-1">
+        {active.length === 0 ? (
+          <span className="flex-1">Idle</span>
+        ) : active.length === 1 ? (
           <JobPill
             job={active[0]}
             cancelling={cancelling.has(active[0].id)}
             onCancel={() => cancelJob(active[0].id)}
           />
-        </div>
-      ) : (
-        <AggregateJobs jobs={active} cancelling={cancelling} onCancel={cancelJob} />
-      )}
-      <button
-        type="button"
-        className="flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 hover:text-fg coarse:min-h-11"
-        onClick={() => navigate("/jobs")}
-        title="Open background job history"
-      >
-        <History size={11} aria-hidden="true" />
-        <span className="hidden sm:inline">History</span>
-      </button>
-      <MediaBreakdown />
-      <ConnectionPill state={conn.state} />
-      <IdentityChip auth={version.data?.auth} accounts={version.data?.accounts === true} />
-      <ServerChip />
-      <span className="tabular-nums">{version.data?.server ?? ""}</span>
+        ) : (
+          <AggregateJobs jobs={active} cancelling={cancelling} onCancel={cancelJob} />
+        )}
+      </div>
+      <div className="flex min-w-0 flex-1 flex-wrap items-center justify-end gap-x-1 gap-y-0.5 lg:flex-initial lg:flex-nowrap lg:gap-x-2">
+        <button
+          type="button"
+          className="flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 hover:text-fg coarse:min-h-11 coarse:min-w-11 coarse:justify-center"
+          onClick={() => navigate("/jobs")}
+          title="Open background job history"
+          aria-label="Open background job history"
+        >
+          <History size={11} aria-hidden="true" />
+          <span className="hidden sm:inline">History</span>
+        </button>
+        <MediaBreakdown />
+        <ConnectionPill state={conn.state} />
+        <IdentityChip auth={version.data?.auth} accounts={version.data?.accounts === true} />
+        <ServerChip />
+        <span className="hidden tabular-nums lg:inline">{version.data?.server ?? ""}</span>
+      </div>
     </footer>
   );
 }
@@ -118,12 +121,14 @@ function IdentityChip({ auth, accounts }: { auth?: string; accounts: boolean }) 
     return (
       <>
         <button
-          className="flex items-center gap-1 rounded px-1.5 py-0.5 text-warn hover:text-fg"
+          className="flex items-center gap-1 rounded px-1.5 py-0.5 text-warn hover:text-fg coarse:min-h-11"
           onClick={() => setOpen(true)}
           title="Browsing read-only — sign in to make changes"
         >
           <LogIn size={11} />
-          <span>Signed out · Sign in</span>
+          <span>
+            <span className="hidden sm:inline">Signed out · </span>Sign in
+          </span>
         </button>
         {open && <SignInModal accounts={accounts} onClose={() => setOpen(false)} />}
       </>
@@ -146,9 +151,9 @@ function IdentityChip({ auth, accounts }: { auth?: string; accounts: boolean }) 
   };
 
   return (
-    <span className="flex items-center gap-1">
+    <span className="flex min-w-0 items-center gap-1">
       <span
-        className="flex items-center gap-1 text-fg-dim"
+        className="flex min-w-0 items-center gap-1 text-fg-dim"
         title={
           canWrite
             ? "Signed in with write access"
@@ -156,8 +161,8 @@ function IdentityChip({ auth, accounts }: { auth?: string; accounts: boolean }) 
         }
       >
         <ShieldCheck size={11} className={canWrite ? "text-accent" : "text-warn"} />
-        <span className="max-w-[140px] truncate">{identity ?? "Signed in"}</span>
-        {!canWrite && <span className="text-warn">· read-only</span>}
+        <span className="max-w-[72px] truncate sm:max-w-[140px]">{identity ?? "Signed in"}</span>
+        {!canWrite && <span className="hidden text-warn sm:inline">· read-only</span>}
       </span>
       {restricted && (
         <span
@@ -170,7 +175,7 @@ function IdentityChip({ auth, accounts }: { auth?: string; accounts: boolean }) 
       )}
       {nativeCredential ? (
         <span
-          className="text-fg-dim"
+          className="hidden text-fg-dim sm:inline"
           title={
             getServer().nativeCredentialForgettable
               ? "Use File → Forget Server Credential, then relaunch"
@@ -181,8 +186,9 @@ function IdentityChip({ auth, accounts }: { auth?: string; accounts: boolean }) 
         </span>
       ) : (
         <button
-          className="flex items-center gap-1 rounded px-1.5 py-0.5 hover:text-fg"
+          className="flex items-center justify-center gap-1 rounded px-1.5 py-0.5 hover:text-fg coarse:min-h-11 coarse:min-w-11"
           onClick={() => void signOut()}
+          aria-label="Sign out"
           title={
             account
               ? "Sign out — end this session (stays connected to this server)"
@@ -190,7 +196,7 @@ function IdentityChip({ auth, accounts }: { auth?: string; accounts: boolean }) 
           }
         >
           <LogOut size={11} />
-          <span>Sign out</span>
+          <span className="hidden sm:inline">Sign out</span>
         </button>
       )}
     </span>
@@ -233,14 +239,14 @@ function ServerChip() {
   return (
     <>
       <button
-        className={`flex items-center gap-1 rounded px-1.5 py-0.5 hover:text-fg ${
+        className={`flex min-w-0 items-center gap-1 rounded px-1.5 py-0.5 hover:text-fg coarse:min-h-11 ${
           isRemote() ? "text-accent" : "text-fg-dim"
         }`}
         onClick={() => setOpen(true)}
         title="Connect to a 3DAM server"
       >
         <Server size={11} />
-        <span className="max-w-[160px] truncate">{serverLabel()}</span>
+        <span className="max-w-[72px] truncate sm:max-w-[160px]">{serverLabel()}</span>
       </button>
       {open && <ConnectDialog onClose={() => setOpen(false)} />}
     </>
@@ -349,9 +355,17 @@ const CONN_META: Record<ConnState, { color: string; label: string | null; pulse:
 
 function ConnectionPill({ state }: { state: ConnState }) {
   const { color, label, pulse } = CONN_META[state];
+  const accessibleLabel =
+    state === "online"
+      ? "Live updates connected"
+      : state === "reconnecting"
+        ? "Live updates paused, reconnecting"
+        : "Server offline";
   return (
     <span
-      className="flex items-center gap-1.5"
+      className="flex shrink-0 items-center gap-1.5"
+      role="status"
+      aria-label={accessibleLabel}
       title={
         state === "online"
           ? "Live updates connected"
@@ -384,12 +398,12 @@ function JobPill({
   const eta = useEta(job.id, done, total ?? null);
   const label = `${job.kind} job${current ? `: ${current}` : ""}`;
   return (
-    <div className="flex min-w-0 items-center gap-2">
-      <Loader2 size={12} className="animate-spin text-accent" aria-hidden="true" />
-      <span className="capitalize">{job.kind}</span>
+    <div className="flex min-w-0 flex-1 items-center gap-2">
+      <Loader2 size={12} className="shrink-0 animate-spin text-accent" aria-hidden="true" />
+      <span className="max-w-16 truncate capitalize sm:max-w-none">{job.kind}</span>
       <ProgressBar pct={pct} label={label} done={done} total={total} current={current} />
       <span className="tabular-nums">{pct != null ? `${pct}%` : done.toLocaleString()}</span>
-      {eta && <span className="tabular-nums text-fg-dim">~{eta} left</span>}
+      {eta && <span className="hidden tabular-nums text-fg-dim sm:inline">~{eta} left</span>}
       {current && (
         <span className="hidden max-w-[220px] truncate text-fg-dim md:inline" title={current}>
           {current}
@@ -444,7 +458,7 @@ function AggregateJobs({
         title="Show individual jobs"
         aria-expanded={open}
       >
-        {label}
+        <span className="max-w-16 truncate sm:max-w-none">{label}</span>
         <ChevronUp
           size={11}
           className="transition-transform"
@@ -460,10 +474,10 @@ function AggregateJobs({
       <span className="tabular-nums">
         {pct != null ? `${pct}%` : `${done.toLocaleString()} done`}
       </span>
-      {eta && <span className="tabular-nums text-fg-dim">~{eta} left</span>}
+      {eta && <span className="hidden tabular-nums text-fg-dim sm:inline">~{eta} left</span>}
 
       {open && (
-        <div className="absolute bottom-full left-0 mb-1.5 flex max-h-64 w-[380px] max-w-[80vw] flex-col gap-1 overflow-y-auto rounded-md border border-border bg-surface p-1.5 shadow-xl">
+        <div className="absolute bottom-full left-0 mb-1.5 flex max-h-64 w-[calc(100vw-1rem)] max-w-[380px] flex-col gap-1 overflow-y-auto rounded-md border border-border bg-surface p-1.5 shadow-xl">
           {jobs.map((j) => {
             const p = j.progress.total
               ? Math.min(100, Math.round((j.progress.done / j.progress.total) * 100))
@@ -532,7 +546,7 @@ function ProgressBar({
       : `${done.toLocaleString()} complete${current ? `, ${current}` : ""}`;
   return (
     <div
-      className="h-1 w-24 shrink-0 overflow-hidden rounded bg-surface-2"
+      className="h-1 w-14 shrink-0 overflow-hidden rounded bg-surface-2 sm:w-24"
       role="progressbar"
       aria-label={label}
       aria-valuemin={0}

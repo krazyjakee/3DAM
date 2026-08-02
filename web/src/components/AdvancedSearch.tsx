@@ -450,7 +450,7 @@ export function AdvancedSearch() {
             event.stopPropagation();
             close(true);
           }}
-          className="absolute right-0 z-50 mt-1 max-h-[70vh] w-80 overflow-y-auto rounded-md border border-border bg-surface p-3 shadow-xl"
+          className="absolute right-0 z-50 mt-1 max-h-[70vh] w-80 max-w-[calc(100vw-1rem)] overflow-y-auto rounded-md border border-border bg-surface p-3 shadow-xl"
         >
           <div className="mb-2 flex items-center justify-between">
             <h2 id="advanced-search-title" className="text-xs font-semibold text-fg">
