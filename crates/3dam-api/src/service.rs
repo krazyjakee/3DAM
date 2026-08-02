@@ -345,11 +345,32 @@ pub trait LibraryService: Send + Sync {
 
     async fn get_asset(&self, ctx: &AuthContext, id: &AssetId) -> Result<Asset, LibError>;
 
+    /// Read an asset using its locally-issued source attribution as an ownership hint. The hint is
+    /// opaque outside the serving library: implementations must resolve it against their own
+    /// source registry and must never interpret it as a caller-controlled endpoint.
+    async fn get_asset_from(
+        &self,
+        ctx: &AuthContext,
+        id: &AssetId,
+        _source: Option<SourceId>,
+    ) -> Result<Asset, LibError> {
+        self.get_asset(ctx, id).await
+    }
+
     /// Read an asset's raw bytes for a preview (the out-of-band data-handoff the WASM viewer islands
     /// consume — tech-spec 09 §B.3). Bounded to preview-sized reads; large assets return an error
     /// rather than streaming the whole file. Read-only, non-destructive (PRODUCT_SPEC §8).
     async fn read_content(&self, ctx: &AuthContext, id: &AssetId)
         -> Result<AssetContent, LibError>;
+
+    async fn read_content_from(
+        &self,
+        ctx: &AuthContext,
+        id: &AssetId,
+        _source: Option<SourceId>,
+    ) -> Result<AssetContent, LibError> {
+        self.read_content(ctx, id).await
+    }
 
     /// Describe the original representation without opening its byte stream. Servers use this to
     /// answer `HEAD`, resolve `Range`, and reject `416` before a local or remote transfer starts.
@@ -358,6 +379,15 @@ pub trait LibraryService: Send + Sync {
         ctx: &AuthContext,
         id: &AssetId,
     ) -> Result<AssetContentMetadata, LibError>;
+
+    async fn content_metadata_from(
+        &self,
+        ctx: &AuthContext,
+        id: &AssetId,
+        _source: Option<SourceId>,
+    ) -> Result<AssetContentMetadata, LibError> {
+        self.content_metadata(ctx, id).await
+    }
 
     /// Stream an exact inclusive range of the original representation. Unlike [`Self::read_content`]
     /// this is not subject to the preview materialisation cap: memory is bounded by the producer's
@@ -368,6 +398,16 @@ pub trait LibraryService: Send + Sync {
         id: &AssetId,
         range: ContentRange,
     ) -> Result<AssetContentStream, LibError>;
+
+    async fn stream_content_from(
+        &self,
+        ctx: &AuthContext,
+        id: &AssetId,
+        range: ContentRange,
+        _source: Option<SourceId>,
+    ) -> Result<AssetContentStream, LibError> {
+        self.stream_content(ctx, id, range).await
+    }
 
     /// Read a file referenced *by relative path* from an asset's own directory within the same
     /// source — the loose-glTF case where a `.gltf` points at sibling `.bin`/texture files by
@@ -380,6 +420,16 @@ pub trait LibraryService: Send + Sync {
         rel: &str,
     ) -> Result<AssetContent, LibError>;
 
+    async fn read_related_content_from(
+        &self,
+        ctx: &AuthContext,
+        id: &AssetId,
+        rel: &str,
+        _source: Option<SourceId>,
+    ) -> Result<AssetContent, LibError> {
+        self.read_related_content(ctx, id, rel).await
+    }
+
     /// Read (generating + caching on miss) a downscaled PNG thumbnail for an asset preview
     /// (tech-spec 04 §6.4). `max_edge` bounds the long side. Only raster images produce one;
     /// audio/3D return `Unsupported` (their previews are WASM islands) and the UI falls back to
@@ -390,6 +440,16 @@ pub trait LibraryService: Send + Sync {
         id: &AssetId,
         max_edge: u32,
     ) -> Result<AssetContent, LibError>;
+
+    async fn read_thumbnail_from(
+        &self,
+        ctx: &AuthContext,
+        id: &AssetId,
+        max_edge: u32,
+        _source: Option<SourceId>,
+    ) -> Result<AssetContent, LibError> {
+        self.read_thumbnail(ctx, id, max_edge).await
+    }
 
     /// Read (generating + caching on miss) the interactive 3D preview for a **model** asset: a
     /// compact self-contained `DMSH` mesh blob (geometry + PBR materials + downscaled textures) that
@@ -402,6 +462,15 @@ pub trait LibraryService: Send + Sync {
         ctx: &AuthContext,
         id: &AssetId,
     ) -> Result<AssetContent, LibError>;
+
+    async fn read_model_preview_from(
+        &self,
+        ctx: &AuthContext,
+        id: &AssetId,
+        _source: Option<SourceId>,
+    ) -> Result<AssetContent, LibError> {
+        self.read_model_preview(ctx, id).await
+    }
 
     /// Library aggregates (totals, media/source/tag counts). `source` scopes the numbers to one
     /// source; for a **federated** source the engine proxies the call to the peer, so the counts

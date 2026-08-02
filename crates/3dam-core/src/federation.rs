@@ -16,7 +16,8 @@ use dam_api::page::{Cursor, ItemWarning, Page, PageParams, PartialStatus};
 use dam_api::service::{AuthContext, LibraryService};
 use dam_api::{protocol_compatible, LibError, PeerAdvertise, FEDERATION_PROTOCOL_VERSION};
 use dam_client::ApiClient;
-use std::collections::BTreeMap;
+use futures::StreamExt;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -77,10 +78,16 @@ impl Peer {
 
 pub(crate) type PeerList = Arc<Vec<Arc<Peer>>>;
 
+struct PeerSnapshot {
+    peers: PeerList,
+    by_source: HashMap<SourceId, Arc<Peer>>,
+}
+
 /// Lazily-built, TTL-cached list of federated peers, rebuilt from the source table. Invalidated on
 /// source add/remove so a new peer participates in the very next query.
 pub(crate) struct PeerRegistry {
-    cache: Mutex<Option<(Instant, PeerList)>>,
+    /// The ordered fan-out list and O(1) owner index are published and invalidated atomically.
+    cache: Mutex<Option<(Instant, PeerSnapshot)>>,
 }
 
 impl PeerRegistry {
@@ -110,9 +117,9 @@ impl EmbeddedLibrary {
     pub(crate) async fn fed_peers(&self) -> PeerList {
         {
             let guard = self.fed.cache.lock().await;
-            if let Some((at, peers)) = guard.as_ref() {
+            if let Some((at, snapshot)) = guard.as_ref() {
                 if at.elapsed() < PEERS_TTL {
-                    return peers.clone();
+                    return snapshot.peers.clone();
                 }
             }
         }
@@ -150,8 +157,30 @@ impl EmbeddedLibrary {
             }
         }
         let peers = Arc::new(peers);
-        *self.fed.cache.lock().await = Some((Instant::now(), peers.clone()));
+        let by_source = peers
+            .iter()
+            .map(|peer| (peer.source_id, peer.clone()))
+            .collect();
+        *self.fed.cache.lock().await = Some((
+            Instant::now(),
+            PeerSnapshot {
+                peers: peers.clone(),
+                by_source,
+            },
+        ));
         peers
+    }
+
+    /// Resolve a locally-issued owner hint in O(1). Loading the current snapshot also handles a
+    /// just-added source; a missing id is intentionally not treated as a remote address.
+    pub(crate) async fn fed_peer(&self, source: SourceId) -> Option<Arc<Peer>> {
+        let _ = self.fed_peers().await;
+        self.fed
+            .cache
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|(_, snapshot)| snapshot.by_source.get(&source).cloned())
     }
 }
 
@@ -620,27 +649,58 @@ pub(crate) async fn federated_similar(
 
 // ── peer read proxying (previews + detail for merged peer hits) ─────────────────────────────
 
-/// Try each peer for a read the local catalog couldn't satisfy. Sequential (there is no local
-/// identity to disambiguate which peer owns the id, and peer counts are small); first success
-/// wins. `None` when nobody has it — the caller returns its original `NotFound`.
-async fn try_peers<T, F, Fut>(lib: &EmbeddedLibrary, call: F) -> Option<T>
+/// Route a follow-up read to its locally registered owner. A valid hint performs exactly one
+/// network request. Missing/stale hints (old bookmarks and removed/reconfigured sources) use one
+/// bounded, concurrent recovery round, so latency never grows with peer count.
+async fn try_peers<T, F, Fut>(
+    lib: &EmbeddedLibrary,
+    owner: Option<SourceId>,
+    call: F,
+) -> Option<(SourceId, T)>
 where
     F: Fn(Arc<Peer>) -> Fut,
     Fut: std::future::Future<Output = Result<T, LibError>>,
 {
-    for peer in lib.fed_peers().await.iter() {
-        match tokio::time::timeout(PROXY_TIMEOUT, call(peer.clone())).await {
-            Ok(Ok(v)) => return Some(v),
-            Ok(Err(_)) | Err(_) => continue, // not this peer / offline — fail-soft
+    if let Some(source) = owner {
+        if let Some(peer) = lib.fed_peer(source).await {
+            if let Ok(Ok(value)) = tokio::time::timeout(PROXY_TIMEOUT, call(peer)).await {
+                return Some((source, value));
+            }
         }
     }
-    None
+
+    let peers = lib.fed_peers().await;
+    let mut attempts = peers
+        .iter()
+        .filter(|peer| Some(peer.source_id) != owner)
+        .cloned()
+        .map(|peer| {
+            let source = peer.source_id;
+            let future = call(peer);
+            async move { future.await.ok().map(|value| (source, value)) }
+        })
+        .collect::<futures::stream::FuturesUnordered<_>>();
+    tokio::time::timeout(PROXY_TIMEOUT, async {
+        while let Some(result) = attempts.next().await {
+            if result.is_some() {
+                return result;
+            }
+        }
+        None
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// Detail record for a peer asset, origin re-tagged to the owning peer.
-pub(crate) async fn proxy_get_asset(lib: &EmbeddedLibrary, id: &AssetId) -> Option<Asset> {
+pub(crate) async fn proxy_get_asset(
+    lib: &EmbeddedLibrary,
+    id: &AssetId,
+    owner: Option<SourceId>,
+) -> Option<Asset> {
     let id = *id;
-    try_peers(lib, |peer| async move {
+    try_peers(lib, owner, |peer| async move {
         let mut asset = peer.client.get_asset(&ectx(), &id).await?;
         asset.summary.origin = Origin::Peer(peer.name.clone());
         // Both attribution fields name the local federated source row, not the peer's own source.
@@ -649,6 +709,7 @@ pub(crate) async fn proxy_get_asset(lib: &EmbeddedLibrary, id: &AssetId) -> Opti
         Ok(asset)
     })
     .await
+    .map(|(_, asset)| asset)
 }
 
 /// Preview-sized raw bytes for a peer asset (audio playback / viewer islands). Pass-through, no
@@ -656,12 +717,14 @@ pub(crate) async fn proxy_get_asset(lib: &EmbeddedLibrary, id: &AssetId) -> Opti
 pub(crate) async fn proxy_read_content(
     lib: &EmbeddedLibrary,
     id: &AssetId,
+    owner: Option<SourceId>,
 ) -> Option<AssetContent> {
     let id = *id;
-    try_peers(lib, |peer| async move {
+    try_peers(lib, owner, |peer| async move {
         peer.client.read_content(&ectx(), &id).await
     })
     .await
+    .map(|(_, content)| content)
 }
 
 /// Stat and stream peer-owned content through the peer's HTTP range transport. No cache is used:
@@ -670,38 +733,44 @@ pub(crate) async fn proxy_read_content(
 pub(crate) async fn proxy_content_metadata(
     lib: &EmbeddedLibrary,
     id: &AssetId,
+    owner: Option<SourceId>,
 ) -> Option<AssetContentMetadata> {
     let id = *id;
-    try_peers(lib, |peer| async move {
+    try_peers(lib, owner, |peer| async move {
         peer.client.content_metadata(&ectx(), &id).await
     })
     .await
+    .map(|(_, metadata)| metadata)
 }
 
 pub(crate) async fn proxy_stream_content(
     lib: &EmbeddedLibrary,
     id: &AssetId,
     range: ContentRange,
+    owner: Option<SourceId>,
 ) -> Option<AssetContentStream> {
     let id = *id;
-    try_peers(lib, |peer| async move {
+    try_peers(lib, owner, |peer| async move {
         peer.client.stream_content(&ectx(), &id, range).await
     })
     .await
+    .map(|(_, stream)| stream)
 }
 
 pub(crate) async fn proxy_read_related(
     lib: &EmbeddedLibrary,
     id: &AssetId,
     rel: &str,
+    owner: Option<SourceId>,
 ) -> Option<AssetContent> {
     let id = *id;
     let rel = rel.to_string();
-    try_peers(lib, |peer| {
+    try_peers(lib, owner, |peer| {
         let rel = rel.clone();
         async move { peer.client.read_related_content(&ectx(), &id, &rel).await }
     })
     .await
+    .map(|(_, content)| content)
 }
 
 /// Thumbnail for a peer asset — the one sanctioned federated byte transfer (a remote-owned
@@ -710,16 +779,24 @@ pub(crate) async fn proxy_thumbnail(
     lib: &EmbeddedLibrary,
     id: &AssetId,
     edge: u32,
+    owner: Option<SourceId>,
 ) -> Option<AssetContent> {
-    let name = format!("{id}-{edge}.png");
-    if let Some(bytes) = peer_cache_read(lib, &name).await {
-        return Some(png_content(bytes));
+    if let Some(source) = owner {
+        // A removed source must not keep serving its old cached bytes. A stale bookmark skips this
+        // cache and enters the bounded recovery round below.
+        if lib.fed_peer(source).await.is_some() {
+            let name = format!("{source}/{id}-{edge}.png");
+            if let Some(bytes) = peer_cache_read(lib, &name).await {
+                return Some(png_content(bytes));
+            }
+        }
     }
     let id = *id;
-    let content = try_peers(lib, |peer| async move {
+    let (source, content) = try_peers(lib, owner, |peer| async move {
         peer.client.read_thumbnail(&ectx(), &id, edge).await
     })
     .await?;
+    let name = format!("{source}/{id}-{edge}.png");
     peer_cache_write(lib, &name, &content.bytes).await;
     Some(content)
 }
@@ -728,21 +805,27 @@ pub(crate) async fn proxy_thumbnail(
 pub(crate) async fn proxy_model_preview(
     lib: &EmbeddedLibrary,
     id: &AssetId,
+    owner: Option<SourceId>,
 ) -> Option<AssetContent> {
-    let name = format!("{id}.dmsh");
-    if let Some(bytes) = peer_cache_read(lib, &name).await {
-        return Some(AssetContent {
-            bytes,
-            content_type: "model/x-dam-preview".to_string(),
-            format: "dmsh".to_string(),
-            media: MediaType::Model,
-        });
+    if let Some(source) = owner {
+        if lib.fed_peer(source).await.is_some() {
+            let name = format!("{source}/{id}.dmsh");
+            if let Some(bytes) = peer_cache_read(lib, &name).await {
+                return Some(AssetContent {
+                    bytes,
+                    content_type: "model/x-dam-preview".to_string(),
+                    format: "dmsh".to_string(),
+                    media: MediaType::Model,
+                });
+            }
+        }
     }
     let id = *id;
-    let content = try_peers(lib, |peer| async move {
+    let (source, content) = try_peers(lib, owner, |peer| async move {
         peer.client.read_model_preview(&ectx(), &id).await
     })
     .await?;
+    let name = format!("{source}/{id}.dmsh");
     peer_cache_write(lib, &name, &content.bytes).await;
     Some(content)
 }
@@ -771,12 +854,16 @@ async fn peer_cache_read(lib: &EmbeddedLibrary, name: &str) -> Option<Vec<u8>> {
 }
 
 async fn peer_cache_write(lib: &EmbeddedLibrary, name: &str, bytes: &[u8]) {
-    let dir = peer_cache_dir(lib);
+    let path = peer_cache_dir(lib).join(name);
+    let Some(dir) = path.parent() else { return };
     if tokio::fs::create_dir_all(&dir).await.is_err() {
         return; // cache is best-effort — the proxied bytes are already in hand
     }
-    let tmp = dir.join(format!(".{name}.tmp"));
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return;
+    };
+    let tmp = dir.join(format!(".{file_name}.tmp"));
     if tokio::fs::write(&tmp, bytes).await.is_ok() {
-        let _ = tokio::fs::rename(&tmp, dir.join(name)).await;
+        let _ = tokio::fs::rename(&tmp, path).await;
     }
 }

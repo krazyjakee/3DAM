@@ -12,6 +12,7 @@ use dam_api::service::{AuthContext, LibraryService};
 use dam_core::EmbeddedLibrary;
 use dam_server::{router, ServerStore};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -142,11 +143,155 @@ async fn fake_peer(body: &'static str) -> (String, tokio::task::JoinHandle<()>) 
     (format!("http://{addr}"), handle)
 }
 
+/// Tiny federation peer for routing tests. Advertise is always immediate; every other request is
+/// counted and either returns a distinct thumbnail byte or deliberately never answers.
+async fn thumbnail_peer(
+    byte: Option<u8>,
+) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let observed = requests.clone();
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            let observed = observed.clone();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 8192];
+                let read = sock.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..read]);
+                if request.starts_with("GET /api/v1/advertise ") {
+                    let body = r#"{"protocol_version":"1.0.0","instance":"routing-test","assets":1,"spaces":{}}"#;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(response.as_bytes()).await;
+                    return;
+                }
+                observed.fetch_add(1, Ordering::SeqCst);
+                match byte {
+                    Some(byte) => {
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: image/png\r\ncontent-length: 1\r\nconnection: close\r\n\r\n{}",
+                            char::from(byte)
+                        );
+                        let _ = sock.write_all(response.as_bytes()).await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            });
+        }
+    });
+    (format!("http://{addr}"), requests, handle)
+}
+
 fn query_all(limit: u32) -> QueryRequest {
     QueryRequest {
         page: PageParams { after: None, limit },
         ..Default::default()
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hinted_reads_contact_one_owner_and_peer_caches_do_not_collide() {
+    let local = library_with(&unique_tmp(), &[("local.wav", b"RIFF....WAVE")]).await;
+    let (a_endpoint, a_requests, _a) = thumbnail_peer(Some(b'A')).await;
+    let (b_endpoint, b_requests, _b) = thumbnail_peer(Some(b'B')).await;
+    let (offline_endpoint, offline_requests, _offline) = thumbnail_peer(None).await;
+    let a_source = add_peer(&local, &a_endpoint, "owner-a").await;
+    let b_source = add_peer(&local, &b_endpoint, "owner-b").await;
+    let _offline_source = add_peer(&local, &offline_endpoint, "unrelated-offline").await;
+    a_requests.store(0, Ordering::SeqCst);
+    b_requests.store(0, Ordering::SeqCst);
+    offline_requests.store(0, Ordering::SeqCst);
+    let (local_endpoint, _local_addr, _local_server) = serve_peer(local.clone()).await;
+
+    // The same remote id can legitimately exist on both peers. Each hinted read goes straight to
+    // its owner, and the owner is part of the disk-cache key so the bytes cannot alias.
+    let id: dam_api::id::AssetId = "00000000-0000-0000-0000-000000000150".parse().unwrap();
+    let started = std::time::Instant::now();
+    let a = reqwest::get(format!(
+        "{local_endpoint}/api/v1/assets/{id}/thumbnail?edge=256&source={a_source}"
+    ))
+    .await
+    .unwrap()
+    .bytes()
+    .await
+    .unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "an unrelated offline peer must not add latency to a hinted read"
+    );
+    let b = reqwest::get(format!(
+        "{local_endpoint}/api/v1/assets/{id}/thumbnail?edge=256&source={b_source}"
+    ))
+    .await
+    .unwrap()
+    .bytes()
+    .await
+    .unwrap();
+    assert_eq!(a.as_ref(), b"A");
+    assert_eq!(b.as_ref(), b"B");
+    assert_eq!(a_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(b_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(offline_requests.load(Ordering::SeqCst), 0);
+
+    // Both second reads are owner-scoped cache hits: no peer receives another request.
+    assert_eq!(
+        local
+            .read_thumbnail_from(&AuthContext::embedded(), &id, 256, Some(a_source))
+            .await
+            .unwrap()
+            .bytes,
+        b"A"
+    );
+    assert_eq!(
+        local
+            .read_thumbnail_from(&AuthContext::embedded(), &id, 256, Some(b_source))
+            .await
+            .unwrap()
+            .bytes,
+        b"B"
+    );
+    assert_eq!(a_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(b_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(offline_requests.load(Ordering::SeqCst), 0);
+
+    // An old bookmark has no owner hint. Recovery is deliberately exceptional and hedges one
+    // bounded round across the registry: the hanging peer cannot turn latency into N × timeout.
+    let old_id: dam_api::id::AssetId = "00000000-0000-0000-0000-000000000151".parse().unwrap();
+    let recovery_started = std::time::Instant::now();
+    let recovered = local
+        .read_thumbnail_from(&AuthContext::embedded(), &old_id, 256, None)
+        .await
+        .unwrap();
+    assert!(recovered.bytes == b"A" || recovered.bytes == b"B");
+    assert!(
+        recovery_started.elapsed() < Duration::from_secs(2),
+        "legacy recovery latency must not depend on the unrelated hanging peer"
+    );
+
+    // Removing the hinted owner invalidates the registry and its cache namespace. The stale hint
+    // cannot serve owner A's cached bytes; bounded recovery may find the colliding id on owner B.
+    local
+        .remove_source(
+            &AuthContext::embedded(),
+            &a_source,
+            RemoveSource {
+                keep_metadata: false,
+            },
+        )
+        .await
+        .unwrap();
+    let after_remove = local
+        .read_thumbnail_from(&AuthContext::embedded(), &id, 256, Some(a_source))
+        .await
+        .unwrap();
+    assert_eq!(after_remove.bytes, b"B");
 }
 
 // ── merged browse/search (issue #39 acceptance) ──────────────────────────────
@@ -206,7 +351,10 @@ async fn query_merges_local_and_peer_results() {
 
     // A peer asset's detail read proxies through to the owning peer, origin re-tagged.
     let b = page.items.iter().find(|a| a.name == "b.wav").unwrap();
-    let detail = local.get_asset(&ctx, &b.id).await.unwrap();
+    let detail = local
+        .get_asset_from(&ctx, &b.id, b.source_id)
+        .await
+        .unwrap();
     assert_eq!(detail.summary.name, "b.wav");
     assert!(matches!(detail.summary.origin, Origin::Peer(ref p) if p == "studio-server"));
 }

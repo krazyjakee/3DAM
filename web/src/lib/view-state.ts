@@ -47,6 +47,8 @@ export interface ViewState {
   mode: SearchMode;
   view: ViewMode;
   selected: string | null;
+  /** Locally-issued federated source id routing follow-up reads for `selected`. */
+  owner: string | null;
 }
 
 export interface ViewStatePatchOptions {
@@ -86,6 +88,7 @@ export function useViewState() {
       mode: (params.get("mode") as SearchMode | null) ?? "lexical",
       view: (params.get("view") as ViewMode | null) ?? "grid",
       selected: params.get("sel"),
+      owner: params.get("owner"),
     }),
     [params],
   );
@@ -113,6 +116,8 @@ export function useViewState() {
       if ("mode" in next) set("mode", next.mode === "lexical" ? null : next.mode);
       if ("view" in next) set("view", next.view);
       if ("selected" in next) set("sel", next.selected);
+      if ("owner" in next) set("owner", next.owner);
+      else if ("selected" in next && next.selected === null) set("owner", null);
 
       // React Router will navigate even when given the current search string. Avoid duplicate
       // history entries for repeated clicks on the already-active source/folder/asset/view.

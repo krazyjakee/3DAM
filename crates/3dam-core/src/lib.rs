@@ -1109,6 +1109,15 @@ impl LibraryService for EmbeddedLibrary {
     }
 
     async fn get_asset(&self, ctx: &AuthContext, id: &AssetId) -> Result<Asset, LibError> {
+        self.get_asset_from(ctx, id, None).await
+    }
+
+    async fn get_asset_from(
+        &self,
+        ctx: &AuthContext,
+        id: &AssetId,
+        source: Option<SourceId>,
+    ) -> Result<Asset, LibError> {
         self.require_asset_visible(ctx, id).await?;
         let id = *id;
         // The detail read is the one path that surfaces collection membership, so it carries the
@@ -1119,7 +1128,7 @@ impl LibraryService for EmbeddedLibrary {
             // A merged result can name a peer-owned asset: proxy the detail read (phase 6).
             // Never for a restricted context — the ceiling can't vouch for peer-owned ids.
             Err(LibError::NotFound(_)) if ctx.visibility.is_full() => {
-                federation::proxy_get_asset(self, &id)
+                federation::proxy_get_asset(self, &id, source)
                     .await
                     .ok_or_else(|| LibError::NotFound(format!("asset {id}")))
             }
@@ -1131,6 +1140,15 @@ impl LibraryService for EmbeddedLibrary {
         &self,
         ctx: &AuthContext,
         id: &AssetId,
+    ) -> Result<AssetContent, LibError> {
+        self.read_content_from(ctx, id, None).await
+    }
+
+    async fn read_content_from(
+        &self,
+        ctx: &AuthContext,
+        id: &AssetId,
+        source: Option<SourceId>,
     ) -> Result<AssetContent, LibError> {
         self.require_asset_visible(ctx, id).await?;
         let id = *id;
@@ -1144,7 +1162,7 @@ impl LibraryService for EmbeddedLibrary {
             .await;
         match local {
             Err(LibError::NotFound(_)) if ctx.visibility.is_full() => {
-                federation::proxy_read_content(self, &id)
+                federation::proxy_read_content(self, &id, source)
                     .await
                     .ok_or_else(|| LibError::NotFound(format!("asset {id}")))
             }
@@ -1156,6 +1174,15 @@ impl LibraryService for EmbeddedLibrary {
         &self,
         ctx: &AuthContext,
         id: &AssetId,
+    ) -> Result<AssetContentMetadata, LibError> {
+        self.content_metadata_from(ctx, id, None).await
+    }
+
+    async fn content_metadata_from(
+        &self,
+        ctx: &AuthContext,
+        id: &AssetId,
+        source: Option<SourceId>,
     ) -> Result<AssetContentMetadata, LibError> {
         self.require_asset_visible(ctx, id).await?;
         let id = *id;
@@ -1172,7 +1199,7 @@ impl LibraryService for EmbeddedLibrary {
             .await;
         match local {
             Err(LibError::NotFound(_)) if ctx.visibility.is_full() => {
-                federation::proxy_content_metadata(self, &id)
+                federation::proxy_content_metadata(self, &id, source)
                     .await
                     .ok_or_else(|| LibError::NotFound(format!("asset {id}")))
             }
@@ -1185,6 +1212,16 @@ impl LibraryService for EmbeddedLibrary {
         ctx: &AuthContext,
         id: &AssetId,
         range: ContentRange,
+    ) -> Result<AssetContentStream, LibError> {
+        self.stream_content_from(ctx, id, range, None).await
+    }
+
+    async fn stream_content_from(
+        &self,
+        ctx: &AuthContext,
+        id: &AssetId,
+        range: ContentRange,
+        source: Option<SourceId>,
     ) -> Result<AssetContentStream, LibError> {
         self.require_asset_visible(ctx, id).await?;
         let id = *id;
@@ -1210,7 +1247,7 @@ impl LibraryService for EmbeddedLibrary {
                 Ok(source_content_stream(source, path, metadata, range))
             }
             Err(LibError::NotFound(_)) if ctx.visibility.is_full() => {
-                federation::proxy_stream_content(self, &id, range)
+                federation::proxy_stream_content(self, &id, range, source)
                     .await
                     .ok_or_else(|| LibError::NotFound(format!("asset {id}")))
             }
@@ -1223,6 +1260,16 @@ impl LibraryService for EmbeddedLibrary {
         ctx: &AuthContext,
         id: &AssetId,
         rel: &str,
+    ) -> Result<AssetContent, LibError> {
+        self.read_related_content_from(ctx, id, rel, None).await
+    }
+
+    async fn read_related_content_from(
+        &self,
+        ctx: &AuthContext,
+        id: &AssetId,
+        rel: &str,
+        source: Option<SourceId>,
     ) -> Result<AssetContent, LibError> {
         self.require_asset_visible(ctx, id).await?;
         let id = *id;
@@ -1238,7 +1285,7 @@ impl LibraryService for EmbeddedLibrary {
             .await;
         match local {
             Err(LibError::NotFound(_)) if ctx.visibility.is_full() => {
-                federation::proxy_read_related(self, &id, &rel)
+                federation::proxy_read_related(self, &id, &rel, source)
                     .await
                     .ok_or_else(|| LibError::NotFound(format!("asset {id}")))
             }
@@ -1251,6 +1298,16 @@ impl LibraryService for EmbeddedLibrary {
         ctx: &AuthContext,
         id: &AssetId,
         max_edge: u32,
+    ) -> Result<AssetContent, LibError> {
+        self.read_thumbnail_from(ctx, id, max_edge, None).await
+    }
+
+    async fn read_thumbnail_from(
+        &self,
+        ctx: &AuthContext,
+        id: &AssetId,
+        max_edge: u32,
+        source: Option<SourceId>,
     ) -> Result<AssetContent, LibError> {
         self.require_asset_visible(ctx, id).await?;
         let id = *id;
@@ -1272,7 +1329,7 @@ impl LibraryService for EmbeddedLibrary {
             // Peer-owned asset: fetch its remote-owned preview — the one sanctioned federated byte
             // transfer (tech-spec 07 §4) — through the 7-day local peer cache. Full-visibility only.
             Err(LibError::NotFound(_)) if ctx.visibility.is_full() => {
-                return federation::proxy_thumbnail(self, &id, edge)
+                return federation::proxy_thumbnail(self, &id, edge, source)
                     .await
                     .ok_or_else(|| LibError::NotFound(format!("asset {id}")))
             }
@@ -1292,6 +1349,15 @@ impl LibraryService for EmbeddedLibrary {
         ctx: &AuthContext,
         id: &AssetId,
     ) -> Result<AssetContent, LibError> {
+        self.read_model_preview_from(ctx, id, None).await
+    }
+
+    async fn read_model_preview_from(
+        &self,
+        ctx: &AuthContext,
+        id: &AssetId,
+        source: Option<SourceId>,
+    ) -> Result<AssetContent, LibError> {
         self.require_asset_visible(ctx, id).await?;
         let id = *id;
         let data_dir = self.data_dir.clone();
@@ -1304,7 +1370,7 @@ impl LibraryService for EmbeddedLibrary {
             .await;
         match local {
             Err(LibError::NotFound(_)) if ctx.visibility.is_full() => {
-                federation::proxy_model_preview(self, &id)
+                federation::proxy_model_preview(self, &id, source)
                     .await
                     .ok_or_else(|| LibError::NotFound(format!("asset {id}")))
             }

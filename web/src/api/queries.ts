@@ -44,7 +44,8 @@ export const qk = {
   version: ["version"] as const,
   whoami: ["whoami"] as const,
   assets: ["assets"] as const,
-  asset: (id: AssetId) => ["asset", id] as const,
+  // Remote ids are only unique within their owning peer. Keep the owner in every detail cache key.
+  asset: (id: AssetId, source?: SourceId | null) => ["asset", source ?? "local-or-legacy", id] as const,
   comments: (id: AssetId) => ["comments", id] as const,
   stats: ["stats"] as const,
   sources: ["sources"] as const,
@@ -126,10 +127,10 @@ export function useAssets(req: QueryRequest, collection?: CollectionId | null) {
   });
 }
 
-export function useAsset(id: AssetId | null) {
+export function useAsset(id: AssetId | null, source?: SourceId | null) {
   return useQuery({
-    queryKey: id ? qk.asset(id) : ["asset", "none"],
-    queryFn: () => api.getAsset(id as AssetId),
+    queryKey: id ? qk.asset(id, source) : ["asset", "none"],
+    queryFn: () => api.getAsset(id as AssetId, source),
     enabled: !!id,
   });
 }

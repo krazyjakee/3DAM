@@ -15,7 +15,7 @@
 
 use dam_api::admin::McpMode;
 use dam_api::dto::*;
-use dam_api::id::AssetId;
+use dam_api::id::{AssetId, SourceId};
 use dam_api::page::PageParams;
 use dam_api::service::{AuthContext, LibraryService, Scope};
 use dam_api::LibError;
@@ -125,7 +125,10 @@ fn tool_defs() -> Vec<ToolDef> {
             schema: || {
                 json!({
                     "type": "object", "required": ["id"],
-                    "properties": {"id": {"type": "string", "description": "Asset id (UUID)."}}
+                    "properties": {
+                        "id": {"type": "string", "description": "Asset id (UUID)."},
+                        "source": {"type": "string", "description": "The source_id returned by search; routes federated follow-up reads directly."}
+                    }
                 })
             },
         },
@@ -398,7 +401,11 @@ impl McpAdapter {
             }
             "get_asset" => {
                 let a: IdArgs = parse_args(args)?;
-                to_value(&lib.get_asset(ctx, &parse_asset(&a.id)?).await?)
+                let source = parse_optional_source(a.source.as_deref())?;
+                to_value(
+                    &lib.get_asset_from(ctx, &parse_asset(&a.id)?, source)
+                        .await?,
+                )
             }
             "list_sources" => to_value(&lib.list_sources(ctx).await?),
             "library_stats" => to_value(&lib.library_stats(ctx, None).await?),
@@ -499,6 +506,30 @@ impl McpAdapter {
             .ok_or_else(|| LibError::BadRequest(format!("not a 3dam uri: {uri}")))?;
         let parts: Vec<&str> = rest.split('/').collect();
         match parts.as_slice() {
+            ["source", source, "asset", id, "preview"] => {
+                let source = parse_optional_source(Some(source))?;
+                let thumb = self
+                    .library
+                    .read_thumbnail_from(ctx, &parse_asset(id)?, 256, source)
+                    .await?;
+                Ok(json!({
+                    "uri": uri,
+                    "mimeType": thumb.content_type,
+                    "blob": base64_encode(&thumb.bytes),
+                }))
+            }
+            ["source", source, "asset", id] => {
+                let source = parse_optional_source(Some(source))?;
+                let asset = self
+                    .library
+                    .get_asset_from(ctx, &parse_asset(id)?, source)
+                    .await?;
+                Ok(text_resource(
+                    uri,
+                    "application/json",
+                    &serde_json::to_string(&asset).unwrap(),
+                ))
+            }
             ["asset", id, "preview"] => {
                 let thumb = self
                     .library
@@ -558,6 +589,7 @@ struct SearchArgs {
 #[derive(serde::Deserialize)]
 struct IdArgs {
     id: String,
+    source: Option<String>,
 }
 #[derive(serde::Deserialize)]
 struct IdLimitArgs {
@@ -589,6 +621,15 @@ fn parse_args<T: serde::de::DeserializeOwned>(v: Value) -> Result<T, LibError> {
 fn parse_asset(s: &str) -> Result<AssetId, LibError> {
     s.parse()
         .map_err(|_| LibError::BadRequest(format!("bad asset id: {s}")))
+}
+fn parse_optional_source(source: Option<&str>) -> Result<Option<SourceId>, LibError> {
+    source
+        .map(|source| {
+            source
+                .parse()
+                .map_err(|_| LibError::BadRequest(format!("bad source id: {source}")))
+        })
+        .transpose()
 }
 fn eq_filter(field: FacetField, value: String) -> Filter {
     Filter {
@@ -636,6 +677,8 @@ fn rpc_error(id: Value, code: i64, message: &str) -> Value {
 
 fn resource_templates() -> Value {
     json!([
+        {"uriTemplate": "3dam://source/{source}/asset/{id}", "name": "routed-asset-metadata", "mimeType": "application/json"},
+        {"uriTemplate": "3dam://source/{source}/asset/{id}/preview", "name": "routed-asset-preview", "mimeType": "image/png"},
         {"uriTemplate": "3dam://asset/{id}", "name": "asset-metadata", "mimeType": "application/json"},
         {"uriTemplate": "3dam://asset/{id}/preview", "name": "asset-preview", "mimeType": "image/png"},
         {"uriTemplate": "3dam://source/{id}", "name": "source", "mimeType": "application/json"},

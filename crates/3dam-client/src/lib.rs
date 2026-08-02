@@ -173,6 +173,15 @@ impl ApiClient {
             .map_err(|e| LibError::BadRequest(e.to_string()))
     }
 
+    fn routed_url(&self, path: &str, source: Option<SourceId>) -> Result<Url, LibError> {
+        let mut url = self.url(path)?;
+        if let Some(source) = source {
+            url.query_pairs_mut()
+                .append_pair("source", &source.to_string());
+        }
+        Ok(url)
+    }
+
     /// The `ws://` / `wss://` URL for the live-event endpoint, derived from the http(s) base.
     fn ws_url(&self) -> Result<Url, LibError> {
         let mut u = self.url("/api/v1/ws")?;
@@ -591,12 +600,36 @@ impl LibraryService for ApiClient {
         self.get(&format!("/api/v1/assets/{id}")).await
     }
 
+    async fn get_asset_from(
+        &self,
+        _ctx: &AuthContext,
+        id: &AssetId,
+        source: Option<SourceId>,
+    ) -> Result<Asset, LibError> {
+        let response = self
+            .http
+            .get(self.routed_url(&format!("/api/v1/assets/{id}"), source)?)
+            .send()
+            .await
+            .map_err(|error| LibError::SourceUnavailable(error.to_string()))?;
+        Self::decode(response).await
+    }
+
     async fn read_content(
         &self,
         ctx: &AuthContext,
         id: &AssetId,
     ) -> Result<AssetContent, LibError> {
-        let metadata = self.content_metadata(ctx, id).await?;
+        self.read_content_from(ctx, id, None).await
+    }
+
+    async fn read_content_from(
+        &self,
+        ctx: &AuthContext,
+        id: &AssetId,
+        source: Option<SourceId>,
+    ) -> Result<AssetContent, LibError> {
+        let metadata = self.content_metadata_from(ctx, id, source).await?;
         if metadata.len > MAX_MATERIALIZED_CONTENT_BYTES {
             return Err(LibError::Unsupported(format!(
                 "asset is {} bytes; preview content is capped at {MAX_MATERIALIZED_CONTENT_BYTES} bytes",
@@ -608,7 +641,7 @@ impl LibraryService for ApiClient {
         let (ct, bytes) = self
             .fetch_bytes_bounded(
                 self.http
-                    .get(self.url(&format!("/api/v1/assets/{id}/content"))?),
+                    .get(self.routed_url(&format!("/api/v1/assets/{id}/content"), source)?),
                 MAX_MATERIALIZED_CONTENT_BYTES,
             )
             .await?;
@@ -627,9 +660,18 @@ impl LibraryService for ApiClient {
         _ctx: &AuthContext,
         id: &AssetId,
     ) -> Result<AssetContentMetadata, LibError> {
+        self.content_metadata_from(_ctx, id, None).await
+    }
+
+    async fn content_metadata_from(
+        &self,
+        _ctx: &AuthContext,
+        id: &AssetId,
+        source: Option<SourceId>,
+    ) -> Result<AssetContentMetadata, LibError> {
         let response = self
             .http
-            .head(self.url(&format!("/api/v1/assets/{id}/content"))?)
+            .head(self.routed_url(&format!("/api/v1/assets/{id}/content"), source)?)
             .send()
             .await
             .map_err(|error| LibError::SourceUnavailable(error.to_string()))?;
@@ -649,9 +691,19 @@ impl LibraryService for ApiClient {
         id: &AssetId,
         range: ContentRange,
     ) -> Result<AssetContentStream, LibError> {
+        self.stream_content_from(_ctx, id, range, None).await
+    }
+
+    async fn stream_content_from(
+        &self,
+        _ctx: &AuthContext,
+        id: &AssetId,
+        range: ContentRange,
+        source: Option<SourceId>,
+    ) -> Result<AssetContentStream, LibError> {
         let response = self
             .http
-            .get(self.url(&format!("/api/v1/assets/{id}/content"))?)
+            .get(self.routed_url(&format!("/api/v1/assets/{id}/content"), source)?)
             .header(
                 reqwest::header::RANGE,
                 format!("bytes={}-{}", range.first(), range.last()),
@@ -719,10 +771,20 @@ impl LibraryService for ApiClient {
         id: &AssetId,
         rel: &str,
     ) -> Result<AssetContent, LibError> {
+        self.read_related_content_from(_ctx, id, rel, None).await
+    }
+
+    async fn read_related_content_from(
+        &self,
+        _ctx: &AuthContext,
+        id: &AssetId,
+        rel: &str,
+        source: Option<SourceId>,
+    ) -> Result<AssetContent, LibError> {
         let (ct, bytes) = self
             .fetch_bytes(
                 self.http
-                    .get(self.url(&format!("/api/v1/assets/{id}/related"))?)
+                    .get(self.routed_url(&format!("/api/v1/assets/{id}/related"), source)?)
                     .query(&[("path", rel)]),
             )
             .await?;
@@ -755,11 +817,21 @@ impl LibraryService for ApiClient {
         id: &AssetId,
         max_edge: u32,
     ) -> Result<AssetContent, LibError> {
+        self.read_thumbnail_from(_ctx, id, max_edge, None).await
+    }
+
+    async fn read_thumbnail_from(
+        &self,
+        _ctx: &AuthContext,
+        id: &AssetId,
+        max_edge: u32,
+        source: Option<SourceId>,
+    ) -> Result<AssetContent, LibError> {
         let (ct, bytes) = self
-            .fetch_bytes(
-                self.http
-                    .get(self.url(&format!("/api/v1/assets/{id}/thumbnail?edge={max_edge}"))?),
-            )
+            .fetch_bytes(self.http.get(self.routed_url(
+                &format!("/api/v1/assets/{id}/thumbnail?edge={max_edge}"),
+                source,
+            )?))
             .await?;
         Ok(AssetContent {
             bytes,
@@ -774,11 +846,20 @@ impl LibraryService for ApiClient {
         _ctx: &AuthContext,
         id: &AssetId,
     ) -> Result<AssetContent, LibError> {
+        self.read_model_preview_from(_ctx, id, None).await
+    }
+
+    async fn read_model_preview_from(
+        &self,
+        _ctx: &AuthContext,
+        id: &AssetId,
+        source: Option<SourceId>,
+    ) -> Result<AssetContent, LibError> {
         // Raw `DMSH` bytes, not JSON — reconstruct `AssetContent` from the HTTP response.
         let (ct, bytes) = self
             .fetch_bytes(
                 self.http
-                    .get(self.url(&format!("/api/v1/assets/{id}/preview-mesh"))?),
+                    .get(self.routed_url(&format!("/api/v1/assets/{id}/preview-mesh"), source)?),
             )
             .await?;
         Ok(AssetContent {

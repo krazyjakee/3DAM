@@ -1169,9 +1169,17 @@ async fn get_asset(
     Reader(ctx): Reader,
     State(st): State<AppState>,
     AxPath(id): AxPath<String>,
+    Query(q): Query<OwnerQuery>,
 ) -> Result<Json<Asset>, ApiError> {
     let id: AssetId = parse_id(&id, "asset")?;
-    Ok(Json(st.lib.get_asset(&ctx, &id).await?))
+    Ok(Json(st.lib.get_asset_from(&ctx, &id, q.source).await?))
+}
+
+#[derive(serde::Deserialize)]
+struct OwnerQuery {
+    /// Locally-issued federated source id from a query/detail result. It is resolved only against
+    /// the server's registry and can never select a caller-controlled endpoint.
+    source: Option<dam_api::id::SourceId>,
 }
 
 /// Build a binary asset response: `Content-Type` from the payload, plus a private cache directive.
@@ -1387,11 +1395,12 @@ async fn asset_content(
     Reader(ctx): Reader,
     State(st): State<AppState>,
     AxPath(id): AxPath<String>,
+    Query(q): Query<OwnerQuery>,
     method: Method,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let id: AssetId = parse_id(&id, "asset")?;
-    let metadata = st.lib.content_metadata(&ctx, &id).await?;
+    let metadata = st.lib.content_metadata_from(&ctx, &id, q.source).await?;
     const CACHE_CONTROL: &str = "private, max-age=60";
 
     // HEAD describes the complete selected representation. Range is defined for GET; more
@@ -1435,7 +1444,10 @@ async fn asset_content(
             ));
         }
     };
-    let content = st.lib.stream_content(&ctx, &id, range).await?;
+    let content = st
+        .lib
+        .stream_content_from(&ctx, &id, range, q.source)
+        .await?;
     Ok(streamed_content_response(content, status, CACHE_CONTROL))
 }
 
@@ -1446,7 +1458,10 @@ async fn asset_related(
     Query(q): Query<RelatedQuery>,
 ) -> Result<Response, ApiError> {
     let id: AssetId = parse_id(&id, "asset")?;
-    let content = st.lib.read_related_content(&ctx, &id, &q.path).await?;
+    let content = st
+        .lib
+        .read_related_content_from(&ctx, &id, &q.path, q.source)
+        .await?;
     Ok(content_response(content, "private, max-age=60"))
 }
 
@@ -1457,9 +1472,10 @@ async fn asset_preview_mesh(
     Reader(ctx): Reader,
     State(st): State<AppState>,
     AxPath(id): AxPath<String>,
+    Query(q): Query<OwnerQuery>,
 ) -> Result<Response, ApiError> {
     let id: AssetId = parse_id(&id, "asset")?;
-    let content = st.lib.read_model_preview(&ctx, &id).await?;
+    let content = st.lib.read_model_preview_from(&ctx, &id, q.source).await?;
     Ok(content_response(content, "private, max-age=300"))
 }
 
@@ -1467,6 +1483,7 @@ async fn asset_preview_mesh(
 struct RelatedQuery {
     /// The glTF-relative URI of the sibling file (`.bin` / texture), resolved against the asset dir.
     path: String,
+    source: Option<dam_api::id::SourceId>,
 }
 
 async fn asset_thumbnail(
@@ -1477,13 +1494,17 @@ async fn asset_thumbnail(
 ) -> Result<Response, ApiError> {
     let id: AssetId = parse_id(&id, "asset")?;
     let edge = q.edge.unwrap_or(256);
-    let content = st.lib.read_thumbnail(&ctx, &id, edge).await?;
+    let content = st
+        .lib
+        .read_thumbnail_from(&ctx, &id, edge, q.source)
+        .await?;
     Ok(content_response(content, "private, max-age=300"))
 }
 
 #[derive(serde::Deserialize)]
 struct ThumbQuery {
     edge: Option<u32>,
+    source: Option<dam_api::id::SourceId>,
 }
 
 #[derive(serde::Deserialize)]

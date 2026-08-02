@@ -58,7 +58,12 @@ export function Thumbnail({ asset, size = 28 }: { asset: AssetSummary; size?: nu
   const version = useThumbnailVersion(asset.id);
   const edge = Math.min(512, Math.max(64, size * 4));
   const media = useMediaBlob(
-    api.assetThumbnailUrl(asset.id, edge, version),
+    api.assetThumbnailUrl(
+      asset.id,
+      edge,
+      version,
+      typeof asset.origin === "object" ? asset.source_id : null,
+    ),
     hasServerThumbnail(asset.media),
   );
 

@@ -84,7 +84,7 @@ export function Inspector({
   onExpand: () => void;
 }) {
   const { state } = useViewState();
-  const selectedAsset = useAsset(state.selected);
+  const selectedAsset = useAsset(state.selected, state.owner);
   const setFavorite = useSetFavorite();
   const canWrite = useCan("write");
 
@@ -145,8 +145,8 @@ function InspectorPanel({
   /** `rail` → the close control collapses the `lg` rail; `drawer` → it dismisses the overlay. */
   mode: "rail" | "drawer";
 }) {
-  const asset = useAsset(selected);
-  const { patch } = useViewState();
+  const { state, patch } = useViewState();
+  const asset = useAsset(selected, state.owner);
   const collapse = mode === "rail";
 
   // If the selected asset no longer exists — its source was removed, or it was removed + blocked
@@ -228,8 +228,8 @@ function Preview({ asset }: { asset: Asset }) {
   const [tiling, setTiling] = useState(false);
   const mediaPath =
     summary.media === "model" && hasInteractive3D(summary.format)
-      ? api.assetPreviewMeshUrl(summary.id)
-      : api.assetContentUrl(summary.id);
+      ? api.assetPreviewMeshUrl(summary.id, asset.source_id)
+      : api.assetContentUrl(summary.id, asset.source_id);
   const streaming = summary.media === "audio" || summary.media === "video";
   const blob = useMediaBlob(mediaPath, !streaming);
   const ticket = useMediaTicket(mediaPath, streaming);
@@ -813,7 +813,10 @@ function DuplicatesSection({ asset }: { asset: Asset }) {
             member={m}
             keep={m.id === group.suggested_keep}
             current={m.id === id}
-            onOpen={() => patch({ selected: m.id })}
+            onOpen={() => patch({
+              selected: m.id,
+              owner: typeof m.origin === "object" ? m.source_id : null,
+            })}
           />
         ))}
       </div>
@@ -936,7 +939,10 @@ function SimilarSection({ asset }: { asset: Asset }) {
               <SimilarTile
                 key={hit.asset.id}
                 hit={hit}
-                onOpen={() => patch({ selected: hit.asset.id })}
+                onOpen={() => patch({
+                  selected: hit.asset.id,
+                  owner: typeof hit.asset.origin === "object" ? hit.asset.source_id : null,
+                })}
               />
             ))}
           </div>

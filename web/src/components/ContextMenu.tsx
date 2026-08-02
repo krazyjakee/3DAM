@@ -150,7 +150,11 @@ export function ContextMenu({
 
   const copyPath = async () => {
     try {
-      const full = await api.getAsset(ids[0]);
+      const target = assets[0];
+      const full = await api.getAsset(
+        ids[0],
+        typeof target.origin === "object" ? target.source_id : null,
+      );
       await copyText(full.path, "Path");
     } catch (error) {
       // The clipboard helper owns clipboard failures. Reaching here means the path itself could not
@@ -178,7 +182,10 @@ export function ContextMenu({
 
       {/* Open + Copy path are single-asset only; the rest apply to the whole target set. */}
       {single && (
-        <Item icon={<Search size={13} />} label="Open" onClick={() => run(() => patch({ selected: ids[0] }))} />
+        <Item icon={<Search size={13} />} label="Open" onClick={() => run(() => patch({
+          selected: ids[0],
+          owner: typeof assets[0].origin === "object" ? assets[0].source_id : null,
+        }))} />
       )}
       {/* Reanalyze forces a re-run (`force: true`) so a deliberate per-asset click is never a silent
           no-op on an already-up-to-date asset; it still analyses never-analysed targets too. */}

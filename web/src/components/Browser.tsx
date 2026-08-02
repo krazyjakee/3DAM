@@ -132,7 +132,7 @@ export function Browser({
   // the single Inspector focus (`state.selected`). `anchor` is the pivot for shift-range.
   const [selection, setSelection] = useState<Set<string>>(new Set());
   const [anchor, setAnchor] = useState<string | null>(null);
-  const selectedAsset = useAsset(state.selected);
+  const selectedAsset = useAsset(state.selected, state.owner);
 
   // `useAssets` retains only a small page LRU. Everything derived here is consequently bounded by
   // that window instead of growing with the lifetime scroll history.
@@ -220,7 +220,7 @@ export function Browser({
     (asset: AssetSummary, mods: ClickMods) => {
       const id = asset.id;
       selectedCache.current.set(id, asset);
-      patch({ selected: id });
+      patch({ selected: id, owner: typeof asset.origin === "object" ? asset.source_id : null });
       if (mods.shift && anchor) {
         const ids = visible.map((a) => a.id);
         const a = ids.indexOf(anchor);
@@ -257,7 +257,10 @@ export function Browser({
   // playback immediately (issue #52). Non-audio just opens in the Inspector's viewer.
   const onItemActivate = useCallback(
     (asset: AssetSummary) => {
-      patch({ selected: asset.id });
+      patch({
+        selected: asset.id,
+        owner: typeof asset.origin === "object" ? asset.source_id : null,
+      });
       if (asset.media === "audio") requestAutoplay(asset.id);
     },
     [patch],
