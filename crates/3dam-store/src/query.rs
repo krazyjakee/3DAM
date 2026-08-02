@@ -765,6 +765,279 @@ mod tests {
         assert_eq!(here(""), 1, "only the loose file at the top level");
     }
 
+    #[test]
+    fn folder_hierarchy_keeps_source_and_segment_boundaries() {
+        use dam_sources::{SftpConfig, SmbConfig};
+
+        let store = Store::open_in_memory().unwrap();
+        let sources = [
+            SourceConnection::LocalFs {
+                root: "/catalog".into(),
+            },
+            SourceConnection::Sftp(SftpConfig {
+                host: "example.test".into(),
+                port: 22,
+                username: "artist".into(),
+                base_path: "/remote/catalog".into(),
+                password: None,
+                private_key: None,
+                passphrase: None,
+                credential_ref: None,
+            }),
+            SourceConnection::Smb(SmbConfig {
+                host: "files.example.test".into(),
+                port: 445,
+                share: "assets".into(),
+                base_path: "catalog".into(),
+                username: String::new(),
+                password: None,
+                domain: None,
+                credential_ref: None,
+            }),
+        ];
+
+        for (index, connection) in sources.iter().enumerate() {
+            let source = store
+                .add_source(connection, &format!("source-{index}"), false)
+                .unwrap();
+            for path in [
+                "Art/loose.png",
+                "Art/Sub/inside.png",
+                "Artist/not-art.png",
+                "日本語/深い/item.png",
+                "root.png",
+            ] {
+                store
+                    .upsert_asset(&NewAsset {
+                        source_id: source,
+                        path: path.into(),
+                        filename: path.rsplit('/').next().unwrap().into(),
+                        content_hash: None,
+                        size_bytes: Some(1),
+                        source_modified_at: None,
+                        scanned_at: now_ms(),
+                        media_type: MediaType::Image,
+                        format: "png".into(),
+                    })
+                    .unwrap();
+            }
+
+            let entries = |prefix: &str| {
+                store
+                    .list_folders(&source, prefix)
+                    .unwrap()
+                    .into_iter()
+                    .map(|entry| (entry.name, entry.asset_count))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                entries(""),
+                vec![
+                    ("Art".into(), 2),
+                    ("Artist".into(), 1),
+                    ("日本語".into(), 1)
+                ],
+                "source {index} lost a root or segment boundary"
+            );
+            assert_eq!(entries("Art/"), vec![("Sub".into(), 1)]);
+            assert_eq!(entries("Artist/"), Vec::<(String, u64)>::new());
+            assert_eq!(entries("日本語/"), vec![("深い".into(), 1)]);
+        }
+    }
+
+    #[test]
+    fn folder_counts_follow_reconciliation_removal_and_source_deletion() {
+        let store = Store::open_in_memory().unwrap();
+        let source = store
+            .add_source(
+                &SourceConnection::LocalFs {
+                    root: "/catalog".into(),
+                },
+                "catalog",
+                false,
+            )
+            .unwrap();
+        let asset = |path: &str, size_bytes: i64| NewAsset {
+            source_id: source,
+            path: path.into(),
+            filename: path.rsplit('/').next().unwrap().into(),
+            content_hash: None,
+            size_bytes: Some(size_bytes),
+            source_modified_at: None,
+            scanned_at: now_ms(),
+            media_type: MediaType::Image,
+            format: "png".into(),
+        };
+        let (first, _) = store.upsert_asset(&asset("A/one.png", 1)).unwrap();
+        store.upsert_asset(&asset("B/two.png", 1)).unwrap();
+
+        // Same-path reconciliation updates the asset row but must not count it a second time.
+        store.upsert_asset(&asset("A/one.png", 2)).unwrap();
+        store
+            .mark_paths_missing(&source, &["A/one.png".into()])
+            .unwrap();
+        store.upsert_asset(&asset("A/one.png", 2)).unwrap();
+        let entries = store.list_folders(&source, "").unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| (entry.name.as_str(), entry.asset_count))
+                .collect::<Vec<_>>(),
+            vec![("A", 1), ("B", 1)]
+        );
+
+        store.remove_asset(&first, false).unwrap();
+        assert_eq!(
+            store
+                .list_folders(&source, "")
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect::<Vec<_>>(),
+            vec!["B".to_string()],
+            "asset removal retained an empty branch"
+        );
+
+        store.remove_source(&source, false).unwrap();
+        let hierarchy_rows: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM folder WHERE source_id = ?1",
+                params![source.as_bytes().to_vec()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(hierarchy_rows, 0);
+    }
+
+    #[test]
+    fn folder_expansion_plan_uses_the_parent_index_without_reading_assets() {
+        let store = store_with("Tree/Branch/leaf.png");
+        let source = store.list_sources().unwrap()[0].id;
+        let conn = store.conn.lock().unwrap();
+        let mut statement = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT name, descendant_asset_count FROM folder
+                  WHERE source_id = ?1 AND parent_path = ?2 AND path <> ''
+                  ORDER BY name COLLATE NOCASE",
+            )
+            .unwrap();
+        let details = statement
+            .query_map(params![source.as_bytes().to_vec(), ""], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let plan = details.join("\n");
+        assert!(
+            plan.contains("SEARCH folder USING INDEX idx_folder_parent")
+                && plan.contains("source_id=? AND parent_path=?"),
+            "folder expansion missed its direct-child index: {plan}"
+        );
+        assert!(
+            !plan.contains("asset"),
+            "folder expansion reached back into catalog rows: {plan}"
+        );
+    }
+
+    fn folder_scale_fixture(rows: usize, width: usize, depth: usize) -> (Store, SourceId) {
+        let store = Store::open_in_memory().unwrap();
+        let source = store
+            .add_source(
+                &SourceConnection::LocalFs {
+                    root: "/folder-benchmark".into(),
+                },
+                "folder-benchmark",
+                false,
+            )
+            .unwrap();
+        {
+            let mut connection = store.conn.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            let mut insert = transaction
+                .prepare_cached(
+                    "INSERT INTO asset(
+                        id, source_id, path, filename, size_bytes, scanned_at,
+                        media_type, format, created_at, updated_at
+                     ) VALUES (?1, ?2, ?3, ?4, 1, 0, 'image', 'png', 0, 0)",
+                )
+                .unwrap();
+            for index in 0..rows {
+                let branch = index % width;
+                let mut directory = format!("branch_{branch:05}/");
+                for level in 0..depth {
+                    directory.push_str(&format!("level_{level:02}/"));
+                }
+                let filename = format!("asset_{index:07}.png");
+                let path = format!("{directory}{filename}");
+                insert
+                    .execute(params![
+                        AssetId::new().as_bytes().to_vec(),
+                        source.as_bytes().to_vec(),
+                        path,
+                        filename,
+                    ])
+                    .unwrap();
+            }
+            drop(insert);
+            transaction.commit().unwrap();
+        }
+        (store, source)
+    }
+
+    fn folder_expansion_p95(
+        rows: usize,
+        width: usize,
+        depth: usize,
+        samples: usize,
+    ) -> (std::time::Duration, std::time::Duration) {
+        let (store, source) = folder_scale_fixture(rows, width, depth);
+        assert_eq!(
+            store.list_folders(&source, "").unwrap().len(),
+            width.min(rows)
+        );
+        assert_eq!(
+            store.list_folders(&source, "branch_00000/").unwrap().len(),
+            usize::from(depth > 0)
+        );
+
+        let p95 = |prefix: &str| {
+            let mut timings = Vec::with_capacity(samples);
+            for _ in 0..samples {
+                let started = std::time::Instant::now();
+                std::hint::black_box(store.list_folders(&source, prefix).unwrap());
+                timings.push(started.elapsed());
+            }
+            timings.sort_unstable();
+            timings[(samples * 95 / 100).min(samples - 1)]
+        };
+        (p95(""), p95("branch_00000/"))
+    }
+
+    #[test]
+    fn scaled_deep_and_wide_folder_expansion_p95_stays_bounded() {
+        let (root_p95, nested_p95) = folder_expansion_p95(20_000, 512, 12, 40);
+        eprintln!("20k folder expansion p95: root={root_p95:?}, nested={nested_p95:?}");
+        assert!(
+            root_p95 < std::time::Duration::from_secs(2)
+                && nested_p95 < std::time::Duration::from_secs(2),
+            "indexed folder expansion regressed: root={root_p95:?}, nested={nested_p95:?}"
+        );
+    }
+
+    /// Reproducible product-scale hierarchy benchmark. Run explicitly with:
+    /// `cargo test -p dam-store million_asset_folder_expansion_p95 -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "builds the explicit deep/wide 1M-asset folder fixture"]
+    fn million_asset_folder_expansion_p95() {
+        let (root_p95, nested_p95) = folder_expansion_p95(1_000_000, 10_000, 20, 50);
+        eprintln!("1M folder expansion p95: root={root_p95:?}, nested={nested_p95:?}");
+    }
+
     /// Issue #66's discovery half: a folder name is meaning the catalog should be able to find, not
     /// just navigate to. Before this, `Cliffs/` was reachable only by walking the tree — typing
     /// "cliffs" matched nothing, because no column held the directory a file sits in.

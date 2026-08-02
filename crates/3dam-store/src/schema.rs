@@ -611,12 +611,194 @@ pub const MIGRATIONS: &[&str] = &[
         UPDATE asset_filename_trigram SET filename = new.filename WHERE rowid = new.rowid;
     END;
     "#,
+    // ── V20: materialized source folder hierarchy (issue #136) ───────────────────────────────
+    // Folder expansion used to split and group every descendant `asset.path` on every click. Keep
+    // one row per source-relative directory instead: `parent_path` is the direct-child lookup key,
+    // while the two counters distinguish files immediately in the directory from its whole subtree.
+    // Paths are the same normalized `/`-separated strings stored on assets; the empty path is the
+    // source root. Asset triggers make every ingest/removal/path move update the hierarchy in the
+    // caller's transaction, including deletes reached through source/blocklist cascades.
+    r#"
+    CREATE TABLE folder (
+        source_id              BLOB NOT NULL REFERENCES source(id) ON DELETE CASCADE,
+        path                   TEXT NOT NULL,
+        parent_path            TEXT NOT NULL,
+        name                   TEXT NOT NULL,
+        direct_asset_count     INTEGER NOT NULL DEFAULT 0 CHECK (direct_asset_count >= 0),
+        descendant_asset_count INTEGER NOT NULL DEFAULT 0 CHECK (descendant_asset_count >= 0),
+        PRIMARY KEY (source_id, path)
+    ) STRICT;
+    CREATE INDEX idx_folder_parent
+        ON folder(source_id, parent_path, name COLLATE NOCASE);
+
+    -- Empty sources still own a root node. The recursive backfill emits root + each directory
+    -- prefix once per asset; `rest` has no slash exactly at that asset's immediate parent.
+    INSERT INTO folder(source_id, path, parent_path, name)
+        SELECT id, '', '', '' FROM source;
+    WITH RECURSIVE hierarchy(source_id, path, parent_path, name, rest) AS (
+        SELECT source_id, '', '', '', path FROM asset
+        UNION ALL
+        SELECT source_id,
+               path || substr(rest, 1, instr(rest, '/')),
+               path,
+               substr(rest, 1, instr(rest, '/') - 1),
+               substr(rest, instr(rest, '/') + 1)
+          FROM hierarchy WHERE instr(rest, '/') > 0
+    )
+    INSERT INTO folder(source_id, path, parent_path, name,
+                       direct_asset_count, descendant_asset_count)
+        SELECT source_id, path, min(parent_path), min(name),
+               sum(CASE WHEN instr(rest, '/') = 0 THEN 1 ELSE 0 END), count(*)
+          FROM hierarchy
+         GROUP BY source_id, path
+        ON CONFLICT(source_id, path) DO UPDATE SET
+            parent_path = excluded.parent_path,
+            name = excluded.name,
+            direct_asset_count = excluded.direct_asset_count,
+            descendant_asset_count = excluded.descendant_asset_count;
+
+    CREATE TRIGGER folder_source_ai AFTER INSERT ON source BEGIN
+        INSERT INTO folder(source_id, path, parent_path, name)
+        VALUES (new.id, '', '', '');
+    END;
+
+    CREATE TRIGGER folder_asset_ai AFTER INSERT ON asset BEGIN
+        INSERT OR IGNORE INTO folder(source_id, path, parent_path, name)
+        SELECT new.source_id, path, parent_path, name FROM (
+            WITH RECURSIVE hierarchy(path, parent_path, name, rest) AS (
+                SELECT '', '', '', new.path
+                UNION ALL
+                SELECT path || substr(rest, 1, instr(rest, '/')),
+                       path,
+                       substr(rest, 1, instr(rest, '/') - 1),
+                       substr(rest, instr(rest, '/') + 1)
+                  FROM hierarchy WHERE instr(rest, '/') > 0
+            )
+            SELECT path, parent_path, name FROM hierarchy
+        );
+        UPDATE folder
+           SET descendant_asset_count = descendant_asset_count + 1,
+               direct_asset_count = direct_asset_count +
+                   CASE WHEN instr(substr(new.path, length(path) + 1), '/') = 0 THEN 1 ELSE 0 END
+         WHERE source_id = new.source_id AND path IN (
+            SELECT path FROM (
+                WITH RECURSIVE hierarchy(path, rest) AS (
+                    SELECT '', new.path
+                    UNION ALL
+                    SELECT path || substr(rest, 1, instr(rest, '/')),
+                           substr(rest, instr(rest, '/') + 1)
+                      FROM hierarchy WHERE instr(rest, '/') > 0
+                )
+                SELECT path FROM hierarchy
+            )
+         );
+    END;
+
+    CREATE TRIGGER folder_asset_ad AFTER DELETE ON asset BEGIN
+        UPDATE folder
+           SET descendant_asset_count = descendant_asset_count - 1,
+               direct_asset_count = direct_asset_count -
+                   CASE WHEN instr(substr(old.path, length(path) + 1), '/') = 0 THEN 1 ELSE 0 END
+         WHERE source_id = old.source_id AND path IN (
+            SELECT path FROM (
+                WITH RECURSIVE hierarchy(path, rest) AS (
+                    SELECT '', old.path
+                    UNION ALL
+                    SELECT path || substr(rest, 1, instr(rest, '/')),
+                           substr(rest, instr(rest, '/') + 1)
+                      FROM hierarchy WHERE instr(rest, '/') > 0
+                )
+                SELECT path FROM hierarchy
+            )
+         );
+        DELETE FROM folder
+         WHERE source_id = old.source_id AND path <> '' AND descendant_asset_count = 0
+           AND path IN (
+            SELECT path FROM (
+                WITH RECURSIVE hierarchy(path, rest) AS (
+                    SELECT '', old.path
+                    UNION ALL
+                    SELECT path || substr(rest, 1, instr(rest, '/')),
+                           substr(rest, instr(rest, '/') + 1)
+                      FROM hierarchy WHERE instr(rest, '/') > 0
+                )
+                SELECT path FROM hierarchy
+            )
+         );
+    END;
+
+    -- A path/source move is logically one removal plus one insertion, but UPDATE does not fire the
+    -- INSERT/DELETE triggers. Repeat those two bounded ancestor walks here so direct SQL importers
+    -- and future rename support cannot leave stale counts.
+    CREATE TRIGGER folder_asset_au AFTER UPDATE OF source_id, path ON asset
+    WHEN old.source_id <> new.source_id OR old.path <> new.path BEGIN
+        UPDATE folder
+           SET descendant_asset_count = descendant_asset_count - 1,
+               direct_asset_count = direct_asset_count -
+                   CASE WHEN instr(substr(old.path, length(path) + 1), '/') = 0 THEN 1 ELSE 0 END
+         WHERE source_id = old.source_id AND path IN (
+            SELECT path FROM (
+                WITH RECURSIVE hierarchy(path, rest) AS (
+                    SELECT '', old.path
+                    UNION ALL
+                    SELECT path || substr(rest, 1, instr(rest, '/')),
+                           substr(rest, instr(rest, '/') + 1)
+                      FROM hierarchy WHERE instr(rest, '/') > 0
+                )
+                SELECT path FROM hierarchy
+            )
+         );
+        INSERT OR IGNORE INTO folder(source_id, path, parent_path, name)
+        SELECT new.source_id, path, parent_path, name FROM (
+            WITH RECURSIVE hierarchy(path, parent_path, name, rest) AS (
+                SELECT '', '', '', new.path
+                UNION ALL
+                SELECT path || substr(rest, 1, instr(rest, '/')),
+                       path,
+                       substr(rest, 1, instr(rest, '/') - 1),
+                       substr(rest, instr(rest, '/') + 1)
+                  FROM hierarchy WHERE instr(rest, '/') > 0
+            )
+            SELECT path, parent_path, name FROM hierarchy
+        );
+        UPDATE folder
+           SET descendant_asset_count = descendant_asset_count + 1,
+               direct_asset_count = direct_asset_count +
+                   CASE WHEN instr(substr(new.path, length(path) + 1), '/') = 0 THEN 1 ELSE 0 END
+         WHERE source_id = new.source_id AND path IN (
+            SELECT path FROM (
+                WITH RECURSIVE hierarchy(path, rest) AS (
+                    SELECT '', new.path
+                    UNION ALL
+                    SELECT path || substr(rest, 1, instr(rest, '/')),
+                           substr(rest, instr(rest, '/') + 1)
+                      FROM hierarchy WHERE instr(rest, '/') > 0
+                )
+                SELECT path FROM hierarchy
+            )
+         );
+        DELETE FROM folder
+         WHERE source_id = old.source_id AND path <> '' AND descendant_asset_count = 0
+           AND path IN (
+            SELECT path FROM (
+                WITH RECURSIVE hierarchy(path, rest) AS (
+                    SELECT '', old.path
+                    UNION ALL
+                    SELECT path || substr(rest, 1, instr(rest, '/')),
+                           substr(rest, instr(rest, '/') + 1)
+                      FROM hierarchy WHERE instr(rest, '/') > 0
+                )
+                SELECT path FROM hierarchy
+            )
+         );
+    END;
+    "#,
 ];
 
 #[cfg(test)]
 mod tests {
     use super::MIGRATIONS;
-    use rusqlite::Connection;
+    use rusqlite::{Connection, OptionalExtension};
 
     /// Apply the first `n` migrations to a fresh in-memory database.
     fn db_at(n: usize) -> Connection {
@@ -766,5 +948,102 @@ mod tests {
         conn.execute("DELETE FROM asset WHERE id = x'03'", [])
             .unwrap();
         assert_eq!(matches("..."), 0, "delete trigger left a stale trigram row");
+    }
+
+    #[test]
+    fn folder_hierarchy_migration_backfills_and_tracks_moves_and_deletes() {
+        let conn = db_at(19);
+        conn.execute_batch(
+            "INSERT INTO source (id, name, kind, connection, created_at, updated_at)
+                VALUES (x'01', 's', 'local_fs', '/tmp', 0, 0);
+             INSERT INTO asset (id, source_id, path, filename, scanned_at, media_type, format,
+                                created_at, updated_at) VALUES
+                (x'02', x'01', 'loose.png', 'loose.png', 0, 'image', 'png', 0, 0),
+                (x'03', x'01', 'Art/one.png', 'one.png', 0, 'image', 'png', 0, 0),
+                (x'04', x'01', 'Art/Deep/two.png', 'two.png', 0, 'image', 'png', 0, 0),
+                (x'05', x'01', 'Artist/three.png', 'three.png', 0, 'image', 'png', 0, 0);",
+        )
+        .unwrap();
+
+        conn.execute_batch(MIGRATIONS[19]).unwrap();
+        let counts = |source: &[u8], path: &str| -> Option<(i64, i64)> {
+            conn.query_row(
+                "SELECT direct_asset_count, descendant_asset_count
+                   FROM folder WHERE source_id = ?1 AND path = ?2",
+                rusqlite::params![source, path],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .unwrap()
+        };
+        assert_eq!(counts(&[1], ""), Some((1, 4)));
+        assert_eq!(counts(&[1], "Art/"), Some((1, 2)));
+        assert_eq!(counts(&[1], "Art/Deep/"), Some((1, 1)));
+        assert_eq!(counts(&[1], "Artist/"), Some((1, 1)));
+
+        conn.execute_batch(
+            "INSERT INTO source (id, name, kind, connection, created_at, updated_at)
+                VALUES (x'06', 'new', 'sftp', '{}', 0, 0);",
+        )
+        .unwrap();
+        assert_eq!(
+            counts(&[6], ""),
+            Some((0, 0)),
+            "a source inserted after V20 did not get an empty root"
+        );
+        conn.execute_batch(
+            "INSERT INTO asset (id, source_id, path, filename, scanned_at, media_type, format,
+                                created_at, updated_at)
+                VALUES (x'07', x'06', 'Incoming/new.png', 'new.png', 0,
+                        'image', 'png', 0, 0);",
+        )
+        .unwrap();
+        assert_eq!(
+            counts(&[6], ""),
+            Some((0, 1)),
+            "an asset inserted after V20 did not maintain the root"
+        );
+        assert_eq!(counts(&[6], "Incoming/"), Some((1, 1)));
+
+        conn.execute(
+            "UPDATE asset SET path = 'Art/New/three.png' WHERE id = x'05'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            counts(&[1], ""),
+            Some((1, 4)),
+            "a move changed the root total"
+        );
+        assert_eq!(counts(&[1], "Art/"), Some((1, 3)));
+        assert_eq!(counts(&[1], "Art/New/"), Some((1, 1)));
+        assert_eq!(
+            counts(&[1], "Artist/"),
+            None,
+            "empty old branch was retained"
+        );
+
+        conn.execute(
+            "UPDATE asset SET source_id = x'06', path = 'Moved/three.png' WHERE id = x'05'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(counts(&[1], ""), Some((1, 3)));
+        assert_eq!(counts(&[1], "Art/New/"), None);
+        assert_eq!(counts(&[6], ""), Some((0, 2)));
+        assert_eq!(counts(&[6], "Moved/"), Some((1, 1)));
+
+        conn.execute("DELETE FROM asset WHERE id = x'04'", [])
+            .unwrap();
+        assert_eq!(counts(&[1], ""), Some((1, 2)));
+        assert_eq!(counts(&[1], "Art/"), Some((1, 1)));
+        assert_eq!(counts(&[1], "Art/Deep/"), None);
+
+        conn.execute_batch("DELETE FROM source WHERE id IN (x'01', x'06');")
+            .unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT count(*) FROM folder", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 0, "source cascade left hierarchy rows behind");
     }
 }

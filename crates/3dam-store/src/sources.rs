@@ -227,12 +227,10 @@ impl Store {
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(internal)
     }
 
-    /// Immediate subfolders directly under `prefix` within one source, each with its whole-subtree
-    /// asset count (issue #66). `prefix` is source-relative, empty or ending in `/`. Derived on the
-    /// fly from the stored paths — the immediate child folder of a descendant is the first path
-    /// segment after the prefix, kept only when the remainder still holds a `/` (else it's a file
-    /// sitting directly in this folder, not a subfolder). `length()`/`substr()` are character-based
-    /// in SQLite, so a multibyte prefix offsets correctly.
+    /// Immediate subfolders directly under `prefix` within one source, each with its materialized
+    /// whole-subtree asset count (issues #66/#136). `prefix` is source-relative, empty or ending in
+    /// `/`. The `(source_id, parent_path)` index makes this one point lookup plus the returned child
+    /// rows; no descendant asset paths are read or split during expansion.
     pub fn list_folders(
         &self,
         source: &SourceId,
@@ -241,21 +239,13 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT folder, COUNT(*) FROM (
-                    SELECT CASE WHEN instr(rest, '/') > 0
-                                THEN substr(rest, 1, instr(rest, '/') - 1)
-                                ELSE NULL END AS folder
-                    FROM (SELECT substr(path, length(?2) + 1) AS rest
-                          FROM asset
-                          WHERE source_id = ?1 AND path LIKE ?3 ESCAPE '\\')
-                 )
-                 WHERE folder IS NOT NULL AND folder <> ''
-                 GROUP BY folder ORDER BY folder COLLATE NOCASE",
+                "SELECT name, descendant_asset_count FROM folder
+                  WHERE source_id = ?1 AND parent_path = ?2 AND path <> ''
+                  ORDER BY name COLLATE NOCASE",
             )
             .map_err(internal)?;
-        let like = format!("{}%", escape_like(prefix));
         let rows = stmt
-            .query_map(params![source.as_bytes().to_vec(), prefix, like], |r| {
+            .query_map(params![source.as_bytes().to_vec(), prefix], |r| {
                 Ok(FolderEntry {
                     name: r.get(0)?,
                     asset_count: r.get::<_, i64>(1)? as u64,
