@@ -164,16 +164,18 @@ export interface DocumentAttributes {
   class?: string | null;
 }
 
+export type SuggestionState = "pending" | "confirmed" | "rejected";
+
 export interface TagRef {
   name: string;
-  state: string; // suggested | confirmed | rejected
+  state: SuggestionState;
   source: string; // auto | user
   confidence: number | null;
+  why?: string | null;
 }
 
-/** Accept promotes a suggested tag to confirmed; reject records a negative (mirrors
- *  `dam-api` `ReviewAction`). Backend route: POST /api/v1/suggestions/review. */
-export type ReviewAction = "accept" | "reject";
+/** Review or undo an automatic suggestion decision (mirrors `dam-api` `ReviewAction`). */
+export type ReviewAction = "accept" | "reject" | "undo";
 export interface SuggestionReview {
   asset: AssetId;
   tag: string;

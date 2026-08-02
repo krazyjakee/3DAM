@@ -2,6 +2,7 @@ import type React from "react";
 import { useEffect, useRef, useState } from "react";
 import {
   Box,
+  Check,
   ClipboardCopy,
   Grid3x3,
   PanelRightClose,
@@ -979,10 +980,8 @@ function SimilarTile({ hit, onOpen }: { hit: SimilarHit; onOpen: () => void }) {
   );
 }
 
-/** Auto-tag review (reject-only lifecycle): every auto-tag is active — it powers search and
- *  filtering as soon as the analysis pass proposes it, no accept step. The only review action is
- *  *reject*, which hides a wrong tag from search and stops the same extractor re-suggesting it;
- *  a rejected tag can be *restored*. User-authored tags are static — there is nothing to review. */
+/** Automatic tag/class review. Pending automation is visible here but confirmed-only discovery
+ *  keeps it out of search and filters until a user accepts it. Decisions are reversible. */
 function TagList({
   assetId,
   tags,
@@ -1055,13 +1054,16 @@ function TagList({
         </div>
       </div>
       <div>
-        <p className="mb-1 text-[10px] font-medium tracking-wide text-fg-dim uppercase">
-          Automatic suggestions
+        <p className="text-[10px] font-medium tracking-wide text-fg-dim uppercase">
+          Automatic suggestions &amp; classifications
+        </p>
+        <p className="mb-1.5 text-[10px] text-fg-dim">
+          Only accepted suggestions affect search and filters.
         </p>
         {automatic.length === 0 ? (
           <p className="text-[11px] text-fg-dim italic">No automatic suggestions</p>
         ) : (
-          <div className="flex flex-wrap gap-1">
+          <div className="flex flex-col gap-1.5">
             {automatic.map((tag) => (
               <TagChip
                 key={tag.name}
@@ -1091,8 +1093,9 @@ function TagChip({
 }) {
   const auto = tag.source === "auto";
   const canWrite = useCan("write");
-  const confidence =
-    tag.confidence != null ? ` · ${Math.round(tag.confidence * 100)}%` : "";
+  const confidence = tag.confidence != null
+    ? `${Math.round(tag.confidence * 100)}% confidence`
+    : "Confidence unavailable";
 
   // User tags (and any non-auto) are not reviewable — render a plain chip.
   if (!auto) {
@@ -1106,71 +1109,88 @@ function TagChip({
     );
   }
 
-  // Reject-only lifecycle: an auto tag is active (searchable) unless rejected. Active tags offer a
-  // reject; rejected tags show struck-through with a restore. There is no accept-to-confirm step.
-  const rejected = tag.state === "rejected";
+  const pending = tag.state === "pending";
+  const confirmed = tag.state === "confirmed";
+  const disabled = busy || !canWrite || !!peerTitle;
   return (
-    <span
-      className="inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px]"
-      style={{
-        borderColor: rejected ? "var(--color-border)" : "var(--color-accent)",
-        color: rejected ? "var(--color-fg-dim)" : "var(--color-accent)",
-        background: "color-mix(in srgb, currentColor 10%, transparent)",
-      }}
-      title={rejected ? `rejected auto tag${confidence}` : `auto tag${confidence} · powers search`}
+    <article
+      tabIndex={0}
+      className={`rounded border p-2 text-[10px] focus-visible:outline-2 focus-visible:outline-accent ${
+        pending
+          ? "border-warn/50 bg-warn/5"
+          : confirmed
+            ? "border-accent/50 bg-accent/5"
+            : "border-border bg-surface-2"
+      }`}
+      aria-label={`${tag.name}, ${tag.state}, ${confidence}`}
       onKeyDown={(event) => {
         if (
+          event.target !== event.currentTarget ||
           event.altKey ||
           event.ctrlKey ||
           event.metaKey ||
           event.shiftKey ||
-          busy ||
-          !canWrite ||
-          peerTitle
+          disabled
         )
           return;
         const key = event.key.toLowerCase();
-        if ((key === "y" && rejected) || (key === "n" && !rejected)) {
+        if (pending && (key === "y" || key === "n")) {
           event.preventDefault();
-          onReview(rejected ? "accept" : "reject");
+          onReview(key === "y" ? "accept" : "reject");
+        } else if (!pending && key === "u") {
+          event.preventDefault();
+          onReview("undo");
         }
       }}
     >
-      <span className={rejected ? "line-through" : ""}>{tag.name}</span>
-      {rejected ? (
-        <button
-          className="flex items-center justify-center hover:text-accent disabled:cursor-not-allowed disabled:opacity-40 coarse:min-h-11 coarse:min-w-11"
-          title={
-            peerTitle ??
-            (!canWrite
-              ? AUTH_COPY.needsWrite
-              : `Restore tag — include it in search again (${shortcutLabel("accept-suggestion")})`)
-          }
-          aria-label={`Restore tag ${tag.name}`}
-          aria-keyshortcuts="Y"
-          disabled={busy || !canWrite || !!peerTitle}
-          onClick={() => onReview("accept")}
-        >
-          <RotateCcw size={12} />
-        </button>
+      <div className="flex items-center gap-2">
+        <span className={`font-medium ${tag.state === "rejected" ? "text-fg-dim line-through" : "text-fg"}`}>
+          {tag.name}
+        </span>
+        <span className={`rounded px-1 py-0.5 font-medium ${
+          pending ? "text-warn" : confirmed ? "text-accent" : "text-danger"
+        }`}>
+          {pending ? "Pending" : confirmed ? "Accepted" : "Rejected"}
+        </span>
+        <span className="ml-auto tabular-nums text-fg-muted">{confidence}</span>
+      </div>
+      <p className="mt-1 text-fg-dim">Why: {tag.why || "The automated analyser proposed this value."}</p>
+      {pending ? (
+        <div className="mt-1.5 flex gap-1.5">
+          <button
+            className="btn flex-1 justify-center coarse:min-h-11"
+            title={peerTitle ?? (!canWrite ? AUTH_COPY.needsWrite : "Accept suggestion (Y)")}
+            aria-label={`Accept suggestion ${tag.name}`}
+            aria-keyshortcuts="Y"
+            disabled={disabled}
+            onClick={() => onReview("accept")}
+          >
+            <Check size={12} /> Accept <kbd className="text-[9px] text-fg-dim">Y</kbd>
+          </button>
+          <button
+            className="btn flex-1 justify-center text-danger coarse:min-h-11"
+            title={peerTitle ?? (!canWrite ? AUTH_COPY.needsWrite : "Reject suggestion (N)")}
+            aria-label={`Reject suggestion ${tag.name}`}
+            aria-keyshortcuts="N"
+            disabled={disabled}
+            onClick={() => onReview("reject")}
+          >
+            <X size={12} /> Reject <kbd className="text-[9px] text-fg-dim">N</kbd>
+          </button>
+        </div>
       ) : (
         <button
-          className="flex items-center justify-center hover:text-danger disabled:cursor-not-allowed disabled:opacity-40 coarse:min-h-11 coarse:min-w-11"
-          title={
-            peerTitle ??
-            (!canWrite
-              ? AUTH_COPY.needsWrite
-              : `Reject tag — hide it from search (${shortcutLabel("reject-suggestion")})`)
-          }
-          aria-label={`Reject tag ${tag.name}`}
-          aria-keyshortcuts="N"
-          disabled={busy || !canWrite || !!peerTitle}
-          onClick={() => onReview("reject")}
+          className="btn mt-1.5 w-full justify-center coarse:min-h-11"
+          title={peerTitle ?? (!canWrite ? AUTH_COPY.needsWrite : "Undo decision (U)")}
+          aria-label={`Undo ${tag.state} suggestion ${tag.name}`}
+          aria-keyshortcuts="U"
+          disabled={disabled}
+          onClick={() => onReview("undo")}
         >
-          <X size={12} />
+          <RotateCcw size={12} /> Undo <kbd className="text-[9px] text-fg-dim">U</kbd>
         </button>
       )}
-    </span>
+    </article>
   );
 }
 

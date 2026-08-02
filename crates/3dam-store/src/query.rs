@@ -1424,21 +1424,99 @@ mod tests {
         assert!(search(&store, "piano").is_empty());
     }
 
-    /// V7: an auto-tag makes an asset findable by text even when the filename never mentions it, and
-    /// rejecting the tag drops it back out of the index — the reject-only lifecycle, end to end.
+    /// Pending automation never powers discovery; accepting makes it searchable, and undo removes
+    /// it again while retaining the suggestion for review.
     #[test]
-    fn tag_name_is_searchable_and_reject_removes_it() {
+    fn pending_tag_is_excluded_until_accept_and_undo_removes_it_again() {
         let store = store_with("clip_0001.wav");
         let id = query_all(&store, &QueryRequest::default()).unwrap().items[0].id;
         // A term that appears only as a tag, never in the filename.
         assert!(search(&store, "snare").is_empty());
-        store.suggest_tag(&id, "snare", 0.9, "test@1").unwrap();
-        assert_eq!(search(&store, "snare"), vec!["clip_0001.wav"]);
-        // Rejecting hides it from search again; restoring (confirm) brings it back.
-        store.set_tag_state(&id, "snare", "rejected").unwrap();
+        store
+            .suggest_tag(&id, "snare", 0.9, "test@1", "waveform matched a snare")
+            .unwrap();
         assert!(search(&store, "snare").is_empty());
-        store.set_tag_state(&id, "snare", "confirmed").unwrap();
+        store
+            .review_suggestion(&id, "snare", ReviewAction::Accept)
+            .unwrap();
         assert_eq!(search(&store, "snare"), vec!["clip_0001.wav"]);
+        store
+            .review_suggestion(&id, "snare", ReviewAction::Undo)
+            .unwrap();
+        assert!(search(&store, "snare").is_empty());
+    }
+
+    #[test]
+    fn automated_class_filter_requires_the_matching_accepted_suggestion() {
+        let store = Store::open_in_memory().unwrap();
+        let source = store
+            .add_source(
+                &SourceConnection::LocalFs {
+                    root: "/tmp".into(),
+                },
+                "classes",
+                false,
+            )
+            .unwrap();
+        let id = store
+            .upsert_asset(&NewAsset {
+                source_id: source,
+                path: "impact.wav".into(),
+                filename: "impact.wav".into(),
+                content_hash: None,
+                size_bytes: Some(1),
+                source_modified_at: None,
+                scanned_at: now_ms(),
+                media_type: MediaType::Audio,
+                format: "wav".into(),
+            })
+            .unwrap()
+            .0;
+        store
+            .set_media_class(&id, MediaType::Audio, "one_shot")
+            .unwrap();
+        store
+            .suggest_tag(
+                &id,
+                "one_shot",
+                0.8,
+                "audio@1",
+                "measured transient envelope",
+            )
+            .unwrap();
+        let request = QueryRequest {
+            filters: vec![Filter {
+                field: FacetField::AudioClass,
+                op: FilterOp::Eq,
+                value: FilterValue::Str("one_shot".into()),
+            }],
+            ..QueryRequest::default()
+        };
+        assert!(query_all(&store, &request).unwrap().items.is_empty());
+        store
+            .review_suggestion(&id, "one_shot", ReviewAction::Accept)
+            .unwrap();
+        assert_eq!(query_all(&store, &request).unwrap().items[0].id, id);
+        store
+            .review_suggestion(&id, "one_shot", ReviewAction::Undo)
+            .unwrap();
+        assert!(query_all(&store, &request).unwrap().items.is_empty());
+
+        store
+            .review_suggestion(&id, "one_shot", ReviewAction::Reject)
+            .unwrap();
+        store
+            .edit_manual_tags(&[id], &["music".into()], &[], false)
+            .unwrap();
+        let corrected = QueryRequest {
+            filters: vec![Filter {
+                field: FacetField::AudioClass,
+                op: FilterOp::Eq,
+                value: FilterValue::Str("music".into()),
+            }],
+            ..QueryRequest::default()
+        };
+        assert_eq!(query_all(&store, &corrected).unwrap().items[0].id, id);
     }
 
     /// Advanced Search: a typed structured-attribute filter round-trips against the stored columns —

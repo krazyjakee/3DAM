@@ -272,6 +272,8 @@ export function useReviewSuggestion() {
     onSuccess: (_data, req) => {
       qc.invalidateQueries({ queryKey: qk.asset(req.asset) });
       qc.invalidateQueries({ queryKey: qk.assets });
+      qc.invalidateQueries({ queryKey: qk.stats });
+      qc.invalidateQueries({ queryKey: qk.tags });
     },
   });
 }

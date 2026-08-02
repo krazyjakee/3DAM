@@ -485,9 +485,22 @@ pub struct DocumentAttributes {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TagRef {
     pub name: String,
-    pub state: String,  // suggested | confirmed | rejected
+    pub state: SuggestionState,
     pub source: String, // auto | user
     pub confidence: Option<f32>,
+    /// Concise, persisted reason the analyser proposed this value. User-authored tags have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
+}
+
+/// Review state presented to users. The store's legacy spelling is `suggested`; the wire and UI
+/// call that state `pending` so it cannot be mistaken for an accepted catalog fact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SuggestionState {
+    Pending,
+    Confirmed,
+    Rejected,
 }
 
 // ── query ──────────────────────────────────────────────────────────────────
@@ -1430,8 +1443,7 @@ pub struct DupGroup {
     pub chosen_keep: Option<AssetId>,
 }
 
-/// Accept or reject one auto-suggested tag (the one-action lifecycle, §1.4). Accept promotes the
-/// suggestion to a confirmed tag; reject records a negative so re-analysis won't re-suggest it.
+/// Accept, reject, or undo one auto-suggested tag decision (the one-action lifecycle, §1.4).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SuggestionReview {
     pub asset: AssetId,
@@ -1496,6 +1508,7 @@ pub struct TagInfo {
 pub enum ReviewAction {
     Accept,
     Reject,
+    Undo,
 }
 
 /// Flag or unflag one asset as a favourite (issue #63). Reversible; the state lives in the asset

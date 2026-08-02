@@ -27,6 +27,7 @@ import type {
   Origin,
   OidcProvisioning,
   ReviewAction,
+  SuggestionState,
   ScanMode,
   SearchMode,
   SortDir,
@@ -83,7 +84,8 @@ export const API_V1_FIELDLESS_ENUMS = {
   disposition: ["write", "collision", "skipped", "unsupported", "done", "failed"],
   upload_collision: ["fail", "suffix", "skip"],
   dup_kind: ["exact", "near"],
-  review_action: ["accept", "reject"],
+  review_action: ["accept", "reject", "undo"],
+  suggestion_state: ["pending", "confirmed", "rejected"],
   collection_kind: ["manual", "smart"],
   export_format: ["json", "csv", "sidecar"],
   change_kind: ["reanalyzed", "retagged", "license_set", "metadata", "note_set", "commented"],
@@ -115,6 +117,7 @@ export type _DispositionContract = ContractAssert<SameUnion<Values<typeof API_V1
 export type _UploadCollisionContract = ContractAssert<SameUnion<Values<typeof API_V1_FIELDLESS_ENUMS.upload_collision>, UploadCollision>>;
 export type _DupKindContract = ContractAssert<SameUnion<Values<typeof API_V1_FIELDLESS_ENUMS.dup_kind>, DupKind>>;
 export type _ReviewContract = ContractAssert<SameUnion<Values<typeof API_V1_FIELDLESS_ENUMS.review_action>, ReviewAction>>;
+export type _SuggestionStateContract = ContractAssert<SameUnion<Values<typeof API_V1_FIELDLESS_ENUMS.suggestion_state>, SuggestionState>>;
 export type _CollectionKindContract = ContractAssert<SameUnion<Values<typeof API_V1_FIELDLESS_ENUMS.collection_kind>, CollectionKind>>;
 export type _ExportFormatContract = ContractAssert<SameUnion<Values<typeof API_V1_FIELDLESS_ENUMS.export_format>, ExportFormat>>;
 export type _ChangeKindContract = ContractAssert<SameUnion<Values<typeof API_V1_FIELDLESS_ENUMS.change_kind>, ChangeKind>>;

@@ -675,8 +675,8 @@ pub trait LibraryService: Send + Sync {
         req: DupReviewRequest,
     ) -> Result<(), LibError>;
 
-    /// Accept or reject one auto-suggested tag (§1.4). Reversible; a reject is remembered so the same
-    /// extractor version won't re-suggest it.
+    /// Accept/reject one pending automatic suggestion, or undo a prior decision. Decisions are
+    /// durable across re-analysis; pending values do not influence confirmed-only discovery.
     async fn review_suggestion(
         &self,
         ctx: &AuthContext,

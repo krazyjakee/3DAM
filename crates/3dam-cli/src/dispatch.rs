@@ -527,11 +527,18 @@ pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             }
         }
 
-        Cmd::Tag { id, tag, reject } => {
+        Cmd::Tag {
+            id,
+            tag,
+            reject,
+            undo,
+        } => {
             let asset: AssetId = id
                 .parse()
                 .map_err(|_| anyhow::anyhow!("invalid asset id"))?;
-            let action = if reject {
+            let action = if undo {
+                ReviewAction::Undo
+            } else if reject {
                 ReviewAction::Reject
             } else {
                 ReviewAction::Accept
@@ -545,7 +552,13 @@ pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 },
             )
             .await?;
-            let verb = if reject { "rejected" } else { "confirmed" };
+            let verb = if undo {
+                "returned to pending"
+            } else if reject {
+                "rejected"
+            } else {
+                "confirmed"
+            };
             println!("{verb} tag '{tag}' on {asset}");
         }
 

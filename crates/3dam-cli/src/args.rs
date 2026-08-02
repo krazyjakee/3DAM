@@ -202,8 +202,11 @@ pub(crate) enum Cmd {
         /// Tag name (e.g. `seamless`, `rigged`).
         tag: String,
         /// Reject instead of accept (records a negative so re-analysis won't re-suggest it).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "undo")]
         reject: bool,
+        /// Undo a prior accept/reject decision and return the suggestion to pending review.
+        #[arg(long, conflicts_with = "reject")]
+        undo: bool,
     },
     /// Read, write, or clear an asset's free-text note (issue #81).
     ///

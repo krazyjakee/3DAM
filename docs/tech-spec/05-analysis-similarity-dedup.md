@@ -110,9 +110,16 @@ in similarity results until stage 5 completes for it.
   suggestion (DESIGN_GUIDELINES §3.4). Accept promotes it to a **confirmed** tag/attribute;
   reject records a negative so re-analysis at the same extractor version does not re-suggest
   it.
-- Everything is **reversible**: confirmed values can be un-confirmed; the underlying suggestion
-  and its explanation are retained (until re-analysis supersedes them). No stage ever deletes,
-  moves, or silently overwrites confirmed user data.
+- Everything is **reversible**: undo returns a confirmed or rejected value to pending; the
+  underlying confidence and explanation are retained. No stage ever deletes, moves, or silently
+  overwrites confirmed/rejected user decisions.
+- **Discovery is confirmed-only.** Pending suggestions are visible in the inspector review queue,
+  but do not feed full-text search, tag filters, class/category facets, exports, or tag vocabulary.
+  This makes automation useful without silently treating it as approved catalog metadata.
+- Media class/category guesses use this same lifecycle: the raw analyser value is retained for
+  diagnostics, while tags are the review/correction record: accept the guess, or reject it and add
+  the correct manual class. Class facets match confirmed tag values only. Continuous or structural measurements (dimensions,
+  duration, geometry counts, tileability score) remain facts and are labelled as measured output.
 - **Bulk accept/reject** (e.g. "confirm all `seamless` suggestions above 0.9") is a batch over
   the same primitive, previewed before it applies (DESIGN_GUIDELINES §3.4).
 
@@ -474,9 +481,10 @@ and results are explainable and regenerable.
   §3.1): affected assets are re-embedded and re-upserted; the old space's vectors are
   superseded. Cross-peer similarity requires **matching** space ids, so a version bump also
   breaks cross-peer ranking until peers upgrade (§3.4, §8).
-- Re-analysis is a background, cancellable job (14) and never touches confirmed user data:
-  new suggestions are surfaced for accept/reject as fresh suggestions (§1.4); prior
-  confirmations stand until the user acts. Analysis can be enabled/disabled per extractor
+- Re-analysis is a background, cancellable job (14) and never touches decided user data:
+  evidence (confidence/explanation/extractor) may refresh while a suggestion remains pending, but
+  confirmed and rejected rows are never overwritten; a newly inferred value is a separate pending
+  suggestion. Prior decisions stand until the user undoes them. Analysis can be enabled/disabled per extractor
   (DESIGN_GUIDELINES §2, PRODUCT_SPEC §6.11 "Analysis & watch" flag), so a low-powered serve
   host can serve a static catalog with re-analysis off.
 

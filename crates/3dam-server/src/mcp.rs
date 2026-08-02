@@ -163,14 +163,15 @@ fn tool_defs() -> Vec<ToolDef> {
         // ── write tools (gated, §6) ──────────────────────────────────────────
         ToolDef {
             name: "tag",
-            description: "Accept (or --reject) an auto-suggested tag on an asset. Reversible.",
+            description: "Accept/reject an automatic suggestion, or undo a prior decision.",
             write: true,
             schema: || {
                 json!({
                     "type": "object", "required": ["id","tag"],
                     "properties": {
                         "id": {"type": "string"}, "tag": {"type": "string"},
-                        "reject": {"type": "boolean", "default": false}
+                        "reject": {"type": "boolean", "default": false},
+                        "undo": {"type": "boolean", "default": false}
                     }
                 })
             },
@@ -433,10 +434,17 @@ impl McpAdapter {
             }
             "tag" => {
                 let a: TagArgs = parse_args(args)?;
+                if a.reject && a.undo {
+                    return Err(LibError::BadRequest(
+                        "tag review cannot reject and undo together".into(),
+                    ));
+                }
                 let req = SuggestionReview {
                     asset: parse_asset(&a.id)?,
                     tag: a.tag,
-                    action: if a.reject {
+                    action: if a.undo {
+                        ReviewAction::Undo
+                    } else if a.reject {
                         ReviewAction::Reject
                     } else {
                         ReviewAction::Accept
@@ -611,6 +619,8 @@ struct TagArgs {
     tag: String,
     #[serde(default)]
     reject: bool,
+    #[serde(default)]
+    undo: bool,
 }
 #[derive(serde::Deserialize)]
 struct ScanArgs {

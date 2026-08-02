@@ -335,7 +335,13 @@ fn analyze_one(
         // Suggested (not confirmed) so they share the accept/reject lifecycle. No-op when the model
         // has no taxonomy for this media (default trait impl returns empty).
         for (tag, conf) in m.zero_shot_labels(t.media, &abs) {
-            if let Err(e) = store.suggest_tag(&t.id, &tag, conf, "semantic@1") {
+            if let Err(e) = store.suggest_tag(
+                &t.id,
+                &tag,
+                conf,
+                "semantic@1",
+                "The semantic model matched this content label.",
+            ) {
                 tracing::warn!(asset = %t.id, tag = %tag, error = %e, "semantic label suggest_tag failed");
             }
         }
@@ -364,7 +370,13 @@ fn suggest_filename_tags(store: &Store, t: &AnalysisPlanTarget) {
         if tok.len() < 3 || tok == fmt || tok.chars().all(|c| c.is_ascii_digit()) {
             continue;
         }
-        if let Err(e) = store.suggest_tag(&t.id, &tok, 0.4, "filename@1") {
+        if let Err(e) = store.suggest_tag(
+            &t.id,
+            &tok,
+            0.4,
+            "filename@1",
+            "This term appears in the source filename.",
+        ) {
             tracing::warn!(asset = %t.id, tag = %tok, error = %e, "filename suggest_tag failed");
         }
     }
@@ -403,7 +415,12 @@ fn analyze_image(store: &Store, t: &AnalysisPlanTarget, abs: &Path) -> Result<()
         "tiled" => suggestions.push(("tileable", 0.8)),
         _ => {}
     }
-    suggest_all(store, &t.id, &suggestions);
+    suggest_all(
+        store,
+        &t.id,
+        &suggestions,
+        "Image analysis inferred this from visual and tiling signals.",
+    );
     Ok(())
 }
 
@@ -489,7 +506,12 @@ fn analyze_audio(
         .set_media_class(&t.id, MediaType::Audio, class)
         .map_err(|e| e.to_string())?;
     extra.insert(0, (class, conf));
-    suggest_all(store, &t.id, &extra);
+    suggest_all(
+        store,
+        &t.id,
+        &extra,
+        "Audio analysis inferred this from measured rhythm, timbre, and envelope signals.",
+    );
     // Waveform peaks for the inspector (issue #73): derived during the same decode as features, so
     // no client or second server pass re-downloads + re-decodes the audio to draw the bars.
     match analysis {
@@ -574,7 +596,12 @@ fn analyze_model(
     if m.has_uvs.unwrap_or(false) {
         suggestions.push(("uv_mapped", 0.9));
     }
-    suggest_all(store, &t.id, &suggestions);
+    suggest_all(
+        store,
+        &t.id,
+        &suggestions,
+        "Model analysis inferred this from measured geometry and structure.",
+    );
     Ok(())
 }
 
@@ -651,7 +678,12 @@ fn analyze_video(
             suggestions.push(("1080p", 0.95));
         }
     }
-    suggest_all(store, &t.id, &suggestions);
+    suggest_all(
+        store,
+        &t.id,
+        &suggestions,
+        "Video analysis inferred this from measured duration, dimensions, and track metadata.",
+    );
     Ok(())
 }
 
@@ -738,7 +770,12 @@ fn analyze_document(
     if d.page_count.is_some_and(|p| p > 20) {
         suggestions.push(("long_form", 0.8));
     }
-    suggest_all(store, &t.id, &suggestions);
+    suggest_all(
+        store,
+        &t.id,
+        &suggestions,
+        "Document analysis inferred this from the filename and extracted text.",
+    );
     Ok(())
 }
 
@@ -749,22 +786,39 @@ fn suggest_audio_extras(store: &Store, id: &dam_api::id::AssetId, f: &dam_media:
     if let Some(bpm) = f.bpm {
         let bucket = ((bpm / 5.0).round() * 5.0) as i64;
         let tag = format!("{bucket}bpm");
-        if let Err(e) = store.suggest_tag(id, &tag, 0.5, "analyze@1") {
+        if let Err(e) = store.suggest_tag(
+            id,
+            &tag,
+            0.5,
+            "analyze@1",
+            "Measured tempo falls in this BPM bucket.",
+        ) {
             tracing::warn!(asset = %id, tag = %tag, error = %e, "bpm suggest_tag failed");
         }
     }
     if let Some(key) = f.key {
         let tag = format!("key-{key}");
-        if let Err(e) = store.suggest_tag(id, &tag, 0.5, "analyze@1") {
+        if let Err(e) = store.suggest_tag(
+            id,
+            &tag,
+            0.5,
+            "analyze@1",
+            "Pitch analysis detected this musical key.",
+        ) {
             tracing::warn!(asset = %id, tag = %tag, error = %e, "key suggest_tag failed");
         }
     }
 }
 
 /// Write a batch of suggested tags fail-soft (a single insert failure never sinks the asset).
-fn suggest_all(store: &Store, id: &dam_api::id::AssetId, suggestions: &[(&str, f32)]) {
+fn suggest_all(
+    store: &Store,
+    id: &dam_api::id::AssetId,
+    suggestions: &[(&str, f32)],
+    explanation: &str,
+) {
     for (name, conf) in suggestions {
-        if let Err(e) = store.suggest_tag(id, name, *conf, "analyze@1") {
+        if let Err(e) = store.suggest_tag(id, name, *conf, "analyze@1", explanation) {
             tracing::warn!(asset = %id, tag = name, error = %e, "suggest_tag failed");
         }
     }

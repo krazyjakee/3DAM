@@ -876,6 +876,19 @@ pub const MIGRATIONS: &[&str] = &[
     ) STRICT;
     CREATE INDEX idx_duplicate_review_state ON duplicate_review(state, updated_at);
     "#,
+    // ── V25: durable suggestion explanations (issue #112) ─────────────────────────────────
+    // Decision state already survives extractor/version changes on the asset/tag identity. Keep
+    // the human-readable reason beside that durable row so review remains explainable after a
+    // restart; re-analysis may refresh a pending reason but cannot overwrite a decided row.
+    r#"
+    ALTER TABLE asset_tag ADD COLUMN explanation TEXT;
+    UPDATE asset_fts SET tags = COALESCE((
+        SELECT group_concat(t.name, ' ') FROM asset_tag at
+        JOIN tag t ON t.id = at.tag_id
+        JOIN asset a ON a.id = at.asset_id
+        WHERE a.rowid = asset_fts.rowid AND at.state = 'confirmed'
+    ), '');
+    "#,
 ];
 
 #[cfg(test)]

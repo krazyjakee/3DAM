@@ -683,7 +683,7 @@ impl Store {
         asset.summary.top_tags = asset
             .tags
             .iter()
-            .filter(|t| t.state == "confirmed")
+            .filter(|t| t.state == SuggestionState::Confirmed)
             .map(|t| t.name.clone())
             .collect();
         Ok(asset)

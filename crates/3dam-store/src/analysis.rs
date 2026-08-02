@@ -559,7 +559,7 @@ impl Store {
 
     pub(crate) fn load_tags(conn: &Connection, id_blob: &[u8]) -> Vec<TagRef> {
         let mut stmt = match conn.prepare(
-            "SELECT t.name, at.state, at.source, at.confidence
+            "SELECT t.name, at.state, at.source, at.confidence, at.explanation
              FROM asset_tag at JOIN tag t ON t.id = at.tag_id
              WHERE at.asset_id = ?1 ORDER BY at.state, t.name",
         ) {
@@ -569,9 +569,14 @@ impl Store {
         let rows = stmt.query_map(params![id_blob], |r| {
             Ok(TagRef {
                 name: r.get(0)?,
-                state: r.get(1)?,
+                state: match r.get::<_, String>(1)?.as_str() {
+                    "confirmed" => SuggestionState::Confirmed,
+                    "rejected" => SuggestionState::Rejected,
+                    _ => SuggestionState::Pending,
+                },
                 source: r.get(2)?,
                 confidence: r.get::<_, Option<f64>>(3)?.map(|v| v as f32),
+                why: r.get(4)?,
             })
         });
         match rows {
@@ -580,15 +585,15 @@ impl Store {
         }
     }
 
-    /// Rewrite an asset's `tags` FTS column to its current non-rejected tag names (schema V7), so tag
-    /// text feeds full-text search and a rejected tag drops back out. Called after every tag mutation.
+    /// Rewrite an asset's `tags` FTS column to confirmed tag names only. Pending automation remains
+    /// discoverable in Inspector but cannot silently power full-text results before review.
     /// Best-effort: an FTS hiccup must never sink the tag write that triggered it.
     fn reindex_asset_tags(conn: &Connection, id: &AssetId) {
         let _ = conn.execute(
             "UPDATE asset_fts SET tags = COALESCE((
                 SELECT group_concat(t.name, ' ') FROM asset_tag at
                 JOIN tag t ON t.id = at.tag_id
-                WHERE at.asset_id = ?1 AND at.state <> 'rejected'), '')
+                WHERE at.asset_id = ?1 AND at.state = 'confirmed'), '')
              WHERE rowid = (SELECT rowid FROM asset WHERE id = ?1)",
             params![id.as_bytes().to_vec()],
         );
@@ -642,40 +647,70 @@ impl Store {
         name: &str,
         confidence: f32,
         extractor: &str,
+        explanation: &str,
     ) -> Result<(), LibError> {
         let conn = self.conn.lock().unwrap();
         let tag_id = Self::intern_tag(&conn, name)?;
         conn.execute(
-            "INSERT INTO asset_tag (asset_id, tag_id, state, source, confidence, extractor, created_at)
-             VALUES (?1, ?2, 'suggested', 'auto', ?3, ?4, ?5)
-             ON CONFLICT(asset_id, tag_id) DO NOTHING",
-            params![id.as_bytes().to_vec(), tag_id, confidence as f64, extractor, now_ms()],
+            "INSERT INTO asset_tag
+                (asset_id, tag_id, state, source, confidence, extractor, created_at, explanation)
+             VALUES (?1, ?2, 'suggested', 'auto', ?3, ?4, ?5, ?6)
+             ON CONFLICT(asset_id, tag_id) DO UPDATE SET
+                confidence=excluded.confidence,
+                extractor=excluded.extractor,
+                explanation=excluded.explanation
+             WHERE asset_tag.state = 'suggested' AND asset_tag.source = 'auto'",
+            params![
+                id.as_bytes().to_vec(),
+                tag_id,
+                confidence.clamp(0.0, 1.0) as f64,
+                extractor,
+                now_ms(),
+                explanation
+            ],
         )
         .map_err(internal)?;
         Self::reindex_asset_tags(&conn, id);
         Ok(())
     }
 
-    /// Accept (`confirmed`) or reject (`rejected`) a suggested tag by name (§1.4). Reversible.
-    pub fn set_tag_state(&self, id: &AssetId, name: &str, state: &str) -> Result<(), LibError> {
+    /// Apply one valid state transition to an existing automatic suggestion. This deliberately
+    /// cannot manufacture a user tag or review an arbitrary name: `Undo` returns a decided row to
+    /// pending, while accept/reject operate only on pending rows.
+    pub fn review_suggestion(
+        &self,
+        id: &AssetId,
+        name: &str,
+        action: ReviewAction,
+    ) -> Result<(), LibError> {
         let conn = self.conn.lock().unwrap();
-        let tag_id = Self::intern_tag(&conn, name)?;
-        let n = conn
-            .execute(
-                "UPDATE asset_tag SET state = ?3 WHERE asset_id = ?1 AND tag_id = ?2",
-                params![id.as_bytes().to_vec(), tag_id, state],
+        let current: Option<String> = conn
+            .query_row(
+                "SELECT at.state FROM asset_tag at JOIN tag t ON t.id = at.tag_id
+                 WHERE at.asset_id = ?1 AND t.name = ?2 COLLATE NOCASE AND at.source = 'auto'",
+                params![id.as_bytes().to_vec(), name],
+                |row| row.get(0),
             )
+            .optional()
             .map_err(internal)?;
-        if n == 0 {
-            // No prior suggestion (e.g. a user confirming a tag directly): create it as user-sourced.
-            conn.execute(
-                "INSERT INTO asset_tag (asset_id, tag_id, state, source, created_at)
-                 VALUES (?1, ?2, ?3, 'user', ?4)
-                 ON CONFLICT(asset_id, tag_id) DO UPDATE SET state = excluded.state",
-                params![id.as_bytes().to_vec(), tag_id, state, now_ms()],
-            )
-            .map_err(internal)?;
-        }
+        let current =
+            current.ok_or_else(|| LibError::NotFound(format!("automatic suggestion {name:?}")))?;
+        let next = match (action, current.as_str()) {
+            (ReviewAction::Accept, "suggested") => "confirmed",
+            (ReviewAction::Reject, "suggested") => "rejected",
+            (ReviewAction::Undo, "confirmed" | "rejected") => "suggested",
+            _ => {
+                return Err(LibError::BadRequest(format!(
+                    "cannot {action:?} a {current} suggestion"
+                )))
+            }
+        };
+        conn.execute(
+            "UPDATE asset_tag SET state = ?3 WHERE asset_id = ?1
+             AND tag_id = (SELECT id FROM tag WHERE name = ?2 COLLATE NOCASE)",
+            params![id.as_bytes().to_vec(), name, next],
+        )
+        .map_err(internal)?;
         Self::reindex_asset_tags(&conn, id);
         Ok(())
     }
@@ -785,7 +820,8 @@ impl Store {
                        (asset_id, tag_id, state, source, confidence, extractor, created_at)
                      VALUES (?1, ?2, 'confirmed', 'user', NULL, NULL, ?3)
                      ON CONFLICT(asset_id, tag_id) DO UPDATE SET
-                       state = 'confirmed', source = 'user', confidence = NULL, extractor = NULL",
+                       state = 'confirmed', source = 'user', confidence = NULL, extractor = NULL,
+                       explanation = NULL",
                     params![id.as_bytes().to_vec(), tag_id, now_ms()],
                 )
                 .map_err(internal)?;
@@ -2115,7 +2151,9 @@ mod tests {
     fn manual_tag_edit_preview_is_reversible_idempotent_and_preserves_suggestions() {
         let store = duplicate_store(1, 1);
         let id = first_asset(&store);
-        store.suggest_tag(&id, "automatic", 0.8, "test@1").unwrap();
+        store
+            .suggest_tag(&id, "automatic", 0.8, "test@1", "test reason")
+            .unwrap();
 
         let preview = store
             .edit_manual_tags(&[id], &["manual".into()], &["automatic".into()], true)
@@ -2167,7 +2205,9 @@ mod tests {
     fn manually_adding_an_auto_tag_converts_authorship_and_vocabulary_is_confirmed_only() {
         let store = duplicate_store(1, 1);
         let id = first_asset(&store);
-        store.suggest_tag(&id, "convert-me", 0.9, "test@1").unwrap();
+        store
+            .suggest_tag(&id, "convert-me", 0.9, "test@1", "test reason")
+            .unwrap();
         assert!(
             store
                 .list_tags(None, 20, &Visibility::Full)
@@ -2184,13 +2224,64 @@ mod tests {
             Store::load_tags(&conn, id.as_bytes())
         };
         assert_eq!(tags[0].source, "user");
-        assert_eq!(tags[0].state, "confirmed");
+        assert_eq!(tags[0].state, SuggestionState::Confirmed);
         assert_eq!(tags[0].confidence, None);
+        assert_eq!(tags[0].why, None);
         let vocabulary = store
             .list_tags(Some("convert"), 20, &Visibility::Full)
             .unwrap();
         assert_eq!(vocabulary.len(), 1);
         assert!(vocabulary[0].manual);
+    }
+
+    #[test]
+    fn suggestion_decisions_survive_reanalysis_and_undo_reopens_pending_metadata() {
+        let store = duplicate_store(1, 1);
+        let id = first_asset(&store);
+        store
+            .suggest_tag(&id, "texture", 0.6, "image@1", "v1 visual classifier")
+            .unwrap();
+        store
+            .review_suggestion(&id, "texture", ReviewAction::Accept)
+            .unwrap();
+
+        // A newer extractor may refresh undecided evidence, but cannot overwrite a human decision.
+        store
+            .suggest_tag(&id, "texture", 0.95, "image@2", "v2 visual classifier")
+            .unwrap();
+        let decided = {
+            let conn = store.conn.lock().unwrap();
+            Store::load_tags(&conn, id.as_bytes()).remove(0)
+        };
+        assert_eq!(decided.state, SuggestionState::Confirmed);
+        assert_eq!(decided.confidence, Some(0.6));
+        assert_eq!(decided.why.as_deref(), Some("v1 visual classifier"));
+
+        store
+            .review_suggestion(&id, "texture", ReviewAction::Undo)
+            .unwrap();
+        store
+            .suggest_tag(&id, "texture", 0.95, "image@2", "v2 visual classifier")
+            .unwrap();
+        let reopened = {
+            let conn = store.conn.lock().unwrap();
+            Store::load_tags(&conn, id.as_bytes()).remove(0)
+        };
+        assert_eq!(reopened.state, SuggestionState::Pending);
+        assert_eq!(reopened.confidence, Some(0.95));
+        assert_eq!(reopened.why.as_deref(), Some("v2 visual classifier"));
+
+        assert!(matches!(
+            store.review_suggestion(&id, "not-proposed", ReviewAction::Accept),
+            Err(LibError::NotFound(_))
+        ));
+        store
+            .review_suggestion(&id, "texture", ReviewAction::Reject)
+            .unwrap();
+        assert!(matches!(
+            store.review_suggestion(&id, "texture", ReviewAction::Reject),
+            Err(LibError::BadRequest(_))
+        ));
     }
 
     #[test]

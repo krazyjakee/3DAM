@@ -2707,13 +2707,11 @@ impl LibraryService for EmbeddedLibrary {
         req: SuggestionReview,
     ) -> Result<(), LibError> {
         self.require_asset_writable(ctx, &req.asset).await?;
-        let state = match req.action {
-            ReviewAction::Accept => "confirmed",
-            ReviewAction::Reject => "rejected",
-        };
         let id = req.asset;
         let tag = req.tag.clone();
-        self.db(move |s| s.set_tag_state(&id, &tag, state)).await?;
+        let action = req.action;
+        self.db(move |s| s.review_suggestion(&id, &tag, action))
+            .await?;
         let source_id = self.db(move |s| s.asset_source(&id)).await?;
         reliability::publish_event(
             &self.events,

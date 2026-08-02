@@ -137,7 +137,8 @@ fn fieldless_enums_match_the_committed_wire_vocabulary() {
     assert_wire_enum!("disposition", Disposition, Disposition::Write => "write", Disposition::Collision => "collision", Disposition::Skipped => "skipped", Disposition::Unsupported => "unsupported", Disposition::Done => "done", Disposition::Failed => "failed");
     assert_wire_enum!("upload_collision", UploadCollision, UploadCollision::Fail => "fail", UploadCollision::Suffix => "suffix", UploadCollision::Skip => "skip");
     assert_wire_enum!("dup_kind", DupKind, DupKind::Exact => "exact", DupKind::Near => "near");
-    assert_wire_enum!("review_action", ReviewAction, ReviewAction::Accept => "accept", ReviewAction::Reject => "reject");
+    assert_wire_enum!("review_action", ReviewAction, ReviewAction::Accept => "accept", ReviewAction::Reject => "reject", ReviewAction::Undo => "undo");
+    assert_wire_enum!("suggestion_state", SuggestionState, SuggestionState::Pending => "pending", SuggestionState::Confirmed => "confirmed", SuggestionState::Rejected => "rejected");
     assert_wire_enum!("collection_kind", CollectionKind, CollectionKind::Manual => "manual", CollectionKind::Smart => "smart");
     assert_wire_enum!("export_format", ExportFormat, ExportFormat::Json => "json", ExportFormat::Csv => "csv", ExportFormat::Sidecar => "sidecar");
     assert_wire_enum!("change_kind", ChangeKind, ChangeKind::Reanalyzed => "reanalyzed", ChangeKind::Retagged => "retagged", ChangeKind::LicenseSet => "license_set", ChangeKind::Metadata => "metadata", ChangeKind::NoteSet => "note_set", ChangeKind::Commented => "commented");

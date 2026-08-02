@@ -201,6 +201,7 @@ CREATE TABLE asset_tag (
     source    TEXT NOT NULL,          -- 'auto' | 'user'  (who created the association)
     confidence REAL,                  -- 0..1 for auto suggestions; NULL for user tags
     extractor  TEXT,                  -- which analyser proposed it (explainability, §1.2)
+    explanation TEXT,                 -- concise visible reason for the proposal
     created_at INTEGER NOT NULL,
     PRIMARY KEY (asset_id, tag_id)
 ) STRICT;
@@ -209,8 +210,11 @@ CREATE INDEX idx_asset_tag_tag   ON asset_tag(tag_id, state);   -- "assets with 
 CREATE INDEX idx_asset_tag_state ON asset_tag(state, source);   -- "review all suggestions"
 ```
 
-- `state = 'suggested'` is an auto-tag awaiting review; `'confirmed'` is accepted (by user, or a user tag from creation); `'rejected'` is a remembered reject so re-analysis does not re-propose it. This tri-state is what powers the one-action accept/reject inspector (DESIGN_GUIDELINES §3.4) and keeps suggestions out of confirmed-only searches by default.
-- `extractor` + `confidence` satisfy the "explainable" requirement (why was this tagged?) without a separate audit table.
+- `state = 'suggested'` is presented as **pending** on the wire/UI; `'confirmed'` is accepted (by user, or a user tag from creation); `'rejected'` is a remembered reject. Undo returns either decided state to pending. This tri-state powers one-action accept/reject/undo and keeps pending automation out of confirmed-only discovery.
+- `extractor` + `confidence` + `explanation` satisfy the "explainable" requirement without a separate audit table. Re-analysis may refresh those fields only while the row is pending; confirmed/rejected decisions are immutable until explicit undo.
+- Auto-category/class values are proposed as these same reviewable rows. Attribute-table `class`
+  columns retain raw analyser output for diagnostics, but class/category filters use confirmed tag
+  values. A correction is reject + add the correct manual class tag. Measured attributes remain ordinary facts.
 
 ### 3.4 Collections & smart folders
 

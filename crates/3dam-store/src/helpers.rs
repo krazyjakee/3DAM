@@ -54,7 +54,7 @@ pub(crate) fn row_to_summary(r: &rusqlite::Row) -> rusqlite::Result<AssetSummary
     let height: Option<i64> = r.get(8)?;
     let duration_ms: Option<i64> = r.get(9)?;
     let tri_count: Option<i64> = r.get(10)?;
-    let audio_class: Option<String> = r.get(11)?;
+    let _audio_class: Option<String> = r.get(11)?;
     // Favourite is bit 1 of the asset `flags` bitset (bit 0 is the scan-derived "missing" mark).
     let flags: i64 = r.get(12)?;
     let page_count: Option<i64> = r.get(13)?;
@@ -77,7 +77,6 @@ pub(crate) fn row_to_summary(r: &rusqlite::Row) -> rusqlite::Result<AssetSummary
             height,
             duration_ms,
             tri_count,
-            audio_class: audio_class.as_deref(),
             page_count,
             word_count,
         }),
@@ -94,13 +93,12 @@ pub(crate) const FAVORITE_FLAG: i64 = 2;
 /// The row shape [`grid_key_attrs`] reads. A struct rather than positional arguments because the
 /// list crossed the point where `(media, width, height, duration_ms, tri_count, …)` at a call site
 /// says nothing about which `Option<i64>` is which.
-pub(crate) struct GridKeyAttrs<'a> {
+pub(crate) struct GridKeyAttrs {
     pub media: MediaType,
     pub width: Option<i64>,
     pub height: Option<i64>,
     pub duration_ms: Option<i64>,
     pub tri_count: Option<i64>,
-    pub audio_class: Option<&'a str>,
     pub page_count: Option<i64>,
     pub word_count: Option<i64>,
 }
@@ -112,10 +110,10 @@ fn fmt_duration(ms: i64) -> String {
 }
 
 /// The couple of cheap per-media attributes shown on a grid tile / table row: dimensions for
-/// images, duration (+ a `loop` marker when the analysis classed it so) for audio, triangle count
+/// images, duration for audio, triangle count
 /// for models, both dimensions and duration for video, page/word count for documents. Cheap and
 /// best-effort.
-pub(crate) fn grid_key_attrs(a: GridKeyAttrs<'_>) -> SmallMap {
+pub(crate) fn grid_key_attrs(a: GridKeyAttrs) -> SmallMap {
     let mut m = SmallMap::new();
     match a.media {
         MediaType::Image => {
@@ -127,11 +125,8 @@ pub(crate) fn grid_key_attrs(a: GridKeyAttrs<'_>) -> SmallMap {
             if let Some(ms) = a.duration_ms {
                 m.insert("duration".into(), fmt_duration(ms));
             }
-            // The DSP classifier (analysis §4.2) labels audio one_shot | loop | music | sfx — surface
-            // it so the table/grid can show the type alongside the duration.
-            if let Some(class) = a.audio_class.filter(|c| !c.is_empty()) {
-                m.insert("type".into(), class.replace('_', "-"));
-            }
+            // Automated class/category output is reviewable as an auto-tag. Do not duplicate the
+            // raw analyser value here as an ordinary grid fact before the user accepts it.
         }
         MediaType::Model => {
             if let Some(t) = a.tri_count {
@@ -690,7 +685,7 @@ pub(crate) fn apply_filter(
                 where_sql.push_str(
                     " AND asset.id IN (SELECT at.asset_id FROM asset_tag at \
                      JOIN tag t ON t.id = at.tag_id \
-                     WHERE t.name = ? COLLATE NOCASE AND at.state <> 'rejected')",
+                     WHERE t.name = ? COLLATE NOCASE AND at.state = 'confirmed')",
                 );
                 binds.push(Value::Text(s.clone()));
             }
@@ -699,7 +694,7 @@ pub(crate) fn apply_filter(
                 where_sql.push_str(&format!(
                     " AND asset.id IN (SELECT at.asset_id FROM asset_tag at \
                      JOIN tag t ON t.id = at.tag_id \
-                     WHERE t.name COLLATE NOCASE IN ({placeholders}) AND at.state <> 'rejected')"
+                     WHERE t.name COLLATE NOCASE IN ({placeholders}) AND at.state = 'confirmed')"
                 ));
                 for it in items {
                     if let FilterValue::Str(s) = it {
@@ -719,7 +714,7 @@ pub(crate) fn apply_filter(
         ColorDepth => attr_num_filter(f, "image_attr", "color_depth", where_sql, binds)?,
         HasAlpha => attr_bool_filter(f, "image_attr", "has_alpha", where_sql, binds)?,
         ColorSpace => attr_str_filter(f, "image_attr", "color_space", where_sql, binds)?,
-        ImageClass => attr_str_filter(f, "image_attr", "class", where_sql, binds)?,
+        ImageClass => reviewed_class_filter(f, "image_attr", where_sql, binds)?,
         Tileability => attr_num_filter(f, "image_attr", "tileability", where_sql, binds)?,
         TileClass => attr_str_filter(f, "image_attr", "tile_class", where_sql, binds)?,
         // Audio attributes (audio_attr).
@@ -738,7 +733,7 @@ pub(crate) fn apply_filter(
         Loudness => attr_num_filter(f, "audio_attr", "loudness_lufs", where_sql, binds)?,
         Brightness => attr_num_filter(f, "audio_attr", "brightness", where_sql, binds)?,
         Harmonicity => attr_num_filter(f, "audio_attr", "harmonicity", where_sql, binds)?,
-        AudioClass => attr_str_filter(f, "audio_attr", "class", where_sql, binds)?,
+        AudioClass => reviewed_class_filter(f, "audio_attr", where_sql, binds)?,
         Codec => attr_str_filter(f, "audio_attr", "codec", where_sql, binds)?,
         Container => attr_str_filter(f, "audio_attr", "container", where_sql, binds)?,
         // Model attributes (model_attr).
@@ -751,18 +746,18 @@ pub(crate) fn apply_filter(
         HasRig => attr_bool_filter(f, "model_attr", "has_rig", where_sql, binds)?,
         HasAnimation => attr_bool_filter(f, "model_attr", "has_animation", where_sql, binds)?,
         HasUv => attr_bool_filter(f, "model_attr", "has_uv", where_sql, binds)?,
-        ModelClass => attr_str_filter(f, "model_attr", "class", where_sql, binds)?,
+        ModelClass => reviewed_class_filter(f, "model_attr", where_sql, binds)?,
         // Video attributes (video_attr). Width/height/duration are handled above, shared with
         // image/audio; these are the axes only video has.
         Fps => attr_num_filter(f, "video_attr", "fps", where_sql, binds)?,
         Bitrate => attr_num_filter(f, "video_attr", "bitrate", where_sql, binds)?,
         HasAudio => attr_bool_filter(f, "video_attr", "has_audio", where_sql, binds)?,
-        VideoClass => attr_str_filter(f, "video_attr", "class", where_sql, binds)?,
+        VideoClass => reviewed_class_filter(f, "video_attr", where_sql, binds)?,
         // Document attributes (document_attr).
         PageCount => attr_num_filter(f, "document_attr", "page_count", where_sql, binds)?,
         WordCount => attr_num_filter(f, "document_attr", "word_count", where_sql, binds)?,
         Author => attr_str_filter(f, "document_attr", "author", where_sql, binds)?,
-        DocumentClass => attr_str_filter(f, "document_attr", "class", where_sql, binds)?,
+        DocumentClass => reviewed_class_filter(f, "document_attr", where_sql, binds)?,
         // A boolean flag on the asset row itself — presence of the filter means "favourites only".
         // `Eq false` inverts it (everything not favourited), which keeps the op meaningful.
         Favorite => {
@@ -909,6 +904,44 @@ fn attr_str_filter(
     };
     where_sql.push_str(&format!(
         " AND asset.id IN (SELECT asset_id FROM {table} WHERE {cond})"
+    ));
+    Ok(())
+}
+
+/// Class/category columns retain the analyser's raw output for diagnostics and re-analysis, but are
+/// not catalog facts. A class facet matches a confirmed tag value on an asset of that media shape:
+/// users may accept the automatic guess or reject it and add the correct manual value. This gives
+/// every media class one correction model instead of a second, irreversible attribute path.
+fn reviewed_class_filter(
+    f: &Filter,
+    table: &str,
+    where_sql: &mut String,
+    binds: &mut Vec<Value>,
+) -> Result<(), LibError> {
+    let cond = match (&f.op, &f.value) {
+        (FilterOp::Eq, FilterValue::Str(value)) => {
+            binds.push(Value::Text(value.clone()));
+            "t.name = ? COLLATE NOCASE".to_string()
+        }
+        (FilterOp::In, FilterValue::List(items)) => {
+            let placeholders = items.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            for item in items {
+                let FilterValue::Str(value) = item else {
+                    return Err(LibError::BadRequest("class IN list wants strings".into()));
+                };
+                binds.push(Value::Text(value.clone()));
+            }
+            format!("t.name COLLATE NOCASE IN ({placeholders})")
+        }
+        _ => return Err(LibError::BadRequest("unsupported class filter".into())),
+    };
+    where_sql.push_str(&format!(
+        " AND asset.id IN (
+            SELECT c.asset_id FROM {table} c
+            JOIN asset_tag at ON at.asset_id = c.asset_id AND at.state = 'confirmed'
+            JOIN tag t ON t.id = at.tag_id
+            WHERE {cond}
+        )"
     ));
     Ok(())
 }

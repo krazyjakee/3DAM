@@ -163,8 +163,18 @@ async fn analyze_similar_dedup_and_review() {
         asset_a
             .tags
             .iter()
-            .any(|t| t.state == "suggested" && t.source == "auto"),
+            .any(|t| t.state == SuggestionState::Pending && t.source == "auto"),
         "at least one auto-suggested tag: {:?}",
+        asset_a.tags
+    );
+    assert!(
+        asset_a
+            .tags
+            .iter()
+            .filter(|tag| tag.source == "auto")
+            .all(|tag| tag.confidence.is_some()
+                && tag.why.as_deref().is_some_and(|why| !why.is_empty())),
+        "automation carries visible confidence and why: {:?}",
         asset_a.tags
     );
 
@@ -253,7 +263,7 @@ async fn analyze_similar_dedup_and_review() {
     let suggested: Vec<String> = asset_a
         .tags
         .iter()
-        .filter(|t| t.state == "suggested")
+        .filter(|t| t.state == SuggestionState::Pending)
         .map(|t| t.name.clone())
         .collect();
     let accept = suggested[0].clone();
@@ -292,15 +302,42 @@ async fn analyze_similar_dedup_and_review() {
         after
             .tags
             .iter()
-            .any(|t| t.name == accept && t.state == "confirmed"),
+            .any(|t| t.name == accept && t.state == SuggestionState::Confirmed),
         "accepted tag state is confirmed"
     );
+
+    lib.review_suggestion(
+        &ctx,
+        SuggestionReview {
+            asset: id_a,
+            tag: accept.clone(),
+            action: ReviewAction::Undo,
+        },
+    )
+    .await
+    .unwrap();
+    let undone = lib.get_asset(&ctx, &id_a).await.unwrap();
+    assert!(!undone.summary.top_tags.contains(&accept));
+    assert!(undone
+        .tags
+        .iter()
+        .any(|tag| tag.name == accept && tag.state == SuggestionState::Pending));
+    lib.review_suggestion(
+        &ctx,
+        SuggestionReview {
+            asset: id_a,
+            tag: accept.clone(),
+            action: ReviewAction::Accept,
+        },
+    )
+    .await
+    .unwrap();
     if reject != accept {
         assert!(
             after
                 .tags
                 .iter()
-                .any(|t| t.name == reject && t.state == "rejected"),
+                .any(|t| t.name == reject && t.state == SuggestionState::Rejected),
             "rejected tag state is rejected"
         );
     }
@@ -330,7 +367,7 @@ async fn analyze_similar_dedup_and_review() {
             reanalysed
                 .tags
                 .iter()
-                .any(|t| t.name == reject && t.state == "rejected"),
+                .any(|t| t.name == reject && t.state == SuggestionState::Rejected),
             "reject survives a forced re-analysis (§1.4)"
         );
     }
@@ -338,7 +375,7 @@ async fn analyze_similar_dedup_and_review() {
         reanalysed
             .tags
             .iter()
-            .any(|t| t.name == accept && t.state == "confirmed"),
+            .any(|t| t.name == accept && t.state == SuggestionState::Confirmed),
         "confirmed tag survives re-analysis"
     );
 
@@ -446,7 +483,7 @@ async fn maintenance_clear_analysis_and_wipe() {
     let confirmed_tag = asset_a
         .tags
         .iter()
-        .find(|t| t.state == "suggested")
+        .find(|t| t.state == SuggestionState::Pending)
         .map(|t| t.name.clone())
         .expect("an auto-suggested tag to confirm");
     lib.review_suggestion(
@@ -504,12 +541,15 @@ async fn maintenance_clear_analysis_and_wipe() {
         asset_a
             .tags
             .iter()
-            .any(|t| t.name == confirmed_tag && t.state == "confirmed"),
+            .any(|t| t.name == confirmed_tag && t.state == SuggestionState::Confirmed),
         "confirmed tag survives clear_analysis: {:?}",
         asset_a.tags
     );
     assert!(
-        !asset_a.tags.iter().any(|t| t.state == "suggested"),
+        !asset_a
+            .tags
+            .iter()
+            .any(|t| t.state == SuggestionState::Pending),
         "no suggestions remain"
     );
 
