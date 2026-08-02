@@ -158,7 +158,9 @@ pub(super) fn metadata(path: &Path) -> Option<ModelAttributes> {
 /// An attribute's unescaped value, if the element carries it.
 fn attr(e: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> Option<String> {
     let a = e.try_get_attribute(key).ok()??;
-    a.unescape_value().ok().map(|v| v.into_owned())
+    a.normalized_value(quick_xml::XmlVersion::default())
+        .ok()
+        .map(|v| v.into_owned())
 }
 
 fn int_attr(e: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> Option<i64> {

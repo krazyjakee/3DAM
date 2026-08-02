@@ -33,20 +33,20 @@ rust-version = "1.91"
 # internal crates. Package names use the `dam-` prefix (cargo forbids a leading digit),
 # so libs import as `dam_api`, `dam_core`, … exactly as the tech-spec pseudocode writes them.
 # Directories keep the branded `3dam-` names; the shipped binary target is `3dam`.
-dam-api = { path = "crates/3dam-api" }
-dam-store = { path = "crates/3dam-store" }
-dam-media = { path = "crates/3dam-media" }
+dam-api = { path = "crates/3dam-api", version = "=0.1.1" }
+dam-store = { path = "crates/3dam-store", version = "=0.1.1" }
+dam-media = { path = "crates/3dam-media", version = "=0.1.1" }
 # default-features off here so light consumers (the store) skip the SFTP/SMB network stack; the
 # engine (dam-core) opts the backends back in via `features = ["sftp", "smb"]`.
-dam-sources = { path = "crates/3dam-sources", default-features = false }
-dam-render = { path = "crates/3dam-render" }
-dam-viewer = { path = "crates/3dam-viewer" }
-dam-core = { path = "crates/3dam-core" }
-dam-client = { path = "crates/3dam-client" }
-dam-server = { path = "crates/3dam-server" }
-dam-frontend = { path = "crates/3dam-frontend" }
-dam-desktop = { path = "crates/3dam-desktop" }
-dam-cli = { path = "crates/3dam-cli" }
+dam-sources = { path = "crates/3dam-sources", version = "=0.1.1", default-features = false }
+dam-render = { path = "crates/3dam-render", version = "=0.1.1" }
+dam-viewer = { path = "crates/3dam-viewer", version = "=0.1.1" }
+dam-core = { path = "crates/3dam-core", version = "=0.1.1" }
+dam-client = { path = "crates/3dam-client", version = "=0.1.1" }
+dam-server = { path = "crates/3dam-server", version = "=0.1.1" }
+dam-frontend = { path = "crates/3dam-frontend", version = "=0.1.1" }
+dam-desktop = { path = "crates/3dam-desktop", version = "=0.1.1" }
+dam-cli = { path = "crates/3dam-cli", version = "=0.1.1" }
 
 # async / runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs", "signal", "time", "io-std", "io-util"] }
@@ -124,12 +124,12 @@ libc = "0.2"
 notify = "7"
 
 # network file sources (tech-spec 07 §3.2–§3.3). SFTP via russh (pure-Rust async SSH) + its SFTP
-# subsystem; SMB2/3 via the pure-Rust `smb` crate. russh is pinned to 0.51: newer russh wants
-# crypto-bigint 0.7.5 while `smb`'s `sspi` pins the =0.7.0-rc.8 prerelease, and the two cannot be
-# unified — 0.51 resolves cleanly alongside `smb`. Bump both together, deliberately.
+# subsystem; SMB2/3 via the pure-Rust `smb` crate. russh 0.60.3 cannot currently coexist with SMB:
+# both pin incompatible pre-releases of crypto-bigint 0.7. Keep 0.51 until one side relaxes its pin;
+# deny.toml documents the temporary advisory exceptions and the source I/O caps that mitigate them.
 russh = "0.51"
 russh-sftp = "2"
-smb = "0.11"
+smb = "0.11.2"
 
 # CSV manifest export (tech-spec, phase 4 Reach — export/manifests).
 csv = "1"
@@ -142,7 +142,6 @@ bytemuck = { version = "1", features = ["derive"] }
 # block_on the wgpu adapter/device init from the synchronous render path (dam-render runs inside
 # spawn_blocking, no async runtime of its own). Same executor the headless-render spike validated.
 pollster = "0.4"
-gltf = { version = "1", default-features = false, features = ["import", "utils", "names"] }
 # Assimp bindings (maintained -ng fork) — the import backend for the full 3D format range with
 # materials/textures. `static-link` builds assimp from source and links it statically (ADR 0011).
 russimp-ng = { version = "3.2", default-features = false }
@@ -159,7 +158,7 @@ log = "0.4"
 
 # media decode / encode (tech-spec 04 handlers + 08 convert). Pure-Rust where possible.
 # `image` covers the v1 raster matrix (ADR 0009 §8); DDS/KTX2/EXR/HDR stage later.
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "tga", "tiff", "webp"] }
+image = { version = "0.25", default-features = false }
 # GPU texture containers (issue #49). Deliberately NOT `image`'s own `dds` feature: that decoder
 # handles only DXT1/3/5 and returns Unsupported for BC4/BC5/BC6H/BC7 — i.e. exactly the formats a
 # real game-asset folder is full of (BC5 normal maps, BC7 albedo). The `dds` crate (image-rs org,
@@ -184,13 +183,12 @@ rustfft = "6"
 # transitively except `lopdf` — no native deps, matching the reasoning in ADR 0015 that kept video
 # decode out of our build. Video needs no crate at all: it shells out to a discovered ffmpeg.
 # PDF page count + text extraction. `default-features = false` drops the date/rayon stack we never
-# touch — we only ever read an existing document, never author one. Pinned to 0.36: lopdf ≥0.40
-# depends on md-5 0.11 → digest 0.11, which cannot unify with the digest 0.10 that `smb`'s crypto
-# stack pins (the same class of conflict documented on `russh` above). Bump with `smb`, deliberately.
-lopdf = { version = "0.36", default-features = false }
+# touch — we only ever read an existing document, never author one. 0.42 bounds nested PDF object
+# parsing, preventing the stack-exhaustion denial of service in RUSTSEC-2026-0187.
+lopdf = { version = "0.42", default-features = false }
 # DOCX/ODT are ZIP containers of XML; `zip` opens them and `quick-xml` streams the text runs out.
 zip = { version = "6", default-features = false, features = ["deflate"] }
-quick-xml = "0.38"
+quick-xml = "0.41"
 # Plaintext encoding detection (UTF-8/UTF-16/legacy single-byte) with BOM sniffing.
 encoding_rs = "0.8"
 

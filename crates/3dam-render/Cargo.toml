@@ -16,7 +16,7 @@ pollster.workspace = true
 # from source and statically linked so the shipped binary carries no runtime libassimp (ADR 0011).
 russimp-ng = { workspace = true, features = ["static-link"] }
 # PNG encode of the rendered frame (the readback path).
-image.workspace = true
+image = { workspace = true, features = ["png", "jpeg", "gif", "bmp", "tga", "tiff", "webp"] }
 thiserror.workspace = true
 # Temp GLB scratch for the Blender bridge (modern `.blend` → GLB → Assimp). Auto-cleaned on drop.
 tempfile.workspace = true

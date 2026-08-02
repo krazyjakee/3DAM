@@ -7,7 +7,7 @@ description = "MediaHandler trait + format detection and per-media handlers (tec
 
 [dependencies]
 dam-api.workspace = true
-image.workspace = true
+image = { workspace = true, features = ["png", "jpeg", "gif", "bmp", "tga", "tiff", "webp"] }
 # GPU texture containers (issue #49): DDS decode, KTX2 container, block-compressed payloads.
 dds.workspace = true
 ktx2.workspace = true

@@ -40,7 +40,7 @@ candle-transformers = { version = "0.11", optional = true }
 candle-core = { version = "0.11", optional = true }
 candle-nn = { version = "0.11", optional = true }
 tokenizers = { version = "0.23", optional = true }
-image = { workspace = true, optional = true }
+image = { workspace = true, features = ["png", "jpeg"], optional = true }
 # CLAP audio tower runs on ONNX Runtime via `ort` (the audio analogue of candle-SigLIP). `load-dynamic`
 # links libonnxruntime at runtime (dlopen) rather than at build, so enabling `semantic` never triggers
 # a build-time binary download and the default build stays offline/model-free (ADR 0006). The mel
@@ -84,6 +84,6 @@ semantic = [
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "rt-multi-thread"] }
-image.workspace = true
+image = { workspace = true, features = ["png"] }
 hound.workspace = true
 rusqlite.workspace = true

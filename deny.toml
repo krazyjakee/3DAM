@@ -5,7 +5,17 @@
 [advisories]
 yanked = "deny"
 unmaintained = "workspace"
-ignore = []
+# `rsa` has no patched release for its timing-side-channel advisory and is used here for public-key
+# verification/authentication, not local private-key decryption. russh 0.60.3 fixes its two
+# allocation advisories but pins crypto-bigint =0.7.0-rc.28, while SMB's sspi pins =0.7.0-rc.8;
+# Cargo cannot resolve both source backends together. Source reads/writes are already bounded by
+# protocol packet and application I/O limits. Remove these two temporary exceptions as soon as the
+# upstream pins converge.
+ignore = [
+    "RUSTSEC-2023-0071",
+    "RUSTSEC-2026-0153",
+    "RUSTSEC-2026-0154",
+]
 
 [licenses]
 confidence-threshold = 0.8
@@ -49,7 +59,7 @@ deny = [
     { crate = "russh", wrappers = ["dam-sources"], reason = "SFTP transport belongs in dam-sources" },
     { crate = "russh-sftp", wrappers = ["dam-sources"], reason = "SFTP transport belongs in dam-sources" },
     { crate = "smb", wrappers = ["dam-sources"], reason = "SMB transport belongs in dam-sources" },
-    { crate = "reqwest", wrappers = ["dam-client", "dam-server", "oauth2", "russimp-sys-ng", "sspi", "tauri"], reason = "Outbound HTTP is restricted to reviewed transport/auth/build boundaries" },
+    { crate = "reqwest", wrappers = ["dam-client", "dam-server", "oauth2", "russimp-sys-ng", "tauri"], reason = "Outbound HTTP is restricted to reviewed transport/auth/build boundaries" },
 
     # No analytics, remote tracing, crash reporting, or product telemetry may enter the tree.
     { crate = "sentry", reason = "3DAM observability is local-only" },
@@ -82,3 +92,17 @@ unknown-git = "deny"
 required-git-spec = "rev"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = []
+
+# The maintained russimp forks ship the upstream BSD-3-Clause text but omit a Cargo `license`
+# field. Pin the exact reviewed license files so a changed crate payload invalidates the exception.
+[[licenses.clarify]]
+name = "russimp-ng"
+version = "3.2.7"
+expression = "BSD-3-Clause"
+license-files = [{ path = "LICENSE", hash = 0x54c778fa }]
+
+[[licenses.clarify]]
+name = "russimp-sys-ng"
+version = "2.0.6"
+expression = "BSD-3-Clause"
+license-files = [{ path = "LICENSE", hash = 0xead3f096 }]
