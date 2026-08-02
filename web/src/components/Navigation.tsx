@@ -26,6 +26,7 @@ import {
   Sun,
   Trash2,
   Upload as UploadIcon,
+  UserRound,
   WifiOff,
 } from "lucide-react";
 import {
@@ -39,6 +40,7 @@ import {
   useSources,
   useStats,
   useVersion,
+  useWhoami,
 } from "@/api/queries";
 import { useCan } from "@/api/queries";
 import type { ShareResource } from "@/api/admin";
@@ -56,6 +58,7 @@ import { licenseColorVar, licenseLabel, sourceStateLabel } from "@/lib/format";
 import { useViewState } from "@/lib/view-state";
 import { useDialogs } from "@/lib/dialogs";
 import { useTheme, type ThemePref } from "@/lib/theme";
+import { ACCOUNT_ROUTES, accountNavigation } from "@/lib/account-surfaces";
 import { AddSourceDialog } from "./AddSourceDialog";
 import { FolderTree } from "./FolderTree";
 import { ShareDialog } from "./ShareDialog";
@@ -222,17 +225,25 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
   const conn = useConnection();
   const { confirm } = useDialogs();
   const { gate } = useWriteGate();
-  const canAdmin = useCan("admin");
   const canWrite = useCan("write");
+  const version = useVersion();
+  const whoami = useWhoami();
+  // Unlike write controls, route discovery should not be optimistic: a viewer must never see an
+  // Administration destination while /whoami is still settling. Auth-off/legacy servers are the
+  // exception because their version posture itself grants local-owner trust.
+  const canAdmin = whoami.data
+    ? whoami.data.scopes.includes("admin")
+    : version.isSuccess && (version.data.auth ?? "off") === "off";
   const [showAdd, setShowAdd] = useState(false);
   // Sharing (user accounts, issue #42): the Share… affordance is admin-only and needs the
   // `user_accounts` flag on — /api/version already reports it, so no extra query.
-  const accountsOn = useVersion().data?.accounts === true;
+  const accountsOn = version.data?.accounts === true;
   const canShare = canAdmin && accountsOn;
+  const accountNav = accountNavigation(whoami.data?.account != null, canAdmin);
   // Uploads (issue #80) need the `upload` flag *and* write scope: the flag says this deployment
   // accepts writes into a source at all, the scope says this caller may make them. Same source of
   // truth as `accounts` — /api/version already reports it, so no extra query.
-  const uploadOn = useVersion().data?.upload === true;
+  const uploadOn = version.data?.upload === true;
   const [share, setShare] = useState<{
     resource: ShareResource;
     id: string;
@@ -494,25 +505,27 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
       >
         <Ban size={14} /> Rescan blocklist
       </Link>
-      {/* Admin / Settings surface (tech-spec 09 §B.4). Gated on the admin scope: a non-admin has
-          nothing to do there (every action 403s), so show it disabled-with-reason rather than a
-          dead-end link. */}
-      {canAdmin ? (
+      {/* Personal account self-service is present only for an actual signed-in account. An API
+          token has no profile or session list of its own. */}
+      {accountNav.profile && (
         <Link
-          to="/settings"
+          to={ACCOUNT_ROUTES.profile}
           onClick={onNavigate}
           className="flex items-center gap-2 border-t border-border px-3 py-2 text-xs text-fg-dim hover:text-accent coarse:min-h-11"
         >
-          <SettingsIcon size={14} /> Settings &amp; Administration
+          <UserRound size={14} /> Profile
         </Link>
-      ) : (
-        <span
-          className="flex cursor-not-allowed items-center gap-2 border-t border-border px-3 py-2 text-xs text-fg-dim opacity-40 coarse:min-h-11"
-          title="Requires an admin token"
-          aria-disabled="true"
+      )}
+      {/* Administration exists in navigation only when the current capability set includes admin.
+          Non-admins are not shown an ordinary-looking destination that can only reject them. */}
+      {accountNav.administration && (
+        <Link
+          to={ACCOUNT_ROUTES.administration}
+          onClick={onNavigate}
+          className="flex items-center gap-2 border-t border-border px-3 py-2 text-xs text-fg-dim hover:text-accent coarse:min-h-11"
         >
-          <SettingsIcon size={14} /> Settings &amp; Administration
-        </span>
+          <SettingsIcon size={14} /> Administration
+        </Link>
       )}
       {showAdd && <AddSourceDialog onClose={() => setShowAdd(false)} />}
       {share && (
@@ -840,7 +853,7 @@ function SourceRow({
             className="flex items-center justify-center text-fg-dim hover:text-accent disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:text-fg-dim coarse:min-h-11 coarse:min-w-11"
             aria-label="Quick rescan this source (changed files only)"
             onClick={onRescan}
-            {...gate({ title: "Quick rescan — changed files only (full re-scan lives in Settings)" })}
+            {...gate({ title: "Quick rescan — changed files only (full re-scan lives in Administration)" })}
           >
             <RefreshCw size={12} className={scanning ? "animate-spin" : ""} />
           </button>

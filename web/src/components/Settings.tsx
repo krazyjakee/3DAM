@@ -1,4 +1,4 @@
-// The admin / Settings surface (tech-spec 09 §B.4, 10 §5, ADR 0004) — plain DOM over the
+// The Administration surface (tech-spec 09 §B.4, 10 §5, ADR 0004) — plain DOM over the
 // `/admin/api/*` routes: grouped toggle cards with a warn-and-confirm before any exposure-increasing
 // change, live/restart labelling, API-token management, and the audit trail. Being DOM (not canvas)
 // is exactly why this is cheap to build well (DESIGN_GUIDELINES §3.6).
@@ -20,13 +20,11 @@ import {
   type StorageUsage,
   type TokenInfo,
 } from "@/api/admin";
-import { authApi } from "@/api/auth";
 import type {
   AccountRole,
   OidcConfigInfo,
   OidcIdentity,
   OidcProvisioning,
-  SessionInfo,
 } from "@/api/types";
 import { ApiError } from "@/api/client";
 import { useWhoami } from "@/api/queries";
@@ -45,7 +43,7 @@ type AccessState =
   | { kind: "granted" }
   | { kind: "denied"; message: string };
 
-export function Settings() {
+export function Administration() {
   const [status, setStatus] = useState<AdminStatus | null>(null);
   const [statusError, setStatusError] = useState<string | null>(null);
   const [flags, setFlags] = useState<FlagInfo[] | null>(null);
@@ -186,7 +184,7 @@ export function Settings() {
   return (
     <div className="mx-auto flex min-h-dvh max-w-3xl flex-col gap-6 p-4 text-sm sm:p-6">
       <header className="flex flex-wrap items-center justify-between gap-3">
-        <h1 className="text-lg font-semibold">Settings &amp; Administration</h1>
+        <h1 className="text-lg font-semibold">Administration</h1>
         <Link to="/" className="text-accent hover:underline">
           ← Back to library
         </Link>
@@ -213,7 +211,7 @@ export function Settings() {
           </button>
         </div>
       )}
-      {signIn && <SettingsSignIn onClose={() => setSignIn(false)} />}
+      {signIn && <AdministrationSignIn onClose={() => setSignIn(false)} />}
 
       {access.kind === "granted" && bootstrap && (
         <div className="rounded border border-lic-permissive/40 bg-lic-permissive/10 p-3">
@@ -463,10 +461,6 @@ export function Settings() {
             )}
           </AdminSectionState>
 
-      {/* The signed-in account's own sessions (issue #42) — self-service, not an admin surface,
-          but Settings is where credential management lives today. */}
-          {whoami.data?.account && <MySessionsSection />}
-
       {/* Single sign-on (issue #41). Gated on the flag's *presence*, not its value — the same
           "does this server support it" signal `FlagCard` uses. Deliberately not its value: the
           provider is configured *before* the capability is switched on, so gating on `=== true`
@@ -505,10 +499,10 @@ export function Settings() {
   );
 }
 
-/** In-page sign-in for the Settings surface (issue: don't dead-end a non-admin at a 403). Wraps the
+/** In-page sign-in for Administration (issue: don't dead-end a non-admin at a 403). Wraps the
  *  shared TokenLoginForm in a focus-trapped, Escape-dismissable modal; a successful sign-in reloads,
  *  re-fetching the admin surface with the new (hopefully admin-scoped) credential. */
-function SettingsSignIn({ onClose }: { onClose: () => void }) {
+function AdministrationSignIn({ onClose }: { onClose: () => void }) {
   const ref = useFocusTrap<HTMLDivElement>(true);
   useEscape(onClose);
   return (
@@ -1344,104 +1338,6 @@ function GroupsSection({
     </section>
   );
 }
-
-/** The signed-in account's own sessions (issue #42): every browser/device holding a live session,
- *  the current one marked, each revocable. Self-service — any signed-in account sees its own list
- *  (the server scopes it); it just lives on the Settings page alongside credential management. */
-function MySessionsSection() {
-  const { confirm } = useDialogs();
-  const [sessions, setSessions] = useState<SessionInfo[] | null>(null);
-  const [err, setErr] = useState<string | null>(null);
-  const [revoking, setRevoking] = useState<string | null>(null);
-
-  const load = useCallback(async () => {
-    try {
-      setSessions(await authApi.sessions());
-      setErr(null);
-    } catch (e) {
-      setErr(errorMessage(e));
-    }
-  }, []);
-  useEffect(() => {
-    void load();
-  }, [load]);
-
-  const revoke = async (s: SessionInfo) => {
-    if (
-      !(await confirm({
-        title: s.current ? "Sign out this session?" : "Revoke this session?",
-        message: s.current
-          ? "This is the session you're using. This browser must sign in again."
-          : "That browser or device loses access immediately and must sign in again.",
-        danger: true,
-        confirmLabel: s.current ? "Sign out" : "Revoke session",
-      }))
-    )
-      return;
-    setRevoking(s.session_id);
-    try {
-      await authApi.revokeSession(s.session_id);
-      if (s.current) {
-        location.reload();
-        return;
-      }
-      await load();
-      toast.success("Session revoked");
-    } catch (e) {
-      toast.error(errorMessage(e));
-    } finally {
-      setRevoking(null);
-    }
-  };
-
-  return (
-    <section className="flex flex-col gap-2">
-      <h2 className="font-medium text-fg-muted">My sessions</h2>
-      {!sessions && !err && <SectionLoading name="My sessions" />}
-      {err && <SectionError name="My sessions" message={err} />}
-      {sessions && <div className="rounded border border-border">
-        {sessions.length === 0 && (
-          <div className="px-3 py-2 text-fg-dim">(no sessions)</div>
-        )}
-        {sessions.map((s) => (
-          <div
-            key={s.session_id}
-            className="flex items-center gap-3 border-b border-border px-3 py-1.5 last:border-0"
-          >
-            <span className="flex min-w-0 flex-1 items-center gap-1.5">
-              <span className="truncate" title={s.user_agent ?? undefined}>
-                {s.user_agent ?? "(unknown client)"}
-              </span>
-              {s.current && (
-                <span
-                  className="shrink-0 rounded bg-accent-muted px-1 text-[10px] tracking-wide text-accent uppercase"
-                  title="The session this browser is using"
-                >
-                  this session
-                </span>
-              )}
-            </span>
-            <span className="text-xs text-fg-dim">
-              started {new Date(s.created).toLocaleDateString()}
-            </span>
-            <span className="text-xs text-fg-dim">
-              seen {new Date(s.last_seen).toLocaleString()}
-            </span>
-            <button
-              type="button"
-              disabled={revoking === s.session_id}
-              onClick={() => void revoke(s)}
-              className="text-danger hover:underline disabled:opacity-40"
-            >
-              {revoking === s.session_id ? "revoking…" : "revoke"}
-            </button>
-          </div>
-        ))}
-      </div>}
-    </section>
-  );
-}
-
 
 /** A link's identity: the same subject can exist under two issuers, so neither half alone is a key. */
 function rowKey(i: OidcIdentity): string {

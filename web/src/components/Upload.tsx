@@ -262,7 +262,7 @@ export function Upload() {
     return (
       <Unavailable>
         Uploads are disabled on this server. Writing files into a source is off by default — an
-        admin can turn it on in Settings, or with{" "}
+        admin can turn it on in Administration, or with{" "}
         <code className="font-mono text-fg">3dam admin flag upload on</code>.
       </Unavailable>
     );

@@ -39,7 +39,7 @@ function hasSessionHint(): boolean {
  *  a login link a stranger sends must not be able to choose where you end up afterwards. Resolved
  *  against the configured server for the same reason every other API call is, though the button is
  *  only offered same-origin. */
-function oidcStartUrl(): string {
+export function oidcStartUrl(): string {
   const returnTo = `${window.location.pathname}${window.location.search}`;
   return resolveUrl(`/api/v1/auth/oidc/start?return_to=${encodeURIComponent(returnTo)}`);
 }
@@ -258,12 +258,16 @@ function RemoteAccountsNotice() {
 export function AccountLoginForm({
   reason,
   allowReadOnly,
+  allowApiToken = true,
   onClose,
 }: {
   /** Why the user is seeing this (rejected/expired credential), or null for a plain sign-in. */
   reason: string | null;
   /** Offer "Browse read-only" (anonymous-mode servers): enters the app signed out. */
   allowReadOnly: boolean;
+  /** Offer the non-personal API-token alternative. Profile turns this off because a token cannot
+   *  create a personal profile or sessions. */
+  allowApiToken?: boolean;
   /** Present when hosted in a dismissable modal (StatusBar sign-in) rather than the boot gate. */
   onClose?: () => void;
 }) {
@@ -358,13 +362,15 @@ export function AccountLoginForm({
         </label>
 
         <div className="flex items-center justify-end gap-2">
-          <button
-            type="button"
-            className="mr-auto text-[12px] text-fg-muted hover:underline"
-            onClick={() => setTokenMode(true)}
-          >
-            Use an API token instead…
-          </button>
+          {allowApiToken && (
+            <button
+              type="button"
+              className="mr-auto text-[12px] text-fg-muted hover:underline"
+              onClick={() => setTokenMode(true)}
+            >
+              Use an API token instead…
+            </button>
+          )}
           {allowReadOnly && (
             <button type="button" className="btn" onClick={browseReadOnly}>
               Browse read-only
@@ -472,7 +478,7 @@ function ClaimScreen({ onSignIn }: { onSignIn?: () => void } = {}) {
         </h2>
         <p className="mb-3 text-[12px] text-fg-dim">
           Create the first admin account for this library. This works once, from the machine the
-          server runs on; further accounts are created in Settings afterwards.
+          server runs on; further accounts are created in Administration afterwards.
         </p>
 
         {error && (

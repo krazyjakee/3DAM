@@ -1,6 +1,6 @@
 import { lazy, Suspense } from "react";
 import { MutationCache, QueryCache, QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { BrowserRouter, Route, Routes } from "react-router";
+import { BrowserRouter, Navigate, Route, Routes } from "react-router";
 import { JobNotifications } from "./components/StatusBar";
 import { Toaster } from "./components/Toaster";
 import { AuthGate } from "./components/AuthGate";
@@ -11,15 +11,19 @@ import { ThemeProvider } from "./lib/theme";
 import { AUTH_COPY, isUnauthorized, notifyUnauthorized } from "./lib/auth";
 import { getServer } from "./lib/server";
 import { errorMessage, toast } from "./lib/toast";
+import { ACCOUNT_ROUTES } from "./lib/account-surfaces";
 
 // Keep route implementations out of the application shell. In particular, the browse workspace
-// pulls in virtualisation and every preview surface, while settings and upload bring their own API
+// pulls in virtualisation and every preview surface, while account/admin and upload bring their own API
 // trees. A direct visit still loads exactly one route chunk; navigation asks Vite for it on demand.
 const Workspace = lazy(() =>
   import("./components/Workspace").then(({ Workspace }) => ({ default: Workspace })),
 );
-const Settings = lazy(() =>
-  import("./components/Settings").then(({ Settings }) => ({ default: Settings })),
+const Profile = lazy(() =>
+  import("./components/Profile").then(({ Profile }) => ({ default: Profile })),
+);
+const Administration = lazy(() =>
+  import("./components/Settings").then(({ Administration }) => ({ default: Administration })),
 );
 const Duplicates = lazy(() =>
   import("./components/Duplicates").then(({ Duplicates }) => ({ default: Duplicates })),
@@ -110,8 +114,14 @@ export function App() {
           <JobNotifications />
           <Suspense fallback={<RouteFallback />}>
             <Routes>
-              {/* The admin / Settings surface (tech-spec 09 §B.4, 10). */}
-              <Route path="/settings" element={<Settings />} />
+              {/* Personal account self-service and server administration are separate surfaces. */}
+              <Route path={ACCOUNT_ROUTES.profile} element={<Profile />} />
+              <Route path={ACCOUNT_ROUTES.administration} element={<Administration />} />
+              {/* Preserve existing bookmarks, but keep their historical admin meaning. */}
+              <Route
+                path={ACCOUNT_ROUTES.legacySettings}
+                element={<Navigate to={ACCOUNT_ROUTES.administration} replace />}
+              />
               {/* Duplicate / dedupe review (tech-spec 05 §4). */}
               <Route path="/duplicates" element={<Duplicates />} />
               {/* Rescan blocklist management (issue #21). */}
