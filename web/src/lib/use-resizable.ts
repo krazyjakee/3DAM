@@ -11,6 +11,10 @@ function clamp(n: number, min: number, max: number): number {
 
 export interface Resizable {
   width: number;
+  min: number;
+  max: number;
+  /** Set a keyboard-selected width; the hook clamps and persists it like pointer dragging. */
+  setWidth: (width: number) => void;
   /** Attach to a handle's `onPointerDown`. `grow` says which drag direction widens the panel:
    *  `"right"` for a left rail (handle on its right edge), `"left"` for a right rail. */
   startDrag: (e: React.PointerEvent, grow: "left" | "right") => void;
@@ -56,5 +60,10 @@ export function useResizableWidth(
     [width, min, max],
   );
 
-  return { width, startDrag };
+  const setClampedWidth = useCallback(
+    (next: number) => setWidth(clamp(next, min, max)),
+    [min, max],
+  );
+
+  return { width, min, max, setWidth: setClampedWidth, startDrag };
 }

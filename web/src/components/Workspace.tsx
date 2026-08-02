@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { Keyboard, PanelRightOpen, X } from "lucide-react";
 import { useLiveUpdates } from "@/api/ws";
 import { useResizableWidth, type Resizable } from "@/lib/use-resizable";
+import { splitterWidthForKey } from "@/lib/splitter-keyboard";
 import { useViewState } from "@/lib/view-state";
 import { useFocusTrap } from "@/lib/use-focus-trap";
 import {
@@ -34,13 +35,21 @@ export function Workspace() {
   // Below `lg` the inspector is an opt-in overlay: selecting highlights in place, and this flag —
   // toggled by the selection bar — controls whether the detail drawer is up (issue #33 item 3).
   const [inspectOpen, setInspectOpen] = useState(false);
+  const [navCollapsed, setNavCollapsed] = useState(
+    () => typeof window !== "undefined" && localStorage.getItem("dam.navCollapsed") === "1",
+  );
+  const collapseNav = useCallback((value: boolean) => {
+    setNavCollapsed(value);
+    if (typeof window !== "undefined")
+      localStorage.setItem("dam.navCollapsed", value ? "1" : "0");
+  }, []);
   // On `lg` the inspector rail can be collapsed to reclaim space for the Browser (issue #65);
   // persisted so the choice survives a reload.
-  const [collapsed, setCollapsed] = useState(
+  const [inspectorCollapsed, setInspectorCollapsed] = useState(
     () => typeof window !== "undefined" && localStorage.getItem("dam.inspectorCollapsed") === "1",
   );
-  const collapse = useCallback((v: boolean) => {
-    setCollapsed(v);
+  const collapseInspector = useCallback((v: boolean) => {
+    setInspectorCollapsed(v);
     if (typeof window !== "undefined")
       localStorage.setItem("dam.inspectorCollapsed", v ? "1" : "0");
   }, []);
@@ -66,6 +75,11 @@ export function Workspace() {
       const handled = dispatchShortcut(event, {
         "focus-search": () => document.getElementById("asset-search")?.focus(),
         "focus-navigation": () => {
+          if (navCollapsed && window.matchMedia("(min-width: 64rem)").matches) {
+            collapseNav(false);
+            focusRegion("[data-shortcut-region='navigation']");
+            return;
+          }
           const nav = visibleRegion("[data-shortcut-region='navigation']");
           if (navOpen && nav?.closest("[role='dialog']")) setNavOpen(false);
           else if (nav) nav.focus();
@@ -80,10 +94,10 @@ export function Workspace() {
               const panel = visibleRegion("[data-shortcut-region='inspector']");
               const focusedInside = panel?.contains(document.activeElement) ?? false;
               if (inspectOpen && panel?.closest("[role='dialog']")) setInspectOpen(false);
-              else if (!collapsed && focusedInside) collapse(true);
+              else if (!inspectorCollapsed && focusedInside) collapseInspector(true);
               else if (panel) panel.focus();
               else {
-                collapse(false);
+                collapseInspector(false);
                 if (!window.matchMedia("(min-width: 64rem)").matches) setInspectOpen(true);
                 focusRegion("[data-shortcut-region='inspector']");
               }
@@ -101,16 +115,38 @@ export function Workspace() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [collapse, collapsed, inspectOpen, navOpen, patch, showShortcuts, state.selected, state.view]);
+  }, [
+    collapseInspector,
+    collapseNav,
+    inspectOpen,
+    inspectorCollapsed,
+    navCollapsed,
+    navOpen,
+    patch,
+    showShortcuts,
+    state.selected,
+    state.view,
+  ]);
 
   return (
     <div className="flex h-dvh flex-col">
       <div className="flex min-h-0 flex-1">
         {/* Navigation — persistent rail on lg, overlay drawer below it. */}
-        <div className="hidden shrink-0 lg:block" style={{ width: nav.width }}>
-          <Navigation />
+        <div
+          id="workspace-navigation-rail"
+          className="hidden shrink-0 lg:block"
+          style={{ width: navCollapsed ? 0 : nav.width }}
+        >
+          {!navCollapsed && <Navigation />}
         </div>
-        <ResizeHandle resizable={nav} grow="right" label="Resize navigation" />
+        <ResizeHandle
+          resizable={nav}
+          grow="right"
+          label="Resize navigation"
+          controls="workspace-navigation-rail"
+          collapsed={navCollapsed}
+          onToggleCollapse={() => collapseNav(!navCollapsed)}
+        />
         <Drawer
           open={navOpen}
           onClose={() => setNavOpen(false)}
@@ -126,15 +162,22 @@ export function Workspace() {
         />
 
         {/* Inspector — persistent rail on lg (collapsible, issue #65); on narrow an opt-in drawer.
-            The splitter is hidden when the rail is collapsed — there's nothing to resize. */}
-        {!collapsed && <ResizeHandle resizable={inspector} grow="left" label="Resize inspector" />}
+            Its splitter remains focusable when collapsed so Enter or an arrow can restore it. */}
+        <ResizeHandle
+          resizable={inspector}
+          grow="left"
+          label="Resize inspector"
+          controls="workspace-inspector-rail"
+          collapsed={inspectorCollapsed}
+          onToggleCollapse={() => collapseInspector(!inspectorCollapsed)}
+        />
         <Inspector
           width={inspector.width}
           open={inspectOpen}
           onClose={() => setInspectOpen(false)}
-          collapsed={collapsed}
-          onCollapse={() => collapse(true)}
-          onExpand={() => collapse(false)}
+          collapsed={inspectorCollapsed}
+          onCollapse={() => collapseInspector(true)}
+          onExpand={() => collapseInspector(false)}
         />
       </div>
       {/* Narrow-screen selection bar: a tapped asset stays highlighted in the grid; "Inspect" raises
@@ -261,18 +304,55 @@ function ResizeHandle({
   resizable,
   grow,
   label,
+  controls,
+  collapsed,
+  onToggleCollapse,
 }: {
   resizable: Resizable;
   grow: "left" | "right";
   label: string;
+  controls: string;
+  collapsed: boolean;
+  onToggleCollapse: () => void;
 }) {
   return (
     <div
       role="separator"
+      tabIndex={0}
       aria-orientation="vertical"
       aria-label={label}
-      onPointerDown={(e) => resizable.startDrag(e, grow)}
-      className="hidden w-1 shrink-0 cursor-col-resize bg-border transition-colors hover:bg-accent lg:block"
+      aria-controls={controls}
+      aria-valuemin={resizable.min}
+      aria-valuemax={resizable.max}
+      aria-valuenow={resizable.width}
+      aria-valuetext={
+        collapsed ? `Collapsed; saved width ${resizable.width} pixels` : `${resizable.width} pixels`
+      }
+      title={`${label}: Arrow keys resize, Home/End set limits, Enter collapses or expands`}
+      onPointerDown={(event) => {
+        if (collapsed) onToggleCollapse();
+        resizable.startDrag(event, grow);
+      }}
+      onDoubleClick={onToggleCollapse}
+      onKeyDown={(event) => {
+        if (event.key === "Enter") {
+          event.preventDefault();
+          onToggleCollapse();
+          return;
+        }
+        const width = splitterWidthForKey({
+          key: event.key,
+          width: resizable.width,
+          min: resizable.min,
+          max: resizable.max,
+          grow,
+        });
+        if (width == null) return;
+        event.preventDefault();
+        if (collapsed) onToggleCollapse();
+        resizable.setWidth(width);
+      }}
+      className="hidden w-1 shrink-0 cursor-col-resize bg-border transition-colors hover:bg-accent focus-visible:bg-accent lg:block"
     />
   );
 }

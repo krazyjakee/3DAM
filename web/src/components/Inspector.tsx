@@ -108,7 +108,10 @@ export function Inspector({
     <>
       {collapsed ? (
         // Collapsed rail (issue #65): a slim edge strip whose only control reopens the inspector.
-        <aside className="hidden w-9 shrink-0 flex-col items-center border-l border-border bg-surface py-2 lg:flex">
+        <aside
+          id="workspace-inspector-rail"
+          className="hidden w-9 shrink-0 flex-col items-center border-l border-border bg-surface py-2 lg:flex"
+        >
           <button
             onClick={onExpand}
             title="Show inspector"
@@ -120,6 +123,7 @@ export function Inspector({
         </aside>
       ) : (
         <aside
+          id="workspace-inspector-rail"
           className="hidden shrink-0 flex-col border-l border-border bg-surface lg:flex"
           style={{ width }}
         >

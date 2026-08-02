@@ -4,7 +4,7 @@
 // copy path, and remove / remove + block (#21). Actions honour the whole target set (the clicked
 // asset, or the multi-selection when the clicked item is part of it — #22).
 
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   FileCog,
   FolderPlus,
@@ -30,6 +30,7 @@ import { copyText } from "@/lib/clipboard";
 import { localOnly, PEER_READONLY_SET, peerReadOnlyTitle } from "@/lib/origin";
 import { errorMessage, toast } from "@/lib/toast";
 import { useViewState } from "@/lib/view-state";
+import { menuItemIndex, menuKeyAction } from "@/lib/menu-keyboard";
 
 export interface MenuState {
   x: number;
@@ -75,6 +76,8 @@ export function ContextMenu({
   onConvert: (assets: AssetSummary[]) => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
+  const submenuRef = useRef<HTMLDivElement>(null);
+  const returnFocusRef = useRef<HTMLElement | null>(null);
   const [pos, setPos] = useState({ x: 0, y: 0 });
   const { patch } = useViewState();
   const analyze = useAnalyze();
@@ -87,28 +90,39 @@ export function ContextMenu({
   // Removal is a two-step, in-menu confirm (issue #21): the first click reveals Remove / Remove+block.
   const [confirming, setConfirming] = useState(false);
 
-  // Close on outside pointer, Escape, scroll, or resize.
+  const close = useCallback(
+    (restoreFocus: boolean) => {
+      const returnFocus = returnFocusRef.current;
+      onClose();
+      if (restoreFocus) requestAnimationFrame(() => returnFocus?.focus());
+    },
+    [onClose],
+  );
+
+  // Close on outside pointer, scroll, or resize. Menu-local keyboard handling below owns Escape
+  // so an open submenu can close independently before the root menu is dismissed.
   useEffect(() => {
     if (!menu) return;
     const onDown = (e: PointerEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) onClose();
+      if (ref.current && !ref.current.contains(e.target as Node)) close(false);
     };
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
+    const onScroll = () => close(true);
+    const onResize = () => close(true);
     window.addEventListener("pointerdown", onDown, true);
-    window.addEventListener("keydown", onKey);
-    window.addEventListener("scroll", onClose, true);
-    window.addEventListener("resize", onClose);
+    window.addEventListener("scroll", onScroll, true);
+    window.addEventListener("resize", onResize);
     return () => {
       window.removeEventListener("pointerdown", onDown, true);
-      window.removeEventListener("keydown", onKey);
-      window.removeEventListener("scroll", onClose, true);
-      window.removeEventListener("resize", onClose);
+      window.removeEventListener("scroll", onScroll, true);
+      window.removeEventListener("resize", onResize);
     };
-  }, [menu, onClose]);
+  }, [menu, close]);
 
   // Clamp within the viewport once the menu size is known.
   useLayoutEffect(() => {
     if (!menu || !ref.current) return;
+    returnFocusRef.current =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
     const r = ref.current.getBoundingClientRect();
     const pad = 6;
     setPos({
@@ -121,6 +135,13 @@ export function ContextMenu({
       ref.current?.querySelector<HTMLElement>("[role='menuitem']:not(:disabled)")?.focus(),
     );
   }, [menu]);
+
+  useLayoutEffect(() => {
+    if (!menu || !confirming) return;
+    requestAnimationFrame(() =>
+      ref.current?.querySelector<HTMLElement>("[data-remove-choice]")?.focus(),
+    );
+  }, [confirming, menu]);
 
   if (!menu) return null;
   const assets = menu.assets;
@@ -141,12 +162,82 @@ export function ContextMenu({
     .filter((a) => a.media === "image" || a.media === "model" || a.media === "video")
     .map((a) => a.id);
 
-  const run = (fn: () => void) => {
+  const run = (fn: () => void, restoreFocus = true) => {
     fn();
-    onClose();
+    close(restoreFocus);
   };
 
   const manualCollections = (collections.data ?? []).filter((c) => c.kind === "manual");
+
+  const directItems = (menuElement: HTMLElement): HTMLElement[] =>
+    [...menuElement.querySelectorAll<HTMLElement>("[role='menuitem']")].filter(
+      (item) => item.closest("[role='menu']") === menuElement,
+    );
+
+  const focusSubmenuTrigger = () =>
+    ref.current?.querySelector<HTMLElement>("[aria-haspopup='menu']")?.focus();
+
+  const openSubmenu = (moveFocus: boolean) => {
+    setSubmenu(true);
+    if (moveFocus) {
+      requestAnimationFrame(() => {
+        const submenuElement = submenuRef.current;
+        if (submenuElement) directItems(submenuElement).at(0)?.focus();
+      });
+    }
+  };
+
+  const closeSubmenu = () => {
+    setSubmenu(false);
+    requestAnimationFrame(focusSubmenuTrigger);
+  };
+
+  const cancelRemove = () => {
+    setConfirming(false);
+    requestAnimationFrame(() =>
+      ref.current?.querySelector<HTMLElement>("[data-remove-trigger]")?.focus(),
+    );
+  };
+
+  const onMenuKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    const target = event.target instanceof HTMLElement ? event.target : null;
+    const menuElement = target?.closest<HTMLElement>("[role='menu']");
+    if (!target || !menuElement || !ref.current?.contains(menuElement)) return;
+    const inSubmenu = menuElement !== ref.current;
+    const hasSubmenu =
+      target.getAttribute("aria-haspopup") === "menu" &&
+      target.getAttribute("aria-disabled") !== "true";
+    const action = menuKeyAction(event.key, { inSubmenu, hasSubmenu });
+    if (!action) return;
+
+    if (action === "tab-away") {
+      // Put focus back on the invoking cell before allowing native Tab/Shift+Tab to continue from
+      // that meaningful location. No menu item is added to the page's tab sequence.
+      returnFocusRef.current?.focus();
+      onClose();
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    if (action === "close-menu") {
+      close(true);
+      return;
+    }
+    if (action === "open-submenu") {
+      openSubmenu(true);
+      return;
+    }
+    if (action === "close-submenu") {
+      closeSubmenu();
+      return;
+    }
+
+    const items = directItems(menuElement);
+    const current = items.indexOf(target);
+    const next = menuItemIndex(current, items.length, action);
+    if (next != null) items[next]?.focus();
+  };
 
   const copyPath = async () => {
     try {
@@ -172,6 +263,8 @@ export function ContextMenu({
     <div
       ref={ref}
       role="menu"
+      aria-label={`Actions for ${heading}`}
+      onKeyDown={onMenuKeyDown}
       className="fixed z-50 min-w-44 rounded-md border border-border bg-surface py-1 text-xs text-fg-muted shadow-xl"
       style={{ left: pos.x, top: pos.y }}
     >
@@ -212,29 +305,51 @@ export function ContextMenu({
         label={single ? "Convert…" : `Convert ${localTargets.length}…`}
         disabled={!canWrite || peerOnly}
         title={peerOnly ? peerTitle : !canWrite ? AUTH_COPY.needsWrite : undefined}
-        onClick={() => run(() => onConvert(localTargets))}
+        onClick={() => {
+          // Seed the dialog focus trap with the invoking asset, not this soon-to-unmount menu item,
+          // so closing Convert returns to a stable cell/row.
+          returnFocusRef.current?.focus();
+          run(() => onConvert(localTargets), false);
+        }}
       />
 
       {/* Add to collection — submenu of manual collections (smart folders are query-driven). */}
       <div
         className="relative"
-        onMouseEnter={() => setSubmenu(true)}
-        onMouseLeave={() => setSubmenu(false)}
+        onMouseEnter={() => {
+          if (canWrite && !peerOnly) setSubmenu(true);
+        }}
+        onMouseLeave={(event) => {
+          if (!event.currentTarget.contains(document.activeElement)) setSubmenu(false);
+        }}
       >
         <Item
           icon={<FolderPlus size={13} />}
           label="Add to collection"
           chevron
+          expanded={submenu}
           disabled={!canWrite || peerOnly}
           title={peerOnly ? peerTitle : !canWrite ? AUTH_COPY.needsWrite : undefined}
-          onClick={() => setSubmenu((s) => !s)}
+          onClick={() => (submenu ? closeSubmenu() : openSubmenu(true))}
         />
-        {/* Hover opens the submenu even when the trigger is disabled — keep it shut for a
-            peer-only target set (there is nothing local to add). */}
-        {submenu && !peerOnly && (
-          <div className="absolute top-0 left-full -mt-1 ml-0.5 min-w-40 rounded-md border border-border bg-surface py-1 shadow-xl">
+        {/* Hover opens the submenu for available local actions; keyboard focus moves in with
+            ArrowRight or activation. */}
+        {submenu && canWrite && !peerOnly && (
+          <div
+            ref={submenuRef}
+            role="menu"
+            aria-label="Collections"
+            className="absolute top-0 left-full -mt-1 ml-0.5 min-w-40 rounded-md border border-border bg-surface py-1 shadow-xl"
+          >
             {manualCollections.length === 0 ? (
-              <div className="px-3 py-1.5 text-[11px] text-fg-dim italic">No collections yet</div>
+              <div
+                role="menuitem"
+                aria-disabled="true"
+                tabIndex={-1}
+                className="px-3 py-1.5 text-[11px] text-fg-dim italic"
+              >
+                No collections yet
+              </div>
             ) : (
               manualCollections.map((c) => (
                 <Item
@@ -279,6 +394,9 @@ export function ContextMenu({
           <div className="flex flex-col gap-1">
             <button
               type="button"
+              role="menuitem"
+              tabIndex={-1}
+              data-remove-choice
               onClick={() => removeAll(false)}
               className="flex items-center gap-2 rounded px-2 py-1.5 text-left text-danger hover:bg-danger/10 coarse:min-h-11"
             >
@@ -286,6 +404,9 @@ export function ContextMenu({
             </button>
             <button
               type="button"
+              role="menuitem"
+              tabIndex={-1}
+              data-remove-choice
               onClick={() => removeAll(true)}
               className="flex items-center gap-2 rounded px-2 py-1.5 text-left text-danger hover:bg-danger/10 coarse:min-h-11"
             >
@@ -293,7 +414,10 @@ export function ContextMenu({
             </button>
             <button
               type="button"
-              onClick={() => setConfirming(false)}
+              role="menuitem"
+              tabIndex={-1}
+              data-remove-choice
+              onClick={cancelRemove}
               className="rounded px-2 py-1.5 text-left hover:bg-surface-2 hover:text-fg coarse:min-h-11"
             >
               Cancel
@@ -304,10 +428,14 @@ export function ContextMenu({
         <button
           type="button"
           role="menuitem"
-          disabled={!canWrite || peerOnly}
+          tabIndex={-1}
+          data-remove-trigger
+          aria-disabled={!canWrite || peerOnly || undefined}
           title={peerOnly ? peerTitle : !canWrite ? AUTH_COPY.needsWrite : undefined}
-          onClick={() => setConfirming(true)}
-          className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-danger hover:bg-danger/10 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent coarse:min-h-11"
+          onClick={() => {
+            if (canWrite && !peerOnly) setConfirming(true);
+          }}
+          className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-danger hover:bg-danger/10 aria-disabled:cursor-not-allowed aria-disabled:opacity-40 aria-disabled:hover:bg-transparent coarse:min-h-11"
         >
           <span className="flex w-4 shrink-0 justify-center">
             <Trash2 size={13} />
@@ -326,6 +454,7 @@ function Item({
   label,
   onClick,
   chevron,
+  expanded,
   disabled,
   title,
 }: {
@@ -333,6 +462,7 @@ function Item({
   label: string;
   onClick: () => void;
   chevron?: boolean;
+  expanded?: boolean;
   disabled?: boolean;
   title?: string;
 }) {
@@ -340,10 +470,15 @@ function Item({
     <button
       type="button"
       role="menuitem"
-      onClick={onClick}
-      disabled={disabled}
+      tabIndex={-1}
+      onClick={() => {
+        if (!disabled) onClick();
+      }}
+      aria-disabled={disabled || undefined}
+      aria-haspopup={chevron ? "menu" : undefined}
+      aria-expanded={chevron ? expanded : undefined}
       title={title}
-      className="flex w-full items-center gap-2 px-3 py-1.5 text-left hover:bg-surface-2 hover:text-fg disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-fg-muted coarse:min-h-11"
+      className="flex w-full items-center gap-2 px-3 py-1.5 text-left hover:bg-surface-2 hover:text-fg aria-disabled:cursor-not-allowed aria-disabled:opacity-40 aria-disabled:hover:bg-transparent aria-disabled:hover:text-fg-muted coarse:min-h-11"
     >
       <span className="flex w-4 shrink-0 justify-center text-fg-dim">{icon}</span>
       <span className="flex-1 truncate">{label}</span>

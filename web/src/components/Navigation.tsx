@@ -706,7 +706,7 @@ function CollectionRow({
           <span className="text-[10px] text-fg-dim tabular-nums">{collection.count}</span>
         )}
       </button>
-      <div className="hidden items-center gap-1 group-hover:flex coarse:flex">
+      <div className="hidden items-center gap-1 group-hover:flex group-focus-within:flex coarse:flex">
         {/* Sharing (issue #42): admin-only, so it bypasses the write gate — an admin always may. */}
         {onShare && (
           <button
@@ -836,7 +836,7 @@ function SourceRow({
         )}
       </button>
       {/* Hover-reveal under a mouse; always visible on touch, where there is no hover. */}
-      <div className="hidden items-center gap-1 group-hover:flex coarse:flex">
+      <div className="hidden items-center gap-1 group-hover:flex group-focus-within:flex coarse:flex">
         {/* Sharing (issue #42): admin-only, so it bypasses the write gate — an admin always may. */}
         {onShare && (
           <button

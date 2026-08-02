@@ -11,6 +11,7 @@ import { Copy } from "lucide-react";
 import { useDuplicates } from "@/api/queries";
 import type { AssetSummary, DupGroup, DupKind, MediaType } from "@/api/types";
 import { bytes, mediaLabel } from "@/lib/format";
+import { shortcutForEvent } from "@/lib/shortcuts";
 import { CenteredCard } from "@/lib/ui";
 import { Thumbnail } from "./Thumbnail";
 import { LicenseBadge } from "./LicenseBadge";
@@ -170,6 +171,14 @@ function MemberTile({
   return (
     <Link
       to={`/?sel=${asset.id}`}
+      data-asset-id={asset.id}
+      aria-keyshortcuts="Shift+F10"
+      onKeyDown={(event) => {
+        if (shortcutForEvent(event.nativeEvent) !== "action-menu") return;
+        event.preventDefault();
+        const rect = event.currentTarget.getBoundingClientRect();
+        onContext(asset, rect.left + Math.min(24, rect.width / 2), rect.top + 24);
+      }}
       onContextMenu={(e) => {
         e.preventDefault();
         onContext(asset, e.clientX, e.clientY);

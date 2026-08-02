@@ -5,7 +5,7 @@
 // `Filter[]` in view-state, so a whole faceted query stays URL-linkable and composes with the
 // sidebar facets and text search. Mirrors the Rust `FacetField` variants one-for-one — keep in sync.
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { SlidersHorizontal, X } from "lucide-react";
 import type { FacetField, Filter, MediaType } from "@/api/types";
 import { useViewState } from "@/lib/view-state";
@@ -221,6 +221,7 @@ function ControlRow({
       <Labeled label={label}>
         <select
           className="field w-full"
+          aria-label={label}
           value={value}
           onChange={(e) =>
             set(e.target.value ? { field, op: "eq", value: { str: e.target.value } } : null)
@@ -244,6 +245,7 @@ function ControlRow({
       <Labeled label={label}>
         <select
           className="field w-full"
+          aria-label={label}
           value={value}
           onChange={(e) =>
             set(e.target.value ? { field, op: "eq", value: { num: Number(e.target.value) } } : null)
@@ -267,6 +269,7 @@ function ControlRow({
       <Labeled label={label}>
         <select
           className="field w-full"
+          aria-label={label}
           value={value}
           onChange={(e) =>
             set(e.target.value ? { field, op: "eq", value: { bool: e.target.value === "yes" } } : null)
@@ -289,6 +292,7 @@ function ControlRow({
         <input
           type="number"
           inputMode="decimal"
+          aria-label={`Minimum ${label}`}
           className="field w-full"
           placeholder="min"
           defaultValue={min}
@@ -299,6 +303,7 @@ function ControlRow({
         <input
           type="number"
           inputMode="decimal"
+          aria-label={`Maximum ${label}`}
           className="field w-full"
           placeholder="max"
           defaultValue={max}
@@ -312,10 +317,10 @@ function ControlRow({
 
 function Labeled({ label, children }: { label: string; children: React.ReactNode }) {
   return (
-    <label className="flex items-center gap-2 text-[11px] text-fg-muted">
+    <div className="flex items-center gap-2 text-[11px] text-fg-muted">
       <span className="w-24 shrink-0">{label}</span>
       {children}
-    </label>
+    </div>
   );
 }
 
@@ -339,6 +344,7 @@ function TagFilter({ adv, onChange }: { adv: Filter[]; onChange: (next: Filter[]
       <span className="text-[11px] text-fg-muted">Tags</span>
       <input
         className="field w-full"
+        aria-label="Add tag filter"
         placeholder="Add a tag filter, then Enter"
         value={text}
         onChange={(e) => setText(e.target.value)}
@@ -377,27 +383,50 @@ function TagFilter({ adv, onChange }: { adv: Filter[]; onChange: (next: Filter[]
 export function AdvancedSearch() {
   const { state, patch } = useViewState();
   const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
   const adv = state.adv;
   const setAdv = (next: Filter[]) => patch({ adv: next, collection: null });
 
-  // Close on Escape for parity with the app's other overlays.
+  const close = useCallback((restoreFocus: boolean) => {
+    setOpen(false);
+    if (restoreFocus) requestAnimationFrame(() => triggerRef.current?.focus());
+  }, []);
+
+  // A non-modal dialog popover: focus enters its labelled panel, click-away dismisses without
+  // stealing focus from the clicked control, and keyboard focus leaving the popover closes it.
   useEffect(() => {
     if (!open) return;
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setOpen(false);
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [open]);
+    const onPointerDown = (event: PointerEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) close(false);
+    };
+    document.addEventListener("pointerdown", onPointerDown, true);
+    requestAnimationFrame(() => panelRef.current?.focus());
+    return () => document.removeEventListener("pointerdown", onPointerDown, true);
+  }, [close, open]);
 
   const controls = state.media ? CATALOG[state.media] : null;
   const activeCount = adv.length;
 
   return (
-    <div className="relative shrink-0">
+    <div
+      ref={rootRef}
+      className="relative shrink-0"
+      onBlur={(event) => {
+        const next = event.relatedTarget;
+        if (next instanceof Node && rootRef.current?.contains(next)) return;
+        close(false);
+      }}
+    >
       <button
+        ref={triggerRef}
         className="btn flex items-center gap-1 px-1.5 py-1 coarse:min-h-11"
         title="Advanced filters"
         aria-label="Advanced filters"
         aria-expanded={open}
+        aria-haspopup="dialog"
+        aria-controls="advanced-search-popover"
         onClick={() => setOpen((o) => !o)}
       >
         <SlidersHorizontal size={14} />
@@ -408,12 +437,26 @@ export function AdvancedSearch() {
         )}
       </button>
       {open && (
-        <>
-          {/* Click-away backdrop. */}
-          <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} aria-hidden />
-          <div className="absolute right-0 z-50 mt-1 max-h-[70vh] w-80 overflow-y-auto rounded-md border border-border bg-surface p-3 shadow-xl">
-            <div className="mb-2 flex items-center justify-between">
-              <span className="text-xs font-semibold text-fg">Advanced filters</span>
+        <div
+          ref={panelRef}
+          id="advanced-search-popover"
+          role="dialog"
+          aria-modal="false"
+          aria-labelledby="advanced-search-title"
+          tabIndex={-1}
+          onKeyDown={(event) => {
+            if (event.key !== "Escape") return;
+            event.preventDefault();
+            event.stopPropagation();
+            close(true);
+          }}
+          className="absolute right-0 z-50 mt-1 max-h-[70vh] w-80 overflow-y-auto rounded-md border border-border bg-surface p-3 shadow-xl"
+        >
+          <div className="mb-2 flex items-center justify-between">
+            <h2 id="advanced-search-title" className="text-xs font-semibold text-fg">
+              Advanced filters
+            </h2>
+            <div className="flex items-center gap-2">
               {activeCount > 0 && (
                 <button
                   className="text-[11px] text-fg-dim hover:text-accent"
@@ -422,25 +465,33 @@ export function AdvancedSearch() {
                   Clear advanced
                 </button>
               )}
+              <button
+                type="button"
+                className="text-fg-dim hover:text-fg"
+                aria-label="Close advanced filters"
+                onClick={() => close(true)}
+              >
+                <X size={13} />
+              </button>
             </div>
-
-            {controls ? (
-              <div className="flex flex-col gap-1.5">
-                {controls.map((c) => (
-                  <ControlRow key={c.field} control={c} adv={adv} onChange={setAdv} />
-                ))}
-              </div>
-            ) : (
-              <p className="text-[11px] text-fg-dim italic">
-                Pick a media type (Audio, Images, 3D Models) to filter on its properties — BPM, key,
-                dimensions, triangle count, and more.
-              </p>
-            )}
-
-            <div className="my-2 border-t border-border" />
-            <TagFilter adv={adv} onChange={setAdv} />
           </div>
-        </>
+
+          {controls ? (
+            <div className="flex flex-col gap-1.5">
+              {controls.map((c) => (
+                <ControlRow key={c.field} control={c} adv={adv} onChange={setAdv} />
+              ))}
+            </div>
+          ) : (
+            <p className="text-[11px] text-fg-dim italic">
+              Pick a media type (Audio, Images, 3D Models) to filter on its properties — BPM, key,
+              dimensions, triangle count, and more.
+            </p>
+          )}
+
+          <div className="my-2 border-t border-border" />
+          <TagFilter adv={adv} onChange={setAdv} />
+        </div>
       )}
     </div>
   );

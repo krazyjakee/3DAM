@@ -134,7 +134,7 @@ running dev client with a seeded catalog. **Every route passes with 0 violations
 |---|---|---|
 | Workspace — grid | 0 | 25 |
 | Workspace — table + inspector open | 0 | 26 |
-| Settings | 0 | 22 |
+| Administration | 0 | 22 |
 | Duplicates | 0 | 18 |
 | Blocklist | 0 | 14 |
 
@@ -163,8 +163,15 @@ s.onload = async () => {
 };
 ```
 
-Note: axe scans the current DOM only, so exercise each route/state (open a dialog, select an asset,
-switch to the table) and re-run to cover controls that mount conditionally.
+Note: axe scans the current DOM only, so exercise each route/state before re-running. In the
+workspace this includes the Advanced filters dialog, the asset action menu, its Add to collection
+submenu, both expanded and collapsed rails, and source/collection rows with an action focused.
+
+The fast regression layer runs with `cd web && pnpm test`: `accessibility-contracts.test.ts`
+asserts that focus-revealed navigation actions, menu/submenu roles, value-bearing splitters, and the
+labelled Advanced Search dialog stay in the rendered component contracts;
+`keyboard-controls.test.ts` exercises menu wrapping/submenu dismissal and splitter direction,
+limits, and ignored keys without requiring a seeded server.
 
 ---
 
@@ -195,6 +202,21 @@ described.
   users.
 - **Dialogs trap focus** and restore it to the trigger on close (issue #26); **Escape** dismisses
   dialogs and the narrow-screen drawers.
+- **Source and collection actions** become visible when the row has `:focus-within`. Tab to the row,
+  then Tab again to reach Share, Rename/Rescan, and Delete/Remove exactly as pointer hover reveals
+  them.
+- **Shift+F10 or the Menu key** opens the focused asset’s action menu and moves focus to its first
+  item. Up/Down wrap, Home/End jump, Right or Enter opens Add to collection, Left/Escape returns
+  from its submenu, and Escape closes the root menu and restores the invoking asset. Tab dismisses
+  the menu and continues from that asset instead of adding menu items to the page tab order.
+- **Desktop rail separators are controls**: Tab announces their label, current pixel width, minimum,
+  maximum, and collapsed state. Left/Right resize in the physical direction, Home/End choose the
+  limits, and Enter collapses or restores either Navigation or Inspector while focus remains on the
+  separator.
+- **Advanced filters is a labelled non-modal dialog popover**. Opening moves focus to the panel;
+  every select, range bound, tag input, and close action has an accessible name. Escape closes and
+  returns to the Filters button. Tabbing or clicking away closes without leaving focus behind an
+  invisible backdrop (the former full-screen backdrop has been removed).
 
 ### Verified walk (grid, 3-asset catalog)
 
@@ -204,6 +226,17 @@ described.
 | Move right | → | focus `0 → 1`, roving tab stop follows |
 | Move right | → | focus `1 → 2` (last) |
 | Select | Enter | `?sel=<id>` set, Inspector shows the asset |
+| Open asset actions | Shift+F10 (or Menu) | labelled menu opens; focus moves to its first item |
+| Traverse actions | ↓ / ↑ / Home / End | focus moves within and wraps inside the root menu |
+| Enter collection submenu | focus “Add to collection”, then → | submenu opens and its first item receives focus |
+| Leave collection submenu | ← or Escape | submenu closes; focus returns to “Add to collection” |
+| Dismiss actions | Escape | root menu closes; focus returns to the asset cell |
+| Open typed filters | Tab to “Advanced filters”, Enter | labelled dialog popover opens and receives focus |
+| Leave typed filters | Escape | popover closes; focus returns to “Advanced filters” |
+| Resize Navigation | Tab to “Resize navigation”, then → | width increases by 10 px and announced value updates |
+| Collapse/restore Navigation | Enter twice | rail collapses/restores; separator retains focus |
+| Resize Inspector | Tab to “Resize inspector”, then ← | right rail grows by 10 px and announced value updates |
+| Collapse/restore Inspector | Enter twice | rail collapses/restores; separator retains focus |
 | Table view | ↓ | row focus `0 → 1` (1-D navigation) |
 
 ### Reproduce
