@@ -13,8 +13,9 @@
 use crate::emit_progress;
 use dam_api::dto::*;
 use dam_api::event::{ChangeKind, LibraryEvent};
-use dam_api::id::JobId;
-use dam_store::{AnalysisTarget, ImageAnalysis, Store};
+use dam_api::id::{AssetId, JobId};
+use dam_api::LibError;
+use dam_store::{AnalysisPlanSource, AnalysisPlanTarget, ImageAnalysis, Store};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::Path;
@@ -57,10 +58,54 @@ pub(crate) fn model_free_space(media: MediaType) -> &'static str {
 }
 
 const PROGRESS_EVERY: u64 = 8;
+pub(crate) const PLAN_BATCH_SIZE: usize = 256;
+pub(crate) const PLAN_PREFETCH_BATCHES: usize = 2;
+type SourceBackends =
+    HashMap<dam_api::id::SourceId, Result<Arc<dyn dam_sources::FileSource>, String>>;
 
-/// The background analysis job (mirrors `scan::run_scan`): plan is already done (the caller passed the
-/// due `targets`), so this runs Extract→Derive→Classify→Index per asset, emitting progress + a
-/// `Reanalyzed` change event as each completes (§1.3 incremental). Runs on a blocking thread.
+pub(crate) struct AnalysisRunPlan {
+    pub current_version: i64,
+    pub force: bool,
+    pub assets: Vec<AssetId>,
+    pub total: u64,
+    pub end: Option<dam_store::AnalysisPlanCursor>,
+}
+
+fn bounded_plan_channel<T>() -> (std::sync::mpsc::SyncSender<T>, std::sync::mpsc::Receiver<T>) {
+    std::sync::mpsc::sync_channel(PLAN_PREFETCH_BATCHES)
+}
+
+fn produce_analysis_batches(
+    store: &Store,
+    plan: &AnalysisRunPlan,
+    cancel: &AtomicBool,
+    sender: std::sync::mpsc::SyncSender<Result<dam_store::AnalysisPlanBatch, LibError>>,
+) {
+    let mut cursor = None;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let batch = store.analysis_target_batch(
+            plan.current_version,
+            plan.force,
+            &plan.assets,
+            cursor,
+            plan.end,
+            PLAN_BATCH_SIZE,
+        );
+        let next = batch.as_ref().ok().and_then(|batch| batch.next);
+        let failed = batch.is_err();
+        if sender.send(batch).is_err() || failed || next.is_none() {
+            break;
+        }
+        cursor = next;
+    }
+}
+
+/// The background analysis job (mirrors `scan::run_scan`): the caller supplies only a stable plan
+/// boundary and total; a bounded producer keyset-streams due targets while this consumer runs
+/// Extract→Derive→Classify→Index and emits a `Reanalyzed` event per completion (§1.3 incremental).
 ///
 /// Per-asset work is CPU-bound (decode → derive → classify → embed), so it fans out across the rayon
 /// pool (ADR 0007, issue #67) — a whole-library pass now scales with cores instead of pinning one. The
@@ -72,77 +117,100 @@ pub(crate) fn run_analyze(
     store: Arc<Store>,
     events: broadcast::Sender<LibraryEvent>,
     job: JobId,
-    targets: Vec<AnalysisTarget>,
+    plan: AnalysisRunPlan,
     cancel: Arc<AtomicBool>,
     model: Option<Arc<dyn crate::semantic::SemanticModel>>,
+    secrets: crate::credentials::SecretVault,
     pool: &rayon::ThreadPool,
     governor: &crate::resources::Governor,
     scratch: &Path,
 ) {
-    let total = targets.len() as u64;
+    let total = plan.total;
     let _ = store.update_job_progress(&job, JobState::Running, 0, Some(total), None);
     // Shared across the rayon workers: a monotonic completion counter and a skip counter.
     let done = AtomicU64::new(0);
     let warnings = AtomicU64::new(0);
     let warning_details = Mutex::new(Vec::new());
 
-    // Rebuild each distinct source's backend **once**, before the fan-out. Opening per asset would
-    // mean an SSH handshake or an SMB session setup per file, which for a remote pass is most of the
-    // wall clock. `FileSource` is `Send + Sync`, so one instance serves every worker.
-    //
-    // A source that won't open (host down, credentials rotated) is recorded here, not raised: its
-    // assets each fail their own item below, exactly like an undecodable file. Degrade one edge, not
-    // the job — golden rule 6.
-    let backends = open_backends(&store, &targets, scratch);
+    let mut backends = SourceBackends::new();
+    let mut planner_error = None;
 
-    // Run on the bounded background pool (not the global rayon pool) so a whole-library pass leaves
-    // cores free for interactive inspector reads instead of pinning every core (tech-spec 14).
-    pool.install(|| {
-        targets.par_iter().for_each(|t| {
-        // Cooperative cancel: in-flight items finish; still-queued ones fall through as cheap no-ops.
-        if cancel.load(Ordering::Relaxed) {
-            return;
-        }
-        // Good-neighbour pacing (tech-spec 14 §3.4): when the *host* runs short on memory or CPU,
-        // every worker parks here between items until pressure clears — a whole-library pass must
-        // never swap a shared box to death. Cancel still exits promptly.
-        governor.pace(&cancel);
-        if cancel.load(Ordering::Relaxed) {
-            return;
-        }
-        let outcome = match backends.get(&t.source_id) {
-            Some(Ok(fs)) => analyze_one(&store, t, model.as_deref(), fs.as_ref()),
-            Some(Err(e)) => Err(e.clone()),
-            None => Err("source backend missing".to_string()),
-        };
-        match outcome {
-            Ok(()) => {
-                let _ = events.send(LibraryEvent::AssetChanged {
-                    id: t.id,
-                    source_id: Some(t.source_id),
-                    kind: ChangeKind::Reanalyzed,
-                });
+    // A planner may be one batch ahead, never one catalog ahead. A full channel blocks the producer
+    // until the bounded rayon consumer releases capacity; dropping the receiver on cancellation
+    // wakes a blocked send immediately.
+    std::thread::scope(|scope| {
+        let (sender, receiver) = bounded_plan_channel();
+        let producer_store = store.clone();
+        let producer_cancel = cancel.clone();
+        scope.spawn(move || {
+            produce_analysis_batches(&producer_store, &plan, &producer_cancel, sender);
+        });
+
+        while let Ok(batch) = receiver.recv() {
+            if cancel.load(Ordering::Relaxed) {
+                break;
             }
-            Err(e) => {
-                let prior = warnings.fetch_add(1, Ordering::Relaxed);
-                if prior < MAX_JOB_WARNING_DETAILS {
-                    warning_details.lock().unwrap().push(format!(
-                        "“{}” could not be analysed; inspect its source status and retry",
-                        t.path
-                    ));
+            let batch = match batch {
+                Ok(batch) => batch,
+                Err(error) => {
+                    planner_error = Some(error.to_string());
+                    break;
                 }
-                tracing::warn!(asset = %t.id, path = %t.path, error = %e, "analysis skipped asset");
-            }
+            };
+            open_batch_backends(&store, &secrets, &mut backends, batch.sources, scratch);
+
+            // Run on the bounded background pool (not the global rayon pool) so a large pass leaves
+            // cores free for interactive reads. Only this page and the small channel are resident.
+            pool.install(|| {
+                batch.targets.par_iter().for_each(|target| {
+                    if cancel.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    governor.pace(&cancel);
+                    if cancel.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let outcome = match backends.get(&target.source_id) {
+                        Some(Ok(source)) => {
+                            analyze_one(&store, target, model.as_deref(), source.as_ref())
+                        }
+                        Some(Err(error)) => Err(error.clone()),
+                        None => Err("source backend missing".to_string()),
+                    };
+                    match outcome {
+                        Ok(()) => {
+                            let _ = events.send(LibraryEvent::AssetChanged {
+                                id: target.id,
+                                source_id: Some(target.source_id),
+                                kind: ChangeKind::Reanalyzed,
+                            });
+                        }
+                        Err(error) => {
+                            let prior = warnings.fetch_add(1, Ordering::Relaxed);
+                            if prior < MAX_JOB_WARNING_DETAILS {
+                                warning_details.lock().unwrap().push(format!(
+                                    "“{}” could not be analysed; inspect its source status and retry",
+                                    target.path
+                                ));
+                            }
+                            tracing::warn!(asset = %target.id, path = %target.path, error = %error, "analysis skipped asset");
+                        }
+                    }
+                    let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n.is_multiple_of(PROGRESS_EVERY) {
+                        let _ = store.update_job_progress(
+                            &job,
+                            JobState::Running,
+                            n,
+                            Some(total),
+                            Some(&target.path),
+                        );
+                        emit_progress(&store, &events, &job);
+                    }
+                });
+            });
         }
-        // Report on every Nth completion — `fetch_add` returns the prior value, so `n` is this
-        // worker's 1-based ordinal; the bar advances monotonically even as workers interleave.
-        let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-        if n.is_multiple_of(PROGRESS_EVERY) {
-            let _ =
-                store.update_job_progress(&job, JobState::Running, n, Some(total), Some(&t.path));
-            emit_progress(&store, &events, &job);
-        }
-    });
+        drop(receiver);
     });
 
     let done = done.load(Ordering::Relaxed);
@@ -156,7 +224,9 @@ pub(crate) fn run_analyze(
             "{omitted} additional warning(s) omitted; inspect source status and server logs"
         ));
     }
-    if cancel.load(Ordering::Relaxed) {
+    if let Some(error) = planner_error {
+        let _ = store.set_job_state(&job, JobState::Failed, Some(&error));
+    } else if cancel.load(Ordering::Relaxed) {
         let _ = store.set_job_state(&job, JobState::Cancelled, None);
     } else {
         let _ = store.update_job_progress(&job, JobState::Done, done, Some(total), None);
@@ -175,28 +245,36 @@ pub(crate) fn run_analyze(
 /// vanish from the pass instead of each reporting why they were skipped. The error is also written
 /// to `source.last_error`, so the offline state surfaces in the sources list and not only in a log
 /// line nobody reads.
-fn open_backends(
+fn open_batch_backends(
     store: &Store,
-    targets: &[AnalysisTarget],
+    secrets: &crate::credentials::SecretVault,
+    backends: &mut SourceBackends,
+    sources: Vec<AnalysisPlanSource>,
     scratch: &Path,
-) -> HashMap<dam_api::id::SourceId, Result<Arc<dyn dam_sources::FileSource>, String>> {
-    let mut out: HashMap<_, Result<Arc<dyn dam_sources::FileSource>, String>> = HashMap::new();
-    for t in targets {
-        if out.contains_key(&t.source_id) {
+) {
+    for source in sources {
+        if backends.contains_key(&source.source_id) {
             continue;
         }
-        let entry = match dam_sources::open_source(&t.connection, scratch) {
-            Ok(fs) => Ok(Arc::from(fs)),
-            Err(e) => {
-                let msg = e.to_string();
-                let _ = store.set_source_error(&t.source_id, &msg);
-                tracing::warn!(source = %t.source_id, error = %msg, "source unavailable for analysis");
-                Err(msg)
-            }
+        let entry = store
+            .get_source_connection(&source.source_id)
+            .map_err(|error| error.to_string())
+            .and_then(|connection| {
+                secrets
+                    .resolve(connection)
+                    .map_err(|error| error.to_string())
+            })
+            .and_then(|connection| {
+                dam_sources::open_source(&connection, scratch)
+                    .map(Arc::from)
+                    .map_err(|error| error.to_string())
+            });
+        if let Err(error) = &entry {
+            let _ = store.set_source_error(&source.source_id, error);
+            tracing::warn!(source = %source.source_id, %error, "source unavailable for analysis");
         };
-        out.insert(t.source_id, entry);
+        backends.insert(source.source_id, entry);
     }
-    out
 }
 
 /// Analyse one asset end-to-end: extract features, derive signals, classify → suggest, index the
@@ -209,7 +287,7 @@ fn open_backends(
 /// not by the size of the batch.
 fn analyze_one(
     store: &Store,
-    t: &AnalysisTarget,
+    t: &AnalysisPlanTarget,
     model: Option<&dyn crate::semantic::SemanticModel>,
     fs: &dyn dam_sources::FileSource,
 ) -> Result<(), String> {
@@ -260,7 +338,7 @@ fn analyze_one(
 /// Suggest a tag for each meaningful whole word in the filename: alphanumeric runs of ≥3 chars that
 /// aren't purely numeric and aren't the format/extension. Low confidence — a name is a weaker signal
 /// than a decoded attribute. Fail-soft per tag.
-fn suggest_filename_tags(store: &Store, t: &AnalysisTarget) {
+fn suggest_filename_tags(store: &Store, t: &AnalysisPlanTarget) {
     let filename = Path::new(&t.path)
         .file_name()
         .and_then(|s| s.to_str())
@@ -277,7 +355,7 @@ fn suggest_filename_tags(store: &Store, t: &AnalysisTarget) {
     }
 }
 
-fn analyze_image(store: &Store, t: &AnalysisTarget, abs: &Path) -> Result<(), String> {
+fn analyze_image(store: &Store, t: &AnalysisPlanTarget, abs: &Path) -> Result<(), String> {
     let f = dam_media::extract_image_features(abs).map_err(|e| e.to_string())?;
     // Derive: persist perceptual/tileability/colour signals (§5, §6).
     store
@@ -316,7 +394,7 @@ fn analyze_image(store: &Store, t: &AnalysisTarget, abs: &Path) -> Result<(), St
 
 fn analyze_audio(
     store: &Store,
-    t: &AnalysisTarget,
+    t: &AnalysisPlanTarget,
     abs: &Path,
     det: &dam_media::Detected,
 ) -> Result<(), String> {
@@ -412,7 +490,7 @@ fn analyze_audio(
 
 fn analyze_model(
     store: &Store,
-    t: &AnalysisTarget,
+    t: &AnalysisPlanTarget,
     abs: &Path,
     det: &dam_media::Detected,
 ) -> Result<(), String> {
@@ -500,7 +578,7 @@ fn analyze_model(
 /// scan time, is exactly what the `space_id` seam exists to prevent.
 fn analyze_video(
     store: &Store,
-    t: &AnalysisTarget,
+    t: &AnalysisPlanTarget,
     abs: &Path,
     det: &dam_media::Detected,
 ) -> Result<(), String> {
@@ -569,7 +647,7 @@ fn analyze_video(
 /// document is findable even if the embedding step later fails.
 fn analyze_document(
     store: &Store,
-    t: &AnalysisTarget,
+    t: &AnalysisPlanTarget,
     abs: &Path,
     det: &dam_media::Detected,
 ) -> Result<(), String> {
@@ -682,4 +760,79 @@ fn suggest_all(store: &Store, id: &dam_api::id::AssetId, suggestions: &[(&str, f
 fn normalise(mut v: Vec<f32>) -> Vec<f32> {
     dam_media::l2_normalise(&mut v);
     v
+}
+
+#[cfg(test)]
+mod planner_tests {
+    use super::*;
+
+    #[test]
+    fn planner_channel_applies_bounded_backpressure() {
+        let (sender, receiver) = bounded_plan_channel();
+        for value in 0..PLAN_PREFETCH_BATCHES {
+            sender.try_send(value).unwrap();
+        }
+        assert!(matches!(
+            sender.try_send(99),
+            Err(std::sync::mpsc::TrySendError::Full(99))
+        ));
+        drop(receiver);
+    }
+
+    #[test]
+    fn cancelled_planner_produces_no_batch() {
+        let store = Store::open_in_memory().unwrap();
+        let cancel = AtomicBool::new(true);
+        let plan = AnalysisRunPlan {
+            current_version: PIPELINE_VERSION,
+            force: false,
+            assets: Vec::new(),
+            total: 0,
+            end: None,
+        };
+        let (sender, receiver) = bounded_plan_channel();
+        produce_analysis_batches(&store, &plan, &cancel, sender);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn blocked_planner_unblocks_when_cancelled_consumer_drops() {
+        let (sender, receiver) = bounded_plan_channel();
+        for value in 0..PLAN_PREFETCH_BATCHES {
+            sender.try_send(value).unwrap();
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let producer_cancel = cancel.clone();
+        let (started_sender, started_receiver) = std::sync::mpsc::channel();
+        let (finished_sender, finished_receiver) = std::sync::mpsc::channel();
+        let producer = std::thread::spawn(move || {
+            started_sender.send(()).unwrap();
+            let result = sender.send(99);
+            finished_sender
+                .send((producer_cancel.load(Ordering::Relaxed), result.is_err()))
+                .unwrap();
+        });
+        started_receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("producer thread did not start");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(
+            matches!(
+                finished_receiver.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ),
+            "producer was not actually blocked by channel backpressure"
+        );
+        cancel.store(true, Ordering::Relaxed);
+        drop(receiver);
+        let (observed_cancel, disconnected) = finished_receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("blocked planner did not stop promptly after consumer cancellation");
+        producer.join().unwrap();
+        assert!(observed_cancel);
+        assert!(disconnected);
+    }
 }

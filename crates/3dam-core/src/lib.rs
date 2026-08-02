@@ -328,13 +328,6 @@ fn serialize_opt_query(q: &Option<QueryRequest>) -> Result<Option<String>, LibEr
         .map_err(|e| LibError::Internal(e.to_string()))
 }
 
-/// The distinct sources an analyse run will touch — the job's visibility attribution (issue #42).
-/// Sorted+deduped so the recorded set is stable regardless of target order.
-pub(crate) fn distinct_sources(targets: &[dam_store::AnalysisTarget]) -> Vec<SourceId> {
-    let set: std::collections::BTreeSet<SourceId> = targets.iter().map(|t| t.source_id).collect();
-    set.into_iter().collect()
-}
-
 /// Emit a job's current progress as a `JobProgress` event (best-effort; a dropped read is skipped).
 /// Shared by the scan and analyse job loops.
 pub(crate) fn emit_progress(store: &Store, events: &broadcast::Sender<LibraryEvent>, job: &JobId) {
@@ -1059,7 +1052,7 @@ impl EmbeddedLibrary {
     /// emits no event.
     pub async fn clear_caches(&self, target: CacheTarget) -> Result<ClearCacheReport, LibError> {
         let cache = self.cache.clone();
-        tokio::task::spawn_blocking(move || {
+        let report = tokio::task::spawn_blocking(move || {
             let tiers: &[cache::Tier] = match target {
                 CacheTarget::Thumbnails => &[cache::Tier::Thumbnail],
                 CacheTarget::Previews => &[cache::Tier::Preview],
@@ -1076,7 +1069,13 @@ impl EmbeddedLibrary {
             }
         })
         .await
-        .map_err(|e| LibError::Internal(e.to_string()))
+        .map_err(|e| LibError::Internal(e.to_string()))?;
+        // V23 is the durable derivative backlog. Clearing bytes must reset the corresponding work
+        // marker or the background worker would believe the now-missing files were still warm.
+        self.db(|store| store.mark_all_derivatives_pending())
+            .await?;
+        self.pipeline_wake.notify_one();
+        Ok(report)
     }
 
     /// Drop the analysis layer (suggestions + embeddings + derived attrs) and mark every asset due
@@ -2322,29 +2321,25 @@ impl LibraryService for EmbeddedLibrary {
         req: AnalyzeRequest,
     ) -> Result<JobId, LibError> {
         Self::require_full_visibility(ctx, "analysis")?;
-        // Plan: resolve the due (or requested) targets up front so the job total is known (§1.2).
+        // Plan only cheap metadata up front; the worker keyset-streams bounded target pages.
         let assets = req.assets.clone();
         let force = req.force;
-        let secrets = self.secrets.clone();
-        let targets = self
+        let summary_assets = assets.clone();
+        let summary = self
             .db(move |s| {
-                let mut targets =
-                    s.list_analysis_targets(analysis::PIPELINE_VERSION, force, &assets)?;
-                for target in &mut targets {
-                    target.connection = secrets.resolve(target.connection.clone())?;
-                }
-                Ok(targets)
+                s.analysis_plan_summary(analysis::PIPELINE_VERSION, force, &summary_assets)
             })
             .await?;
-        if targets.is_empty() {
+        if summary.total == 0 {
             return Err(LibError::BadRequest(
                 "nothing to analyse (all assets are up to date; pass --force to re-run)".into(),
             ));
         }
 
         let params = serde_json::to_string(&req).unwrap_or_else(|_| "{}".into());
-        let total = targets.len() as u64;
-        let touched = distinct_sources(&targets);
+        let total = summary.total;
+        let end = summary.end;
+        let touched = summary.sources;
         let job = self
             .db(move |s| s.create_job(JobKind::Analyze, &params, Some(total), &touched))
             .await?;
@@ -2355,12 +2350,28 @@ impl LibraryService for EmbeddedLibrary {
         let store = self.store.clone();
         let events = self.events.clone();
         let model = self.semantic.clone();
+        let secrets = self.secrets.clone();
         let pool = self.bg_pool.clone();
         let governor = self.governor.clone();
         let scratch = self.scratch();
         tokio::task::spawn_blocking(move || {
             analysis::run_analyze(
-                store, events, job, targets, cancel, model, &pool, &governor, &scratch,
+                store,
+                events,
+                job,
+                analysis::AnalysisRunPlan {
+                    current_version: analysis::PIPELINE_VERSION,
+                    force,
+                    assets,
+                    total,
+                    end,
+                },
+                cancel,
+                model,
+                secrets,
+                &pool,
+                &governor,
+                &scratch,
             );
         });
         Ok(job)
@@ -2380,20 +2391,25 @@ impl LibraryService for EmbeddedLibrary {
         // Resolve each asset's content key inside the store lock, then purge its cache slice; the
         // next thumbnail read re-renders from source. A missing asset fails the whole request (the
         // caller passed a bad id) — per-item fail-soft applies to the file deletes, not the lookup.
-        self.db(move |s| {
-            let mut report = ThumbnailRegenReport::default();
-            for id in &req.assets {
-                let asset = s.get_asset(id)?;
-                let key = asset
-                    .hash
-                    .map(|h| h.to_hex())
-                    .unwrap_or_else(|| asset.summary.id.to_string());
-                report.files_deleted += purge_asset_cache(&cache, &key);
-                report.assets += 1;
-            }
-            Ok(report)
-        })
-        .await
+        let assets = req.assets.clone();
+        let report = self
+            .db(move |s| {
+                let mut report = ThumbnailRegenReport::default();
+                for id in &req.assets {
+                    let asset = s.get_asset(id)?;
+                    let key = asset
+                        .hash
+                        .map(|h| h.to_hex())
+                        .unwrap_or_else(|| asset.summary.id.to_string());
+                    report.files_deleted += purge_asset_cache(&cache, &key);
+                    report.assets += 1;
+                }
+                s.mark_derivatives_pending(&assets)?;
+                Ok(report)
+            })
+            .await?;
+        self.pipeline_wake.notify_one();
+        Ok(report)
     }
 
     async fn find_similar(

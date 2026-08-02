@@ -32,6 +32,7 @@ pub trait PipelinePolicy: Send + Sync + 'static {
 /// MCP thumbnail size, so a freshly-connected client's first grid mostly hits warm cache. Clients
 /// that ask for a different edge still fall back to on-demand generation for that slice.
 pub(crate) const PREGEN_THUMB_EDGE: u32 = 256;
+pub(crate) const DERIVATIVE_VERSION: i64 = 1;
 
 impl EmbeddedLibrary {
     /// Start the always-on hosted-mode pipeline (issue #71). Long-running roles (`serve`) call this
@@ -101,22 +102,15 @@ impl EmbeddedLibrary {
     /// (both clients see the server working). Awaited to completion — the worker won't start a second
     /// overlapping analyze job.
     async fn drain_analysis(&self) -> Result<(), LibError> {
-        let secrets = self.secrets.clone();
-        let targets = self
-            .db(move |s| {
-                let mut targets =
-                    s.list_analysis_targets(crate::analysis::PIPELINE_VERSION, false, &[])?;
-                for target in &mut targets {
-                    target.connection = secrets.resolve(target.connection.clone())?;
-                }
-                Ok(targets)
-            })
+        let summary = self
+            .db(|s| s.analysis_plan_summary(crate::analysis::PIPELINE_VERSION, false, &[]))
             .await?;
-        if targets.is_empty() {
+        if summary.total == 0 {
             return Ok(()); // everything already analysed — idempotent no-op
         }
-        let total = targets.len() as u64;
-        let touched = crate::distinct_sources(&targets);
+        let total = summary.total;
+        let end = summary.end;
+        let touched = summary.sources;
         let job = self
             .db(move |s| s.create_job(JobKind::Analyze, "{\"auto\":true}", Some(total), &touched))
             .await?;
@@ -126,12 +120,28 @@ impl EmbeddedLibrary {
         let store = self.store.clone();
         let events = self.events.clone();
         let model = self.semantic.clone();
+        let secrets = self.secrets.clone();
         let pool = self.bg_pool.clone();
         let governor = self.governor.clone();
         let scratch = self.scratch();
         let outcome = tokio::task::spawn_blocking(move || {
             crate::analysis::run_analyze(
-                store, events, job, targets, cancel, model, &pool, &governor, &scratch,
+                store,
+                events,
+                job,
+                crate::analysis::AnalysisRunPlan {
+                    current_version: crate::analysis::PIPELINE_VERSION,
+                    force: false,
+                    assets: Vec::new(),
+                    total,
+                    end,
+                },
+                cancel,
+                model,
+                secrets,
+                &pool,
+                &governor,
+                &scratch,
             );
         })
         .await;
@@ -144,67 +154,104 @@ impl EmbeddedLibrary {
     /// on one blocking thread (bounded), off the request path. Fail-soft: an asset that can't be
     /// rendered is skipped, never fatal.
     async fn drain_thumbnails(&self) -> Result<(), LibError> {
-        // `force = true` lists every local_fs asset (not just the analysis-due ones) — the set whose
-        // previews we want warm. Federated/offline sources have no local bytes and are excluded.
-        let targets = self
-            .db(|s| s.list_analysis_targets(crate::analysis::PIPELINE_VERSION, true, &[]))
-            .await?;
-        if targets.is_empty() {
-            return Ok(());
-        }
-        let data_dir = self.data_dir.clone();
-        let secrets = self.secrets.clone();
-        let governor = self.governor.clone();
-        let cache = self.cache.clone();
-        let generated = self
-            .run_bg(move |store| {
-                let never_cancelled = AtomicBool::new(false);
-                let mut generated = 0u64;
-                for t in targets {
-                    // Good-neighbour pacing (tech-spec 14 §3.4): pre-rendering is pure opportunism — it
-                    // parks whenever the host is short on memory or CPU and resumes on recovery.
-                    governor.pace(&never_cancelled);
-                    let Ok(asset) = store.get_asset(&t.id) else {
-                        continue; // vanished between listing and read — fail-soft
-                    };
-                    let is_model = asset.summary.media == MediaType::Model;
-                    let key = if is_model {
-                        format!("model-derivatives:{}:{PREGEN_THUMB_EDGE}", t.id)
-                    } else {
-                        format!("thumbnail:{}:{PREGEN_THUMB_EDGE}", t.id)
-                    };
-                    let warmed = cache.singleflight_blocking(key, || {
-                        if is_model {
-                            gen_model_derivatives(
-                                &cache,
-                                &data_dir,
-                                store,
-                                &secrets,
-                                &asset,
-                                PREGEN_THUMB_EDGE,
-                            )
-                            .map(|_| ())
+        let mut cursor = None;
+        let mut generated_total = 0u64;
+        let mut failed_total = 0u64;
+        loop {
+            let batch = self
+                .db(move |store| {
+                    store.derivative_target_batch(
+                        DERIVATIVE_VERSION,
+                        cursor,
+                        crate::analysis::PLAN_BATCH_SIZE,
+                    )
+                })
+                .await?;
+            let next = batch.next;
+            if batch.targets.is_empty() && next.is_none() {
+                break;
+            }
+            let targets = batch.targets;
+            let data_dir = self.data_dir.clone();
+            let secrets = self.secrets.clone();
+            let governor = self.governor.clone();
+            let cache = self.cache.clone();
+            let (generated, failed) = self
+                .run_bg(move |store| {
+                    let never_cancelled = AtomicBool::new(false);
+                    let mut generated = 0u64;
+                    let mut failed = 0u64;
+                    for t in targets {
+                        // Good-neighbour pacing (tech-spec 14 §3.4): pre-rendering is pure opportunism — it
+                        // parks whenever the host is short on memory or CPU and resumes on recovery.
+                        governor.pace(&never_cancelled);
+                        let Ok(asset) = store.get_asset(&t.id) else {
+                            continue; // vanished between listing and read — fail-soft
+                        };
+                        let is_model = asset.summary.media == MediaType::Model;
+                        let key = if is_model {
+                            format!("model-derivatives:{}:{PREGEN_THUMB_EDGE}", t.id)
                         } else {
-                            gen_thumbnail(
-                                &cache,
-                                &data_dir,
-                                store,
-                                &secrets,
-                                &asset,
-                                PREGEN_THUMB_EDGE,
-                            )
-                            .map(|_| ())
+                            format!("thumbnail:{}:{PREGEN_THUMB_EDGE}", t.id)
+                        };
+                        let warmed = cache.singleflight_blocking(key, || {
+                            if is_model {
+                                gen_model_derivatives(
+                                    &cache,
+                                    &data_dir,
+                                    store,
+                                    &secrets,
+                                    &asset,
+                                    PREGEN_THUMB_EDGE,
+                                )
+                                .map(|_| ())
+                            } else {
+                                gen_thumbnail(
+                                    &cache,
+                                    &data_dir,
+                                    store,
+                                    &secrets,
+                                    &asset,
+                                    PREGEN_THUMB_EDGE,
+                                )
+                                .map(|_| ())
+                            }
+                        });
+                        if warmed.is_some_and(|result| result.is_ok()) {
+                            if store.mark_derivative_ready(
+                                &t.id,
+                                DERIVATIVE_VERSION,
+                                t.content_hash,
+                            )? {
+                                generated += 1;
+                            } else {
+                                // Content changed while the derivative was rendering; the scan reset
+                                // the new revision to pending, so never bless the stale cache key.
+                                failed += 1;
+                            }
+                        } else {
+                            // Leave the durable marker pending. The keyset cursor still advances, so a
+                            // bad asset is attempted at most once in this drain and retries on a later
+                            // wake rather than spinning in a tight loop.
+                            failed += 1;
                         }
-                    });
-                    if warmed.is_some_and(|result| result.is_ok()) {
-                        generated += 1;
                     }
-                }
-                Ok(generated)
-            })
-            .await?;
-        if generated > 0 {
-            tracing::info!(generated, "background pipeline warmed thumbnails");
+                    Ok((generated, failed))
+                })
+                .await?;
+            generated_total += generated;
+            failed_total += failed;
+            let Some(next) = next else {
+                break;
+            };
+            cursor = Some(next);
+        }
+        if generated_total > 0 || failed_total > 0 {
+            tracing::info!(
+                generated = generated_total,
+                pending_failures = failed_total,
+                "background pipeline warmed derivatives"
+            );
         }
         Ok(())
     }

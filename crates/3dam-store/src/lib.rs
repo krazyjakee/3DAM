@@ -71,6 +71,48 @@ pub struct AnalysisTarget {
     pub content_hash: Option<ContentHash>,
 }
 
+/// Stable keyset checkpoint for a bounded analysis/derivative planner batch. Ordering by source and
+/// asset id keeps a source's rows adjacent and makes the cursor independent of mutable filenames or
+/// timestamps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AnalysisPlanCursor {
+    pub due_version: i64,
+    pub source_id: SourceId,
+    pub asset_id: AssetId,
+}
+
+/// A distinct source referenced by a planner batch. The consumer resolves its connection only on
+/// the first sighting and shares one opened backend across every later page.
+pub struct AnalysisPlanSource {
+    pub source_id: SourceId,
+}
+
+/// One bounded-plan row. Source connection state lives in [`AnalysisPlanBatch::sources`] rather
+/// than being cloned and reparsed into every asset.
+#[derive(Clone, Debug)]
+pub struct AnalysisPlanTarget {
+    pub id: AssetId,
+    pub source_id: SourceId,
+    pub path: String,
+    pub media: MediaType,
+    pub format: String,
+    pub content_hash: Option<ContentHash>,
+}
+
+/// A bounded, resumable planner page plus the distinct source state needed by its targets.
+pub struct AnalysisPlanBatch {
+    pub targets: Vec<AnalysisPlanTarget>,
+    pub sources: Vec<AnalysisPlanSource>,
+    pub next: Option<AnalysisPlanCursor>,
+}
+
+/// Cheap job metadata computed without materializing the eligible asset rows.
+pub struct AnalysisPlanSummary {
+    pub total: u64,
+    pub sources: Vec<SourceId>,
+    pub end: Option<AnalysisPlanCursor>,
+}
+
 /// Derived image signals the analysis pass persists (tech-spec 05 §5, §6). Passed as primitives so the
 /// store never depends on `dam-media`.
 pub struct ImageAnalysis {

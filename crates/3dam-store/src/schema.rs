@@ -849,6 +849,21 @@ pub const MIGRATIONS: &[&str] = &[
         UPDATE asset SET browse_size_bytes = size_bytes WHERE id = old.asset_id;
     END;
     "#,
+    // ── V23: incremental derivative backlog (issue #140) ────────────────────────────────────
+    // Zero means the content-keyed thumbnail/model-preview slice still needs warming. A successful
+    // background render advances the marker; content changes and explicit cache clears reset it.
+    // Keeping this beside the asset makes restart recovery durable and turns every wake from a
+    // catalog sweep into an indexed walk over only pending rows.
+    r#"
+    ALTER TABLE asset ADD COLUMN derivative_version INTEGER NOT NULL DEFAULT 0;
+    CREATE INDEX idx_asset_analysis_planner
+        ON asset(analysis_version, source_id, id);
+    CREATE INDEX idx_asset_force_planner
+        ON asset(source_id, id);
+    CREATE INDEX idx_asset_derivative_pending
+        ON asset(derivative_version, source_id, id)
+        WHERE media_type IN ('image','video','model');
+    "#,
 ];
 
 #[cfg(test)]
@@ -1101,6 +1116,34 @@ mod tests {
             .query_row("SELECT count(*) FROM folder", [], |row| row.get(0))
             .unwrap();
         assert_eq!(rows, 0, "source cascade left hierarchy rows behind");
+    }
+
+    #[test]
+    fn derivative_backlog_migration_marks_existing_and_new_assets_pending() {
+        let conn = db_at(22);
+        conn.execute_batch(
+            "INSERT INTO source (id, name, kind, connection, created_at, updated_at)
+                VALUES (x'01', 's', 'local_fs', '{\"kind\":\"local_fs\",\"root\":\"/tmp\"}', 0, 0);
+             INSERT INTO asset (id, source_id, path, filename, scanned_at, media_type, format,
+                                created_at, updated_at)
+                VALUES (x'02', x'01', 'old.png', 'old.png', 0, 'image', 'png', 0, 0);",
+        )
+        .unwrap();
+        conn.execute_batch(MIGRATIONS[22]).unwrap();
+        conn.execute_batch(
+            "INSERT INTO asset (id, source_id, path, filename, scanned_at, media_type, format,
+                                created_at, updated_at)
+                VALUES (x'03', x'01', 'new.png', 'new.png', 0, 'image', 'png', 0, 0);",
+        )
+        .unwrap();
+        let pending: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM asset WHERE derivative_version=0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 2);
     }
 
     #[test]

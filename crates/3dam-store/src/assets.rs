@@ -27,6 +27,9 @@ impl Store {
             // a row that simply had no hash before is not evidence the file was edited, and
             // resetting unconditionally would re-analyse the whole library on every scan.
             let content_changed = matches!((&prev_hash, &hash_blob), (Some(p), Some(n)) if p != n);
+            // Derivative paths are keyed by hash with an asset-id fallback, so even learning a
+            // previously absent hash changes the cache key and must reopen V23's warm-up gate.
+            let derivative_key_changed = prev_hash != hash_blob;
             // A reclassification (the content probe finding an audio-only `.mp4`, or ffprobe
             // becoming available between scans) is the same problem plus one: the derived rows are
             // in the wrong tables entirely.
@@ -80,6 +83,13 @@ impl Store {
                 // the stale derivation forever, because the version alone still looks current.
                 conn.execute(
                     "UPDATE asset SET analysis_version = 0, analysed_at = NULL WHERE id = ?1",
+                    params![id_blob],
+                )
+                .map_err(internal)?;
+            }
+            if derivative_key_changed || media_changed {
+                conn.execute(
+                    "UPDATE asset SET derivative_version = 0 WHERE id = ?1",
                     params![id_blob],
                 )
                 .map_err(internal)?;
