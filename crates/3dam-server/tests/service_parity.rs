@@ -241,7 +241,7 @@ async fn behavior_transcript(
                 .collect(),
         ),
         similar: similar.items.len(),
-        duplicates: duplicates.len(),
+        duplicates: duplicates.items.len(),
         missing_code,
         final_sources: service.list_sources(ctx).await.unwrap().len(),
     }

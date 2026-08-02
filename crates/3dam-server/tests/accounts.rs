@@ -789,7 +789,7 @@ async fn leak_audit_similar_and_duplicates() {
     .await;
     assert_eq!(st, StatusCode::OK);
     assert!(
-        !body.as_array().unwrap().is_empty(),
+        !body["items"].as_array().unwrap().is_empty(),
         "admin should see the cross-source duplicate group"
     );
     let (st, body) = call(
@@ -802,7 +802,7 @@ async fn leak_audit_similar_and_duplicates() {
     .await;
     assert_eq!(st, StatusCode::OK);
     assert!(
-        body.as_array().unwrap().is_empty(),
+        body["items"].as_array().unwrap().is_empty(),
         "viewer duplicates leaked a group spanning an unshared source: {body}"
     );
 }

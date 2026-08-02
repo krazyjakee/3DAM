@@ -1056,8 +1056,33 @@ impl LibraryService for ApiClient {
         &self,
         _ctx: &AuthContext,
         req: DupRequest,
-    ) -> Result<Vec<DupGroup>, LibError> {
+    ) -> Result<Page<DupGroup>, LibError> {
         self.post("/api/v1/duplicates", &req).await
+    }
+
+    async fn duplicate_membership(
+        &self,
+        _ctx: &AuthContext,
+        req: DupMembershipRequest,
+    ) -> Result<Vec<DupMembership>, LibError> {
+        self.post("/api/v1/duplicates/membership", &req).await
+    }
+
+    async fn duplicate_group(
+        &self,
+        _ctx: &AuthContext,
+        asset: &AssetId,
+    ) -> Result<Option<DupGroup>, LibError> {
+        self.get(&format!("/api/v1/assets/{asset}/duplicates"))
+            .await
+    }
+
+    async fn duplicate_group_members(
+        &self,
+        _ctx: &AuthContext,
+        req: DupGroupMembersRequest,
+    ) -> Result<Page<AssetSummary>, LibError> {
+        self.post("/api/v1/duplicates/group-members", &req).await
     }
 
     async fn review_suggestion(

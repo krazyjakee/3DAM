@@ -426,6 +426,7 @@ impl McpAdapter {
                     },
                     media,
                     limit: a.limit.unwrap_or(50),
+                    after: None,
                 };
                 to_value(&lib.list_duplicates(ctx, req).await?)
             }

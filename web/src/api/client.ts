@@ -16,6 +16,9 @@ import type {
   ConvertReport,
   ConvertRequest,
   DupGroup,
+  DupGroupMembersRequest,
+  DupMembership,
+  DupMembershipRequest,
   DupRequest,
   ExportReport,
   ExportRequest,
@@ -201,7 +204,12 @@ export const api = {
   findSimilar: (req: SimilarRequest) => send<Page<SimilarHit>>("POST", `${API}/similar`, req),
 
   /** Duplicate groups for review — exact (content hash) or near (pHash/embedding), tech-spec 05 §4. */
-  listDuplicates: (req: DupRequest) => send<DupGroup[]>("POST", `${API}/duplicates`, req),
+  listDuplicates: (req: DupRequest) => send<Page<DupGroup>>("POST", `${API}/duplicates`, req),
+  duplicateMembership: (req: DupMembershipRequest) =>
+    send<DupMembership[]>("POST", `${API}/duplicates/membership`, req),
+  duplicateGroup: (id: AssetId) => get<DupGroup | null>(`${API}/assets/${id}/duplicates`),
+  duplicateGroupMembers: (req: DupGroupMembersRequest) =>
+    send<Page<AssetSummary>>("POST", `${API}/duplicates/group-members`, req),
 
   /** Export a manifest (json/csv/sidecar) for a selection / collection / query to a server path. */
   exportAssets: (req: ExportRequest) => send<ExportReport>("POST", `${API}/export`, req),

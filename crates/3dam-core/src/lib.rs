@@ -2484,9 +2484,44 @@ impl LibraryService for EmbeddedLibrary {
         &self,
         ctx: &AuthContext,
         req: DupRequest,
-    ) -> Result<Vec<DupGroup>, LibError> {
+    ) -> Result<Page<DupGroup>, LibError> {
         let vis = ctx.visibility.clone();
         self.db(move |s| s.duplicates(&req, &vis)).await
+    }
+
+    async fn duplicate_membership(
+        &self,
+        ctx: &AuthContext,
+        req: DupMembershipRequest,
+    ) -> Result<Vec<DupMembership>, LibError> {
+        if req.assets.len() > DUP_MEMBERSHIP_ASSET_MAX {
+            return Err(LibError::BadRequest(format!(
+                "duplicate membership accepts at most {DUP_MEMBERSHIP_ASSET_MAX} assets"
+            )));
+        }
+        let vis = ctx.visibility.clone();
+        self.db(move |s| s.duplicate_membership(&req.assets, &vis))
+            .await
+    }
+
+    async fn duplicate_group(
+        &self,
+        ctx: &AuthContext,
+        asset: &AssetId,
+    ) -> Result<Option<DupGroup>, LibError> {
+        let vis = ctx.visibility.clone();
+        let asset = *asset;
+        self.db(move |s| s.duplicate_group(&asset, &vis)).await
+    }
+
+    async fn duplicate_group_members(
+        &self,
+        ctx: &AuthContext,
+        req: DupGroupMembersRequest,
+    ) -> Result<Page<AssetSummary>, LibError> {
+        let vis = ctx.visibility.clone();
+        self.db(move |s| s.duplicate_group_members(&req, &vis))
+            .await
     }
 
     async fn review_suggestion(

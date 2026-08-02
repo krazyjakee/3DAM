@@ -658,6 +658,14 @@ pub trait LibraryService: Send + Sync {
         asset: &AssetId,
     ) -> Result<Option<DupGroup>, LibError>;
 
+    /// Continue through one exact group's members using the opaque keyset cursor returned on the
+    /// group. Each page is independently server-capped.
+    async fn duplicate_group_members(
+        &self,
+        ctx: &AuthContext,
+        req: DupGroupMembersRequest,
+    ) -> Result<Page<AssetSummary>, LibError>;
+
     /// Accept or reject one auto-suggested tag (§1.4). Reversible; a reject is remembered so the same
     /// extractor version won't re-suggest it.
     async fn review_suggestion(

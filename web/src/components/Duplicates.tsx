@@ -5,9 +5,10 @@
 // any member for the same per-item context menu as the Browser tiles/rows (analyze, convert, add to
 // collection, copy path, remove / remove + block). Blocked hashes are managed on the /blocklist surface.
 
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router";
 import { Copy } from "lucide-react";
+import { api } from "@/api/client";
 import { useDuplicates } from "@/api/queries";
 import type { AssetSummary, DupGroup, DupKind, MediaType } from "@/api/types";
 import { bytes, mediaLabel } from "@/lib/format";
@@ -33,7 +34,14 @@ export function Duplicates() {
   const [kind, setKind] = useState<DupKind>("exact");
   const [media, setMedia] = useState<MediaType | "">("");
   const groups = useDuplicates({ kind, media: media || undefined });
-  const data = groups.data ?? [];
+  const data = groups.data?.pages.flatMap((page) => page.items) ?? [];
+  const partialWarnings = [
+    ...new Set(
+      groups.data?.pages.flatMap((page) =>
+        page.partial.complete ? [] : (page.partial.warnings ?? []).map((warning) => warning.message),
+      ) ?? [],
+    ),
+  ];
 
   // Same per-item context menu as the Browser tiles/rows (issue #20). The Duplicates page has no
   // multi-selection, so the target is always the single right-clicked / long-pressed member.
@@ -97,6 +105,10 @@ export function Duplicates() {
         </span>
       </div>
 
+      {partialWarnings.map((warning) => (
+        <CenteredCard key={warning}>{warning}</CenteredCard>
+      ))}
+
       {groups.isLoading ? (
         <CenteredCard>Scanning for duplicates…</CenteredCard>
       ) : groups.isError ? (
@@ -108,9 +120,22 @@ export function Duplicates() {
         </CenteredCard>
       ) : (
         <div className="flex flex-col gap-4">
-          {data.map((g, i) => (
-            <GroupCard key={i} group={g} onContext={openMenu} />
+          {data.map((g) => (
+            <GroupCard
+              key={g.group ?? `${g.kind}:${g.suggested_keep}`}
+              group={g}
+              onContext={openMenu}
+            />
           ))}
+          {groups.hasNextPage && (
+            <button
+              className="btn self-center"
+              disabled={groups.isFetchingNextPage}
+              onClick={() => void groups.fetchNextPage()}
+            >
+              {groups.isFetchingNextPage ? "Loading…" : "Load more groups"}
+            </button>
+          )}
         </div>
       )}
 
@@ -133,11 +158,41 @@ function GroupCard({
   group: DupGroup;
   onContext: (asset: AssetSummary, x: number, y: number) => void;
 }) {
+  const [members, setMembers] = useState(group.members);
+  const [memberCursor, setMemberCursor] = useState(group.members_cursor);
+  const [loadingMembers, setLoadingMembers] = useState(false);
+  const [memberError, setMemberError] = useState(false);
+
+  useEffect(() => {
+    setMembers(group.members);
+    setMemberCursor(group.members_cursor);
+    setLoadingMembers(false);
+    setMemberError(false);
+  }, [group.group, group.members, group.members_cursor]);
+
+  const loadMembers = async () => {
+    if (!group.group || !memberCursor || loadingMembers) return;
+    setLoadingMembers(true);
+    setMemberError(false);
+    try {
+      const page = await api.duplicateGroupMembers({
+        group: group.group,
+        after: memberCursor,
+      });
+      setMembers((current) => [...current, ...page.items]);
+      setMemberCursor(page.cursor);
+    } catch {
+      setMemberError(true);
+    } finally {
+      setLoadingMembers(false);
+    }
+  };
+
   return (
     <section className="rounded border border-border bg-surface p-3">
       <div className="mb-2 flex items-center justify-between gap-2">
         <span className="text-[11px] text-fg-dim">
-          {mediaLabel[group.media]} · {group.members.length} items
+          {mediaLabel[group.media]} · {group.total_members} items
         </span>
         {/* the pairwise signal is the explanation (DESIGN_GUIDELINES §1.2) */}
         <span className="rounded bg-surface-2 px-1.5 py-0.5 font-mono text-[10px] text-fg-muted">
@@ -145,7 +200,7 @@ function GroupCard({
         </span>
       </div>
       <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-        {group.members.map((m) => (
+        {members.map((m) => (
           <MemberTile
             key={m.id}
             asset={m}
@@ -154,6 +209,19 @@ function GroupCard({
           />
         ))}
       </div>
+      {memberCursor && group.group && (
+        <button className="btn mt-2" disabled={loadingMembers} onClick={() => void loadMembers()}>
+          {loadingMembers
+            ? "Loading…"
+            : `Load more members (${members.length}/${group.total_members})`}
+        </button>
+      )}
+      {memberError && <p className="mt-2 text-[11px] text-danger">Couldn’t load more members.</p>}
+      {!memberCursor && members.length < group.total_members && (
+        <p className="mt-2 text-[11px] text-fg-dim">
+          Showing {members.length} of {group.total_members} computed near-duplicate members.
+        </p>
+      )}
     </section>
   );
 }

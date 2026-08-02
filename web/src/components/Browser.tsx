@@ -24,19 +24,18 @@ import {
   useCan,
   useCollectionMembers,
   useCollections,
-  useDuplicates,
+  useDuplicateMembership,
   useSetFavorite,
   useSources,
 } from "@/api/queries";
 import { api } from "@/api/client";
-import type { AssetSummary, DupGroup, SearchMode, SortField } from "@/api/types";
+import type { AssetSummary, SearchMode, SortField } from "@/api/types";
 import { AUTH_COPY } from "@/lib/auth";
 import { isLocal, localOnly, PEER_READONLY_SET } from "@/lib/origin";
 import { useWriteGate } from "@/lib/write-gate";
 import { useViewState } from "@/lib/view-state";
 import { useDebounced } from "@/lib/use-debounced";
 import { bytes } from "@/lib/format";
-import { DUPLICATE_QUERY_LIMIT } from "@/lib/limits";
 import { requestAutoplay } from "@/lib/audio-intent";
 import {
   dispatchShortcut,
@@ -66,6 +65,7 @@ import {
   flattenBrowsePages,
   type BrowsePageParam,
 } from "@/lib/browse-window";
+import { collapseExactDuplicates } from "@/lib/duplicate-membership";
 
 /** Modifier keys that change what a click does to the multi-selection (issue #10/#22). */
 export interface ClickMods {
@@ -80,40 +80,6 @@ const CELL_H = 132;
 const COARSE_POINTER =
   typeof window !== "undefined" && window.matchMedia("(pointer: coarse)").matches;
 const ROW_H = COARSE_POINTER ? 44 : 30;
-// Pull enough exact-duplicate groups to collapse the retained browse window (server cap is 100).
-
-/** Collapse byte-identical duplicates in the browse list (issue: dedup in grid/table). Each exact
- *  group renders once — the first member that appears in the current sort/filter represents it, so a
- *  group never vanishes and the visible order is preserved — carrying a badge count of the *other*
- *  copies (library-wide). Near-duplicates are deliberately left expanded: they're merely similar
- *  (surfaced via "Find similar" / the Duplicates page), so collapsing them would hide distinct assets. */
-function collapseExactDuplicates(
-  items: AssetSummary[],
-  groups: DupGroup[] | undefined,
-): { visible: AssetSummary[]; dupCounts: Map<string, number> } {
-  const memberToGroup = new Map<string, DupGroup>();
-  for (const g of groups ?? []) {
-    if (g.members.length < 2) continue;
-    for (const m of g.members) memberToGroup.set(m.id, g);
-  }
-  if (memberToGroup.size === 0) return { visible: items, dupCounts: new Map() };
-
-  const seen = new Set<DupGroup>();
-  const visible: AssetSummary[] = [];
-  const dupCounts = new Map<string, number>();
-  for (const a of items) {
-    const g = memberToGroup.get(a.id);
-    if (!g) {
-      visible.push(a);
-      continue;
-    }
-    if (seen.has(g)) continue; // an earlier member already represents this group
-    seen.add(g);
-    visible.push(a);
-    dupCounts.set(a.id, g.members.length - 1);
-  }
-  return { visible, dupCounts };
-}
 
 export function Browser({
   onOpenNav,
@@ -194,10 +160,13 @@ export function Browser({
     prefetchedPages.current = current;
   }, [assets.data]);
 
-  // Collapse byte-identical duplicates into one row each, badged with the hidden-copy count; the
-  // full group is listed in the Inspector. Whole-library groups, cached + shared with the Inspector
-  // and the Duplicates page under `qk.duplicates`.
-  const dups = useDuplicates({ kind: "exact", limit: DUPLICATE_QUERY_LIMIT });
+  // IDs from peers are only meaningful to their owning peer. Never submit them to this local
+  // lookup: a colliding UUID must not acquire a local duplicate badge or reveal a local group.
+  const localAssetIds = useMemo(
+    () => items.filter((asset) => isLocal(asset.origin)).map((asset) => asset.id),
+    [items],
+  );
+  const dups = useDuplicateMembership(localAssetIds);
   const { visible, dupCounts } = useMemo(
     () => collapseExactDuplicates(items, dups.data),
     [items, dups.data],
@@ -1094,7 +1063,7 @@ function Grid({
                     active={isSelected(a)}
                     focusable={localIndex === focusIndex}
                     onFocusIndex={setFocusIndex}
-                    dupCount={dupCounts.get(a.id)}
+                    dupCount={dupCounts.get(assetSelectionKey(a))}
                     onClick={onItemClick}
                     onActivate={onItemActivate}
                     onContext={onContext}
@@ -1367,7 +1336,7 @@ function Table({
               active={isSelected(a)}
               focusable={localIndex === focusIndex}
               onFocusIndex={setFocusIndex}
-              dupCount={dupCounts.get(a.id)}
+              dupCount={dupCounts.get(assetSelectionKey(a))}
               top={vr.start}
               onClick={onItemClick}
               onActivate={onItemActivate}

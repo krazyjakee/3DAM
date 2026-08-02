@@ -3,7 +3,6 @@ import { HttpResponse, http } from "msw";
 import { afterEach, expect, test, vi } from "vitest";
 import { qk } from "../../src/api/queries";
 import { Inspector } from "../../src/components/Inspector";
-import { DUPLICATE_QUERY_LIMIT } from "../../src/lib/limits";
 import { asset } from "./fixtures";
 import { renderApp, testQueryClient } from "./render";
 import { server } from "./server";
@@ -28,10 +27,7 @@ test("asset notes save once after a typing pause and flush immediately on blur",
   });
   client.setQueryData(qk.sources, []);
   client.setQueryData(qk.collections, []);
-  client.setQueryData(
-    [...qk.duplicates, { kind: "exact", limit: DUPLICATE_QUERY_LIMIT }],
-    [],
-  );
+  client.setQueryData([...qk.duplicates, "asset", "asset-a"], null);
 
   const saves: { id: string; body: unknown }[] = [];
   server.use(

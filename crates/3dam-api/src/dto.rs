@@ -1293,10 +1293,45 @@ pub struct DupRequest {
     pub media: Option<MediaType>,
     #[serde(default = "default_dup_limit")]
     pub limit: u32,
+    /// Opaque continuation returned by the previous duplicate-review page.
+    #[serde(default)]
+    pub after: Option<crate::Cursor>,
 }
 
 fn default_dup_limit() -> u32 {
-    100
+    24
+}
+
+/// Hard response and work bounds for duplicate reads. Callers may request less, never more.
+pub const DUP_GROUP_PAGE_MAX: u32 = 100;
+pub const DUP_GROUP_MEMBER_MAX: usize = 100;
+pub const DUP_MEMBERSHIP_ASSET_MAX: usize = 600;
+
+/// Lightweight exact-duplicate lookup for a bounded set of browse rows.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DupMembershipRequest {
+    pub assets: Vec<AssetId>,
+}
+
+/// Exact-duplicate membership without any member summaries.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DupMembership {
+    pub asset: AssetId,
+    /// Stable within this library: the lower-case content hash identifying the group.
+    pub group: String,
+    /// Visible members in the complete group, including `asset`.
+    pub count: u32,
+}
+
+/// Continue through the members of one exact duplicate group.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DupGroupMembersRequest {
+    /// Group key returned on [`DupGroup`].
+    pub group: String,
+    #[serde(default)]
+    pub after: Option<crate::Cursor>,
+    #[serde(default = "default_dup_limit")]
+    pub limit: u32,
 }
 
 /// A cluster of duplicates for the review view (§4.3). Never auto-deleted — 3DAM only groups.
@@ -1304,7 +1339,15 @@ fn default_dup_limit() -> u32 {
 pub struct DupGroup {
     pub kind: DupKind,
     pub media: MediaType,
+    /// Exact-group key used to continue member pagination. `None` for computed near groups.
+    #[serde(default)]
+    pub group: Option<String>,
     pub members: Vec<AssetSummary>,
+    /// Visible members in the complete group. `members` is capped for bounded responses.
+    pub total_members: u32,
+    /// Continue this group's member list without reloading its first summaries.
+    #[serde(default)]
+    pub members_cursor: Option<crate::Cursor>,
     /// The pairwise signal that linked the group — the explanation (§4.3).
     pub signal: String,
     /// A suggested "keep" (highest resolution / most-permissive / largest); the user disposes.

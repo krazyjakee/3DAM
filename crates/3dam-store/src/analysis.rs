@@ -600,52 +600,141 @@ impl Store {
         &self,
         req: &DupRequest,
         vis: &Visibility,
-    ) -> Result<Vec<DupGroup>, LibError> {
+    ) -> Result<Page<DupGroup>, LibError> {
         const NEAR_COS: f32 = 0.92; // conservative "strong near-dup" band (§4.2; tuned later, §8)
+        const NEAR_CANDIDATE_MAX: usize = 2_000;
         let conn = self.conn.lock().unwrap();
         let mut groups: Vec<DupGroup> = Vec::new();
+        let limit = req.limit.clamp(1, DUP_GROUP_PAGE_MAX) as usize;
+        let has_more;
+        let mut next_cursor = None;
+        let mut partial = dam_api::PartialStatus::default();
 
         match req.kind {
             DupKind::Exact => {
-                let mut media_pred = String::new();
+                let after = decode_exact_dup_cursor(req.after.as_ref())?;
+                let mut where_sql = String::from(" WHERE content_hash IS NOT NULL");
+                let mut binds: Vec<Value> = Vec::new();
                 if let Some(m) = req.media {
-                    media_pred = format!(" AND media_type = '{}'", m.as_str());
+                    where_sql.push_str(" AND media_type = ?");
+                    binds.push(Value::Text(m.as_str().to_string()));
+                }
+                push_visibility(vis, "asset", &mut where_sql, &mut binds);
+                let mut having = String::from(" HAVING n > 1");
+                if let Some((count, hash)) = after {
+                    having.push_str(" AND (n < ? OR (n = ? AND content_hash > ?))");
+                    binds.push(Value::Integer(count as i64));
+                    binds.push(Value::Integer(count as i64));
+                    binds.push(Value::Blob(hash));
                 }
                 let sql = format!(
-                    "SELECT lower(hex(content_hash)) h, group_concat(lower(hex(id))) ids, COUNT(*) n
-                     FROM asset WHERE content_hash IS NOT NULL{media_pred}
-                     GROUP BY content_hash HAVING n > 1 ORDER BY n DESC LIMIT {}",
-                    req.limit
+                    "SELECT content_hash, COUNT(*) n FROM asset {where_sql}
+                     GROUP BY content_hash {having}
+                     ORDER BY n DESC, content_hash ASC LIMIT ?"
                 );
+                binds.push(Value::Integer((limit + 1) as i64));
                 let mut stmt = conn.prepare(&sql).map_err(internal)?;
                 let rows = stmt
-                    .query_map([], |r| Ok((r.get::<_, String>(1)?,)))
+                    .query_map(rusqlite::params_from_iter(binds.iter()), |r| {
+                        Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, u32>(1)?))
+                    })
                     .map_err(internal)?;
-                for r in rows {
-                    let (ids_csv,) = r.map_err(internal)?;
-                    let ids = parse_hex_ids(&ids_csv);
-                    if let Some(g) = Self::build_dup_group(
-                        &conn,
-                        DupKind::Exact,
-                        &ids,
-                        "identical bytes (same content hash)",
-                        vis,
-                    )? {
-                        groups.push(g);
+                let mut exact: Vec<(Vec<u8>, u32)> = rows
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(internal)?;
+                has_more = exact.len() > limit;
+                exact.truncate(limit);
+                if has_more {
+                    next_cursor = exact
+                        .last()
+                        .map(|(hash, count)| Cursor(format!("exact:{count}:{}", encode_hex(hash))));
+                }
+
+                if !exact.is_empty() {
+                    // Rank within every selected hash in SQL, then cap before summary hydration.
+                    // The whole review page is hydrated by the single summaries query below.
+                    let mut ranked_where = String::from(" WHERE asset.content_hash IS NOT NULL");
+                    let mut ranked_binds: Vec<Value> = Vec::new();
+                    push_visibility(vis, "asset", &mut ranked_where, &mut ranked_binds);
+                    let hash_ph = exact.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                    let member_sql = format!(
+                        "WITH ranked AS (
+                           SELECT asset.id, asset.content_hash,
+                                  COALESCE(asset.size_bytes, 0) member_size,
+                                  ROW_NUMBER() OVER (
+                                    PARTITION BY asset.content_hash
+                                    ORDER BY COALESCE(asset.size_bytes, 0) DESC, asset.id ASC
+                                  ) member_rank
+                           FROM asset {ranked_where}
+                         )
+                         SELECT id, content_hash, member_size FROM ranked
+                         WHERE member_rank <= ? AND content_hash IN ({hash_ph})
+                         ORDER BY content_hash ASC, member_rank ASC"
+                    );
+                    ranked_binds.push(Value::Integer(DUP_GROUP_MEMBER_MAX as i64));
+                    for (hash, _) in &exact {
+                        ranked_binds.push(Value::Blob(hash.clone()));
+                    }
+                    let mut member_stmt = conn.prepare(&member_sql).map_err(internal)?;
+                    let member_rows = member_stmt
+                        .query_map(rusqlite::params_from_iter(ranked_binds.iter()), |r| {
+                            Ok((
+                                r.get::<_, Vec<u8>>(1)?,
+                                blob_to_asset_id(&r.get::<_, Vec<u8>>(0)?),
+                                r.get::<_, i64>(2)?.max(0) as u64,
+                            ))
+                        })
+                        .map_err(internal)?;
+                    let mut ids_by_hash: std::collections::HashMap<Vec<u8>, Vec<AssetId>> =
+                        std::collections::HashMap::new();
+                    let mut size_by_id = std::collections::HashMap::new();
+                    let mut all_ids = Vec::new();
+                    for row in member_rows {
+                        let (hash, id, size) = row.map_err(internal)?;
+                        ids_by_hash.entry(hash).or_default().push(id);
+                        size_by_id.insert(id, size);
+                        all_ids.push(id);
+                    }
+                    let summaries = Self::summaries_for_ids(&conn, &all_ids, &[], vis)?;
+                    for (hash, total_members) in exact {
+                        let ids = ids_by_hash.remove(&hash).unwrap_or_default();
+                        let group_key = encode_hex(&hash);
+                        let members_cursor = (ids.len() < total_members as usize)
+                            .then(|| member_cursor(&ids, &size_by_id))
+                            .flatten();
+                        if let Some(group) = Self::build_dup_group_from_summaries(
+                            DupKind::Exact,
+                            &ids,
+                            total_members,
+                            Some(group_key),
+                            members_cursor,
+                            "identical bytes (same content hash)",
+                            &summaries,
+                        ) {
+                            groups.push(group);
+                        }
                     }
                 }
             }
             DupKind::Near => {
+                let offset = decode_near_dup_cursor(req.after.as_ref(), NEAR_CANDIDATE_MAX)?;
                 // Load embeddings for the requested media (or all), union-find over cosine ≥ threshold.
                 let mut sql = String::from(
                     "SELECT e.asset_id, e.vec FROM embedding e JOIN asset a ON a.id = e.asset_id",
                 );
+                let mut where_sql = String::from(" WHERE 1=1");
+                let mut binds: Vec<Value> = Vec::new();
                 if let Some(m) = req.media {
-                    sql.push_str(&format!(" WHERE e.media_type = '{}'", m.as_str()));
+                    where_sql.push_str(" AND e.media_type = ?");
+                    binds.push(Value::Text(m.as_str().to_string()));
                 }
+                push_visibility(vis, "a", &mut where_sql, &mut binds);
+                sql.push_str(&where_sql);
+                sql.push_str(" ORDER BY e.asset_id LIMIT ?");
+                binds.push(Value::Integer((NEAR_CANDIDATE_MAX + 1) as i64));
                 let mut stmt = conn.prepare(&sql).map_err(internal)?;
                 let rows = stmt
-                    .query_map([], |r| {
+                    .query_map(rusqlite::params_from_iter(binds.iter()), |r| {
                         Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?))
                     })
                     .map_err(internal)?;
@@ -656,6 +745,18 @@ impl Store {
                     ids.push(blob_to_asset_id(&id_blob));
                     vecs.push(bytes_to_f32(&vbytes));
                 }
+                if ids.len() > NEAR_CANDIDATE_MAX {
+                    ids.truncate(NEAR_CANDIDATE_MAX);
+                    vecs.truncate(NEAR_CANDIDATE_MAX);
+                    partial.complete = false;
+                    partial.warnings.push(dam_api::ItemWarning {
+                        subject: "near-duplicates".into(),
+                        code: "duplicate_candidates_capped".into(),
+                        message: format!(
+                            "near-duplicate analysis is capped at {NEAR_CANDIDATE_MAX} candidates"
+                        ),
+                    });
+                }
                 let mut uf = UnionFind::new(ids.len());
                 for i in 0..vecs.len() {
                     for j in (i + 1)..vecs.len() {
@@ -664,27 +765,209 @@ impl Store {
                         }
                     }
                 }
-                for comp in uf.components() {
+                let components: Vec<Vec<usize>> = uf
+                    .components()
+                    .into_iter()
+                    .filter(|comp| comp.len() >= 2)
+                    .skip(offset)
+                    .take(limit + 1)
+                    .collect();
+                has_more = components.len() > limit;
+                let components = &components[..components.len().min(limit)];
+                let all_ids: Vec<AssetId> = components
+                    .iter()
+                    .flat_map(|comp| {
+                        comp.iter()
+                            .take(DUP_GROUP_MEMBER_MAX)
+                            .map(|&index| ids[index])
+                    })
+                    .collect();
+                let summaries = Self::summaries_for_ids(&conn, &all_ids, &[], vis)?;
+                for comp in components {
                     if comp.len() < 2 {
                         continue;
                     }
-                    if groups.len() >= req.limit as usize {
-                        break;
-                    }
-                    let member_ids: Vec<AssetId> = comp.iter().map(|&i| ids[i]).collect();
-                    if let Some(g) = Self::build_dup_group(
-                        &conn,
+                    let member_ids: Vec<AssetId> = comp
+                        .iter()
+                        .take(DUP_GROUP_MEMBER_MAX)
+                        .map(|&i| ids[i])
+                        .collect();
+                    if let Some(g) = Self::build_dup_group_from_summaries(
                         DupKind::Near,
                         &member_ids,
+                        comp.len() as u32,
+                        None,
+                        None,
                         &format!("embedding cosine ≥ {NEAR_COS:.2}"),
-                        vis,
-                    )? {
+                        &summaries,
+                    ) {
                         groups.push(g);
                     }
                 }
+                if has_more {
+                    next_cursor = Some(Cursor(format!("near:{}", offset + groups.len())));
+                }
             }
         }
-        Ok(groups)
+        let mut page = Page::new(groups, next_cursor);
+        page.partial = partial;
+        Ok(page)
+    }
+
+    /// Set-based exact-duplicate membership for the currently retained browse rows. The request is
+    /// bounded by the service before reaching SQLite and this query returns no asset summaries.
+    pub fn duplicate_membership(
+        &self,
+        ids: &[AssetId],
+        vis: &Visibility,
+    ) -> Result<Vec<DupMembership>, LibError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().unwrap();
+        let requested_ph = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let mut requested_where =
+            format!(" WHERE asset.content_hash IS NOT NULL AND asset.id IN ({requested_ph})");
+        let mut requested_binds: Vec<Value> = ids
+            .iter()
+            .map(|id| Value::Blob(id.as_bytes().to_vec()))
+            .collect();
+        push_visibility(vis, "asset", &mut requested_where, &mut requested_binds);
+        let mut count_where = String::from(" WHERE asset.content_hash IS NOT NULL");
+        let mut count_binds = Vec::new();
+        push_visibility(vis, "asset", &mut count_where, &mut count_binds);
+        requested_binds.extend(count_binds);
+        let sql = format!(
+            "WITH requested AS (
+               SELECT asset.id, asset.content_hash FROM asset {requested_where}
+             ), counts AS (
+               SELECT asset.content_hash, COUNT(*) n FROM asset
+               JOIN (SELECT DISTINCT content_hash FROM requested) wanted
+                 ON wanted.content_hash = asset.content_hash
+               {count_where} GROUP BY asset.content_hash
+             )
+             SELECT requested.id, lower(hex(requested.content_hash)), counts.n
+             FROM requested JOIN counts USING (content_hash) WHERE counts.n > 1"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(internal)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(requested_binds.iter()), |row| {
+                Ok(DupMembership {
+                    asset: blob_to_asset_id(&row.get::<_, Vec<u8>>(0)?),
+                    group: row.get(1)?,
+                    count: row.get(2)?,
+                })
+            })
+            .map_err(internal)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(internal)
+    }
+
+    /// One exact group for Inspector. Only one group is hydrated and its summaries are hard-capped.
+    pub fn duplicate_group(
+        &self,
+        id: &AssetId,
+        vis: &Visibility,
+    ) -> Result<Option<DupGroup>, LibError> {
+        let Some(membership) = self.duplicate_membership(&[*id], vis)?.into_iter().next() else {
+            return Ok(None);
+        };
+        let hash = decode_hash_hex(&membership.group)?;
+        let conn = self.conn.lock().unwrap();
+        let mut where_sql = String::from(" WHERE asset.content_hash = ?");
+        let mut binds = vec![Value::Blob(hash)];
+        push_visibility(vis, "asset", &mut where_sql, &mut binds);
+        let sql = format!(
+            "SELECT asset.id, COALESCE(asset.size_bytes, 0) FROM asset {where_sql}
+             ORDER BY COALESCE(asset.size_bytes, 0) DESC, asset.id ASC LIMIT ?"
+        );
+        binds.push(Value::Integer(DUP_GROUP_MEMBER_MAX as i64));
+        let mut stmt = conn.prepare(&sql).map_err(internal)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(binds.iter()), |row| {
+                Ok((
+                    blob_to_asset_id(&row.get::<_, Vec<u8>>(0)?),
+                    row.get::<_, i64>(1)?.max(0) as u64,
+                ))
+            })
+            .map_err(internal)?;
+        let ordered = rows
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(internal)?;
+        let ids: Vec<AssetId> = ordered.iter().map(|(id, _)| *id).collect();
+        let members_cursor = (ids.len() < membership.count as usize)
+            .then(|| {
+                ordered
+                    .last()
+                    .map(|(id, size)| Cursor(format!("members:{size}:{id}")))
+            })
+            .flatten();
+        let summaries = Self::summaries_for_ids(&conn, &ids, &[], vis)?;
+        Ok(Self::build_dup_group_from_summaries(
+            DupKind::Exact,
+            &ids,
+            membership.count,
+            Some(membership.group),
+            members_cursor,
+            "identical bytes (same content hash)",
+            &summaries,
+        ))
+    }
+
+    /// Continue one exact group's member summaries with a stable `(size, id)` keyset.
+    pub fn duplicate_group_members(
+        &self,
+        req: &DupGroupMembersRequest,
+        vis: &Visibility,
+    ) -> Result<Page<AssetSummary>, LibError> {
+        let hash = decode_hash_hex(&req.group)?;
+        let after = decode_dup_member_cursor(req.after.as_ref())?;
+        let limit = req.limit.clamp(1, DUP_GROUP_PAGE_MAX) as usize;
+        let conn = self.conn.lock().unwrap();
+        let mut where_sql = String::from(" WHERE asset.content_hash = ?");
+        let mut binds = vec![Value::Blob(hash)];
+        push_visibility(vis, "asset", &mut where_sql, &mut binds);
+        if let Some((size, id)) = after {
+            where_sql.push_str(
+                " AND (COALESCE(asset.size_bytes, 0) < ? OR
+                       (COALESCE(asset.size_bytes, 0) = ? AND asset.id > ?))",
+            );
+            binds.push(Value::Integer(size as i64));
+            binds.push(Value::Integer(size as i64));
+            binds.push(Value::Blob(id.as_bytes().to_vec()));
+        }
+        let sql = format!(
+            "SELECT asset.id, COALESCE(asset.size_bytes, 0) FROM asset {where_sql}
+             ORDER BY COALESCE(asset.size_bytes, 0) DESC, asset.id ASC LIMIT ?"
+        );
+        binds.push(Value::Integer((limit + 1) as i64));
+        let mut stmt = conn.prepare(&sql).map_err(internal)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(binds.iter()), |row| {
+                Ok((
+                    blob_to_asset_id(&row.get::<_, Vec<u8>>(0)?),
+                    row.get::<_, i64>(1)?.max(0) as u64,
+                ))
+            })
+            .map_err(internal)?;
+        let mut ordered = rows
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(internal)?;
+        let has_more = ordered.len() > limit;
+        ordered.truncate(limit);
+        let ids: Vec<AssetId> = ordered.iter().map(|(id, _)| *id).collect();
+        let summaries = Self::summaries_for_ids(&conn, &ids, &[], vis)?;
+        let items: Vec<AssetSummary> = ids
+            .iter()
+            .filter_map(|id| summaries.get(id).cloned())
+            .collect();
+        let cursor = has_more
+            .then(|| {
+                ordered
+                    .last()
+                    .map(|(id, size)| Cursor(format!("members:{size}:{id}")))
+            })
+            .flatten();
+        Ok(Page::new(items, cursor))
     }
 
     /// Build a `DupGroup` from member ids: load summaries, pick the suggested keep (largest bytes,
@@ -692,30 +975,40 @@ impl Store {
     /// which also re-forms visibility-filtered groups (issue #42 leak audit): a duplicate pair
     /// spanning a shared and an unshared source collapses to one visible member, and a group of one
     /// is not a duplicate, so the hidden file's existence never shows.
-    fn build_dup_group(
-        conn: &Connection,
+    fn build_dup_group_from_summaries(
         kind: DupKind,
         ids: &[AssetId],
+        total_members: u32,
+        group: Option<String>,
+        members_cursor: Option<Cursor>,
         signal: &str,
-        vis: &Visibility,
-    ) -> Result<Option<DupGroup>, LibError> {
-        let map = Self::summaries_for_ids(conn, ids, &[], vis)?;
+        map: &std::collections::HashMap<AssetId, AssetSummary>,
+    ) -> Option<DupGroup> {
         let mut members: Vec<AssetSummary> =
             ids.iter().filter_map(|i| map.get(i).cloned()).collect();
         if members.len() < 2 {
-            return Ok(None);
+            return None;
         }
         // Suggested keep: the biggest file (a decent proxy for highest fidelity, §4.3).
-        members.sort_by_key(|b| std::cmp::Reverse(b.size));
-        let suggested_keep = members[0].id;
+        if kind == DupKind::Near {
+            members.sort_by_key(|member| (std::cmp::Reverse(member.size), member.id));
+        }
+        let suggested_keep = members
+            .iter()
+            .max_by_key(|member| member.size)
+            .expect("duplicate group has members")
+            .id;
         let media = members[0].media;
-        Ok(Some(DupGroup {
+        Some(DupGroup {
             kind,
             media,
+            group,
             members,
+            total_members,
+            members_cursor,
             signal: signal.to_string(),
             suggested_keep,
-        }))
+        })
     }
 
     /// Fetch summaries for a set of ids, applying the same faceted filters as text search (§3.3)
@@ -763,6 +1056,90 @@ pub(crate) fn bytes_to_f32(b: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+fn decode_exact_dup_cursor(cursor: Option<&Cursor>) -> Result<Option<(u32, Vec<u8>)>, LibError> {
+    let Some(Cursor(raw)) = cursor else {
+        return Ok(None);
+    };
+    let mut parts = raw.split(':');
+    let valid_prefix = parts.next() == Some("exact");
+    let count = parts.next().and_then(|part| part.parse::<u32>().ok());
+    let hash = parts.next().and_then(|part| decode_hash_hex(part).ok());
+    if !valid_prefix
+        || count.is_none()
+        || hash.as_ref().is_none_or(|hash| hash.len() != 32)
+        || parts.next().is_some()
+    {
+        return Err(LibError::BadRequest(
+            "invalid exact-duplicate cursor".into(),
+        ));
+    }
+    Ok(Some((count.unwrap(), hash.unwrap())))
+}
+
+fn decode_hash_hex(raw: &str) -> Result<Vec<u8>, LibError> {
+    if raw.len() != 64 || !raw.is_ascii() {
+        return Err(LibError::BadRequest("invalid duplicate hash".into()));
+    }
+    (0..raw.len())
+        .step_by(2)
+        .map(|index| {
+            u8::from_str_radix(&raw[index..index + 2], 16)
+                .map_err(|_| LibError::BadRequest("invalid duplicate hash".into()))
+        })
+        .collect()
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
+}
+
+fn member_cursor(
+    ids: &[AssetId],
+    sizes: &std::collections::HashMap<AssetId, u64>,
+) -> Option<Cursor> {
+    let id = *ids.last()?;
+    let size = sizes.get(&id)?;
+    Some(Cursor(format!("members:{size}:{id}")))
+}
+
+fn decode_near_dup_cursor(cursor: Option<&Cursor>, max: usize) -> Result<usize, LibError> {
+    let Some(Cursor(raw)) = cursor else {
+        return Ok(0);
+    };
+    let Some(offset) = raw
+        .strip_prefix("near:")
+        .and_then(|part| part.parse::<usize>().ok())
+        .filter(|offset| *offset <= max)
+    else {
+        return Err(LibError::BadRequest("invalid near-duplicate cursor".into()));
+    };
+    Ok(offset)
+}
+
+fn decode_dup_member_cursor(cursor: Option<&Cursor>) -> Result<Option<(u64, AssetId)>, LibError> {
+    let Some(Cursor(raw)) = cursor else {
+        return Ok(None);
+    };
+    let mut parts = raw.split(':');
+    let valid_prefix = parts.next() == Some("members");
+    let size = parts
+        .next()
+        .and_then(|part| part.parse::<u64>().ok())
+        .filter(|size| *size <= i64::MAX as u64);
+    let id = parts.next().and_then(|part| part.parse::<AssetId>().ok());
+    if !valid_prefix || size.is_none() || id.is_none() || parts.next().is_some() {
+        return Err(LibError::BadRequest(
+            "invalid duplicate-member cursor".into(),
+        ));
+    }
+    Ok(Some((size.unwrap(), id.unwrap())))
+}
+
 /// Cosine similarity. Vectors are stored L2-normalised, so this is a dot product; we still divide by
 /// the norms defensively in case a legacy/zero vector slips in.
 pub(crate) fn cosine(a: &[f32], b: &[f32]) -> f32 {
@@ -781,19 +1158,6 @@ pub(crate) fn cosine(a: &[f32], b: &[f32]) -> f32 {
         return 0.0;
     }
     dot / (na.sqrt() * nb.sqrt())
-}
-
-/// Parse a `group_concat(lower(hex(id)))` CSV of 32-hex-char UUIDs back into ids.
-fn parse_hex_ids(csv: &str) -> Vec<AssetId> {
-    csv.split(',')
-        .filter_map(|h| {
-            let bytes = (0..h.len())
-                .step_by(2)
-                .map(|i| u8::from_str_radix(h.get(i..i + 2)?, 16).ok())
-                .collect::<Option<Vec<u8>>>()?;
-            (bytes.len() == 16).then(|| blob_to_asset_id(&bytes))
-        })
-        .collect()
 }
 
 /// Tiny union-find for near-dup connected components (§4.3).
@@ -832,7 +1196,11 @@ impl UnionFind {
             let root = self.find(i);
             map.entry(root).or_default().push(i);
         }
-        map.into_values().collect()
+        let mut components: Vec<Vec<usize>> = map.into_values().collect();
+        // `HashMap` iteration is intentionally random; a cursor page needs a repeatable component
+        // order for the same candidate snapshot.
+        components.sort_by_key(|component| component.first().copied().unwrap_or(usize::MAX));
+        components
     }
 }
 
@@ -840,6 +1208,170 @@ impl UnionFind {
 mod tests {
     use super::*;
     use dam_sources::{FederatedConfig, SftpConfig, SourceConnection};
+
+    fn duplicate_store(groups: usize, members_per_group: usize) -> Store {
+        let store = Store::open_in_memory().unwrap();
+        let source = store
+            .add_source(
+                &SourceConnection::LocalFs {
+                    root: "/duplicate-test".into(),
+                },
+                "duplicates",
+                false,
+            )
+            .unwrap();
+        for group in 0..groups {
+            let mut hash = [0_u8; 32];
+            hash[..8].copy_from_slice(&(group as u64).to_be_bytes());
+            for member in 0..members_per_group {
+                store
+                    .upsert_asset(&NewAsset {
+                        source_id: source,
+                        path: format!("{group}/{member}.png"),
+                        filename: format!("{member}.png"),
+                        content_hash: Some(ContentHash(hash)),
+                        size_bytes: Some(member as i64 + 1),
+                        source_modified_at: None,
+                        scanned_at: now_ms(),
+                        media_type: MediaType::Image,
+                        format: "png".into(),
+                    })
+                    .unwrap();
+            }
+        }
+        store
+    }
+
+    #[test]
+    fn exact_duplicate_pages_use_a_bounded_keyset_cursor() {
+        let store = duplicate_store(DUP_GROUP_PAGE_MAX as usize + 5, 2);
+        let first = store
+            .duplicates(
+                &DupRequest {
+                    kind: DupKind::Exact,
+                    media: None,
+                    limit: u32::MAX,
+                    after: None,
+                },
+                &Visibility::Full,
+            )
+            .unwrap();
+        assert_eq!(first.items.len(), DUP_GROUP_PAGE_MAX as usize);
+        assert!(first.items.iter().all(|group| group.members.len() == 2));
+        let cursor = first.cursor.expect("five groups remain");
+        assert!(cursor.0.starts_with("exact:2:"));
+
+        let second = store
+            .duplicates(
+                &DupRequest {
+                    kind: DupKind::Exact,
+                    media: None,
+                    limit: u32::MAX,
+                    after: Some(cursor),
+                },
+                &Visibility::Full,
+            )
+            .unwrap();
+        assert_eq!(second.items.len(), 5);
+        assert!(second.cursor.is_none());
+
+        let invalid = store.duplicates(
+            &DupRequest {
+                kind: DupKind::Exact,
+                media: None,
+                limit: 10,
+                after: Some(Cursor("999999999999999999999".into())),
+            },
+            &Visibility::Full,
+        );
+        assert!(matches!(invalid, Err(LibError::BadRequest(_))));
+    }
+
+    #[test]
+    fn duplicate_group_hydration_has_a_hard_member_cap() {
+        let store = duplicate_store(1, DUP_GROUP_MEMBER_MAX + 7);
+        let id = {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row("SELECT id FROM asset LIMIT 1", [], |row| {
+                Ok(blob_to_asset_id(&row.get::<_, Vec<u8>>(0)?))
+            })
+            .unwrap()
+        };
+        let membership = store
+            .duplicate_membership(&[id], &Visibility::Full)
+            .unwrap();
+        let group = store
+            .duplicate_group(&membership[0].asset, &Visibility::Full)
+            .unwrap()
+            .unwrap();
+        assert_eq!(group.total_members as usize, DUP_GROUP_MEMBER_MAX + 7);
+        assert_eq!(group.members.len(), DUP_GROUP_MEMBER_MAX);
+        let group_key = group.group.clone().unwrap();
+        let mut seen: Vec<AssetId> = group.members.iter().map(|member| member.id).collect();
+        let mut cursor = group.members_cursor;
+        while let Some(after) = cursor {
+            let page = store
+                .duplicate_group_members(
+                    &DupGroupMembersRequest {
+                        group: group_key.clone(),
+                        after: Some(after),
+                        limit: 17,
+                    },
+                    &Visibility::Full,
+                )
+                .unwrap();
+            seen.extend(page.items.iter().map(|member| member.id));
+            cursor = page.cursor;
+        }
+        let expected: Vec<AssetId> = {
+            let conn = store.conn.lock().unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id FROM asset
+                     ORDER BY COALESCE(size_bytes, 0) DESC, id ASC",
+                )
+                .unwrap();
+            stmt.query_map([], |row| Ok(blob_to_asset_id(&row.get::<_, Vec<u8>>(0)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(
+            seen, expected,
+            "member pages must have no gaps or duplicates"
+        );
+        let overflowing_cursor = store.duplicate_group_members(
+            &DupGroupMembersRequest {
+                group: group_key,
+                after: Some(Cursor(format!("members:{}:{id}", u64::MAX))),
+                limit: 10,
+            },
+            &Visibility::Full,
+        );
+        assert!(matches!(overflowing_cursor, Err(LibError::BadRequest(_))));
+    }
+
+    /// Manual scale benchmark for issue #142. Even with ten thousand groups the returned page and
+    /// hydrated summaries remain fixed-size; run with `cargo test -p dam-store -- --ignored`.
+    #[test]
+    #[ignore = "large-catalog duplicate benchmark"]
+    fn duplicate_page_large_catalog_benchmark() {
+        let store = duplicate_store(10_000, 2);
+        let started = std::time::Instant::now();
+        let page = store
+            .duplicates(&DupRequest::default(), &Visibility::Full)
+            .unwrap();
+        eprintln!("10k duplicate groups: {:?}", started.elapsed());
+        assert_eq!(page.items.len(), 24);
+        assert!(page.cursor.is_some());
+        assert!(
+            page.items
+                .iter()
+                .map(|group| group.members.len())
+                .sum::<usize>()
+                <= 24 * DUP_GROUP_MEMBER_MAX
+        );
+    }
 
     fn sftp_conn() -> SourceConnection {
         SourceConnection::Sftp(SftpConfig {

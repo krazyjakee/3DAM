@@ -509,12 +509,20 @@ pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 None => None,
             };
             let groups = lib
-                .list_duplicates(&ctx, DupRequest { kind, media, limit })
+                .list_duplicates(
+                    &ctx,
+                    DupRequest {
+                        kind,
+                        media,
+                        limit,
+                        after: None,
+                    },
+                )
                 .await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&groups)?);
             } else {
-                print_dedup(&groups);
+                print_dedup(&groups.items);
             }
         }
 

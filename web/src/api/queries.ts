@@ -353,9 +353,29 @@ export function useDeleteComment(id: AssetId) {
 /** Duplicate groups for the review surface (exact or near). Refetches when the tier/media changes;
  *  ws.ts invalidates `qk.duplicates` on asset changes and finished jobs so new pHashes surface. */
 export function useDuplicates(req: DupRequest) {
-  return useQuery({
+  return useInfiniteQuery({
     queryKey: [...qk.duplicates, req],
-    queryFn: () => api.listDuplicates(req),
+    queryFn: ({ pageParam }) => api.listDuplicates({ ...req, after: pageParam }),
+    initialPageParam: null as string | null,
+    getNextPageParam: (last) => last.cursor ?? undefined,
+  });
+}
+
+/** Exact duplicate membership for only the local rows retained by Browser's bounded page window. */
+export function useDuplicateMembership(assets: AssetId[]) {
+  return useQuery({
+    queryKey: [...qk.duplicates, "membership", assets],
+    queryFn: () => api.duplicateMembership({ assets }),
+    enabled: assets.length > 0,
+  });
+}
+
+/** At most one capped exact group for the local asset currently open in Inspector. */
+export function useDuplicateGroup(id: AssetId | null) {
+  return useQuery({
+    queryKey: [...qk.duplicates, "asset", id],
+    queryFn: () => api.duplicateGroup(id as AssetId),
+    enabled: id !== null,
   });
 }
 

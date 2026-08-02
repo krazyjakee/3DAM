@@ -202,15 +202,29 @@ async fn analyze_similar_dedup_and_review() {
                 kind: DupKind::Exact,
                 media: None,
                 limit: 50,
+                after: None,
             },
         )
         .await
         .unwrap();
-    assert_eq!(exact.len(), 1, "one exact-dup group");
-    let g = &exact[0];
+    assert_eq!(exact.items.len(), 1, "one exact-dup group");
+    let g = &exact.items[0];
     assert_eq!(g.members.len(), 2, "d + d_copy");
     let names: Vec<&str> = g.members.iter().map(|m| m.name.as_str()).collect();
     assert!(names.contains(&"d.png") && names.contains(&"d_copy.png"));
+
+    let oversized_membership = lib
+        .duplicate_membership(
+            &ctx,
+            DupMembershipRequest {
+                assets: vec![AssetId::new(); DUP_MEMBERSHIP_ASSET_MAX + 1],
+            },
+        )
+        .await;
+    assert!(matches!(
+        oversized_membership,
+        Err(dam_api::LibError::BadRequest(_))
+    ));
 
     // ── dedup: near groups a with b (high embedding cosine) ──────────────────
     let near = lib
@@ -220,12 +234,13 @@ async fn analyze_similar_dedup_and_review() {
                 kind: DupKind::Near,
                 media: Some(MediaType::Image),
                 limit: 50,
+                after: None,
             },
         )
         .await
         .unwrap();
     assert!(
-        near.iter().any(|grp| {
+        near.items.iter().any(|grp| {
             let m: Vec<AssetId> = grp.members.iter().map(|x| x.id).collect();
             m.contains(&id_a) && m.contains(&id_b)
         }),

@@ -490,13 +490,34 @@ export interface DupRequest {
   kind?: DupKind;
   media?: MediaType;
   limit?: number;
+  after?: string | null;
+}
+
+export interface DupMembershipRequest {
+  assets: AssetId[];
+}
+
+export interface DupMembership {
+  asset: AssetId;
+  group: string;
+  count: number;
+}
+
+export interface DupGroupMembersRequest {
+  group: string;
+  after?: string | null;
+  limit?: number;
 }
 
 /** A cluster of duplicates for the review view. 3DAM only *groups* — nothing is auto-deleted. */
 export interface DupGroup {
   kind: DupKind;
   media: MediaType;
+  group: string | null;
   members: AssetSummary[];
+  /** Complete visible group size; `members` is capped by the server. */
+  total_members: number;
+  members_cursor: string | null;
   /** The pairwise signal that linked the group — the explanation (content hash / pHash distance). */
   signal: string;
   /** A suggested "keep" (highest resolution / largest); the user disposes. */

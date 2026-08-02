@@ -16,15 +16,10 @@ test("the browser collapses exact copies and keeps selection behavior on visible
     http.post("http://localhost/api/v1/query", () =>
       HttpResponse.json({ ...assetPage([first, copy, other]), total: 100 }),
     ),
-    http.post("http://localhost/api/v1/duplicates", () =>
+    http.post("http://localhost/api/v1/duplicates/membership", () =>
       HttpResponse.json([
-        {
-          kind: "exact",
-          media: "audio",
-          members: [first, copy],
-          signal: "same content hash",
-          suggested_keep: first.id,
-        },
+        { asset: first.id, group: "hash", count: 2 },
+        { asset: copy.id, group: "hash", count: 2 },
       ]),
     ),
     http.post("http://localhost/api/v1/prefetch", () => new HttpResponse(null, { status: 204 })),

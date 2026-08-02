@@ -18,7 +18,7 @@ import {
   useCan,
   useCollectionMembers,
   useCollections,
-  useDuplicates,
+  useDuplicateGroup,
   useRegenerateThumbnail,
   useReviewSuggestion,
   useSetFavorite,
@@ -42,8 +42,7 @@ import type {
 } from "@/api/types";
 import { bytes, duration, mediaLabel, originLabel, relTime } from "@/lib/format";
 import { copyText } from "@/lib/clipboard";
-import { DUPLICATE_QUERY_LIMIT } from "@/lib/limits";
-import { peerReadOnlyTitle } from "@/lib/origin";
+import { isLocal, peerReadOnlyTitle } from "@/lib/origin";
 import { hasInteractive3D } from "@/lib/model-formats";
 import { useViewState } from "@/lib/view-state";
 import { shortcutLabel, SHORTCUT_EVENT, type ShortcutId } from "@/lib/shortcuts";
@@ -787,9 +786,6 @@ function CollectionsGroup({ asset }: { asset: Asset }) {
   );
 }
 
-/** Pull enough exact-duplicate groups to cover the library; keyed identically to the Browser's fetch
- *  so the two share one cached request under `qk.duplicates`. */
-
 /** The byte-identical copies of this asset. In the grid/table those copies collapse into one badged
  *  card; this is where the full set is enumerated (the request in the golden rules: "duplicates listed
  *  in the inspector"). Exact only — perceptual near-matches are the separate "Similar" surface. Absent
@@ -797,13 +793,13 @@ function CollectionsGroup({ asset }: { asset: Asset }) {
 function DuplicatesSection({ asset }: { asset: Asset }) {
   const { patch } = useViewState();
   const id = asset.summary.id;
-  const dups = useDuplicates({ kind: "exact", limit: DUPLICATE_QUERY_LIMIT });
-  const group = dups.data?.find(
-    (g) => g.members.length > 1 && g.members.some((m) => m.id === id),
-  );
+  // A peer-local UUID may collide with a local UUID. Never resolve it against this server's local
+  // duplicate index; peer duplicate review belongs to the owning peer.
+  const dups = useDuplicateGroup(isLocal(asset.summary.origin) ? id : null);
+  const group = dups.data;
   if (!group) return null;
 
-  const others = group.members.length - 1;
+  const others = group.total_members - 1;
   return (
     <Group title={`Duplicates (${others})`}>
       <p className="mb-2 text-[11px] text-fg-dim">
@@ -824,6 +820,12 @@ function DuplicatesSection({ asset }: { asset: Asset }) {
           />
         ))}
       </div>
+      {group.members.length < group.total_members && (
+        <p className="mt-2 text-[11px] text-fg-dim">
+          Showing {group.members.length} of {group.total_members} copies. Open Duplicate review to
+          page through the set.
+        </p>
+      )}
     </Group>
   );
 }
