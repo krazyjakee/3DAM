@@ -15,6 +15,7 @@ import type {
   ContentHash,
   ConvertReport,
   ConvertRequest,
+  ManagedConvertRequest,
   DupGroup,
   DupGroupMembersRequest,
   DupMember,
@@ -24,6 +25,7 @@ import type {
   DupReviewRequest,
   ExportReport,
   ExportRequest,
+  ManagedExportRequest,
   JobId,
   JobListRequest,
   JobStatus,
@@ -58,7 +60,7 @@ import type {
   ErrorBody,
 } from "./types";
 
-import { authHeaders, csrfHeaders, mediaUrl, resolveUrl } from "@/lib/server";
+import { authenticatedFetch, authHeaders, csrfHeaders, mediaUrl, resolveUrl } from "@/lib/server";
 
 const API = "/api/v1";
 
@@ -225,11 +227,30 @@ export const api = {
   exportAssets: (req: ExportRequest) => send<ExportReport>("POST", `${API}/export`, req),
   submitExport: (req: ExportRequest) =>
     send<{ job_id: JobId }>("POST", `${API}/jobs/export`, req),
+  submitManagedExport: (req: ManagedExportRequest) =>
+    send<{ job_id: JobId }>("POST", `${API}/jobs/export-artifact`, req),
 
   /** Convert assets to a target format into a server output dir (source-safe, atomic; tech-spec 08). */
   convert: (req: ConvertRequest) => send<ConvertReport>("POST", `${API}/convert`, req),
   submitConvert: (req: ConvertRequest) =>
     send<{ job_id: JobId }>("POST", `${API}/jobs/convert`, req),
+  submitManagedConvert: (req: ManagedConvertRequest) =>
+    send<{ job_id: JobId }>("POST", `${API}/jobs/convert-artifact`, req),
+
+  /** Fetch with the active bearer/native credential, then hand a same-origin blob to the browser's
+   * download UI. The server supplies a fixed, job-derived Content-Disposition filename. */
+  downloadJobArtifact: async (id: JobId): Promise<void> => {
+    const res = await authenticatedFetch(`${API}/jobs/${id}/artifact`);
+    if (!res.ok) return decode<void>(res);
+    const disposition = res.headers.get("content-disposition") ?? "";
+    const filename = disposition.match(/filename="([^"]+)"/)?.[1] ?? `3dam-artifact-${id}`;
+    const href = URL.createObjectURL(await res.blob());
+    const anchor = document.createElement("a");
+    anchor.href = href;
+    anchor.download = filename;
+    anchor.click();
+    setTimeout(() => URL.revokeObjectURL(href), 0);
+  },
 
   /** URL for an asset's raw bytes — fed to the WASM viewer islands (tech-spec 09 §B.3). The DOM
    *  fetches this and hands it across the wasm-bindgen boundary; the island does no networking. */

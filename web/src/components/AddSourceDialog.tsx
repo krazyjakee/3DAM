@@ -3,7 +3,7 @@ import { FolderPlus } from "lucide-react";
 import { useAddSource, useScan } from "@/api/queries";
 import { ApiError } from "@/api/client";
 import { Modal } from "@/lib/dialogs";
-import { pickDirectory, tauriDialog } from "@/lib/tauri";
+import { hasLocalFilesystemAccess, pickDirectory, pickFile } from "@/lib/tauri";
 import type { SourceKind, SourceOptions } from "@/api/types";
 
 // local_fs, sftp and smb are backed by the phase-4 engine; federated peers by the phase-6
@@ -48,13 +48,24 @@ export function AddSourceDialog({ onClose }: { onClose: () => void }) {
   const federated = kind === "federated";
   // Inside the Tauri desktop shell (ADR 0013) a local folder can be picked natively; in a plain
   // browser there is no picker for a server-side path, so the button simply doesn't exist.
-  const canBrowse = kind === "local_fs" && tauriDialog() !== null;
+  const localPaths = hasLocalFilesystemAccess();
+  const canBrowse = kind === "local_fs" && localPaths;
 
   const browse = async () => {
     setErr(null);
     try {
       const dir = await pickDirectory("Choose a folder to add");
       if (dir) setUri(dir);
+    } catch (e) {
+      setErr(String(e));
+    }
+  };
+
+  const browsePrivateKey = async () => {
+    setErr(null);
+    try {
+      const file = await pickFile("Choose an SSH private key");
+      if (file) setPrivateKey(file);
     } catch (e) {
       setErr(String(e));
     }
@@ -129,11 +140,23 @@ export function AddSourceDialog({ onClose }: { onClose: () => void }) {
           ))}
         </select>
 
-        <label className="mb-1 block text-[11px] text-fg-muted">{URI_FIELD[kind].label}</label>
+        <label className="mb-1 block text-[11px] text-fg-muted">
+          {kind === "local_fs"
+            ? localPaths
+              ? "Folder on this computer"
+              : "Folder on the 3DAM server"
+            : URI_FIELD[kind].label}
+        </label>
         <div className="mb-3 flex gap-2">
           <input
             className="field min-w-0"
-            placeholder={URI_FIELD[kind].placeholder}
+            placeholder={
+              kind === "local_fs"
+                ? localPaths
+                  ? "/Users/you/Assets"
+                  : "/srv/3dam/assets"
+                : URI_FIELD[kind].placeholder
+            }
             value={uri}
             onChange={(e) => setUri(e.target.value)}
             autoFocus
@@ -145,6 +168,13 @@ export function AddSourceDialog({ onClose }: { onClose: () => void }) {
             </button>
           )}
         </div>
+        {kind === "local_fs" && (
+          <p className="-mt-2 mb-3 text-[10px] text-fg-dim">
+            {localPaths
+              ? "This path is read by the embedded 3DAM server on this computer."
+              : "This path is read by the machine running 3DAM, not by this browser."}
+          </p>
+        )}
 
         {federated && (
           <>
@@ -187,13 +217,22 @@ export function AddSourceDialog({ onClose }: { onClose: () => void }) {
             </Field>
             {kind === "sftp" && (
               <>
-                <Field label="Private key path (optional)">
-                  <input
-                    className="field"
-                    placeholder="~/.ssh/id_ed25519"
-                    value={privateKey}
-                    onChange={(e) => setPrivateKey(e.target.value)}
-                  />
+                <Field
+                  label={`Private key file ${localPaths ? "on this computer" : "on the 3DAM server"} (optional)`}
+                >
+                  <div className="flex gap-2">
+                    <input
+                      className="field min-w-0"
+                      placeholder={localPaths ? "/Users/you/.ssh/id_ed25519" : "/etc/3dam/id_ed25519"}
+                      value={privateKey}
+                      onChange={(e) => setPrivateKey(e.target.value)}
+                    />
+                    {localPaths && (
+                      <button type="button" className="btn shrink-0" onClick={browsePrivateKey}>
+                        Browse…
+                      </button>
+                    )}
+                  </div>
                 </Field>
                 <Field label="Key passphrase (optional)">
                   <input

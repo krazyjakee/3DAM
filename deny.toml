@@ -50,7 +50,7 @@ deny = [
     # shell and Tauri's own plugins/runtime may acquire a native window/event loop.
     { crate = "wgpu", wrappers = ["dam-render", "dam-viewer"], reason = "GPU code belongs in the renderer or browser viewer island" },
     { crate = "winit", reason = "3DAM uses the reviewed Tauri/tao/wry desktop stack; other window loops require an architecture review" },
-    { crate = "tauri", wrappers = ["dam-desktop", "tauri-plugin-dialog", "tauri-plugin-fs", "tauri-plugin-window-state"], reason = "Tauri belongs at the desktop shell boundary" },
+    { crate = "tauri", wrappers = ["dam-desktop", "tauri-plugin-dialog", "tauri-plugin-fs", "tauri-plugin-opener", "tauri-plugin-window-state"], reason = "Tauri belongs at the desktop shell boundary" },
     { crate = "tao", wrappers = ["tauri-runtime-wry"], reason = "The event loop is owned by Tauri's desktop runtime" },
     { crate = "wry", wrappers = ["tauri-runtime-wry"], reason = "The webview is owned by Tauri's desktop runtime" },
 

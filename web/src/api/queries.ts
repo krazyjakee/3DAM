@@ -527,12 +527,32 @@ export function useExport() {
   });
 }
 
+export function useManagedExport() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (req: import("./types").ManagedExportRequest) =>
+      (await api.submitManagedExport(req)).job_id,
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.jobs }),
+    meta: { errorPrefix: "Export failed" },
+  });
+}
+
 /** Convert assets to a target format. Writes to an output dir outside any source, so the catalog is
  *  unchanged — no invalidation; the caller shows the per-item report. */
 export function useConvert() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: async (req: ConvertRequest) => (await api.submitConvert(req)).job_id,
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.jobs }),
+    meta: { errorPrefix: "Convert failed" },
+  });
+}
+
+export function useManagedConvert() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (req: import("./types").ManagedConvertRequest) =>
+      (await api.submitManagedConvert(req)).job_id,
     onSuccess: () => qc.invalidateQueries({ queryKey: qk.jobs }),
     meta: { errorPrefix: "Convert failed" },
   });

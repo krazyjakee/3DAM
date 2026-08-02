@@ -6,7 +6,7 @@
 
 import { useMemo, useState } from "react";
 import { FileCog } from "lucide-react";
-import { useConvert } from "@/api/queries";
+import { useConvert, useManagedConvert } from "@/api/queries";
 import { ApiError } from "@/api/client";
 import { Modal } from "@/lib/dialogs";
 import type {
@@ -14,6 +14,7 @@ import type {
   CollisionRule,
   ConvertTarget,
 } from "@/api/types";
+import { hasLocalFilesystemAccess, pickDirectory } from "@/lib/tauri";
 
 const IMAGE_FORMATS = ["png", "jpg", "webp", "bmp", "tga", "tiff", "gif"];
 const AUDIO_FORMATS = ["wav"];
@@ -47,6 +48,7 @@ export function ConvertDialog({
   onClose: () => void;
 }) {
   const run = useConvert();
+  const runManaged = useManagedConvert();
   const [err, setErr] = useState<string | null>(null);
 
   // Default the target media to whichever the selection mostly is.
@@ -70,6 +72,10 @@ export function ConvertDialog({
   const [outputDir, setOutputDir] = useState("");
   const [collision, setCollision] = useState<CollisionRule>("fail");
   const [dryRun, setDryRun] = useState(true);
+  const localPaths = hasLocalFilesystemAccess();
+  const [delivery, setDelivery] = useState<"download" | "server_path">(
+    localPaths ? "server_path" : "download",
+  );
 
   const switchMedia = (m: TargetMedia) => {
     setMedia(m);
@@ -79,9 +85,20 @@ export function ConvertDialog({
   // How many inputs match the chosen target media (the rest will report `unsupported`).
   const matching = assets.filter((a) => a.media === media).length;
 
+  const browseOutput = async () => {
+    setErr(null);
+    try {
+      const picked = await pickDirectory("Choose a converted-files destination");
+      if (picked) setOutputDir(picked);
+    } catch (e) {
+      setErr(String(e));
+    }
+  };
+
   const submit = () => {
     setErr(null);
-    if (!outputDir.trim()) return setErr("An output directory is required.");
+    if (delivery === "server_path" && !outputDir.trim())
+      return setErr("An output directory is required.");
     const target: ConvertTarget =
       media === "image"
         ? {
@@ -93,19 +110,18 @@ export function ConvertDialog({
         : media === "model"
           ? { media: "model", format, optimize }
           : { media: "audio", format };
-    run.mutate(
-      {
-        inputs: assets.map((a) => a.id),
-        target,
-        output_dir: outputDir.trim(),
-        dry_run: dryRun,
-        on_collision: collision,
-      },
-      {
-        onSuccess: onClose,
-        onError: (e) => setErr(e instanceof ApiError ? e.message : String(e)),
-      },
-    );
+    const common = {
+      inputs: assets.map((a) => a.id),
+      target,
+      dry_run: dryRun,
+      on_collision: collision,
+    };
+    const options = {
+      onSuccess: onClose,
+      onError: (e: unknown) => setErr(e instanceof ApiError ? e.message : String(e)),
+    };
+    if (delivery === "download") runManaged.mutate(common, options);
+    else run.mutate({ ...common, output_dir: outputDir.trim() }, options);
   };
 
   return (
@@ -212,17 +228,58 @@ export function ConvertDialog({
 
             {/* output dir */}
             <div>
-              <label className="mb-1 block text-[11px] text-fg-muted">Output directory</label>
-              <input
-                className="field"
-                placeholder="/home/me/converted"
-                value={outputDir}
-                onChange={(e) => setOutputDir(e.target.value)}
-                spellCheck={false}
-              />
-              <p className="mt-1 text-[10px] text-fg-dim">
-                Must be outside any registered source — 3DAM never writes into a source.
-              </p>
+              {!localPaths && (
+                <div className="mb-2 flex overflow-hidden rounded border border-border">
+                  <button
+                    type="button"
+                    className="flex-1 px-3 py-1 text-xs coarse:min-h-11"
+                    aria-pressed={delivery === "download"}
+                    onClick={() => setDelivery("download")}
+                  >
+                    Download outputs
+                  </button>
+                  <button
+                    type="button"
+                    className="flex-1 border-l border-border px-3 py-1 text-xs coarse:min-h-11"
+                    aria-pressed={delivery === "server_path"}
+                    onClick={() => setDelivery("server_path")}
+                  >
+                    Write on server
+                  </button>
+                </div>
+              )}
+              {delivery === "download" ? (
+                <p className="rounded border border-border bg-surface-2 p-2 text-[10px] text-fg-dim">
+                  3DAM will keep these outputs in its managed artifact area. When the job finishes,
+                  download the package from Job history; no server shell access is needed.
+                </p>
+              ) : (
+                <>
+                  <label className="mb-1 block text-[11px] text-fg-muted">
+                    Output directory {localPaths ? "on this computer" : "on the 3DAM server"}
+                  </label>
+                  <div className="flex gap-2">
+                    <input
+                      className="field min-w-0"
+                      placeholder={localPaths ? "/Users/you/Converted" : "/srv/3dam/converted"}
+                      value={outputDir}
+                      onChange={(e) => setOutputDir(e.target.value)}
+                      spellCheck={false}
+                    />
+                    {localPaths && (
+                      <button type="button" className="btn shrink-0" onClick={browseOutput}>
+                        Browse…
+                      </button>
+                    )}
+                  </div>
+                  <p className="mt-1 text-[10px] text-fg-dim">
+                    {localPaths
+                      ? "The embedded server writes here on this computer."
+                      : "The server machine writes here; this path does not refer to your browser's computer."}{" "}
+                    Must be outside every registered source.
+                  </p>
+                </>
+              )}
             </div>
 
             {/* collision + dry run */}
@@ -261,9 +318,13 @@ export function ConvertDialog({
               <button
                 className="btn btn-accent"
                 onClick={submit}
-                disabled={run.isPending}
+                disabled={run.isPending || runManaged.isPending}
               >
-                {run.isPending ? "Submitting…" : dryRun ? "Plan in background" : "Convert in background"}
+                {run.isPending || runManaged.isPending
+                  ? "Submitting…"
+                  : dryRun
+                    ? "Plan in background"
+                    : "Convert in background"}
               </button>
             </div>
       </div>

@@ -262,6 +262,39 @@ Desktop/tablet-first; phones graceful-degrade — cheap precisely because the sh
 
 ---
 
+## B.6 Filesystem locality and hosted artifacts
+
+Every path field names the machine which resolves it. A plain browser (including one opened on the
+same workstation) has no authority over its own filesystem: local-source roots, SSH key files,
+convert destinations, and explicit export destinations are paths on the machine running
+`3dam serve`. Examples therefore use server-shaped paths such as `/srv/3dam/assets`, never a home
+directory which implies the browser user's computer.
+
+The embedded Tauri shell injects an immutable `__3DAM_EMBEDDED_SERVER__` launch-mode bit before page
+scripts and grants native picker/open commands only to its loopback origin. The shared web client
+offers native source/file/directory pickers and **Open** only when both that bit and the relevant
+Tauri command are present. Feature detection alone is insufficient: a shell connected to a hosted
+server must continue to label paths as server-side even if a Tauri global is visible.
+
+Hosted convert/export defaults to server-managed delivery. `POST /api/v1/jobs/{convert,export}-artifact`
+accepts the operation but no output path, allocates an opaque destination under the server data
+directory, and returns the ordinary durable job id. A completed visible job gains one application
+route, `GET|HEAD /api/v1/jobs/{id}/artifact`:
+
+- authorization and sharing are re-resolved from the durable job for every request; the route never
+  accepts a caller-supplied path;
+- the reported result is canonicalized under the private artifact root, including symlink escape
+  rejection, before any bytes are opened;
+- JSON/CSV stream as exact attachment files with byte ranges; sidecars and managed convert outputs
+  are flat ZIP packages containing only regular files from that fresh job directory;
+- cancelled, failed, dry-run, outside-root, or empty convert results have no downloadable artifact;
+- `Content-Disposition`, `nosniff`, private/no-store caching, `HEAD`, and single byte ranges make the
+  result usable by browsers and resumable clients without exposing the server filesystem path.
+
+Job history is the durable handoff: managed jobs show **Download**; explicit paths show **Copy
+path**, plus **Open** only in embedded mode. Thus a completed hosted job never leaves a browser user
+with only an inaccessible server path.
+
 ## Open questions
 
 Carried from PRODUCT_SPEC §10 open questions (this file is where they bottom out for the server/web-client area):

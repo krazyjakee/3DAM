@@ -174,6 +174,39 @@ impl ApiClient {
         })
     }
 
+    /// Submit a hosted conversion whose destination is allocated by the server. This is
+    /// transport-specific (an embedded `LibraryService` has no remote artifact boundary), so it is
+    /// an inherent client method rather than part of the shared engine trait.
+    pub async fn submit_managed_convert(
+        &self,
+        req: ManagedConvertRequest,
+    ) -> Result<JobId, LibError> {
+        let reply: JobIdReply = self.post("/api/v1/jobs/convert-artifact", &req).await?;
+        Ok(reply.job_id)
+    }
+
+    /// Submit a hosted manifest whose destination is allocated by the server.
+    pub async fn submit_managed_export(
+        &self,
+        req: ManagedExportRequest,
+    ) -> Result<JobId, LibError> {
+        let reply: JobIdReply = self.post("/api/v1/jobs/export-artifact", &req).await?;
+        Ok(reply.job_id)
+    }
+
+    /// Retrieve the exact artifact authorized by a completed visible job. The returned MIME type
+    /// distinguishes JSON/CSV from packaged multi-file outputs; the server owns the filename.
+    pub async fn download_job_artifact(
+        &self,
+        job: &JobId,
+    ) -> Result<(Option<String>, Vec<u8>), LibError> {
+        self.fetch_bytes(
+            self.http
+                .get(self.url(&format!("/api/v1/jobs/{job}/artifact"))?),
+        )
+        .await
+    }
+
     fn url(&self, path: &str) -> Result<Url, LibError> {
         self.base
             .join(path)

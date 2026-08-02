@@ -20,6 +20,7 @@ rustls = { workspace = true }
 tower-http = { workspace = true, features = ["compression-br", "compression-gzip"] }
 rust-embed.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 futures.workspace = true
@@ -46,6 +47,8 @@ url.workspace = true
 # Stages an upload body on real disk before it is written into a source (issue #80). The temp file
 # is removed on drop, so a client that disconnects mid-transfer leaves nothing behind.
 tempfile.workspace = true
+# Package server-managed multi-file exports/conversions for authenticated browser retrieval.
+zip.workspace = true
 
 [dev-dependencies]
 dam-client.workspace = true

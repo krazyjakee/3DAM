@@ -13,18 +13,32 @@ interface TauriDialog {
     multiple?: boolean;
     title?: string;
   }): Promise<string | string[] | null>;
+  save(options: { title?: string; defaultPath?: string }): Promise<string | null>;
+}
+
+interface TauriOpener {
+  openPath(path: string): Promise<void>;
 }
 
 declare global {
   interface Window {
     /** Injected by the desktop shell's webview; never present in a plain browser. */
-    __TAURI__?: { dialog?: TauriDialog };
+    __TAURI__?: { dialog?: TauriDialog; opener?: TauriOpener };
+    /** Immutable launch-mode bit injected before page scripts by the native shell. */
+    __3DAM_EMBEDDED_SERVER__?: boolean;
   }
 }
 
 /** The shell's dialog API, or null outside the desktop shell — gate desktop-only UI on this. */
 export function tauriDialog(): TauriDialog | null {
   return window.__TAURI__?.dialog ?? null;
+}
+
+/** True only when a native path and the active API resolve on the same computer. A Tauri shell may
+ * remain available while its API points at a hosted server, so feature detection alone is not a
+ * locality decision. */
+export function hasLocalFilesystemAccess(): boolean {
+  return window.__3DAM_EMBEDDED_SERVER__ === true && tauriDialog() !== null;
 }
 
 /** Open the native directory picker. Resolves to the chosen absolute path, or null when the user
@@ -35,4 +49,23 @@ export async function pickDirectory(title: string): Promise<string | null> {
   if (!dialog) return null;
   const picked = await dialog.open({ directory: true, multiple: false, title });
   return typeof picked === "string" ? picked : null;
+}
+
+export async function pickFile(title: string): Promise<string | null> {
+  const dialog = tauriDialog();
+  if (!dialog) return null;
+  const picked = await dialog.open({ directory: false, multiple: false, title });
+  return typeof picked === "string" ? picked : null;
+}
+
+export async function saveFile(title: string, defaultPath: string): Promise<string | null> {
+  const dialog = tauriDialog();
+  return dialog ? dialog.save({ title, defaultPath }) : null;
+}
+
+export async function openNativePath(path: string): Promise<boolean> {
+  const opener = window.__TAURI__?.opener;
+  if (!opener) return false;
+  await opener.openPath(path);
+  return true;
 }

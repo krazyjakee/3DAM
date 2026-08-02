@@ -2,9 +2,13 @@ import { useMemo } from "react";
 import { AlertTriangle, Ban, CheckCircle2, CircleX, Clock3, History } from "lucide-react";
 import { Link, useSearchParams } from "react-router";
 import { useCancelJob, useJob, useJobHistory, useSources } from "@/api/queries";
+import { api } from "@/api/client";
 import type { ConvertReport, JobStatus } from "@/api/types";
 import { bytes } from "@/lib/format";
 import { CenteredCard } from "@/lib/ui";
+import { copyText } from "@/lib/clipboard";
+import { hasLocalFilesystemAccess, openNativePath } from "@/lib/tauri";
+import { toast } from "@/lib/toast";
 
 /** Persisted job list + terminal report. The server performs visibility filtering before returning
  * every page; this client deliberately shows source names, never reconstructs connection paths. */
@@ -196,10 +200,20 @@ function JobDetails({ job, sources }: { job: JobStatus; sources: Map<string, str
           <ul className="mt-2 space-y-1 text-xs">
             {artifacts.map((artifact, index) => (
               <li key={`${index}-${artifact.label}`}>
-                {artifact.route ? (
-                  <Link to={artifact.route} className="text-accent hover:underline">
+                {artifact.route?.endsWith("/artifact") ? (
+                  <button
+                    type="button"
+                    className="text-accent hover:underline"
+                    onClick={() =>
+                      void api.downloadJobArtifact(job.id).catch((error) =>
+                        toast.error(error instanceof Error ? error.message : String(error)),
+                      )
+                    }
+                  >
                     {artifact.label}
-                  </Link>
+                  </button>
+                ) : artifact.route ? (
+                  <Link to={artifact.route} className="text-accent hover:underline">{artifact.label}</Link>
                 ) : (
                   <span className="text-fg">{artifact.label}</span>
                 )}
@@ -219,6 +233,9 @@ function JobDetails({ job, sources }: { job: JobStatus; sources: Map<string, str
           <p className="mt-1 break-all font-mono text-[10px] text-fg-dim">
             {job.result.report.output}
           </p>
+          {job.result.report.output !== "Server-managed download" && (
+            <PathActions path={job.result.report.output} />
+          )}
         </section>
       )}
     </article>
@@ -230,6 +247,8 @@ function ConvertResult({ report }: { report: ConvertReport }) {
     <section className="mt-4 border-t border-border pt-3 text-xs">
       <h3 className="font-medium text-fg-muted">Convert report</h3>
       <p className="mt-1 break-all text-fg">{report.output_dir}</p>
+      {report.output_dir !== "Server-managed download" &&
+        report.output_dir !== "No output (dry run)" && <PathActions path={report.output_dir} />}
       <p className="mt-1 text-fg-dim">
         {report.dry_run ? "Plan" : "Output"}: {report.done} ready/done · {report.failed} failed ·{" "}
         {report.collisions} collisions · {report.unsupported} unsupported
@@ -250,6 +269,30 @@ function ConvertResult({ report }: { report: ConvertReport }) {
         ))}
       </div>
     </section>
+  );
+}
+
+function PathActions({ path }: { path: string }) {
+  const canOpen = hasLocalFilesystemAccess();
+  return (
+    <div className="mt-2 flex gap-2">
+      <button type="button" className="btn text-[10px]" onClick={() => void copyText(path, "Path")}>
+        Copy path
+      </button>
+      {canOpen && (
+        <button
+          type="button"
+          className="btn text-[10px]"
+          onClick={() =>
+            void openNativePath(path).catch((error) =>
+              toast.error(error instanceof Error ? error.message : String(error)),
+            )
+          }
+        >
+          Open
+        </button>
+      )}
+    </div>
   );
 }
 

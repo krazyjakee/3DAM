@@ -31,9 +31,12 @@ anyhow = { workspace = true }
 # The webview shell (ADR 0013). Declared here rather than in the workspace table since this crate is
 # its only consumer (the eframe precedent).
 tauri = { version = "2", features = [] }
-# Native file dialogs (the Add-Source folder picker). Exposed to the web client through the
+# Native path dialogs (sources plus convert/export destinations). Exposed to the web client through the
 # loopback-scoped capability in `capabilities/` — see that file for the security posture.
 tauri-plugin-dialog = "2"
+# Open completed local outputs from the embedded shell. The capability is loopback-only, like the
+# picker; a remote hosted page never receives native filesystem authority.
+tauri-plugin-opener = "2"
 # Window geometry persistence (size/position/maximized across launches). Its `on_window_ready` hook
 # restores runtime-created windows too, so the window built in `.setup()` is covered without an
 # explicit `restore_state` call.

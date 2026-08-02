@@ -51,6 +51,7 @@ dam-cli = { path = "crates/3dam-cli", version = "=0.1.1" }
 # async / runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs", "signal", "time", "io-std", "io-util"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util = { version = "0.7", features = ["io"] }
 async-trait = "0.1"
 futures = "0.3"
 

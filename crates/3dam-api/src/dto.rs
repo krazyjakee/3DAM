@@ -1018,6 +1018,32 @@ pub struct ConvertRequest {
     pub on_collision: CollisionRule,
 }
 
+/// Convert request whose destination is allocated by the serving host. This transport-facing shape
+/// deliberately has no path: a browser cannot accidentally nominate a path on its own machine (or
+/// use an artifact endpoint as an arbitrary server-file reader). The server turns it into an
+/// ordinary [`ConvertRequest`] under its private artifact root.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ManagedConvertRequest {
+    pub inputs: Vec<AssetId>,
+    pub target: ConvertTarget,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub on_collision: CollisionRule,
+}
+
+impl ManagedConvertRequest {
+    pub fn with_output_dir(self, output_dir: String) -> ConvertRequest {
+        ConvertRequest {
+            inputs: self.inputs,
+            target: self.target,
+            output_dir,
+            dry_run: self.dry_run,
+            on_collision: self.on_collision,
+        }
+    }
+}
+
 /// The media-typed encode spec (tech-spec 08 §3). One target per request; a batch that mixes media
 /// types against a single-media target fails those items as `unsupported` (fail-soft).
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1698,6 +1724,35 @@ pub struct ExportRequest {
     /// Restrict a manifest to license/attribution fields (the "credits list" use case).
     #[serde(default)]
     pub attribution_only: bool,
+}
+
+/// Manifest export whose destination is owned by the server and retrievable through the
+/// authenticated job-artifact route. Keeping `output` out of this wire shape makes locality
+/// explicit and prevents a download request from ever naming an arbitrary filesystem path.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ManagedExportRequest {
+    #[serde(default)]
+    pub assets: Vec<AssetId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collection: Option<CollectionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<QueryRequest>,
+    pub format: ExportFormat,
+    #[serde(default)]
+    pub attribution_only: bool,
+}
+
+impl ManagedExportRequest {
+    pub fn with_output(self, output: String) -> ExportRequest {
+        ExportRequest {
+            assets: self.assets,
+            collection: self.collection,
+            query: self.query,
+            format: self.format,
+            output,
+            attribution_only: self.attribution_only,
+        }
+    }
 }
 
 /// Manifest shape (tech-spec: JSON/CSV/sidecar).

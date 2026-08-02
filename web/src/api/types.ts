@@ -447,6 +447,9 @@ export interface ConvertRequest {
   dry_run?: boolean;
   on_collision?: CollisionRule;
 }
+/** Hosted delivery: the server allocates a private destination and exposes only the completed,
+ * authenticated job artifact. No browser filesystem path crosses the wire. */
+export type ManagedConvertRequest = Omit<ConvertRequest, "output_dir">;
 
 /** How one input resolved (mirrors `dam-api` `Disposition`). */
 export type Disposition =
@@ -498,6 +501,8 @@ export interface ExportRequest {
   output: string;
   attribution_only?: boolean;
 }
+/** Hosted delivery counterpart to `ExportRequest`; the server owns the output path. */
+export type ManagedExportRequest = Omit<ExportRequest, "output">;
 export interface ExportReport {
   format: ExportFormat;
   output: string;

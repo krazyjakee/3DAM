@@ -91,20 +91,22 @@ pub fn run(args: Vec<OsString>) -> u8 {
 
     // Runs before page scripts. The secret remains captured in native-installed plumbing and is
     // attached only to this server's origin+mount; the app sees only a non-secret capability bit.
-    let init_script = token
-        .as_deref()
-        .map(|secret| native_credential_script(&url, secret, hosted));
+    let mut init_script = shell_mode_script(hosted);
+    if let Some(secret) = token.as_deref() {
+        init_script.push_str(&native_credential_script(&url, secret, hosted));
+    }
 
     // The webview zoom factor lives in the menu-event closure: `set_zoom` is write-only, so the
     // shell is the source of truth for Zoom In/Out stepping.
     let zoom = Mutex::new(1.0_f64);
 
     let outcome = tauri::Builder::default()
-        // Native dialogs (the Add-Source folder picker). The webview loads a remote
+        // Native path dialogs and completed-output opening. The webview loads a remote
         // `http://127.0.0.1:<port>` URL, so IPC is off by default; the capability in
-        // `capabilities/loopback-dialog.json` grants exactly `dialog:allow-open` to the loopback
-        // origin — a `--connect` remote server's page never gets IPC.
+        // `capabilities/loopback-dialog.json` grants only open/save dialogs and path opening to the
+        // loopback origin — a `--connect` remote server's page never gets IPC.
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
         // Persist exactly what the window-geometry contract promises — size, position, maximized —
         // and nothing surprising (no VISIBLE, so a crash while hidden can't persist a ghost window;
         // no FULLSCREEN, so F11 is per-session). Restore is automatic: the plugin's
@@ -134,9 +136,7 @@ pub fn run(args: Vec<OsString>) -> u8 {
                 // rule 1 says the web client *is* the UI, so the drop zone is web code and this
                 // shell's job is only to stop swallowing its events.
                 .disable_drag_drop_handler();
-            if let Some(script) = &init_script {
-                win = win.initialization_script(script);
-            }
+            win = win.initialization_script(&init_script);
             win.build()?;
             Ok(())
         })
@@ -329,6 +329,13 @@ fn native_credential_script(url: &url::Url, secret: &str, forgettable: bool) -> 
         )
 }
 
+fn shell_mode_script(hosted: bool) -> String {
+    format!(
+        "Object.defineProperty(window,'__3DAM_EMBEDDED_SERVER__',{{value:{},writable:false,configurable:false}});",
+        !hosted
+    )
+}
+
 /// Boot the in-process server on a background thread — its own Tokio runtime, since the main thread
 /// belongs to the webview event loop — and block until it reports its bound address (or fails).
 /// The thread is detached: it serves until the process exits with the window.
@@ -415,5 +422,12 @@ mod tests {
     fn rejects_unknown_flags_and_missing_values() {
         assert!(parse(&["--nope"]).is_err());
         assert!(parse(&["--connect"]).is_err());
+    }
+
+    #[test]
+    fn launch_mode_distinguishes_embedded_from_connect_even_at_a_remote_root() {
+        assert!(shell_mode_script(false).contains("value:true"));
+        assert!(shell_mode_script(true).contains("value:false"));
+        assert!(shell_mode_script(true).contains("writable:false"));
     }
 }
