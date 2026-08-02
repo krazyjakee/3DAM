@@ -10,7 +10,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use dam_api::accounts::*;
 use dam_api::admin::*;
-use dam_api::dto::{CollectionKind, SourceKind};
+use dam_api::dto::SourceKind;
 use dam_api::service::LibraryService;
 use dam_api::LibError;
 
@@ -272,20 +272,10 @@ async fn create_share(
     // *now* (the store only validates uuid shape; ids are never recycled, so this can't be raced
     // into granting a future resource).
     //
-    // It must also be a resource a share can actually *grant*. Two shapes pass the liveness check
-    // yet grant nothing, and a share that is accepted but inert is worse than a refusal — the
-    // operator believes access was given:
-    //
-    //  - a **smart collection**: `push_visibility` expands a granted collection only through
-    //    `collection_member`, and a smart folder's membership is a live query, so it has no rows
-    //    there — ever. The grant would be permanently empty.
-    //  - a **federated peer source**: the engine skips the peer path for any restricted context
-    //    (`is_full()` guards on query / get_asset / read_content / read_thumbnail), so the grantee
-    //    would see the source in the sidebar with a non-zero count from the proxied stats — over a
-    //    permanently empty grid.
-    //
-    // Both are v1 gaps in *reach*, not sharing bugs; when the engine can evaluate a peer or a
-    // smart query under a ceiling, these rejections come out.
+    // A smart folder is a grant to the *view*, never to everything its saved query can match: the
+    // engine evaluates it under the caller's independent source/manual-collection ceiling. A
+    // federated source read share similarly selects exactly one peer for fan-out. Peer catalogs
+    // remain remote-owned and read-only, so accepting a write-shaped peer grant would over-promise.
     let ectx = dam_api::service::AuthContext::embedded();
     match req.resource {
         ShareResource::Source => {
@@ -294,9 +284,9 @@ async fn create_share(
                 .parse::<dam_api::id::SourceId>()
                 .map_err(|_| ApiError(LibError::BadRequest("invalid source id".into())))?;
             let source = st.lib.get_source(&ectx, &id).await?;
-            if source.kind == SourceKind::Federated {
+            if source.kind == SourceKind::Federated && req.access == ShareAccess::Write {
                 return Err(ApiError(LibError::BadRequest(
-                    "a federated peer source cannot be shared: reads against a peer are not                      evaluated under a visibility ceiling in v1, so the grant would show an empty                      library".into(),
+                    "a federated peer source is read-only; create a read share instead".into(),
                 )));
             }
         }
@@ -305,12 +295,7 @@ async fn create_share(
                 .resource_id
                 .parse::<dam_api::id::CollectionId>()
                 .map_err(|_| ApiError(LibError::BadRequest("invalid collection id".into())))?;
-            let coll = st.lib.get_collection(&ectx, &id).await?;
-            if coll.kind == CollectionKind::Smart {
-                return Err(ApiError(LibError::BadRequest(
-                    "a smart folder cannot be shared: its membership is a live query with no                      stored members, so the grant would reach nothing. Share the source(s) it                      draws from instead".into(),
-                )));
-            }
+            st.lib.get_collection(&ectx, &id).await?;
         }
     }
     Ok(Json(st.store.create_share(&req, &actor_of(&ctx))?))

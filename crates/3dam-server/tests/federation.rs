@@ -7,10 +7,12 @@
 
 use dam_api::admin::{FlagKey, FlagValue, SetFlag};
 use dam_api::dto::*;
+use dam_api::event::{LibraryEvent, SubscribeRequest};
 use dam_api::page::PageParams;
 use dam_api::service::{AuthContext, LibraryService};
 use dam_core::EmbeddedLibrary;
-use dam_server::{router, ServerStore};
+use dam_server::{router, McpAdapter, ServerStore, WriteGate};
+use futures::StreamExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -401,6 +403,251 @@ async fn source_filter_routes_to_the_peer_alone() {
     // Unscoped stays the local library (peers merge into queries, not local aggregates).
     let all = local.library_stats(&ctx, None).await.unwrap();
     assert_eq!(all.total, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restricted_federated_share_reaches_only_that_peer_and_revokes_cached_reads() {
+    let owner = AuthContext::embedded();
+
+    let peer_a_dir = unique_tmp();
+    std::fs::create_dir_all(peer_a_dir.join("src")).unwrap();
+    gradient(32, 32)
+        .save(peer_a_dir.join("src").join("a-reference.png"))
+        .unwrap();
+    let mut near = gradient(32, 32);
+    near.put_pixel(0, 0, image::Rgba([250, 1, 1, 255]));
+    near.save(peer_a_dir.join("src").join("a-near.png"))
+        .unwrap();
+    let peer_a = library_with(&peer_a_dir, &[]).await;
+    analyze_all(&peer_a, &owner).await;
+    let (endpoint_a, _addr_a, _server_a) = serve_peer(peer_a).await;
+
+    let peer_b_dir = unique_tmp();
+    std::fs::create_dir_all(peer_b_dir.join("src")).unwrap();
+    let mut secret = gradient(32, 32);
+    secret.put_pixel(3, 7, image::Rgba([1, 250, 1, 255]));
+    secret
+        .save(peer_b_dir.join("src").join("b-secret.png"))
+        .unwrap();
+    let peer_b = library_with(&peer_b_dir, &[]).await;
+    analyze_all(&peer_b, &owner).await;
+    let (endpoint_b, _addr_b, _server_b) = serve_peer(peer_b).await;
+
+    let local = library_with(&unique_tmp(), &[("local.wav", b"RIFF....WAVE")]).await;
+    let source_a = add_peer(&local, &endpoint_a, "shared-peer").await;
+    let source_b = add_peer(&local, &endpoint_b, "hidden-peer").await;
+
+    let all = local.query(&owner, query_all(50)).await.unwrap();
+    let reference = all
+        .items
+        .iter()
+        .find(|asset| asset.name == "a-reference.png")
+        .unwrap()
+        .clone();
+    let hidden = all
+        .items
+        .iter()
+        .find(|asset| asset.name == "b-secret.png")
+        .unwrap()
+        .clone();
+    assert_ne!(reference.id, hidden.id, "fixtures must not alias asset ids");
+
+    let mut scope = dam_api::VisibilityScope::default();
+    scope.sources.insert(source_a);
+    let restricted = AuthContext::connected(
+        Some("shared-peer-viewer".into()),
+        dam_api::service::Scopes::anonymous(),
+        dam_api::Visibility::Restricted(scope),
+    );
+
+    // Search fans out to exactly the granted peer: neither the local index nor another peer may
+    // contribute rows or warnings that disclose it was contacted.
+    let page = local.query(&restricted, query_all(50)).await.unwrap();
+    let names: Vec<&str> = page.items.iter().map(|asset| asset.name.as_str()).collect();
+    assert_eq!(names, ["a-near.png", "a-reference.png"]);
+    assert!(page.partial.complete);
+    assert!(page
+        .items
+        .iter()
+        .all(|asset| asset.source_id == Some(source_a)));
+
+    let detail = local
+        .get_asset_from(&restricted, &reference.id, Some(source_a))
+        .await
+        .unwrap();
+    assert_eq!(detail.summary.name, "a-reference.png");
+    assert!(matches!(detail.summary.origin, Origin::Peer(ref name) if name == "shared-peer"));
+    assert!(!local
+        .read_content_from(&restricted, &reference.id, Some(source_a))
+        .await
+        .unwrap()
+        .bytes
+        .is_empty());
+    // Populate the outer peer cache before the revocation check below.
+    assert!(!local
+        .read_thumbnail_from(&restricted, &reference.id, 128, Some(source_a))
+        .await
+        .unwrap()
+        .bytes
+        .is_empty());
+
+    // A wrong, missing, or unshared hint cannot trigger the unrestricted recovery round.
+    assert!(local
+        .get_asset_from(&restricted, &hidden.id, Some(source_b))
+        .await
+        .is_err());
+    assert!(local
+        .get_asset_from(&restricted, &reference.id, None)
+        .await
+        .is_err());
+    assert!(local
+        .read_thumbnail_from(&restricted, &hidden.id, 128, Some(source_b))
+        .await
+        .is_err());
+
+    let scoped = local
+        .library_stats(&restricted, Some(source_a))
+        .await
+        .unwrap();
+    assert_eq!(scoped.total, 2);
+    let aggregate = local.library_stats(&restricted, None).await.unwrap();
+    assert_eq!(aggregate.total, 2);
+    assert_eq!(aggregate.sources, 1);
+    assert_eq!(aggregate.by_source.get("shared-peer"), Some(&2));
+    assert!(!aggregate.by_source.contains_key("hidden-peer"));
+
+    let mcp = McpAdapter::new(local.clone(), WriteGate::local_stdio());
+    let reply = mcp
+        .handle_message(
+            &restricted,
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "search", "arguments": {"limit": 50}}
+            }),
+        )
+        .await
+        .unwrap();
+    let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("a-reference.png"));
+    assert!(!text.contains("b-secret.png"));
+    assert!(!text.contains("local.wav"));
+
+    let export_path = unique_tmp().join("shared-peer.json");
+    let report = local
+        .export(
+            &restricted,
+            ExportRequest {
+                assets: Vec::new(),
+                collection: None,
+                query: None,
+                format: ExportFormat::Json,
+                output: export_path.to_string_lossy().into_owned(),
+                attribution_only: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.assets, 2);
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&export_path).unwrap()).unwrap();
+    let exported: Vec<&str> = manifest["assets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|asset| asset["name"].as_str())
+        .collect();
+    assert_eq!(exported, ["a-near.png", "a-reference.png"]);
+
+    // Background export jobs and their live progress events carry the same one-peer attribution.
+    let mut events = local
+        .subscribe(&restricted, SubscribeRequest::default())
+        .await
+        .unwrap();
+    let job = local
+        .submit_export(
+            &restricted,
+            ExportRequest {
+                assets: Vec::new(),
+                collection: None,
+                query: None,
+                format: ExportFormat::Json,
+                output: unique_tmp().join("job.json").to_string_lossy().into_owned(),
+                attribution_only: false,
+            },
+        )
+        .await
+        .unwrap();
+    let event = tokio::time::timeout(Duration::from_secs(10), events.next())
+        .await
+        .unwrap()
+        .unwrap();
+    match event {
+        LibraryEvent::JobProgress(progress) => {
+            assert_eq!(progress.id, job);
+            assert_eq!(progress.sources, vec![source_a]);
+        }
+        other => panic!("expected shared-peer export progress, got {other:?}"),
+    }
+    wait_job(&local, &restricted, &job).await;
+
+    let similar = local
+        .find_similar(
+            &restricted,
+            SimilarRequest {
+                asset: reference.id,
+                k: 10,
+                filters: Vec::new(),
+                local_only: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(similar
+        .items
+        .iter()
+        .any(|hit| hit.asset.name == "a-near.png" && hit.asset.source_id == Some(source_a)));
+    assert!(local
+        .find_similar(
+            &restricted,
+            SimilarRequest {
+                asset: hidden.id,
+                k: 10,
+                filters: Vec::new(),
+                local_only: false,
+            },
+        )
+        .await
+        .is_err());
+
+    // Remote ownership stays authoritative even if an administrator attempted to describe the
+    // source share as writable: no local asset row exists to mutate.
+    assert!(local
+        .set_favorite(
+            &restricted,
+            FavoriteRequest {
+                asset: reference.id,
+                favorite: true,
+            },
+        )
+        .await
+        .is_err());
+
+    // The next request after revocation cannot use an already-populated preview cache.
+    let revoked = AuthContext::connected(
+        Some("shared-peer-viewer".into()),
+        dam_api::service::Scopes::anonymous(),
+        dam_api::Visibility::Restricted(dam_api::VisibilityScope::default()),
+    );
+    assert!(local
+        .query(&revoked, query_all(50))
+        .await
+        .unwrap()
+        .items
+        .is_empty());
+    assert!(local
+        .read_thumbnail_from(&revoked, &reference.id, 128, Some(source_a))
+        .await
+        .is_err());
 }
 
 // ── partial results on a dead/slow peer (issue #39 acceptance) ───────────────

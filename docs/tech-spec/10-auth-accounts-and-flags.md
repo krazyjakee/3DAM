@@ -328,6 +328,23 @@ does not apply to them.
 
 For v1 scoping **bottoms out at source and collection level** (not per-asset — an Open question, PRODUCT_SPEC §10). The library service ([03](03-library-service-and-api.md)) receives the `AuthContext` and applies the visibility filter as a query predicate; federated fan-out ([07](07-sources-and-federation.md)) restricts which peers/sources are consulted accordingly. Enforcement is in the engine's query path, not bolted onto each handler, so it cannot be forgotten per endpoint — and it covers the whole leak surface: search, similarity (filtered at the candidate set, not post-top-k), dedup groups (re-formed after filtering; a group of one is not a duplicate), stats/tag aggregates, folder trees, thumbnails/content by id, exports, jobs/events, and MCP (same engine, same predicate).
 
+**Smart and federated grants (implemented by issue #127).** Sharing a smart folder makes its record
+reachable but does not add its live matches to the ceiling; search, counts and manifest export run
+the saved query only after intersecting it with independently shared sources and manual
+collections. A read share on a federated source selects only that registered peer for fan-out and
+for cross-peer similarity, preserves the peer credential/deadline/partial-warning/embedding-space
+gates, and re-attributes returned rows to the local federated source id. Detail and preview reads by
+id must carry that source id (as returned by search); restricted callers never use the
+unrestricted, hintless legacy-bookmark recovery round, and revocation therefore also gates an
+already-cached preview. Federated sources are remote-owned and always read-only: the admin API
+rejects a `write` share rather than recording authority the engine cannot exercise.
+
+Two federation presentation limits remain explicit. A registered peer represents its whole remote
+catalog as one local source, so the local folder-tree endpoint cannot enumerate the peer's internal
+source roots (folder facets in a federated query still work). The peer's own background jobs and
+event stream are not relayed; local jobs such as manifest export are attributed to the federated
+source and obey the ordinary job/event ceiling.
+
 **The cross-database seam.** Identity (accounts, groups, shares) lives in `server.db`; sources and collections live in `library.db`. A share's `resource_id` is therefore a **soft reference** — no FK can enforce it. The layering resolution: shares are resolved **at auth time, in the server**, into a finished `Visibility` value carried on `AuthContext`; the engine never learns what an account or group is. Deleting a source/collection garbage-collects its share rows; ids are UUIDs and never recycled, so a missed GC is clutter, never a grant to a future resource. A share change takes effect on the next request; long-lived subscriptions (the WS stream) watch a generation counter and re-resolve.
 
 **Restricted identities and library-wide operations.** Operations that inherently span the catalog — source add/remove, scans, analysis, blocklist edits, collection creation — require `Full` visibility; the per-resource grant model has no meaningful subset semantics for them in v1.

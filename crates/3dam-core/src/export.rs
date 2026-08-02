@@ -55,6 +55,143 @@ pub(crate) fn run_export(
     run_export_with_checkpoint(store, req, vis, |_| Ok(()))
 }
 
+/// Encode already-authorized assets fetched through federation. The ordinary local export keeps
+/// its bounded SQL streamer; this path exists because peer rows deliberately are not copied into
+/// `library.db`, yet a manifest is still a read surface and must represent a shared peer catalog.
+pub(crate) fn run_federated_export(
+    req: ExportRequest,
+    assets: &[Asset],
+) -> Result<ExportReport, LibError> {
+    let rows = assets.iter().map(remote_export_row).collect::<Vec<_>>();
+    let (count, files_written) = match req.format {
+        ExportFormat::Json => {
+            let out = Path::new(&req.output);
+            let temp = atomic_file(out)?;
+            let mut writer = BufWriter::new(temp);
+            writer.write_all(b"{\"assets\":[").map_err(io_err)?;
+            let mut first = true;
+            let mut count = 0;
+            for row in &rows {
+                if req.attribution_only && !needs_attribution(row) {
+                    continue;
+                }
+                if !first {
+                    writer.write_all(b",").map_err(io_err)?;
+                }
+                first = false;
+                if req.attribution_only {
+                    serde_json::to_writer(&mut writer, &credit_row(row))
+                } else {
+                    serde_json::to_writer(&mut writer, &manifest_row(row))
+                }
+                .map_err(|error| LibError::Internal(format!("write json: {error}")))?;
+                count += 1;
+            }
+            writer.write_all(b"]}").map_err(io_err)?;
+            writer.flush().map_err(io_err)?;
+            persist_file(
+                writer
+                    .into_inner()
+                    .map_err(|error| io_err(error.into_error()))?,
+                out,
+            )?;
+            (count, 1)
+        }
+        ExportFormat::Csv => {
+            let out = Path::new(&req.output);
+            let temp = atomic_file(out)?;
+            let mut writer = csv::Writer::from_writer(temp);
+            let mut count = 0;
+            for row in &rows {
+                if req.attribution_only && !needs_attribution(row) {
+                    continue;
+                }
+                if req.attribution_only {
+                    writer.serialize(credit_row(row))
+                } else {
+                    writer.serialize(manifest_row(row))
+                }
+                .map_err(|error| LibError::Internal(format!("write csv: {error}")))?;
+                count += 1;
+            }
+            writer.flush().map_err(io_err)?;
+            persist_file(
+                writer.into_inner().map_err(|error| {
+                    LibError::Internal(format!("finish csv: {}", error.error()))
+                })?,
+                out,
+            )?;
+            (count, 1)
+        }
+        ExportFormat::Sidecar => {
+            let out = Path::new(&req.output);
+            let parent = output_parent(out);
+            std::fs::create_dir_all(parent).map_err(io_err)?;
+            let stage = tempfile::Builder::new()
+                .prefix(".3dam-export-")
+                .tempdir_in(parent)
+                .map_err(io_err)?;
+            let mut count = 0;
+            for row in &rows {
+                if req.attribution_only && !needs_attribution(row) {
+                    continue;
+                }
+                let path = available_sidecar_path(stage.path(), &row.id.to_string(), &row.name);
+                let mut file = std::fs::File::create(path).map_err(io_err)?;
+                if req.attribution_only {
+                    serde_json::to_writer_pretty(&mut file, &credit_row(row))
+                } else {
+                    serde_json::to_writer_pretty(&mut file, &manifest_row(row))
+                }
+                .map_err(|error| LibError::Internal(format!("encode sidecar: {error}")))?;
+                file.flush().map_err(io_err)?;
+                count += 1;
+            }
+            replace_directory(stage, out)?;
+            (count, count)
+        }
+    };
+    Ok(ExportReport {
+        format: req.format,
+        output: req.output,
+        assets: count,
+        files_written,
+    })
+}
+
+fn remote_export_row(asset: &Asset) -> ExportAssetRow {
+    ExportAssetRow {
+        id: asset.summary.id,
+        name: asset.summary.name.clone(),
+        path: asset.path.clone(),
+        media: asset.summary.media,
+        format: asset.summary.format.clone(),
+        size_bytes: asset.summary.size,
+        hash: asset.hash,
+        license_id: asset.license.id.clone(),
+        license_status: asset.license.status,
+        commercial: asset.license.commercial,
+        modify: asset.license.modify,
+        redistribute: asset.license.redistribute,
+        attribution: asset.license.attribution,
+        attribution_holder: asset.license.holder.clone(),
+        attribution_credit: asset.license.credit.clone(),
+        license_url: asset.license.url.clone(),
+        tags: asset
+            .tags
+            .iter()
+            .filter(|tag| tag.state == SuggestionState::Confirmed)
+            .map(|tag| tag.name.as_str())
+            .collect::<Vec<_>>()
+            .join(";"),
+        note: asset
+            .note
+            .as_ref()
+            .map(|note| note.body.clone())
+            .unwrap_or_default(),
+    }
+}
+
 /// The callback is the progress/cancellation seam for issue #114's background-job wrapper. It is
 /// called before work and after every bounded batch; returning `Cancelled` (or any error) drops the
 /// staging target, leaving a previous successful export untouched.

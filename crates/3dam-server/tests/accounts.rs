@@ -1011,6 +1011,19 @@ async fn leak_audit_collections_and_shared_collection_grant() {
         StatusCode::OK,
         "a shared collection's member must resolve"
     );
+    // The explicit source hint is a federated-routing requirement only. A local asset reached
+    // through manual collection membership must retain every ordinary by-id preview surface.
+    for uri in [
+        format!("/api/v1/assets/{secret_id}/content"),
+        format!("/api/v1/assets/{secret_id}/thumbnail"),
+    ] {
+        let (st, _) = call(&app, "GET", &uri, Some(&vera), None).await;
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "manual collection preview regressed: {uri}"
+        );
+    }
     // Collection ⊅ source: the twin in the same source is still absent.
     let twin_id = asset_id_by_name(&app, &admin, "brick_red_copy.png").await;
     let (st, _) = call(
@@ -2085,12 +2098,11 @@ async fn share_resource_id_is_canonicalised() {
     );
 }
 
-// ── shares that would grant nothing are refused, not accepted-and-inert ──────
+// ── smart-folder and federated-source shares (issue #127) ───────────────────
 
 #[tokio::test]
-async fn smart_collection_cannot_be_shared() {
-    let (app, _s, lib, admin, _vera, _shared, _secret, vera_id) = leak_world().await;
-    // Smart folders are CLI-created in v1 — go through the engine directly.
+async fn smart_collection_share_grants_the_view_but_never_widens_its_live_query() {
+    let (app, store, lib, admin, vera, _shared, _secret, vera_id) = leak_world().await;
     let smart = lib
         .create_collection(
             &AuthContext::embedded(),
@@ -2102,6 +2114,7 @@ async fn smart_collection_cannot_be_shared() {
         )
         .await
         .unwrap();
+    let smart_only_id = create_account(&app, &admin, "smart-only", "viewer").await;
     let (st, body) = call(
         &app,
         "POST",
@@ -2113,16 +2126,147 @@ async fn smart_collection_cannot_be_shared() {
         })),
     )
     .await;
-    assert_eq!(
-        st,
-        StatusCode::BAD_REQUEST,
-        "a smart folder grants nothing — refuse rather than record an inert share: {body}"
-    );
-    assert!(body["message"].as_str().unwrap().contains("smart folder"));
+    assert_eq!(st, StatusCode::OK, "smart-folder share failed: {body}");
+    let vera_share = body["share_id"].as_str().unwrap().to_string();
+    let smart_only_share = share(
+        &app,
+        &admin,
+        "collection",
+        &smart.to_string(),
+        ("account_id", &smart_only_id),
+        "read",
+    )
+    .await;
+
+    // Vera separately holds one source grant. The smart folder's default "all assets" query is
+    // intersected with that grant, so it returns the two shared-source rows and not the two hidden
+    // rows. The live count is evaluated through the same ceiling-filtered query.
+    let (st, body) = call(
+        &app,
+        "POST",
+        &format!("/api/v1/collections/{smart}/assets"),
+        Some(&vera),
+        Some(json!({"limit": 50})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let names: Vec<&str> = body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|asset| asset["name"].as_str())
+        .collect();
+    assert_eq!(names, ["brick_blue.png", "brick_red.png"]);
+    let (st, body) = call(
+        &app,
+        "GET",
+        &format!("/api/v1/collections/{smart}"),
+        Some(&vera),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(body["count"], 2);
+
+    // The second viewer has the smart-folder grant *alone*. The folder record is reachable, but
+    // its saved query grants no assets on search/detail/stats/jobs/export surfaces.
+    let smart_only = login(&app, "smart-only", "password123").await;
+    let (st, body) = call(
+        &app,
+        "POST",
+        &format!("/api/v1/collections/{smart}/assets"),
+        Some(&smart_only),
+        Some(json!({"limit": 50})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(body["items"].as_array().unwrap().is_empty());
+    assert!(query_names(&app, &smart_only).await.is_empty());
+    let (_, stats) = call(&app, "GET", "/api/v1/stats", Some(&smart_only), None).await;
+    assert_eq!(stats["total"], 0);
+    let secret = asset_id_by_name(&app, &admin, "secret_wall.png").await;
+    for uri in [
+        format!("/api/v1/assets/{secret}"),
+        format!("/api/v1/assets/{secret}/content"),
+        format!("/api/v1/assets/{secret}/thumbnail"),
+    ] {
+        let (status, _) = call(&app, "GET", &uri, Some(&smart_only), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "smart query widened {uri}");
+    }
+    let (_, jobs) = call(
+        &app,
+        "POST",
+        "/api/v1/jobs/list",
+        Some(&smart_only),
+        Some(json!({})),
+    )
+    .await;
+    assert!(jobs["items"].as_array().unwrap().is_empty());
+
+    let account = store.get_account(&smart_only_id).unwrap();
+    let visibility = store
+        .resolve_visibility(&dam_api::AccountIdentity {
+            account_id: account.account_id,
+            username: account.username.clone(),
+            role: account.role,
+        })
+        .unwrap();
+    let smart_ctx =
+        AuthContext::connected(Some(account.username), account.role.scopes(), visibility);
+    let output = unique_tmp().join("smart-only.json");
+    let report = lib
+        .export(
+            &smart_ctx,
+            ExportRequest {
+                assets: Vec::new(),
+                collection: Some(smart),
+                query: None,
+                format: ExportFormat::Json,
+                output: output.to_string_lossy().into_owned(),
+                attribution_only: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.assets, 0, "a smart share widened export selection");
+
+    // Both direct and group/account revocations already share this store path. Assert this specific
+    // smart grant bumps the live-subscription generation and disappears on the very next request.
+    let generation = store.visibility_generation();
+    let (st, _) = call(
+        &app,
+        "DELETE",
+        &format!("/admin/api/shares/{smart_only_share}"),
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    assert!(store.visibility_generation() > generation);
+    let (st, _) = call(
+        &app,
+        "GET",
+        &format!("/api/v1/collections/{smart}"),
+        Some(&smart_only),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    // Keep the first share live through all assertions, then prove its direct revocation too.
+    let (st, _) = call(
+        &app,
+        "DELETE",
+        &format!("/admin/api/shares/{vera_share}"),
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
 }
 
 #[tokio::test]
-async fn federated_peer_source_cannot_be_shared() {
+async fn federated_peer_accepts_read_share_rejects_write_and_revokes_next_request() {
     // Needs a *real* peer: the federated `add_source` handshakes over HTTP, so the oneshot seam
     // can't stand in. Bind a second server on an ephemeral port with the federation flag on.
     let peer_lib = Arc::new(
@@ -2147,7 +2291,7 @@ async fn federated_peer_source_cannot_be_shared() {
     let peer_addr = listener.local_addr().unwrap();
     let peer_task = tokio::spawn(async move { axum::serve(listener, peer_app).await.unwrap() });
 
-    let (app, _s, lib, admin, _vera, _shared, _secret, vera_id) = leak_world().await;
+    let (app, store, lib, admin, vera, _shared, _secret, vera_id) = leak_world().await;
     let peer_sid = lib
         .add_source(
             &AuthContext::embedded(),
@@ -2161,6 +2305,7 @@ async fn federated_peer_source_cannot_be_shared() {
         .await
         .unwrap();
 
+    let generation = store.visibility_generation();
     let (st, body) = call(
         &app,
         "POST",
@@ -2172,12 +2317,47 @@ async fn federated_peer_source_cannot_be_shared() {
         })),
     )
     .await;
-    assert_eq!(
-        st,
-        StatusCode::BAD_REQUEST,
-        "peer reads bypass the ceiling, so the grant would be an empty grid under a real count: {body}"
-    );
-    assert!(body["message"].as_str().unwrap().contains("federated peer"));
+    assert_eq!(st, StatusCode::OK, "federated read share failed: {body}");
+    assert!(store.visibility_generation() > generation);
+    let share_id = body["share_id"].as_str().unwrap().to_string();
+    let (st, sources) = call(&app, "GET", "/api/v1/sources", Some(&vera), None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(sources
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|source| source["id"] == peer_sid.to_string()));
+
+    let (st, _) = call(
+        &app,
+        "DELETE",
+        &format!("/admin/api/shares/{share_id}"),
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    let (st, sources) = call(&app, "GET", "/api/v1/sources", Some(&vera), None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(!sources
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|source| source["id"] == peer_sid.to_string()));
+
+    let (st, body) = call(
+        &app,
+        "POST",
+        "/admin/api/shares",
+        Some(&admin),
+        Some(json!({
+            "resource": "source", "resource_id": peer_sid.to_string(),
+            "account_id": vera_id, "access": "write",
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert!(body["message"].as_str().unwrap().contains("read-only"));
     peer_task.abort();
 }
 

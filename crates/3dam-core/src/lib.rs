@@ -891,17 +891,37 @@ impl EmbeddedLibrary {
     /// Guard a single-asset read: an asset outside the ceiling answers `NotFound`,
     /// indistinguishable from a nonexistent id.
     async fn require_asset_visible(&self, ctx: &AuthContext, id: &AssetId) -> Result<(), LibError> {
-        if ctx.visibility.is_full() {
-            return Ok(());
-        }
-        let vis = ctx.visibility.clone();
-        let id = *id;
-        let ok = self.db(move |s| s.asset_visible(&id, &vis)).await?;
-        if ok {
+        if self.asset_visible(ctx, id).await? {
             Ok(())
         } else {
             Err(LibError::NotFound(format!("asset {id}")))
         }
+    }
+
+    /// Local-catalog half of an asset guard. Peer-owned assets are not stored in this database, so
+    /// follow-up reads use the explicit federated source hint after this returns false.
+    async fn asset_visible(&self, ctx: &AuthContext, id: &AssetId) -> Result<bool, LibError> {
+        if ctx.visibility.is_full() {
+            let id = *id;
+            return self
+                .db(move |store| match store.get_asset(&id) {
+                    Ok(_) => Ok(true),
+                    Err(LibError::NotFound(_)) => Ok(false),
+                    Err(error) => Err(error),
+                })
+                .await;
+        }
+        let vis = ctx.visibility.clone();
+        let id = *id;
+        self.db(move |s| s.asset_visible(&id, &vis)).await
+    }
+
+    /// Whether a failed local lookup may be routed to a peer. Restricted callers must carry the
+    /// source attribution returned by search and that source must still be in the current ceiling;
+    /// unrestricted owner contexts retain bounded hintless bookmark recovery.
+    fn may_proxy_peer(ctx: &AuthContext, source: Option<SourceId>) -> bool {
+        ctx.visibility.is_full()
+            || source.is_some_and(|source| ctx.visibility.allows_source(&source))
     }
 
     /// Guard a single-asset write: the asset must be *write*-reachable (a `write` share on its
@@ -952,16 +972,7 @@ impl EmbeddedLibrary {
         }
     }
 
-    /// The local-index query path — the pre-federation body of [`LibraryService::query`], shared
-    /// by the plain path and the fan-out engine (which merges this page with the peers').
-    pub(crate) async fn local_query(
-        &self,
-        req: QueryRequest,
-    ) -> Result<Page<AssetSummary>, LibError> {
-        self.local_query_vis(req, Visibility::Full).await
-    }
-
-    /// [`Self::local_query`] under a visibility ceiling (issue #42) — the ceiling composes into the
+    /// The local-index query path under a visibility ceiling (issue #42) — the ceiling composes into the
     /// store's WHERE clause, so lexical, hybrid, and semantic paths all filter identically.
     pub(crate) async fn local_query_vis(
         &self,
@@ -983,6 +994,84 @@ impl EmbeddedLibrary {
             s.query_assets_semantic(&req, text_vec, &vis)
         })
         .await
+    }
+
+    /// Materialize the authorized union only when a restricted export includes at least one
+    /// federated source. Peer rows are never copied into the local store, so the local SQL exporter
+    /// cannot see them; collecting details through the ordinary guarded read seam keeps source
+    /// selection, peer credentials, deadlines, and revocation identical to interactive reads.
+    async fn federated_export_assets(
+        &self,
+        ctx: &AuthContext,
+        req: &ExportRequest,
+    ) -> Result<Option<Vec<Asset>>, LibError> {
+        if ctx.visibility.is_full() {
+            return Ok(None);
+        }
+        let peer_sources = self
+            .fed_peers()
+            .await
+            .iter()
+            .filter(|peer| ctx.visibility.allows_source(&peer.source_id))
+            .map(|peer| peer.source_id)
+            .collect::<Vec<_>>();
+        if peer_sources.is_empty() {
+            return Ok(None);
+        }
+
+        if !req.assets.is_empty() {
+            let mut assets = Vec::new();
+            for id in &req.assets {
+                if let Ok(asset) = self.get_asset(ctx, id).await {
+                    assets.push(asset);
+                    continue;
+                }
+                for source in &peer_sources {
+                    if let Ok(asset) = self.get_asset_from(ctx, id, Some(*source)).await {
+                        assets.push(asset);
+                        break;
+                    }
+                }
+            }
+            return Ok(Some(assets));
+        }
+
+        let mut query = if let Some(collection) = req.collection {
+            let record = self.get_collection(ctx, &collection).await?;
+            if record.kind == CollectionKind::Manual {
+                return Ok(None);
+            }
+            record.query.ok_or_else(incompatible_smart_query)?
+        } else {
+            req.query.clone().unwrap_or_default()
+        };
+        query.include_facets = false;
+        query.include_total = Some(false);
+        query.page = PageParams {
+            after: None,
+            limit: 500,
+        };
+
+        let mut assets = Vec::new();
+        loop {
+            let page = self.query(ctx, query.clone()).await?;
+            if !page.partial.complete {
+                return Err(LibError::SourceUnavailable(
+                    "federated export stopped because an authorized peer did not answer".into(),
+                ));
+            }
+            for summary in page.items {
+                assets.push(
+                    self.get_asset_from(ctx, &summary.id, summary.source_id)
+                        .await?,
+                );
+            }
+            let Some(cursor) = page.cursor else {
+                break;
+            };
+            query.page.after = Some(cursor);
+        }
+        Ok(Some(assets))
     }
 
     /// The `media type → EmbeddingSpace id` map this instance ranks similarity in — what
@@ -1169,8 +1258,8 @@ impl LibraryService for EmbeddedLibrary {
         // are registered. `local_only` marks a peer-bound call — one hop, never transitive.
         // Restricted contexts never fan out (a peer's catalog is outside their reachable set);
         // their query runs locally under the ceiling predicate.
-        if !req.local_only && ctx.visibility.is_full() {
-            if let Some(page) = federation::federated_query(self, &req).await? {
+        if !req.local_only {
+            if let Some(page) = federation::federated_query(self, &req, &ctx.visibility).await? {
                 return Ok(page);
             }
         }
@@ -1187,17 +1276,21 @@ impl LibraryService for EmbeddedLibrary {
         id: &AssetId,
         source: Option<SourceId>,
     ) -> Result<Asset, LibError> {
-        self.require_asset_visible(ctx, id).await?;
         let id = *id;
         // The detail read is the one path that surfaces collection membership, so it carries the
         // ceiling: an asset reached through a collection share must not enumerate the *other*
         // collections holding it (issue #42 — unreachable is absent, not merely denied).
         let vis = ctx.visibility.clone();
-        match self.db(move |s| s.get_asset_detail(&id, &vis)).await {
+        let local = if self.asset_visible(ctx, &id).await? {
+            self.db(move |s| s.get_asset_detail(&id, &vis)).await
+        } else {
+            Err(LibError::NotFound(format!("asset {id}")))
+        };
+        match local {
             // A merged result can name a peer-owned asset: proxy the detail read (phase 6).
             // Never for a restricted context — the ceiling can't vouch for peer-owned ids.
-            Err(LibError::NotFound(_)) if ctx.visibility.is_full() => {
-                federation::proxy_get_asset(self, &id, source)
+            Err(LibError::NotFound(_)) if Self::may_proxy_peer(ctx, source) => {
+                federation::proxy_get_asset(self, &id, source, ctx.visibility.is_full())
                     .await
                     .ok_or_else(|| LibError::NotFound(format!("asset {id}")))
             }
@@ -1219,19 +1312,21 @@ impl LibraryService for EmbeddedLibrary {
         id: &AssetId,
         source: Option<SourceId>,
     ) -> Result<AssetContent, LibError> {
-        self.require_asset_visible(ctx, id).await?;
         let id = *id;
         let scratch = self.scratch();
         let secrets = self.secrets.clone();
-        let local = self
-            .db(move |s| {
+        let local = if self.asset_visible(ctx, &id).await? {
+            self.db(move |s| {
                 let asset = s.get_asset(&id)?;
                 read_asset_content(s, &secrets, &asset, &scratch)
             })
-            .await;
+            .await
+        } else {
+            Err(LibError::NotFound(format!("asset {id}")))
+        };
         match local {
-            Err(LibError::NotFound(_)) if ctx.visibility.is_full() => {
-                federation::proxy_read_content(self, &id, source)
+            Err(LibError::NotFound(_)) if Self::may_proxy_peer(ctx, source) => {
+                federation::proxy_read_content(self, &id, source, ctx.visibility.is_full())
                     .await
                     .ok_or_else(|| LibError::NotFound(format!("asset {id}")))
             }
@@ -1253,22 +1348,24 @@ impl LibraryService for EmbeddedLibrary {
         id: &AssetId,
         source: Option<SourceId>,
     ) -> Result<AssetContentMetadata, LibError> {
-        self.require_asset_visible(ctx, id).await?;
         let id = *id;
         let scratch = self.scratch();
         let secrets = self.secrets.clone();
-        let local = self
-            .db(move |store| {
+        let local = if self.asset_visible(ctx, &id).await? {
+            self.db(move |store| {
                 let asset = store.get_asset(&id)?;
                 let connection = secrets.resolve(store.get_source_connection(&asset.source_id)?)?;
                 let source = dam_sources::open_source(&connection, &scratch)?;
                 let stat = source.content_stat(&asset.path)?;
                 Ok(content_metadata(&asset, stat))
             })
-            .await;
+            .await
+        } else {
+            Err(LibError::NotFound(format!("asset {id}")))
+        };
         match local {
-            Err(LibError::NotFound(_)) if ctx.visibility.is_full() => {
-                federation::proxy_content_metadata(self, &id, source)
+            Err(LibError::NotFound(_)) if Self::may_proxy_peer(ctx, source) => {
+                federation::proxy_content_metadata(self, &id, source, ctx.visibility.is_full())
                     .await
                     .ok_or_else(|| LibError::NotFound(format!("asset {id}")))
             }
@@ -1292,12 +1389,11 @@ impl LibraryService for EmbeddedLibrary {
         range: ContentRange,
         source: Option<SourceId>,
     ) -> Result<AssetContentStream, LibError> {
-        self.require_asset_visible(ctx, id).await?;
         let id = *id;
         let scratch = self.scratch();
         let secrets = self.secrets.clone();
-        let local = self
-            .db(move |store| {
+        let local = if self.asset_visible(ctx, &id).await? {
+            self.db(move |store| {
                 let asset = store.get_asset(&id)?;
                 let connection = secrets.resolve(store.get_source_connection(&asset.source_id)?)?;
                 let source = dam_sources::open_source(&connection, &scratch)?;
@@ -1310,13 +1406,16 @@ impl LibraryService for EmbeddedLibrary {
                 let metadata = content_metadata(&asset, stat);
                 Ok((source, asset.path, metadata))
             })
-            .await;
+            .await
+        } else {
+            Err(LibError::NotFound(format!("asset {id}")))
+        };
         match local {
             Ok((source, path, metadata)) => {
                 Ok(source_content_stream(source, path, metadata, range))
             }
-            Err(LibError::NotFound(_)) if ctx.visibility.is_full() => {
-                federation::proxy_stream_content(self, &id, range, source)
+            Err(LibError::NotFound(_)) if Self::may_proxy_peer(ctx, source) => {
+                federation::proxy_stream_content(self, &id, range, source, ctx.visibility.is_full())
                     .await
                     .ok_or_else(|| LibError::NotFound(format!("asset {id}")))
             }
@@ -1340,21 +1439,23 @@ impl LibraryService for EmbeddedLibrary {
         rel: &str,
         source: Option<SourceId>,
     ) -> Result<AssetContent, LibError> {
-        self.require_asset_visible(ctx, id).await?;
         let id = *id;
         let rel = rel.to_string();
         let rel2 = rel.clone();
         let scratch = self.scratch();
         let secrets = self.secrets.clone();
-        let local = self
-            .db(move |s| {
+        let local = if self.asset_visible(ctx, &id).await? {
+            self.db(move |s| {
                 let asset = s.get_asset(&id)?;
                 read_related_content(s, &secrets, &asset, &rel2, &scratch)
             })
-            .await;
+            .await
+        } else {
+            Err(LibError::NotFound(format!("asset {id}")))
+        };
         match local {
-            Err(LibError::NotFound(_)) if ctx.visibility.is_full() => {
-                federation::proxy_read_related(self, &id, &rel, source)
+            Err(LibError::NotFound(_)) if Self::may_proxy_peer(ctx, source) => {
+                federation::proxy_read_related(self, &id, &rel, source, ctx.visibility.is_full())
                     .await
                     .ok_or_else(|| LibError::NotFound(format!("asset {id}")))
             }
@@ -1378,7 +1479,6 @@ impl LibraryService for EmbeddedLibrary {
         max_edge: u32,
         source: Option<SourceId>,
     ) -> Result<AssetContent, LibError> {
-        self.require_asset_visible(ctx, id).await?;
         let id = *id;
         let edge = max_edge.clamp(THUMB_MIN_EDGE, THUMB_MAX_EDGE);
         let data_dir = self.data_dir.clone();
@@ -1387,24 +1487,33 @@ impl LibraryService for EmbeddedLibrary {
         // Fast path: a cheap cache probe on the unbounded pool, so an already-rendered thumbnail is
         // never stuck behind background generation.
         let probe_dir = data_dir.clone();
-        let probe = self
-            .db(move |s| {
+        let probe = if self.asset_visible(ctx, &id).await? {
+            self.db(move |s| {
                 let asset = s.get_asset(&id)?;
                 Ok((
                     thumb_cache_lookup(&cache, &probe_dir, &asset, edge),
                     asset.summary.media == MediaType::Model,
                 ))
             })
-            .await;
+            .await
+        } else {
+            Err(LibError::NotFound(format!("asset {id}")))
+        };
         let is_model = match probe {
             Ok((Some(hit), _)) => return Ok(hit),
             Ok((None, is_model)) => is_model,
             // Peer-owned asset: fetch its remote-owned preview — the one sanctioned federated byte
             // transfer (tech-spec 07 §4) — through the 7-day local peer cache. Full-visibility only.
-            Err(LibError::NotFound(_)) if ctx.visibility.is_full() => {
-                return federation::proxy_thumbnail(self, &id, edge, source)
-                    .await
-                    .ok_or_else(|| LibError::NotFound(format!("asset {id}")))
+            Err(LibError::NotFound(_)) if Self::may_proxy_peer(ctx, source) => {
+                return federation::proxy_thumbnail(
+                    self,
+                    &id,
+                    edge,
+                    source,
+                    ctx.visibility.is_full(),
+                )
+                .await
+                .ok_or_else(|| LibError::NotFound(format!("asset {id}")))
             }
             Err(e) => return Err(e),
         };
@@ -1449,14 +1558,13 @@ impl LibraryService for EmbeddedLibrary {
         id: &AssetId,
         source: Option<SourceId>,
     ) -> Result<AssetContent, LibError> {
-        self.require_asset_visible(ctx, id).await?;
         let id = *id;
         let data_dir = self.data_dir.clone();
         let cache = self.cache.clone();
         let secrets = self.secrets.clone();
         let probe_dir = data_dir.clone();
-        let probe = self
-            .db(move |s| {
+        let probe = if self.asset_visible(ctx, &id).await? {
+            self.db(move |s| {
                 let asset = s.get_asset(&id)?;
                 if asset.summary.media != MediaType::Model {
                     return Err(LibError::Unsupported(
@@ -1465,14 +1573,22 @@ impl LibraryService for EmbeddedLibrary {
                 }
                 Ok(model_preview_cache_lookup(&cache, &probe_dir, &asset))
             })
-            .await;
+            .await
+        } else {
+            Err(LibError::NotFound(format!("asset {id}")))
+        };
         match probe {
             Ok(Some(hit)) => return Ok(hit),
             Ok(None) => {}
-            Err(LibError::NotFound(_)) if ctx.visibility.is_full() => {
-                return federation::proxy_model_preview(self, &id, source)
-                    .await
-                    .ok_or_else(|| LibError::NotFound(format!("asset {id}")));
+            Err(LibError::NotFound(_)) if Self::may_proxy_peer(ctx, source) => {
+                return federation::proxy_model_preview(
+                    self,
+                    &id,
+                    source,
+                    ctx.visibility.is_full(),
+                )
+                .await
+                .ok_or_else(|| LibError::NotFound(format!("asset {id}")));
             }
             Err(error) => return Err(error),
         }
@@ -1610,7 +1726,40 @@ impl LibraryService for EmbeddedLibrary {
     ) -> Result<LibraryStats, LibError> {
         let vis = ctx.visibility.clone();
         let Some(sid) = source else {
-            return self.db(move |s| s.stats(None, &vis)).await;
+            let mut stats = self.db(move |s| s.stats(None, &vis)).await?;
+            // Preserve the established owner view (unscoped stats describe the local index), but
+            // make a restricted peer-only account's aggregate agree with its federated search and
+            // MCP view. Only shared peers are contacted; unavailable peers fail soft because this
+            // DTO predates per-peer partial warnings.
+            if !ctx.visibility.is_full() {
+                for peer in self
+                    .fed_peers()
+                    .await
+                    .iter()
+                    .filter(|peer| ctx.visibility.allows_source(&peer.source_id))
+                {
+                    let peer_stats = tokio::time::timeout(
+                        federation::QUERY_DEADLINE,
+                        peer.client.library_stats(&AuthContext::embedded(), None),
+                    )
+                    .await;
+                    let Ok(Ok(peer_stats)) = peer_stats else {
+                        continue;
+                    };
+                    stats.total += peer_stats.total;
+                    stats.unanalyzed += peer_stats.unanalyzed;
+                    for (media, count) in peer_stats.by_media {
+                        *stats.by_media.entry(media).or_default() += count;
+                    }
+                    for (tag, count) in peer_stats.tags {
+                        *stats.tags.entry(tag).or_default() += count;
+                    }
+                    // The peer is one source in this library's namespace. Do not leak or collide
+                    // its internal source names in the outer sidebar aggregate.
+                    stats.by_source.insert(peer.name.clone(), peer_stats.total);
+                }
+            }
+            return Ok(stats);
         };
         // A source-scoped read of an unreachable source is absent, not an aggregate oracle.
         if !ctx.visibility.allows_source(&sid) {
@@ -2224,6 +2373,11 @@ impl LibraryService for EmbeddedLibrary {
         ctx: &AuthContext,
         req: ExportRequest,
     ) -> Result<ExportReport, LibError> {
+        if let Some(assets) = self.federated_export_assets(ctx, &req).await? {
+            return tokio::task::spawn_blocking(move || export::run_federated_export(req, &assets))
+                .await
+                .map_err(|error| LibError::Internal(error.to_string()))?;
+        }
         let vis = ctx.visibility.clone();
         self.db(move |s| export::run_export(s, req, &vis)).await
     }
@@ -2233,6 +2387,7 @@ impl LibraryService for EmbeddedLibrary {
         ctx: &AuthContext,
         req: ExportRequest,
     ) -> Result<JobId, LibError> {
+        let federated_assets = self.federated_export_assets(ctx, &req).await?;
         let total = (!req.assets.is_empty()).then_some(req.assets.len() as u64);
         let params = serde_json::to_string(&req).unwrap_or_else(|_| "{}".into());
         let (sources, collections): (Vec<SourceId>, Vec<CollectionId>) =
@@ -2264,25 +2419,33 @@ impl LibraryService for EmbeddedLibrary {
         let events = self.events.clone();
         let vis = ctx.visibility.clone();
         tokio::task::spawn_blocking(move || {
-            let outcome = export::run_export_with_checkpoint(&store, req, &vis, |done| {
+            let outcome = if let Some(assets) = federated_assets {
                 if cancel.load(Ordering::Relaxed) {
-                    return Err(LibError::Cancelled);
+                    Err(LibError::Cancelled)
+                } else {
+                    export::run_federated_export(req, &assets)
                 }
-                reliability::retryable_store_write(
-                    store.update_job_progress(
-                        &job,
-                        JobState::Running,
-                        done,
-                        total,
-                        Some("Encoding manifest"),
-                    ),
-                    "persist export progress",
-                    Some(&job),
-                    None,
-                );
-                emit_progress(&store, &events, &job);
-                Ok(())
-            });
+            } else {
+                export::run_export_with_checkpoint(&store, req, &vis, |done| {
+                    if cancel.load(Ordering::Relaxed) {
+                        return Err(LibError::Cancelled);
+                    }
+                    reliability::retryable_store_write(
+                        store.update_job_progress(
+                            &job,
+                            JobState::Running,
+                            done,
+                            total,
+                            Some("Encoding manifest"),
+                        ),
+                        "persist export progress",
+                        Some(&job),
+                        None,
+                    );
+                    emit_progress(&store, &events, &job);
+                    Ok(())
+                })
+            };
             match outcome {
                 Ok(report) => {
                     let result = JobResult::Export(report.clone());
@@ -2528,7 +2691,16 @@ impl LibraryService for EmbeddedLibrary {
     ) -> Result<Page<SimilarHit>, LibError> {
         // The seed asset itself must be reachable (a hidden id must not seed a ranking), and the
         // neighbour candidates are ceiling-filtered inside the store's summary fetch.
-        self.require_asset_visible(ctx, &req.asset).await?;
+        if !self.asset_visible(ctx, &req.asset).await? {
+            if !req.local_only {
+                if let Some(page) =
+                    federation::federated_seed_similar(self, &req, &ctx.visibility).await
+                {
+                    return Ok(page);
+                }
+            }
+            return Err(LibError::NotFound(format!("asset {}", req.asset)));
+        }
         let (asset, k) = (req.asset, req.k);
         let filters = req.filters.clone();
         let vis = ctx.visibility.clone();
@@ -2548,8 +2720,7 @@ impl LibraryService for EmbeddedLibrary {
                 score,
             })
             .collect::<Vec<_>>();
-        if req.local_only || !ctx.visibility.is_full() {
-            // Restricted contexts never fan out — peer catalogs sit outside their reachable set.
+        if req.local_only {
             return Ok(Page::new(hits, None));
         }
         // Cross-peer similarity (phase 6, issue #40): ship the query asset's own vector to every
@@ -2565,7 +2736,16 @@ impl LibraryService for EmbeddedLibrary {
         match embedding {
             Some((space, vector)) => {
                 let media = self.get_asset(ctx, &req.asset).await?.summary.media;
-                Ok(federation::federated_similar(self, &req, media, space, vector, hits).await)
+                Ok(federation::federated_similar(
+                    self,
+                    &req,
+                    &ctx.visibility,
+                    media,
+                    space,
+                    vector,
+                    hits,
+                )
+                .await)
             }
             None => {
                 let local_has = !hits.is_empty()

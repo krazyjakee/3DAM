@@ -248,6 +248,7 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
     resource: ShareResource;
     id: string;
     name: string;
+    readOnly?: boolean;
   } | null>(null);
 
   const total = stats.data?.total ?? 0;
@@ -413,12 +414,14 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
             go({ source: state.source === s.id ? null : s.id, path: null, collection: null })
           }
           onShare={
-            // A federated peer source can be shared in the data model but grants nothing: the
-            // engine skips the peer path for any restricted context, so the grantee would get a
-            // sidebar entry with a real count over a permanently empty grid. The server rejects
-            // such a share; don't offer it here either (issue #42).
-            canShare && s.kind !== "federated"
-              ? () => setShare({ resource: "source", id: s.id, name: s.name })
+            canShare
+              ? () =>
+                  setShare({
+                    resource: "source",
+                    id: s.id,
+                    name: s.name,
+                    readOnly: s.kind === "federated",
+                  })
               : undefined
           }
           onRescan={() => scan.mutate({ sources: [s.id], mode: "delta" })}
@@ -451,8 +454,6 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
       <Collections
         gate={gate}
         onShare={
-          // Smart folders are excluded inside `Collections` (their membership is a live query with
-          // no rows to grant) — see the `onShare` guard on each row.
           canShare
             ? (c) => setShare({ resource: "collection", id: c.id, name: c.name })
             : undefined
@@ -533,6 +534,7 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
           resource={share.resource}
           resourceId={share.id}
           resourceName={share.name}
+          readOnly={share.readOnly}
           onClose={() => setShare(null)}
         />
       )}
@@ -634,10 +636,7 @@ function Collections({
           collection={c}
           gate={gate}
           active={activeId === c.id}
-          // A smart folder's membership is a live query, and a collection grant expands only
-          // through stored `collection_member` rows — so sharing one would grant nothing at all.
-          // The server rejects it; the affordance is absent rather than a button that errors.
-          onShare={onShare && c.kind !== "smart" ? () => onShare(c) : undefined}
+          onShare={onShare ? () => onShare(c) : undefined}
           onSelect={() => onSelect(activeId === c.id ? null : c.id)}
           onRename={async () => {
             const name = (

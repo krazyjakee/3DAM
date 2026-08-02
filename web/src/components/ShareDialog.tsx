@@ -21,12 +21,15 @@ export function ShareDialog({
   resource,
   resourceId,
   resourceName,
+  readOnly = false,
   onClose,
 }: {
   resource: ShareResource;
   resourceId: string;
   /** The source/collection's display name — for the title only. */
   resourceName: string;
+  /** Federated sources are remote-owned: they may be shared for reading, never writing. */
+  readOnly?: boolean;
   onClose: () => void;
 }) {
   const [shares, setShares] = useState<ShareInfo[] | null>(null);
@@ -83,7 +86,7 @@ export function ShareDialog({
         resource,
         resource_id: resourceId,
         ...(kind === "account" ? { account_id: target } : { group_id: target }),
-        access,
+        access: readOnly ? "read" : access,
       });
       setTarget("");
       await load();
@@ -120,7 +123,7 @@ export function ShareDialog({
     >
       <p className="mb-3 text-xs text-fg-dim">
         Grant accounts or groups access to this {resource}. Without a grant it stays visible to
-        admins only.
+        admins only.{readOnly ? " This federated source is read-only." : ""}
       </p>
 
       {error && <p className="mb-2 text-xs text-danger">{error}</p>}
@@ -186,9 +189,10 @@ export function ShareDialog({
           aria-label="Access level"
           value={access}
           onChange={(e) => setAccess(e.target.value as ShareAccess)}
+          disabled={readOnly}
         >
           <option value="read">read</option>
-          <option value="write">write</option>
+          {!readOnly && <option value="write">write</option>}
         </select>
         <button
           type="button"

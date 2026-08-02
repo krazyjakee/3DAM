@@ -15,7 +15,7 @@ use base64::Engine as _;
 use dam_api::dto::*;
 use dam_api::id::{AssetId, SourceId};
 use dam_api::page::{Cursor, ItemWarning, Page, PageParams, PartialStatus};
-use dam_api::service::{AuthContext, LibraryService};
+use dam_api::service::{AuthContext, LibraryService, Visibility};
 use dam_api::{protocol_compatible, LibError, PeerAdvertise, FEDERATION_PROTOCOL_VERSION};
 use dam_client::ApiClient;
 use futures::StreamExt;
@@ -452,6 +452,7 @@ fn sum_stream_totals(
 pub(crate) async fn federated_query(
     lib: &EmbeddedLibrary,
     req: &QueryRequest,
+    visibility: &Visibility,
 ) -> Result<Option<Page<AssetSummary>>, LibError> {
     let peers = lib.fed_peers().await;
     if peers.is_empty() {
@@ -488,9 +489,21 @@ pub(crate) async fn federated_query(
     }
 
     let active_peers: Vec<Arc<Peer>> = match &peer_target {
-        Some(p) => vec![p.clone()],
-        None => peers.iter().cloned().collect(),
+        Some(p) if visibility.allows_source(&p.source_id) => vec![p.clone()],
+        Some(_) => Vec::new(),
+        None => peers
+            .iter()
+            .filter(|peer| visibility.allows_source(&peer.source_id))
+            .cloned()
+            .collect(),
     };
+
+    // No reachable peer means this is an ordinary local query under the ceiling. In particular,
+    // a source filter naming an unshared peer reaches this branch and returns an empty local page;
+    // the peer is never contacted and its existence is not reflected in a partial warning.
+    if active_peers.is_empty() {
+        return Ok(None);
+    }
 
     // Local page (skipped under peer-only routing). A local failure is a hard error — fail-soft
     // applies to remote edges, not our own index.
@@ -506,7 +519,7 @@ pub(crate) async fn federated_query(
                 r.local_only = true;
                 r.include_facets = false;
                 r.page = PageParams { after, limit };
-                lib.local_query(r)
+                lib.local_query_vis(r, visibility.clone())
             })
             .await,
         )
@@ -622,6 +635,7 @@ pub(crate) async fn federated_query(
 pub(crate) async fn federated_similar(
     lib: &EmbeddedLibrary,
     req: &SimilarRequest,
+    visibility: &Visibility,
     media: MediaType,
     space: String,
     vector: Vec<f32>,
@@ -631,48 +645,51 @@ pub(crate) async fn federated_similar(
     let mut partial = PartialStatus::default();
     let mut all = local;
 
-    let peer_futs = peers.iter().map(|p| {
-        let peer = p.clone();
-        let (media, space, vector) = (media, space.clone(), vector.clone());
-        let filters = req.filters.clone();
-        let k = req.k;
-        async move {
-            let run = async {
-                let ad = peer.advertise().await?;
-                if !protocol_compatible(&ad.protocol_version, FEDERATION_PROTOCOL_VERSION) {
-                    return Err(LibError::Unsupported(format!(
-                        "peer speaks federation protocol {}, this build speaks {}",
-                        ad.protocol_version, FEDERATION_PROTOCOL_VERSION
-                    )));
-                }
-                if ad.spaces.get(media.as_str()) != Some(&space) {
-                    return Ok(None); // mismatched embedding space — never co-rank (issue #40)
-                }
-                let hits = peer
-                    .client
-                    .find_similar_by_vector(
-                        &ectx(),
-                        dam_api::VectorSimilarRequest {
-                            media,
-                            space: space.clone(),
-                            vector,
-                            k,
-                            filters,
-                        },
-                    )
-                    .await?;
-                Ok(Some(hits.items))
-            };
-            let res = match tokio::time::timeout(QUERY_DEADLINE, run).await {
-                Ok(r) => r,
-                Err(_) => Err(LibError::SourceUnavailable(format!(
-                    "no answer within the {}ms federated deadline",
-                    QUERY_DEADLINE.as_millis()
-                ))),
-            };
-            (peer, res)
-        }
-    });
+    let peer_futs = peers
+        .iter()
+        .filter(|peer| visibility.allows_source(&peer.source_id))
+        .map(|p| {
+            let peer = p.clone();
+            let (media, space, vector) = (media, space.clone(), vector.clone());
+            let filters = req.filters.clone();
+            let k = req.k;
+            async move {
+                let run = async {
+                    let ad = peer.advertise().await?;
+                    if !protocol_compatible(&ad.protocol_version, FEDERATION_PROTOCOL_VERSION) {
+                        return Err(LibError::Unsupported(format!(
+                            "peer speaks federation protocol {}, this build speaks {}",
+                            ad.protocol_version, FEDERATION_PROTOCOL_VERSION
+                        )));
+                    }
+                    if ad.spaces.get(media.as_str()) != Some(&space) {
+                        return Ok(None); // mismatched embedding space — never co-rank (issue #40)
+                    }
+                    let hits = peer
+                        .client
+                        .find_similar_by_vector(
+                            &ectx(),
+                            dam_api::VectorSimilarRequest {
+                                media,
+                                space: space.clone(),
+                                vector,
+                                k,
+                                filters,
+                            },
+                        )
+                        .await?;
+                    Ok(Some(hits.items))
+                };
+                let res = match tokio::time::timeout(QUERY_DEADLINE, run).await {
+                    Ok(r) => r,
+                    Err(_) => Err(LibError::SourceUnavailable(format!(
+                        "no answer within the {}ms federated deadline",
+                        QUERY_DEADLINE.as_millis()
+                    ))),
+                };
+                (peer, res)
+            }
+        });
 
     for (peer, res) in futures::future::join_all(peer_futs).await {
         match res {
@@ -719,6 +736,35 @@ pub(crate) async fn federated_similar(
     }
 }
 
+/// Forward an id-seeded similarity request when the seed belongs to a peer. Asset ids are global
+/// UUIDs but the v1 request has no separate owner field, so contact only peers inside the caller's
+/// ceiling and stop at the first one that recognizes the seed. A restricted context therefore
+/// cannot use an arbitrary id as a probe against unshared peers.
+pub(crate) async fn federated_seed_similar(
+    lib: &EmbeddedLibrary,
+    req: &SimilarRequest,
+    visibility: &Visibility,
+) -> Option<Page<SimilarHit>> {
+    let peers = lib.fed_peers().await;
+    for peer in peers
+        .iter()
+        .filter(|peer| visibility.allows_source(&peer.source_id))
+    {
+        let mut fwd = req.clone();
+        fwd.local_only = true;
+        let result =
+            tokio::time::timeout(QUERY_DEADLINE, peer.client.find_similar(&ectx(), fwd)).await;
+        if let Ok(Ok(mut page)) = result {
+            for hit in &mut page.items {
+                hit.asset.origin = Origin::Peer(peer.name.clone());
+                hit.asset.source_id = Some(peer.source_id);
+            }
+            return Some(page);
+        }
+    }
+    None
+}
+
 // ── peer read proxying (previews + detail for merged peer hits) ─────────────────────────────
 
 /// Route a follow-up read to its locally registered owner. A valid hint performs exactly one
@@ -727,6 +773,7 @@ pub(crate) async fn federated_similar(
 async fn try_peers<T, F, Fut>(
     lib: &EmbeddedLibrary,
     owner: Option<SourceId>,
+    recover: bool,
     call: F,
 ) -> Option<(SourceId, T)>
 where
@@ -739,6 +786,13 @@ where
                 return Some((source, value));
             }
         }
+    }
+
+    // A restricted caller must provide the source attribution returned by search and may contact
+    // only that peer. Hintless/stale-bookmark recovery is reserved for unrestricted owner
+    // contexts; otherwise a revoked share could silently fall through to another peer.
+    if !recover {
+        return None;
     }
 
     let peers = lib.fed_peers().await;
@@ -770,9 +824,10 @@ pub(crate) async fn proxy_get_asset(
     lib: &EmbeddedLibrary,
     id: &AssetId,
     owner: Option<SourceId>,
+    recover: bool,
 ) -> Option<Asset> {
     let id = *id;
-    try_peers(lib, owner, |peer| async move {
+    try_peers(lib, owner, recover, |peer| async move {
         let mut asset = peer.client.get_asset(&ectx(), &id).await?;
         asset.summary.origin = Origin::Peer(peer.name.clone());
         // Both attribution fields name the local federated source row, not the peer's own source.
@@ -790,9 +845,10 @@ pub(crate) async fn proxy_read_content(
     lib: &EmbeddedLibrary,
     id: &AssetId,
     owner: Option<SourceId>,
+    recover: bool,
 ) -> Option<AssetContent> {
     let id = *id;
-    try_peers(lib, owner, |peer| async move {
+    try_peers(lib, owner, recover, |peer| async move {
         peer.client.read_content(&ectx(), &id).await
     })
     .await
@@ -806,9 +862,10 @@ pub(crate) async fn proxy_content_metadata(
     lib: &EmbeddedLibrary,
     id: &AssetId,
     owner: Option<SourceId>,
+    recover: bool,
 ) -> Option<AssetContentMetadata> {
     let id = *id;
-    try_peers(lib, owner, |peer| async move {
+    try_peers(lib, owner, recover, |peer| async move {
         peer.client.content_metadata(&ectx(), &id).await
     })
     .await
@@ -820,9 +877,10 @@ pub(crate) async fn proxy_stream_content(
     id: &AssetId,
     range: ContentRange,
     owner: Option<SourceId>,
+    recover: bool,
 ) -> Option<AssetContentStream> {
     let id = *id;
-    try_peers(lib, owner, |peer| async move {
+    try_peers(lib, owner, recover, |peer| async move {
         peer.client.stream_content(&ectx(), &id, range).await
     })
     .await
@@ -834,10 +892,11 @@ pub(crate) async fn proxy_read_related(
     id: &AssetId,
     rel: &str,
     owner: Option<SourceId>,
+    recover: bool,
 ) -> Option<AssetContent> {
     let id = *id;
     let rel = rel.to_string();
-    try_peers(lib, owner, |peer| {
+    try_peers(lib, owner, recover, |peer| {
         let rel = rel.clone();
         async move { peer.client.read_related_content(&ectx(), &id, &rel).await }
     })
@@ -852,6 +911,7 @@ pub(crate) async fn proxy_thumbnail(
     id: &AssetId,
     edge: u32,
     owner: Option<SourceId>,
+    recover: bool,
 ) -> Option<AssetContent> {
     let flight = format!(
         "peer-thumbnail:{}:{id}:{edge}",
@@ -870,7 +930,7 @@ pub(crate) async fn proxy_thumbnail(
                 }
             }
             let id = *id;
-            let (source, content) = try_peers(lib, owner, |peer| async move {
+            let (source, content) = try_peers(lib, owner, recover, |peer| async move {
                 peer.client.read_thumbnail(&ectx(), &id, edge).await
             })
             .await?;
@@ -886,6 +946,7 @@ pub(crate) async fn proxy_model_preview(
     lib: &EmbeddedLibrary,
     id: &AssetId,
     owner: Option<SourceId>,
+    recover: bool,
 ) -> Option<AssetContent> {
     let flight = format!(
         "peer-model:{}:{id}",
@@ -907,7 +968,7 @@ pub(crate) async fn proxy_model_preview(
                 }
             }
             let id = *id;
-            let (source, content) = try_peers(lib, owner, |peer| async move {
+            let (source, content) = try_peers(lib, owner, recover, |peer| async move {
                 peer.client.read_model_preview(&ectx(), &id).await
             })
             .await?;
