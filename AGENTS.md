@@ -21,7 +21,7 @@ Use standard `rustfmt` output (four-space indentation) and resolve every Clippy 
 
 ## Testing Guidelines
 
-Add focused unit tests near implementation code and behavior-level integration tests under the affected crate's `tests/` directory, using descriptive snake-case filenames such as `waveform_peaks.rs`. Run targeted tests while iterating (`cargo test -p dam-core`) and the full workspace before submission. The web client has no dedicated test framework or coverage threshold; `pnpm lint` and `pnpm typecheck` both enforce TypeScript correctness.
+Add focused unit tests near implementation code and behavior-level integration tests under the affected crate's `tests/` directory, using descriptive snake-case filenames such as `waveform_peaks.rs`. Run targeted tests while iterating (`cargo test -p dam-core`) and the full workspace before submission. Web component tests use Vitest, Testing Library, jsdom, and MSW under `web/tests/components`; `pnpm test` runs both the fast Node tests and focused component coverage. `pnpm lint` and `pnpm typecheck` enforce TypeScript correctness.
 
 ## Commit & Pull Request Guidelines
 

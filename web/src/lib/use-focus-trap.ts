@@ -26,13 +26,23 @@ const FOCUSABLE = [
 
 export function useFocusTrap<T extends HTMLElement>(active: boolean) {
   const ref = useRef<T>(null);
+  // Capture during render, before React's commit phase applies any descendant `autoFocus`. Capturing
+  // inside the effect is too late for those dialogs: the element we would remember is already the
+  // modal's first button, which disappears on close and leaves focus on `<body>`.
+  const session = useRef<{ active: boolean; restore: HTMLElement | null }>({
+    active: false,
+    restore: null,
+  });
+  if (active && !session.current.active) {
+    session.current.restore = document.activeElement as HTMLElement | null;
+  }
+  session.current.active = active;
 
   useEffect(() => {
     if (!active) return;
     const node = ref.current;
     if (!node) return;
-
-    const previouslyFocused = document.activeElement as HTMLElement | null;
+    const focusSession = session.current;
 
     // Visible, tabbable descendants in DOM order (`offsetParent` is null for `display:none`).
     const focusables = () =>
@@ -70,7 +80,11 @@ export function useFocusTrap<T extends HTMLElement>(active: boolean) {
     return () => {
       node.removeEventListener("keydown", onKey);
       // Return focus to the trigger so keyboard users aren't dumped at the top of the page.
-      previouslyFocused?.focus?.();
+      focusSession.restore?.focus?.();
+      // A false→true transition starts a new focus session and must capture its new trigger. During
+      // React's development-only effect replay `active` remains true, so retain the original target
+      // for the real close/unmount cleanup.
+      if (!focusSession.active) focusSession.restore = null;
     };
   }, [active]);
 

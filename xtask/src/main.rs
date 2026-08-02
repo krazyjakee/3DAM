@@ -600,6 +600,7 @@ fn build_web() -> bool {
         return false;
     }
     run_in(&web, "pnpm", &["install", "--frozen-lockfile"])
+        && run_in(&web, "pnpm", &["test"])
         && run_in(&web, "pnpm", &["build"])
         && require_artifacts("xtask web", &web.join("dist"), WEB_ARTIFACTS)
 }
