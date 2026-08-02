@@ -5,6 +5,8 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::process::{Command, ExitCode};
 
+mod perf;
+
 fn main() -> ExitCode {
     let task = std::env::args().nth(1).unwrap_or_default();
     let ok = match task.as_str() {
@@ -31,10 +33,11 @@ fn main() -> ExitCode {
         // binary that leg built.
         "packaging" => stage_packaging(flag_value("--target").as_deref()),
         "check-deps" => check_deps(),
+        "perf" => perf::run(std::env::args().skip(2).collect()),
         other => {
             eprintln!(
                 "unknown xtask '{other}'. try: ci | feature-matrix | web | wasm | bundle | \
-                 packaging | check-deps"
+                 packaging | check-deps | perf"
             );
             false
         }

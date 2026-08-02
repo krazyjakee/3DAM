@@ -306,10 +306,10 @@ same change.
 
 The `1M+ assets` design target (PRODUCT_SPEC §8) is only real if it is exercised:
 
-- **Generated corpora:** an `xtask gen-corpus` produces a synthetic library of N assets
-  (configurable mix of media types, with realistic size/attribute distributions and a
-  controllable fraction of bad files) — cheap to scale to 1M rows for DB/query/out-of-core
-  testing without shipping gigabytes.
+- **Generated corpora:** `cargo xtask perf --profile smoke|100k|1m` creates a deterministic,
+  migrated catalog with mixed sources/media, deep paths, tags, embeddings, and controlled exact
+  duplicates. The strict profiles and recipe live under `perf/`; generated databases stay under
+  `target/` and are never committed. See [the harness guide](../performance-harness.md).
 - **Curated real messy libraries:** a small set of real-world-shaped trees (deep nesting,
   duplicate-heavy, mixed-format packs, wrong extensions, one blanket license over a pack) used
   to validate that dedup, auto-tag, and license handling behave on genuinely untidy input, not
@@ -326,12 +326,16 @@ out-of-core) belong to [14](14-concurrency-performance-reliability.md); this fil
 
 - **`criterion`** benchmarks for the hot pure paths (query building, similarity/ANN lookup,
   hashing, tileability, geometry stats) — statistically sound, with saved baselines.
-- **Scale-harness timings:** the `xtask` scale harness measures end-to-end scan/analyse/query
-  throughput against the generated corpora and emits a machine-readable report.
+- **Scale-harness timings:** the `xtask` scale harness measures query/facet/stats latency,
+  scan-upsert and export throughput, analysis planning, duplicate detection, peak RSS, initial
+  browser payload, and synthetic long-scroll memory/frame behavior. Its JSON report records all
+  samples plus the exact fixture recipe, profile, machine, toolchain, and git revision.
 - **Regression guard:** benchmarks and scale timings run in a **nightly/pre-release CI job**
   (not per-push — they are slow and machine-sensitive) and **fail if a headline metric
-  regresses past a threshold** against the committed baseline. The thresholds trace directly
-  to the `14` targets, so a perf regression is caught as a build failure, not in the field.
+  regresses past a threshold** against the profile-specific ratio baseline in
+  `perf/baselines.json`. A bounded smoke profile runs on pull requests; scheduled and manually
+  dispatched jobs publish the full 100k/1m reports as artifacts. The thresholds trace directly to
+  the `14` targets, so a perf regression is caught as a build failure, not in the field.
 
 ### 15.4.6 CI dependency and feature guards
 

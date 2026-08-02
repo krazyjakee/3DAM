@@ -3,6 +3,8 @@
 **/target/
 # Frontend component-test coverage output.
 /web/coverage/
+# Local scale-harness reports; CI publishes these as workflow artifacts.
+/perf-results/
 # Generated shell completions + man pages (`cargo xtask packaging`). Deliberately NOT under
 # target/: `tauri.conf.json` names these paths as literal strings under `bundle.linux.deb.files`
 # and cannot interpolate a `[build] target-dir` override, which is a normal thing for a developer

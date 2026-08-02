@@ -1,0 +1,1062 @@
+use dam_api::dto::{DupRequest, QueryRequest};
+use dam_api::id::{ContentHash, SourceId};
+use dam_api::page::{Cursor, PageParams};
+use dam_api::service::Visibility;
+use dam_store::{ExportSelection, NewAsset, Store};
+use rusqlite::{params, Connection};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+const RECIPE_VERSION: &str = "3dam-scale-v1";
+const FIXED_SEED: u64 = 0x3da1_2026_0132;
+const DEFAULT_PROFILES: &str = "perf/profiles.json";
+const DEFAULT_BASELINES: &str = "perf/baselines.json";
+const WORK_DIR_MARKER: &str = ".3dam-perf-workdir";
+
+const STORE_METRICS: &[&str] = &[
+    "first_page_ms",
+    "late_page_ms",
+    "search_ms",
+    "faceted_query_ms",
+    "stats_ms",
+    "scan_upsert_assets_per_second",
+    "analysis_plan_ms",
+    "duplicate_detection_ms",
+    "export_assets_per_second",
+    "peak_rss_bytes",
+    "browser_initial_payload_bytes",
+];
+const BROWSER_METRICS: &[&str] = &["browser_long_scroll_p99_ms", "browser_heap_growth_bytes"];
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Profile {
+    asset_count: usize,
+    source_count: usize,
+    max_depth: usize,
+    tag_count: usize,
+    embedding_every: usize,
+    embedding_dim: usize,
+    duplicate_every: usize,
+    samples: usize,
+    upsert_sample: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProfilesFile {
+    schema_version: u32,
+    profiles: BTreeMap<String, Profile>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BaselinesFile {
+    schema_version: u32,
+    profiles: BTreeMap<String, BaselineProfile>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BaselineProfile {
+    metrics: BTreeMap<String, BaselineMetric>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BaselineMetric {
+    reference: f64,
+    max_ratio: f64,
+    direction: Direction,
+}
+
+#[derive(Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Direction {
+    LowerIsBetter,
+    HigherIsBetter,
+}
+
+#[derive(Serialize)]
+struct Report {
+    schema_version: u32,
+    generated_at_unix_ms: u128,
+    fixture_recipe: FixtureRecipe,
+    profile_name: String,
+    profile: Profile,
+    machine: Machine,
+    browser: BrowserStatus,
+    fixture_generate_seconds: f64,
+    database_bytes: u64,
+    metrics: BTreeMap<String, Metric>,
+    comparisons: BTreeMap<String, Comparison>,
+    passed: bool,
+}
+
+#[derive(Serialize)]
+struct FixtureRecipe {
+    version: &'static str,
+    seed: u64,
+    migration_path: &'static str,
+}
+
+#[derive(Serialize)]
+struct Machine {
+    os: String,
+    arch: String,
+    logical_cpus: usize,
+    cpu_model: Option<String>,
+    total_memory_bytes: Option<u64>,
+    rustc: Option<String>,
+    git_sha: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum BrowserStatus {
+    Measured {
+        retained_pages: usize,
+        cursor_entries: usize,
+    },
+    Failed {
+        message: String,
+    },
+    Skipped {
+        reason: String,
+    },
+}
+
+#[derive(Serialize)]
+struct Metric {
+    value: f64,
+    p95: f64,
+    unit: &'static str,
+    direction: Direction,
+    samples: Vec<f64>,
+}
+
+#[derive(Serialize)]
+struct Comparison {
+    reference: f64,
+    ratio: Option<f64>,
+    max_ratio: f64,
+    direction: Direction,
+    status: &'static str,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserResult {
+    retained_pages: usize,
+    cursor_entries: usize,
+    heap_growth_bytes: f64,
+    p99_ms: f64,
+}
+
+struct Options {
+    profile: String,
+    profiles_path: PathBuf,
+    baseline_path: PathBuf,
+    output: PathBuf,
+    work_dir: PathBuf,
+    skip_browser: bool,
+    keep_catalog: bool,
+}
+
+pub fn run(args: Vec<String>) -> bool {
+    match execute(parse_args(args)) {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!("performance harness failed: {error}");
+            false
+        }
+    }
+}
+
+fn execute(options: Result<Options, String>) -> Result<(), String> {
+    let options = validate_paths(options?)?;
+    let profiles: ProfilesFile = load_json(&options.profiles_path)?;
+    if profiles.schema_version != 1 {
+        return Err(format!(
+            "unsupported profile schema {}",
+            profiles.schema_version
+        ));
+    }
+    let profile = profiles
+        .profiles
+        .get(&options.profile)
+        .cloned()
+        .ok_or_else(|| format!("unknown profile '{}'", options.profile))?;
+    validate_profile(&profile)?;
+    let baselines: BaselinesFile = load_json(&options.baseline_path)?;
+    if baselines.schema_version != 1 {
+        return Err(format!(
+            "unsupported baseline schema {}",
+            baselines.schema_version
+        ));
+    }
+    let baseline = baselines
+        .profiles
+        .get(&options.profile)
+        .ok_or_else(|| format!("baseline has no '{}' profile", options.profile))?;
+    validate_baseline(baseline)?;
+
+    prepare_work_dir(&options.work_dir)?;
+
+    eprintln!(
+        "generating {} deterministic assets ({}, seed {FIXED_SEED:#x})",
+        profile.asset_count, RECIPE_VERSION
+    );
+    let generation_started = Instant::now();
+    generate_catalog(&options.work_dir, &profile)?;
+    let fixture_generate_seconds = generation_started.elapsed().as_secs_f64();
+    let database_path = options.work_dir.join("library.db");
+    let database_bytes = fs::metadata(&database_path)
+        .map_err(|e| format!("stat {}: {e}", database_path.display()))?
+        .len();
+
+    let store = Store::open(&options.work_dir).map_err(|e| format!("open fixture: {e}"))?;
+    let mut metrics = benchmark_store(&store, &profile)?;
+    let browser = if options.skip_browser {
+        BrowserStatus::Skipped {
+            reason: "requested with --skip-browser".into(),
+        }
+    } else {
+        match benchmark_browser(profile.asset_count) {
+            Ok(result) => {
+                insert_metric(
+                    &mut metrics,
+                    "browser_long_scroll_p99_ms",
+                    result.p99_ms,
+                    "ms",
+                    Direction::LowerIsBetter,
+                    vec![result.p99_ms],
+                )?;
+                insert_metric(
+                    &mut metrics,
+                    "browser_heap_growth_bytes",
+                    result.heap_growth_bytes,
+                    "bytes",
+                    Direction::LowerIsBetter,
+                    vec![result.heap_growth_bytes],
+                )?;
+                BrowserStatus::Measured {
+                    retained_pages: result.retained_pages,
+                    cursor_entries: result.cursor_entries,
+                }
+            }
+            Err(message) => BrowserStatus::Failed { message },
+        }
+    };
+
+    let browser_failed = matches!(browser, BrowserStatus::Failed { .. });
+    let (comparisons, comparisons_passed) =
+        compare(&metrics, baseline, options.skip_browser, browser_failed)?;
+    let browser_passed = !matches!(browser, BrowserStatus::Failed { .. });
+    let passed = comparisons_passed && browser_passed;
+    let report = Report {
+        schema_version: 1,
+        generated_at_unix_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_millis(),
+        fixture_recipe: FixtureRecipe {
+            version: RECIPE_VERSION,
+            seed: FIXED_SEED,
+            migration_path: "Store::open followed by fixture recipe v1",
+        },
+        profile_name: options.profile.clone(),
+        profile,
+        machine: machine_metadata(),
+        browser,
+        fixture_generate_seconds,
+        database_bytes,
+        metrics,
+        comparisons,
+        passed,
+    };
+    if let Some(parent) = options.output.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("create report directory {}: {e}", parent.display()))?;
+    }
+    fs::write(
+        &options.output,
+        serde_json::to_vec_pretty(&report).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| format!("write {}: {e}", options.output.display()))?;
+    eprintln!("performance report: {}", options.output.display());
+
+    drop(store);
+    if !options.keep_catalog {
+        remove_owned_work_dir(&options.work_dir)?;
+    }
+    if passed {
+        Ok(())
+    } else {
+        Err("one or more performance thresholds failed; see the JSON report".into())
+    }
+}
+
+fn parse_args(args: Vec<String>) -> Result<Options, String> {
+    let mut profile = None;
+    let mut profiles_path = PathBuf::from(DEFAULT_PROFILES);
+    let mut baseline_path = PathBuf::from(DEFAULT_BASELINES);
+    let mut output = None;
+    let mut work_dir = None;
+    let mut skip_browser = false;
+    let mut keep_catalog = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--profile" => profile = Some(next_value(&args, &mut index, "--profile")?),
+            "--profiles" => profiles_path = next_value(&args, &mut index, "--profiles")?.into(),
+            "--baseline" => baseline_path = next_value(&args, &mut index, "--baseline")?.into(),
+            "--output" => output = Some(PathBuf::from(next_value(&args, &mut index, "--output")?)),
+            "--work-dir" => {
+                work_dir = Some(PathBuf::from(next_value(&args, &mut index, "--work-dir")?))
+            }
+            "--skip-browser" => skip_browser = true,
+            "--keep-catalog" => keep_catalog = true,
+            "--help" | "-h" => {
+                return Err("usage: cargo xtask perf --profile smoke|100k|1m [--output FILE] [--work-dir DIR] [--profiles FILE] [--baseline FILE] [--skip-browser] [--keep-catalog]".into());
+            }
+            other => return Err(format!("unknown perf argument '{other}'")),
+        }
+        index += 1;
+    }
+    let profile = profile.ok_or("--profile is required")?;
+    Ok(Options {
+        output: output.unwrap_or_else(|| PathBuf::from(format!("perf-results/{profile}.json"))),
+        work_dir: work_dir
+            .unwrap_or_else(|| PathBuf::from(format!("target/perf-catalog-{profile}"))),
+        profile,
+        profiles_path,
+        baseline_path,
+        skip_browser,
+        keep_catalog,
+    })
+}
+
+fn validate_paths(mut options: Options) -> Result<Options, String> {
+    let current = fs::canonicalize(std::env::current_dir().map_err(|e| e.to_string())?)
+        .map_err(|e| format!("resolve current directory: {e}"))?;
+    options.work_dir = resolve_path(&options.work_dir)?;
+    options.output = resolve_path(&options.output)?;
+    let is_root = options.work_dir.parent().is_none();
+    if is_root || current.starts_with(&options.work_dir) {
+        return Err(format!(
+            "refusing destructive work directory '{}': it is a filesystem root, the workspace, or an ancestor of the workspace",
+            options.work_dir.display()
+        ));
+    }
+    if options.output.starts_with(&options.work_dir) {
+        return Err(format!(
+            "report '{}' must be outside disposable work directory '{}'",
+            options.output.display(),
+            options.work_dir.display()
+        ));
+    }
+    Ok(options)
+}
+
+fn prepare_work_dir(path: &Path) -> Result<(), String> {
+    if path.exists() {
+        remove_owned_work_dir(path)?;
+    }
+    fs::create_dir_all(path).map_err(|e| format!("create {}: {e}", path.display()))?;
+    fs::write(path.join(WORK_DIR_MARKER), RECIPE_VERSION)
+        .map_err(|e| format!("mark disposable directory {}: {e}", path.display()))
+}
+
+fn remove_owned_work_dir(path: &Path) -> Result<(), String> {
+    let marker = path.join(WORK_DIR_MARKER);
+    let owner = fs::read_to_string(&marker).map_err(|_| {
+        format!(
+            "refusing to remove existing unowned work directory '{}'; choose an empty path or a directory created by this harness",
+            path.display()
+        )
+    })?;
+    if owner.trim() != RECIPE_VERSION {
+        return Err(format!(
+            "refusing to remove work directory '{}' with an unknown ownership marker",
+            path.display()
+        ));
+    }
+    fs::remove_dir_all(path).map_err(|e| format!("remove fixture {}: {e}", path.display()))
+}
+
+/// Resolve an existing path exactly, or canonicalize its nearest existing ancestor and append the
+/// not-yet-created suffix. This closes `..` and symlink escapes before any recursive deletion.
+fn resolve_path(path: &Path) -> Result<PathBuf, String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| e.to_string())?
+            .join(path)
+    };
+    let mut ancestor = absolute.clone();
+    let mut suffix = Vec::new();
+    while !ancestor.exists() {
+        let name = ancestor
+            .file_name()
+            .ok_or_else(|| format!("cannot resolve path '{}'", path.display()))?;
+        suffix.push(name.to_os_string());
+        if !ancestor.pop() {
+            return Err(format!("cannot resolve path '{}'", path.display()));
+        }
+    }
+    let mut resolved =
+        fs::canonicalize(&ancestor).map_err(|e| format!("resolve {}: {e}", ancestor.display()))?;
+    for component in suffix.iter().rev() {
+        resolved.push(component);
+    }
+    Ok(resolved)
+}
+
+fn next_value(args: &[String], index: &mut usize, flag: &str) -> Result<String, String> {
+    *index += 1;
+    args.get(*index)
+        .cloned()
+        .ok_or_else(|| format!("{flag} requires a value"))
+}
+
+fn load_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, String> {
+    let bytes = fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    serde_json::from_slice(&bytes).map_err(|e| format!("parse {}: {e}", path.display()))
+}
+
+fn validate_profile(profile: &Profile) -> Result<(), String> {
+    if profile.asset_count < 100
+        || profile.source_count < 4
+        || profile.max_depth < 2
+        || profile.tag_count < 4
+        || profile.embedding_every == 0
+        || profile.embedding_dim < 4
+        || profile.duplicate_every < 4
+        || profile.samples == 0
+        || profile.upsert_sample == 0
+        || profile.upsert_sample > profile.asset_count
+    {
+        return Err("invalid profile: counts, samples, depth and fixture intervals must be positive and representative".into());
+    }
+    Ok(())
+}
+
+fn validate_baseline(profile: &BaselineProfile) -> Result<(), String> {
+    let expected: BTreeSet<&str> = STORE_METRICS
+        .iter()
+        .chain(BROWSER_METRICS.iter())
+        .copied()
+        .collect();
+    let actual: BTreeSet<&str> = profile.metrics.keys().map(String::as_str).collect();
+    if actual != expected {
+        let unknown: Vec<_> = actual.difference(&expected).copied().collect();
+        let missing: Vec<_> = expected.difference(&actual).copied().collect();
+        return Err(format!(
+            "baseline metric keys do not match the harness (unknown={unknown:?}, missing={missing:?})"
+        ));
+    }
+    for (name, metric) in &profile.metrics {
+        if !metric.reference.is_finite()
+            || metric.reference <= 0.0
+            || !metric.max_ratio.is_finite()
+            || metric.max_ratio < 1.0
+        {
+            return Err(format!("invalid baseline values for {name}"));
+        }
+    }
+    Ok(())
+}
+
+fn generate_catalog(data_dir: &Path, profile: &Profile) -> Result<(), String> {
+    // The supported API creates and migrates the database first. The fixture recipe below is
+    // versioned because it deliberately populates the public schema in large transactions; using
+    // Store::upsert_asset one million times would benchmark transaction setup, not dataset shape.
+    drop(Store::open(data_dir).map_err(|e| format!("migrate fixture: {e}"))?);
+    let mut connection =
+        Connection::open(data_dir.join("library.db")).map_err(|e| e.to_string())?;
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;",
+        )
+        .map_err(|e| e.to_string())?;
+    let now = 1_700_000_000_000_i64;
+    let source_connections = [
+        r#"{"kind":"local_fs","root":"/fixture/local"}"#,
+        r#"{"kind":"sftp","host":"fixture.invalid","port":22,"username":"bench","base_path":"/assets"}"#,
+        r#"{"kind":"smb","host":"fixture.invalid","port":445,"share":"assets","base_path":"library","username":"bench"}"#,
+        r#"{"kind":"federated","endpoint":"https://fixture.invalid"}"#,
+    ];
+    let source_kinds = ["local_fs", "sftp", "smb", "federated"];
+    {
+        let transaction = connection.transaction().map_err(|e| e.to_string())?;
+        for index in 0..profile.source_count {
+            transaction
+                .execute(
+                    "INSERT INTO source(id,name,kind,connection,online,watch,created_at,updated_at) VALUES(?,?,?,?,1,0,?,?)",
+                    params![deterministic_id(1, index as u64).to_vec(), format!("fixture-source-{index}"), source_kinds[index % 4], source_connections[index % 4], now, now],
+                )
+                .map_err(|e| e.to_string())?;
+        }
+        for index in 0..profile.tag_count {
+            transaction
+                .execute(
+                    "INSERT INTO tag(id,name) VALUES(?,?)",
+                    params![
+                        deterministic_id(2, index as u64).to_vec(),
+                        format!("fixture-tag-{index:03}")
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+        }
+        transaction.commit().map_err(|e| e.to_string())?;
+    }
+
+    for batch_start in (0..profile.asset_count).step_by(10_000) {
+        let batch_end = (batch_start + 10_000).min(profile.asset_count);
+        let transaction = connection.transaction().map_err(|e| e.to_string())?;
+        for index in batch_start..batch_end {
+            let asset_id = deterministic_id(3, index as u64);
+            let source = index % profile.source_count;
+            let (media, extension) = match index % 5 {
+                0 => ("image", "png"),
+                1 => ("audio", "wav"),
+                2 => ("model", "glb"),
+                3 => ("video", "mp4"),
+                _ => ("document", "pdf"),
+            };
+            let filename = if index % 10 == 0 {
+                format!("hero_texture_{index:09}.{extension}")
+            } else {
+                format!("asset_{index:09}.{extension}")
+            };
+            let depth = 2 + index % (profile.max_depth - 1);
+            let folders = (0..depth)
+                .map(|level| format!("level{level:02}_{}", (index / (level + 1)) % 97))
+                .collect::<Vec<_>>()
+                .join("/");
+            let path = format!("{folders}/{filename}");
+            let remainder = index % profile.duplicate_every;
+            let hash_index = if remainder < 3 {
+                index - remainder
+            } else {
+                index
+            };
+            let hash = deterministic_hash(hash_index as u64);
+            transaction
+                .execute(
+                    "INSERT INTO asset(id,content_hash,source_id,path,filename,size_bytes,source_modified_at,scanned_at,media_type,format,analysis_version,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,0,?,?)",
+                    params![asset_id.to_vec(), hash.to_vec(), deterministic_id(1, source as u64).to_vec(), path, filename, 1024_i64 + (index % 1_000_000) as i64, now + index as i64, now, media, extension, now, now],
+                )
+                .map_err(|e| format!("insert asset {index}: {e}"))?;
+            let first_tag = index % profile.tag_count;
+            let second_tag = (index * 17 + 3) % profile.tag_count;
+            for tag in [first_tag, second_tag] {
+                transaction
+                    .execute(
+                        "INSERT OR IGNORE INTO asset_tag(asset_id,tag_id,state,source,confidence,extractor,created_at) VALUES(?,?,'confirmed','auto',0.9,?,?)",
+                        params![asset_id.to_vec(), deterministic_id(2, tag as u64).to_vec(), RECIPE_VERSION, now],
+                    )
+                    .map_err(|e| e.to_string())?;
+            }
+            transaction
+                .execute(
+                    "UPDATE asset_fts SET tags=?, folder=? WHERE rowid=(SELECT rowid FROM asset WHERE id=?)",
+                    params![format!("fixture-tag-{first_tag:03} fixture-tag-{second_tag:03}"), folders.replace('/', " ").to_lowercase(), asset_id.to_vec()],
+                )
+                .map_err(|e| e.to_string())?;
+            if index % profile.embedding_every == 0 {
+                let embedding = deterministic_embedding(index, profile.embedding_dim);
+                transaction
+                    .execute(
+                        "INSERT INTO embedding(asset_id,space_id,media_type,dim,vec,extractor,created_at) VALUES(?,?,?,?,?,?,?)",
+                        params![asset_id.to_vec(), format!("fixture-{media}-{}d", profile.embedding_dim), media, profile.embedding_dim as i64, embedding, RECIPE_VERSION, now],
+                    )
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        transaction.commit().map_err(|e| e.to_string())?;
+        if profile.asset_count >= 100_000 && batch_end % 100_000 == 0 {
+            eprintln!("generated {batch_end}/{} assets", profile.asset_count);
+        }
+    }
+    connection
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); ANALYZE;")
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn deterministic_id(namespace: u8, index: u64) -> [u8; 16] {
+    let mut bytes = [0_u8; 16];
+    bytes[0] = 0x3d;
+    bytes[1] = namespace;
+    bytes[2..8].copy_from_slice(&FIXED_SEED.to_be_bytes()[2..]);
+    bytes[8..].copy_from_slice(&index.to_be_bytes());
+    bytes
+}
+
+fn deterministic_hash(index: u64) -> [u8; 32] {
+    let mut bytes = [0_u8; 32];
+    for chunk in bytes.chunks_exact_mut(8) {
+        chunk.copy_from_slice(&index.wrapping_mul(0x9e37_79b9_7f4a_7c15).to_le_bytes());
+    }
+    bytes
+}
+
+fn deterministic_embedding(index: usize, dimension: usize) -> Vec<u8> {
+    let mut values = vec![0.0_f32; dimension];
+    values[index % dimension] = 0.8;
+    values[(index * 7 + 1) % dimension] += 0.6;
+    let norm = values.iter().map(|v| v * v).sum::<f32>().sqrt();
+    values
+        .into_iter()
+        .flat_map(|value| (value / norm).to_le_bytes())
+        .collect()
+}
+
+fn benchmark_store(store: &Store, profile: &Profile) -> Result<BTreeMap<String, Metric>, String> {
+    let visibility = Visibility::Full;
+    let mut metrics = BTreeMap::new();
+    let first_request = QueryRequest::default();
+    let (first_samples, first_page) = sample_result(profile.samples, || {
+        store.query_assets_semantic(&first_request, None, &visibility)
+    })?;
+    insert_timing(&mut metrics, "first_page_ms", first_samples)?;
+    let initial_payload = serde_json::to_vec(&first_page)
+        .map_err(|e| e.to_string())?
+        .len() as f64;
+    insert_metric(
+        &mut metrics,
+        "browser_initial_payload_bytes",
+        initial_payload,
+        "bytes",
+        Direction::LowerIsBetter,
+        vec![initial_payload],
+    )?;
+
+    let late_request = QueryRequest {
+        page: PageParams {
+            after: Some(Cursor(profile.asset_count.saturating_sub(100).to_string())),
+            limit: 100,
+        },
+        ..QueryRequest::default()
+    };
+    insert_timing(
+        &mut metrics,
+        "late_page_ms",
+        sample(profile.samples, || {
+            store
+                .query_assets_semantic(&late_request, None, &visibility)
+                .map(|_| ())
+        })?,
+    )?;
+
+    let search_request = QueryRequest {
+        text: Some("hero".into()),
+        ..QueryRequest::default()
+    };
+    insert_timing(
+        &mut metrics,
+        "search_ms",
+        sample(profile.samples, || {
+            store
+                .query_assets_semantic(&search_request, None, &visibility)
+                .map(|_| ())
+        })?,
+    )?;
+
+    let faceted_request = QueryRequest {
+        include_facets: true,
+        ..QueryRequest::default()
+    };
+    insert_timing(
+        &mut metrics,
+        "faceted_query_ms",
+        sample(profile.samples, || {
+            store
+                .query_assets_semantic(&faceted_request, None, &visibility)
+                .map(|_| ())
+        })?,
+    )?;
+    insert_timing(
+        &mut metrics,
+        "stats_ms",
+        sample(profile.samples, || {
+            store.stats(None, &visibility).map(|_| ())
+        })?,
+    )?;
+    insert_timing(
+        &mut metrics,
+        "analysis_plan_ms",
+        sample(profile.samples, || {
+            store.list_analysis_targets(1, false, &[]).map(|_| ())
+        })?,
+    )?;
+    insert_timing(
+        &mut metrics,
+        "duplicate_detection_ms",
+        sample(profile.samples, || {
+            store
+                .duplicates(&DupRequest::default(), &visibility)
+                .map(|_| ())
+        })?,
+    )?;
+
+    let export_started = Instant::now();
+    let export_stats = store
+        .stream_export_rows(
+            &ExportSelection::Query(QueryRequest::default()),
+            &visibility,
+            1_000,
+            |_| Ok(()),
+        )
+        .map_err(|e| e.to_string())?;
+    let export_rate = export_stats.rows as f64 / export_started.elapsed().as_secs_f64();
+    insert_metric(
+        &mut metrics,
+        "export_assets_per_second",
+        export_rate,
+        "assets_per_second",
+        Direction::HigherIsBetter,
+        vec![export_rate],
+    )?;
+
+    let upsert_started = Instant::now();
+    for index in 0..profile.upsert_sample {
+        let source = index % profile.source_count;
+        let (media, extension) = media(index);
+        let filename = if index % 10 == 0 {
+            format!("hero_texture_{index:09}.{extension}")
+        } else {
+            format!("asset_{index:09}.{extension}")
+        };
+        let depth = 2 + index % (profile.max_depth - 1);
+        let folders = (0..depth)
+            .map(|level| format!("level{level:02}_{}", (index / (level + 1)) % 97))
+            .collect::<Vec<_>>()
+            .join("/");
+        store
+            .upsert_asset(&NewAsset {
+                source_id: SourceId::from_bytes(deterministic_id(1, source as u64)),
+                path: format!("{folders}/{filename}"),
+                filename,
+                content_hash: Some(ContentHash(deterministic_hash(index as u64))),
+                size_bytes: Some(1024 + (index % 1_000_000) as i64),
+                source_modified_at: Some(1_700_000_000_000 + index as i64),
+                scanned_at: 1_700_000_000_000,
+                media_type: media,
+                format: extension.into(),
+            })
+            .map_err(|e| e.to_string())?;
+    }
+    let upsert_rate = profile.upsert_sample as f64 / upsert_started.elapsed().as_secs_f64();
+    insert_metric(
+        &mut metrics,
+        "scan_upsert_assets_per_second",
+        upsert_rate,
+        "assets_per_second",
+        Direction::HigherIsBetter,
+        vec![upsert_rate],
+    )?;
+    let rss = peak_rss_bytes().ok_or("peak RSS is unavailable on this platform")? as f64;
+    insert_metric(
+        &mut metrics,
+        "peak_rss_bytes",
+        rss,
+        "bytes",
+        Direction::LowerIsBetter,
+        vec![rss],
+    )?;
+    Ok(metrics)
+}
+
+fn media(index: usize) -> (dam_api::dto::MediaType, &'static str) {
+    use dam_api::dto::MediaType::*;
+    match index % 5 {
+        0 => (Image, "png"),
+        1 => (Audio, "wav"),
+        2 => (Model, "glb"),
+        3 => (Video, "mp4"),
+        _ => (Document, "pdf"),
+    }
+}
+
+fn sample<T>(
+    count: usize,
+    mut operation: impl FnMut() -> Result<T, dam_api::LibError>,
+) -> Result<Vec<f64>, String> {
+    let (samples, _) = sample_result(count, &mut operation)?;
+    Ok(samples)
+}
+
+fn sample_result<T>(
+    count: usize,
+    mut operation: impl FnMut() -> Result<T, dam_api::LibError>,
+) -> Result<(Vec<f64>, T), String> {
+    let mut samples = Vec::with_capacity(count);
+    let mut last = None;
+    for _ in 0..count {
+        let started = Instant::now();
+        last = Some(operation().map_err(|e| e.to_string())?);
+        samples.push(started.elapsed().as_secs_f64() * 1_000.0);
+    }
+    Ok((samples, last.ok_or("sample count must not be zero")?))
+}
+
+fn insert_timing(
+    metrics: &mut BTreeMap<String, Metric>,
+    name: &str,
+    mut samples: Vec<f64>,
+) -> Result<(), String> {
+    samples.sort_by(f64::total_cmp);
+    let median = samples[samples.len() / 2];
+    insert_metric(
+        metrics,
+        name,
+        median,
+        "ms",
+        Direction::LowerIsBetter,
+        samples,
+    )
+}
+
+fn insert_metric(
+    metrics: &mut BTreeMap<String, Metric>,
+    name: &str,
+    value: f64,
+    unit: &'static str,
+    direction: Direction,
+    samples: Vec<f64>,
+) -> Result<(), String> {
+    if !value.is_finite() || samples.iter().any(|sample| !sample.is_finite()) {
+        return Err(format!("metric {name} is missing, NaN, or infinite"));
+    }
+    metrics.insert(
+        name.into(),
+        Metric {
+            value,
+            p95: {
+                let mut ordered = samples.clone();
+                ordered.sort_by(f64::total_cmp);
+                let index = (ordered.len() * 95).div_ceil(100).saturating_sub(1);
+                ordered[index]
+            },
+            unit,
+            direction,
+            samples,
+        },
+    );
+    Ok(())
+}
+
+fn compare(
+    metrics: &BTreeMap<String, Metric>,
+    baseline: &BaselineProfile,
+    browser_skipped: bool,
+    browser_failed: bool,
+) -> Result<(BTreeMap<String, Comparison>, bool), String> {
+    let mut comparisons = BTreeMap::new();
+    let mut passed = true;
+    for (name, reference) in &baseline.metrics {
+        if browser_skipped && BROWSER_METRICS.contains(&name.as_str()) {
+            comparisons.insert(
+                name.clone(),
+                Comparison {
+                    reference: reference.reference,
+                    ratio: None,
+                    max_ratio: reference.max_ratio,
+                    direction: reference.direction,
+                    status: "skipped",
+                },
+            );
+            continue;
+        }
+        if browser_failed && BROWSER_METRICS.contains(&name.as_str()) {
+            passed = false;
+            comparisons.insert(
+                name.clone(),
+                Comparison {
+                    reference: reference.reference,
+                    ratio: None,
+                    max_ratio: reference.max_ratio,
+                    direction: reference.direction,
+                    status: "failed",
+                },
+            );
+            continue;
+        }
+        let measured = metrics
+            .get(name)
+            .ok_or_else(|| format!("required metric '{name}' is missing"))?;
+        if measured.direction != reference.direction {
+            return Err(format!(
+                "baseline direction for '{name}' disagrees with the harness"
+            ));
+        }
+        let ratio = match reference.direction {
+            Direction::LowerIsBetter => measured.value / reference.reference,
+            Direction::HigherIsBetter => reference.reference / measured.value,
+        };
+        if !ratio.is_finite() {
+            return Err(format!("comparison ratio for '{name}' is not finite"));
+        }
+        let metric_passed = ratio <= reference.max_ratio;
+        passed &= metric_passed;
+        comparisons.insert(
+            name.clone(),
+            Comparison {
+                reference: reference.reference,
+                ratio: Some(ratio),
+                max_ratio: reference.max_ratio,
+                direction: reference.direction,
+                status: if metric_passed { "passed" } else { "failed" },
+            },
+        );
+    }
+    let unknown_measured: Vec<_> = metrics
+        .keys()
+        .filter(|name| !baseline.metrics.contains_key(*name))
+        .collect();
+    if !unknown_measured.is_empty() {
+        return Err(format!(
+            "metrics have no baseline entries: {unknown_measured:?}"
+        ));
+    }
+    Ok((comparisons, passed))
+}
+
+fn benchmark_browser(asset_count: usize) -> Result<BrowserResult, String> {
+    let output = Command::new("node")
+        .args([
+            "--expose-gc",
+            "--experimental-strip-types",
+            "web/scripts/profile-scale.mts",
+            &asset_count.to_string(),
+        ])
+        .output()
+        .map_err(|e| format!("could not launch Node: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Node profile exited {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    serde_json::from_slice(&output.stdout).map_err(|e| format!("invalid browser profile JSON: {e}"))
+}
+
+fn peak_rss_bytes() -> Option<u64> {
+    let status = fs::read_to_string("/proc/self/status").ok()?;
+    let kb = status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmHWM:"))?
+        .split_whitespace()
+        .next()?
+        .parse::<u64>()
+        .ok()?;
+    Some(kb * 1024)
+}
+
+fn machine_metadata() -> Machine {
+    Machine {
+        os: std::env::consts::OS.into(),
+        arch: std::env::consts::ARCH.into(),
+        logical_cpus: std::thread::available_parallelism()
+            .map(|value| value.get())
+            .unwrap_or(1),
+        cpu_model: fs::read_to_string("/proc/cpuinfo").ok().and_then(|text| {
+            text.lines()
+                .find_map(|line| line.strip_prefix("model name\t: ").map(str::to_owned))
+        }),
+        total_memory_bytes: fs::read_to_string("/proc/meminfo").ok().and_then(|text| {
+            text.lines()
+                .find_map(|line| line.strip_prefix("MemTotal:"))
+                .and_then(|value| value.split_whitespace().next())
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(|kb| kb * 1024)
+        }),
+        rustc: command_line("rustc", &["--version"]),
+        git_sha: command_line("git", &["rev-parse", "HEAD"]),
+    }
+}
+
+fn command_line(program: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(program).args(args).output().ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deterministic_recipe_is_stable() {
+        assert_eq!(deterministic_id(3, 42), deterministic_id(3, 42));
+        assert_ne!(deterministic_id(3, 42), deterministic_id(3, 43));
+        assert_eq!(deterministic_hash(8), deterministic_hash(8));
+    }
+
+    #[test]
+    fn checked_in_configuration_parses_and_validates() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let profiles: ProfilesFile = load_json(&root.join("perf/profiles.json")).unwrap();
+        assert_eq!(profiles.schema_version, 1);
+        for profile in profiles.profiles.values() {
+            validate_profile(profile).unwrap();
+        }
+        let baselines: BaselinesFile = load_json(&root.join("perf/baselines.json")).unwrap();
+        for baseline in baselines.profiles.values() {
+            validate_baseline(baseline).unwrap();
+        }
+    }
+
+    #[test]
+    fn rejects_destructive_or_nested_report_paths() {
+        let current = fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+        let options = |work_dir: PathBuf, output: PathBuf| Options {
+            profile: "smoke".into(),
+            profiles_path: "perf/profiles.json".into(),
+            baseline_path: "perf/baselines.json".into(),
+            output,
+            work_dir,
+            skip_browser: false,
+            keep_catalog: false,
+        };
+        assert!(validate_paths(options(current.clone(), current.join("report.json"))).is_err());
+        assert!(validate_paths(options(
+            current.parent().unwrap().to_path_buf(),
+            current.join("report.json")
+        ))
+        .is_err());
+        let safe_work = current.join("target/perf-safety-test");
+        assert!(validate_paths(options(safe_work.clone(), safe_work.join("report.json"))).is_err());
+        assert!(validate_paths(options(
+            safe_work,
+            current.join("target/perf-safety-report.json")
+        ))
+        .is_ok());
+    }
+
+    #[test]
+    fn removes_only_harness_owned_work_directories() {
+        let path = std::env::current_dir()
+            .unwrap()
+            .join(format!("target/perf-ownership-test-{}", std::process::id()));
+        if path.exists() {
+            fs::remove_dir_all(&path).unwrap();
+        }
+        fs::create_dir_all(&path).unwrap();
+        assert!(remove_owned_work_dir(&path).is_err());
+        fs::write(path.join(WORK_DIR_MARKER), RECIPE_VERSION).unwrap();
+        remove_owned_work_dir(&path).unwrap();
+        assert!(!path.exists());
+    }
+}

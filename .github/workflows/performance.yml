@@ -1,0 +1,100 @@
+name: performance-regression
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Scale profile to run
+        required: true
+        default: smoke
+        type: choice
+        options: [smoke, 100k, 1m, all]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: perf-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  smoke:
+    if: github.event_name == 'pull_request' || github.event_name == 'push' || inputs.profile == 'smoke'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.22.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: performance-smoke
+      - name: Run bounded scale smoke profile
+        run: cargo run --locked --package xtask -- perf --profile smoke --output perf-results/smoke.json
+      - name: Publish performance report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-smoke
+          path: perf-results/smoke.json
+          if-no-files-found: error
+
+  full:
+    if: github.event_name == 'schedule' || inputs.profile == 'all'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [100k, 1m]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.22.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: performance-${{ matrix.profile }}
+      - name: Run full scale profile
+        run: cargo run --release --locked --package xtask -- perf --profile ${{ matrix.profile }} --output perf-results/${{ matrix.profile }}.json
+      - name: Publish performance report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-${{ matrix.profile }}
+          path: perf-results/${{ matrix.profile }}.json
+          if-no-files-found: error
+
+  requested-scale:
+    if: github.event_name == 'workflow_dispatch' && (inputs.profile == '100k' || inputs.profile == '1m')
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.22.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: performance-${{ inputs.profile }}
+      - name: Run requested scale profile
+        run: cargo run --release --locked --package xtask -- perf --profile ${{ inputs.profile }} --output perf-results/${{ inputs.profile }}.json
+      - name: Publish performance report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-${{ inputs.profile }}
+          path: perf-results/${{ inputs.profile }}.json
+          if-no-files-found: error

@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "profiles": {
+    "smoke": {
+      "asset_count": 2000,
+      "source_count": 4,
+      "max_depth": 8,
+      "tag_count": 24,
+      "embedding_every": 4,
+      "embedding_dim": 32,
+      "duplicate_every": 20,
+      "samples": 3,
+      "upsert_sample": 100
+    },
+    "100k": {
+      "asset_count": 100000,
+      "source_count": 8,
+      "max_depth": 12,
+      "tag_count": 128,
+      "embedding_every": 4,
+      "embedding_dim": 32,
+      "duplicate_every": 20,
+      "samples": 3,
+      "upsert_sample": 1000
+    },
+    "1m": {
+      "asset_count": 1000000,
+      "source_count": 16,
+      "max_depth": 16,
+      "tag_count": 256,
+      "embedding_every": 4,
+      "embedding_dim": 32,
+      "duplicate_every": 20,
+      "samples": 1,
+      "upsert_sample": 5000
+    }
+  }
+}

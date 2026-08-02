@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "profiles": {
+    "smoke": {
+      "metrics": {
+        "first_page_ms": { "reference": 100, "max_ratio": 2.0, "direction": "lower_is_better" },
+        "late_page_ms": { "reference": 100, "max_ratio": 2.0, "direction": "lower_is_better" },
+        "search_ms": { "reference": 150, "max_ratio": 2.0, "direction": "lower_is_better" },
+        "faceted_query_ms": { "reference": 250, "max_ratio": 2.0, "direction": "lower_is_better" },
+        "stats_ms": { "reference": 250, "max_ratio": 2.0, "direction": "lower_is_better" },
+        "scan_upsert_assets_per_second": { "reference": 100, "max_ratio": 2.0, "direction": "higher_is_better" },
+        "analysis_plan_ms": { "reference": 250, "max_ratio": 2.0, "direction": "lower_is_better" },
+        "duplicate_detection_ms": { "reference": 250, "max_ratio": 2.0, "direction": "lower_is_better" },
+        "export_assets_per_second": { "reference": 2000, "max_ratio": 2.0, "direction": "higher_is_better" },
+        "peak_rss_bytes": { "reference": 536870912, "max_ratio": 1.5, "direction": "lower_is_better" },
+        "browser_initial_payload_bytes": { "reference": 2097152, "max_ratio": 1.5, "direction": "lower_is_better" },
+        "browser_long_scroll_p99_ms": { "reference": 16, "max_ratio": 1.25, "direction": "lower_is_better" },
+        "browser_heap_growth_bytes": { "reference": 25165824, "max_ratio": 1.25, "direction": "lower_is_better" }
+      }
+    },
+    "100k": {
+      "metrics": {
+        "first_page_ms": { "reference": 250, "max_ratio": 1.5, "direction": "lower_is_better" },
+        "late_page_ms": { "reference": 500, "max_ratio": 1.5, "direction": "lower_is_better" },
+        "search_ms": { "reference": 750, "max_ratio": 1.5, "direction": "lower_is_better" },
+        "faceted_query_ms": { "reference": 1500, "max_ratio": 1.5, "direction": "lower_is_better" },
+        "stats_ms": { "reference": 1500, "max_ratio": 1.5, "direction": "lower_is_better" },
+        "scan_upsert_assets_per_second": { "reference": 100, "max_ratio": 2.0, "direction": "higher_is_better" },
+        "analysis_plan_ms": { "reference": 2500, "max_ratio": 1.5, "direction": "lower_is_better" },
+        "duplicate_detection_ms": { "reference": 2500, "max_ratio": 1.5, "direction": "lower_is_better" },
+        "export_assets_per_second": { "reference": 10000, "max_ratio": 2.0, "direction": "higher_is_better" },
+        "peak_rss_bytes": { "reference": 1073741824, "max_ratio": 1.5, "direction": "lower_is_better" },
+        "browser_initial_payload_bytes": { "reference": 2097152, "max_ratio": 1.5, "direction": "lower_is_better" },
+        "browser_long_scroll_p99_ms": { "reference": 16, "max_ratio": 1.25, "direction": "lower_is_better" },
+        "browser_heap_growth_bytes": { "reference": 25165824, "max_ratio": 1.25, "direction": "lower_is_better" }
+      }
+    },
+    "1m": {
+      "metrics": {
+        "first_page_ms": { "reference": 1000, "max_ratio": 1.5, "direction": "lower_is_better" },
+        "late_page_ms": { "reference": 2500, "max_ratio": 1.5, "direction": "lower_is_better" },
+        "search_ms": { "reference": 4000, "max_ratio": 1.5, "direction": "lower_is_better" },
+        "faceted_query_ms": { "reference": 7500, "max_ratio": 1.5, "direction": "lower_is_better" },
+        "stats_ms": { "reference": 7500, "max_ratio": 1.5, "direction": "lower_is_better" },
+        "scan_upsert_assets_per_second": { "reference": 100, "max_ratio": 2.0, "direction": "higher_is_better" },
+        "analysis_plan_ms": { "reference": 15000, "max_ratio": 1.5, "direction": "lower_is_better" },
+        "duplicate_detection_ms": { "reference": 15000, "max_ratio": 1.5, "direction": "lower_is_better" },
+        "export_assets_per_second": { "reference": 10000, "max_ratio": 2.0, "direction": "higher_is_better" },
+        "peak_rss_bytes": { "reference": 4294967296, "max_ratio": 1.5, "direction": "lower_is_better" },
+        "browser_initial_payload_bytes": { "reference": 2097152, "max_ratio": 1.5, "direction": "lower_is_better" },
+        "browser_long_scroll_p99_ms": { "reference": 16, "max_ratio": 1.25, "direction": "lower_is_better" },
+        "browser_heap_growth_bytes": { "reference": 25165824, "max_ratio": 1.25, "direction": "lower_is_better" }
+      }
+    }
+  }
+}
