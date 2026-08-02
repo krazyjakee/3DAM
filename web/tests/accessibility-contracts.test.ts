@@ -14,17 +14,20 @@ test("source and collection actions reveal while their row owns keyboard focus",
 });
 
 test("asset menus retain root and submenu WAI-ARIA contracts", async () => {
-  const [menu, duplicates] = await Promise.all([
-    source("ContextMenu.tsx"),
-    source("Duplicates.tsx"),
-  ]);
+  const menu = await source("ContextMenu.tsx");
   assert.match(menu, /role="menu"/);
   assert.match(menu, /role="menuitem"/);
   assert.match(menu, /aria-haspopup=\{chevron \? "menu"/);
   assert.match(menu, /aria-expanded=\{chevron \? expanded/);
   assert.match(menu, /tabIndex=\{-1\}/);
-  assert.match(duplicates, /aria-keyshortcuts="Shift\+F10"/);
-  assert.match(duplicates, /shortcutForEvent\(event\.nativeEvent\)/);
+});
+
+test("duplicate review exposes direct keyboard actions without a context-menu dependency", async () => {
+  const duplicates = await source("Duplicates.tsx");
+  for (const shortcut of ["Enter", "D", "K", "R", "B"]) {
+    assert.match(duplicates, new RegExp(`aria-keyshortcuts="${shortcut}"`));
+  }
+  assert.doesNotMatch(duplicates, /<ContextMenu/);
 });
 
 test("workspace splitters are focusable value-bearing separators", async () => {
