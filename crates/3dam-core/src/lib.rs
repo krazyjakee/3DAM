@@ -328,6 +328,13 @@ fn serialize_opt_query(q: &Option<QueryRequest>) -> Result<Option<String>, LibEr
         .map_err(|e| LibError::Internal(e.to_string()))
 }
 
+fn incompatible_smart_query() -> LibError {
+    LibError::BadRequest(
+        "this smart folder uses a saved query that this version cannot read; replace its query"
+            .into(),
+    )
+}
+
 /// Emit a job's current progress as a `JobProgress` event (best-effort; a dropped read is skipped).
 /// Shared by the scan and analyse job loops.
 pub(crate) fn emit_progress(store: &Store, events: &broadcast::Sender<LibraryEvent>, job: &JobId) {
@@ -2030,20 +2037,29 @@ impl LibraryService for EmbeddedLibrary {
     ) -> Result<Collection, LibError> {
         let id = *id;
         let vis = ctx.visibility.clone();
-        self.db(move |s| {
-            if !s.collection_visible(&id, &vis)? {
-                return Err(LibError::NotFound(format!("collection {id}")));
-            }
-            let mut c = s.get_collection(&id, &vis)?;
-            // A smart folder's count is the live match count — compute it on the single-item read,
-            // under the caller's ceiling so the count is never an oracle for hidden matches.
-            if c.kind == CollectionKind::Smart {
-                let ids = s.query_asset_ids(&c.query.clone().unwrap_or_default(), &vis)?;
-                c.count = Some(ids.len() as u64);
-            }
-            Ok(c)
-        })
-        .await
+        let mut collection = self
+            .db(move |s| {
+                if !s.collection_visible(&id, &vis)? {
+                    return Err(LibError::NotFound(format!("collection {id}")));
+                }
+                s.get_collection(&id, &vis)
+            })
+            .await?;
+        if collection.kind == CollectionKind::Smart {
+            // Count through the same path used to open the folder, including federation. Limit the
+            // payload to one row and explicitly request the exact answering-stream total.
+            let mut query = collection
+                .query
+                .clone()
+                .ok_or_else(incompatible_smart_query)?;
+            query.page = PageParams {
+                after: None,
+                limit: 1,
+            };
+            query.include_total = Some(true);
+            collection.count = self.query(ctx, query).await?.total;
+        }
+        Ok(collection)
     }
 
     async fn create_collection(
@@ -2121,26 +2137,33 @@ impl LibraryService for EmbeddedLibrary {
     ) -> Result<Page<AssetSummary>, LibError> {
         let id = *id;
         let vis = ctx.visibility.clone();
-        self.db(move |s| {
-            if !s.collection_visible(&id, &vis)? {
-                return Err(LibError::NotFound(format!("collection {id}")));
-            }
-            let coll = s.get_collection(&id, &vis)?;
-            match coll.kind {
-                CollectionKind::Manual => {
+        let collection = self
+            .db(move |s| {
+                if !s.collection_visible(&id, &vis)? {
+                    return Err(LibError::NotFound(format!("collection {id}")));
+                }
+                s.get_collection(&id, &vis)
+            })
+            .await?;
+        match collection.kind {
+            CollectionKind::Manual => {
+                let vis = ctx.visibility.clone();
+                self.db(move |s| {
                     let items = s.collection_summaries(&id, page.clamped(500), &vis)?;
                     Ok(Page::new(items, None))
-                }
-                CollectionKind::Smart => {
-                    // Live resolution: run the saved query with the caller's page window, under
-                    // the caller's ceiling (a shared smart folder never widens the reachable set).
-                    let mut q = coll.query.unwrap_or_default();
-                    q.page = page;
-                    s.query_assets_semantic(&q, None, &vis)
-                }
+                })
+                .await
             }
-        })
-        .await
+            CollectionKind::Smart => {
+                // Resolve through the ordinary query entry point, not the local store directly:
+                // saved source filters and unscoped searches retain federation semantics. A query
+                // that an upgraded build can no longer decode fails closed instead of widening to
+                // the entire library; the web UI surfaces this as a replace-query warning.
+                let mut query = collection.query.ok_or_else(incompatible_smart_query)?;
+                query.page = page;
+                self.query(ctx, query).await
+            }
+        }
     }
 
     async fn export(
@@ -2980,7 +3003,10 @@ impl LibraryService for EmbeddedLibrary {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_sibling;
+    use super::{resolve_sibling, EmbeddedLibrary};
+    use dam_api::dto::CollectionKind;
+    use dam_api::page::PageParams;
+    use dam_api::service::{AuthContext, LibraryService};
 
     #[test]
     fn resolve_sibling_confines_to_source() {
@@ -3022,5 +3048,38 @@ mod tests {
         assert!(resolve_sibling("m/s.gltf", "file:/etc/passwd").is_err());
         // Empty is rejected.
         assert!(resolve_sibling("m/s.gltf", "  ").is_err());
+    }
+
+    #[tokio::test]
+    async fn incompatible_smart_query_fails_closed_instead_of_listing_every_asset() {
+        let temp = tempfile::tempdir().unwrap();
+        let library = EmbeddedLibrary::open(temp.path()).await.unwrap();
+        let id = library
+            .db(|store| {
+                store.create_collection(
+                    "legacy search",
+                    CollectionKind::Smart,
+                    Some(
+                        r#"{"filters":[{"field":"removed_facet","op":"eq","value":{"str":"x"}}]}"#,
+                    ),
+                )
+            })
+            .await
+            .unwrap();
+        let error = library
+            .collection_assets(
+                &AuthContext::embedded(),
+                &id,
+                PageParams {
+                    after: None,
+                    limit: 24,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("cannot read"),
+            "legacy query should produce an actionable error: {error}"
+        );
     }
 }

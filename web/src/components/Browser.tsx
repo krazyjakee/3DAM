@@ -4,6 +4,7 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   ChevronRight,
   CloudOff,
+  AlertTriangle,
   FileCog,
   FileDown,
   Layers,
@@ -68,6 +69,8 @@ import {
   type BrowsePageParam,
 } from "@/lib/browse-window";
 import { collapseExactDuplicates } from "@/lib/duplicate-membership";
+import { summarizeQuery } from "@/lib/query-summary";
+import { SmartFolderDialog } from "./SmartFolderDialog";
 
 /** Modifier keys that change what a click does to the multi-selection (issue #10/#22). */
 export interface ClickMods {
@@ -112,6 +115,14 @@ export function Browser({
     [request, debouncedText],
   );
   const assets = useAssets(searchReq, state.collection);
+  const collections = useCollections();
+  const sources = useSources();
+  const smartFolderWarning = useMemo(() => {
+    if (!state.collection) return null;
+    const collection = collections.data?.find((item) => item.id === state.collection);
+    if (collection?.kind !== "smart") return null;
+    return summarizeQuery(collection.query, sources.data).warnings[0] ?? null;
+  }, [state.collection, collections.data, sources.data]);
   // A search is pending while the field's text hasn't yet been applied to the query.
   const searching = state.q.trim() !== debouncedText.trim();
   const [menu, setMenu] = useState<MenuState | null>(null);
@@ -389,6 +400,15 @@ export function Browser({
       {/* Folder breadcrumb (issue #66) — the current source + path segments, each clickable to jump
           up the tree. Only shown when browsing a source (not a collection view). */}
       <Breadcrumb />
+      {smartFolderWarning && (
+        <div
+          role="alert"
+          className="flex items-start gap-2 border-b border-warn/40 bg-warn/10 px-3 py-1.5 text-[11px] text-warn"
+        >
+          <AlertTriangle size={13} className="mt-0.5 shrink-0" />
+          <span>{smartFolderWarning} Replace this smart folder’s query from a compatible search.</span>
+        </div>
+      )}
       {/* Partial-results strip (issue #39): one warn-tinted line, non-blocking — the results below
           are real, just possibly missing a slow peer's contribution. */}
       {droppedPeers && (
@@ -423,7 +443,11 @@ export function Browser({
             <TableSkeleton />
           )
         ) : assets.isError ? (
-          <Centered tone="danger">Failed to load — is `3dam serve` running?</Centered>
+          <Centered tone="danger">
+            {smartFolderWarning
+              ? "This smart folder’s saved query could not be loaded. Replace it from a compatible search."
+              : "Failed to load — is `3dam serve` running?"}
+          </Centered>
         ) : items.length === 0 ? (
           <Centered>
             No assets match. Add a source and scan, or clear the filters.
@@ -700,6 +724,7 @@ function Toolbar({
   const { state, patch, request } = useViewState();
   const { gate } = useWriteGate();
   const [showExport, setShowExport] = useState(false);
+  const [showSmartFolder, setShowSmartFolder] = useState(false);
   return (
     <>
     <div className="browser-toolbar border-b border-border px-3 py-2">
@@ -809,6 +834,20 @@ function Toolbar({
       {/* Export the current view — a collection when one is active, else the faceted query. */}
       <button
         className="btn shrink-0 px-1.5 py-1 disabled:cursor-not-allowed disabled:opacity-40 coarse:min-h-11 coarse:min-w-11 coarse:justify-center"
+        aria-label="Save search as smart folder"
+        onClick={() => setShowSmartFolder(true)}
+        {...gate({
+          disabled: state.collection !== null,
+          title: state.collection
+            ? "Open a search view before saving a smart folder"
+            : "Save this search as a live smart folder",
+        })}
+      >
+        <Sparkles size={14} />
+      </button>
+
+      <button
+        className="btn shrink-0 px-1.5 py-1 disabled:cursor-not-allowed disabled:opacity-40 coarse:min-h-11 coarse:min-w-11 coarse:justify-center"
         aria-label="Export manifest"
         onClick={() => setShowExport(true)}
         {...gate({ title: "Export manifest for the current view" })}
@@ -850,6 +889,9 @@ function Toolbar({
           scope={state.collection ? { collection: state.collection } : { query: request }}
           onClose={() => setShowExport(false)}
         />
+      )}
+      {showSmartFolder && (
+        <SmartFolderDialog query={request} onClose={() => setShowSmartFolder(false)} />
       )}
     </>
   );

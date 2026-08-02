@@ -295,6 +295,44 @@ async fn manual_and_smart_collections() {
         Some(3),
         "smart folder reports its live match count"
     );
+    // The same UI patch can rename the folder and replace its query. Resolution changes
+    // immediately; no materialized membership needs rebuilding.
+    lib.update_collection(
+        &ctx,
+        &smart,
+        UpdateCollection {
+            name: Some("audio-only".into()),
+            query: Some(QueryRequest {
+                filters: vec![Filter {
+                    field: FacetField::MediaType,
+                    op: FilterOp::Eq,
+                    value: FilterValue::Str("audio".into()),
+                }],
+                ..Default::default()
+            }),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        lib.get_collection(&ctx, &smart).await.unwrap().name,
+        "audio-only"
+    );
+    assert!(
+        lib.collection_assets(
+            &ctx,
+            &smart,
+            PageParams {
+                after: None,
+                limit: 50,
+            },
+        )
+        .await
+        .unwrap()
+        .items
+        .is_empty(),
+        "replacing a smart query changes its live result set"
+    );
     // A smart folder's membership is query-driven — direct edits are rejected.
     assert!(lib
         .modify_collection_members(

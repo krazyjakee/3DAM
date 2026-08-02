@@ -39,6 +39,7 @@ import type {
   SourceId,
   SuggestionReview,
   TagEditRequest,
+  UpdateCollection,
 } from "./types";
 
 /** Stable query-key roots — ws.ts invalidates against these. */
@@ -453,15 +454,18 @@ export function useCreateCollection() {
   });
 }
 
-/** Rename a collection (the only field the web UI edits directly; a smart folder's query is set
- *  at creation via the CLI in v1). */
-export function useRenameCollection() {
+/** Rename a collection and/or replace a smart folder's saved query. Refresh the active browse too:
+ * replacing the query changes its live result set immediately. */
+export function useUpdateCollection() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ id, name }: { id: CollectionId; name: string }) =>
-      api.updateCollection(id, { name }),
-    meta: { errorPrefix: "Couldn’t rename collection" },
-    onSuccess: () => qc.invalidateQueries({ queryKey: qk.collections }),
+    mutationFn: ({ id, patch }: { id: CollectionId; patch: UpdateCollection }) =>
+      api.updateCollection(id, patch),
+    meta: { success: "Collection updated", errorPrefix: "Couldn’t update collection" },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: qk.collections });
+      qc.invalidateQueries({ queryKey: qk.assets });
+    },
   });
 }
 

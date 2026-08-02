@@ -35,10 +35,10 @@ import {
   useCreateCollection,
   useDeleteCollection,
   useRemoveSource,
-  useRenameCollection,
   useScan,
   useSources,
   useStats,
+  useUpdateCollection,
   useVersion,
   useWhoami,
 } from "@/api/queries";
@@ -574,10 +574,8 @@ function Count({ n, loading = false }: { n: number; loading?: boolean }) {
   );
 }
 
-/** Collections & smart folders (issue #3). Lists them, filters the grid on click, and offers
- *  create / rename / delete. The web UI creates *manual* collections here; a smart folder carries a
- *  saved query (set via the CLI in v1) and is shown read-only with a Sparkles marker. Adding assets
- *  to a manual collection happens per-asset in the Inspector (batch add lands with multi-select). */
+/** Collections & smart folders (issue #3/#108). Manual collections are created here; the Browser
+ * toolbar saves or replaces smart folders from a faceted search. */
 function Collections({
   gate,
   activeId,
@@ -592,13 +590,18 @@ function Collections({
 }) {
   const collections = useCollections();
   const create = useCreateCollection();
-  const rename = useRenameCollection();
+  const update = useUpdateCollection();
   const del = useDeleteCollection();
   const { confirm, prompt } = useDialogs();
   const items = collections.data ?? [];
 
   const onCreate = async () => {
-    const name = (await prompt({ title: "New collection", placeholder: "Name", confirmLabel: "Create" }))?.trim();
+    const name = (await prompt({
+      title: "New manual collection",
+      message: "Manual collections keep assets you add yourself. To save a live search, use the sparkles button in the browser toolbar.",
+      placeholder: "Name",
+      confirmLabel: "Create",
+    }))?.trim();
     if (name) create.mutate({ name, kind: "manual" });
   };
 
@@ -610,9 +613,9 @@ function Collections({
         </span>
         <button
           className="flex items-center justify-center text-fg-dim hover:text-accent disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:text-fg-dim coarse:min-h-11 coarse:min-w-11"
-          aria-label="New collection"
+          aria-label="New manual collection"
           onClick={onCreate}
-          {...gate({ disabled: create.isPending, title: "New collection" })}
+          {...gate({ disabled: create.isPending, title: "New manual collection" })}
         >
           <FolderPlus size={14} />
         </button>
@@ -622,7 +625,7 @@ function Collections({
           className="mx-3 my-1 rounded border border-dashed border-border px-2 py-2 text-center text-[11px] text-fg-dim hover:border-accent hover:text-accent"
           onClick={onCreate}
         >
-          + Group assets into a collection
+          + Create a manual collection
         </button>
       )}
       {items.map((c) => (
@@ -640,7 +643,8 @@ function Collections({
             const name = (
               await prompt({ title: "Rename collection", initial: c.name, confirmLabel: "Rename" })
             )?.trim();
-            if (name && name !== c.name) rename.mutate({ id: c.id, name });
+            if (name && name !== c.name)
+              update.mutate({ id: c.id, patch: { name } });
           }}
           onDelete={async () => {
             if (
@@ -718,7 +722,7 @@ function CollectionRow({
             <Share2 size={12} />
           </button>
         )}
-        {/* Renaming a smart folder is fine; its query is edited via the CLI in v1. */}
+        {/* A smart folder can be renamed here; replace its saved query from the Browser toolbar. */}
         <button
           className="flex items-center justify-center text-fg-dim hover:text-accent disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:text-fg-dim coarse:min-h-11 coarse:min-w-11"
           aria-label={`Rename collection ${collection.name}`}
