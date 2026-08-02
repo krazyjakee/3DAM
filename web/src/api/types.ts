@@ -733,6 +733,7 @@ export type LibraryEvent =
   | { type: "asset_removed"; id: AssetId; source_id: SourceId | null }
   | { type: "source_state"; id: SourceId; state: SourceState }
   | ({ type: "job_progress" } & JobStatus)
+  | { type: "stream_lagged" } // bounded subscriber missed events — refresh visible caches once
   | { type: "catalog_reset" }; // whole catalog wiped (maintenance) — drop caches and refetch
 
 // ── user accounts (issue #42) ───────────────────────────────────────────────

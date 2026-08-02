@@ -2693,7 +2693,8 @@ impl LibraryService for EmbeddedLibrary {
     ) -> Result<EventStream<LibraryEvent>, LibError> {
         let rx = self.events.subscribe();
         let vis = ctx.visibility.clone();
-        // Drop lag errors (a slow subscriber missed events) rather than failing the stream.
+        // A bounded broadcast receiver reports lag explicitly. Turn that gap into a payload the
+        // transport can forward so every consumer performs one resync instead of staying stale.
         //
         // Restricted subscribers get a per-event ceiling check rather than a blanket withhold
         // (issue #42). Every event now carries the attribution the check needs — `source_id` on the
@@ -2702,14 +2703,14 @@ impl LibraryService for EmbeddedLibrary {
         // itself lives in `Visibility::allows_event` so the engine and any future transport enforce
         // one definition, and so adding a `LibraryEvent` variant fails to compile until it is judged.
         let stream = tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(move |r| {
-            let keep = r.as_ref().is_ok_and(|ev| vis.allows_event(ev));
-            async move {
-                if keep {
-                    r.ok()
-                } else {
-                    None
+            let event = match r {
+                Ok(ev) if vis.allows_event(&ev) => Some(ev),
+                Ok(_) => None,
+                Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(_)) => {
+                    Some(LibraryEvent::StreamLagged)
                 }
-            }
+            };
+            async move { event }
         });
         Ok(Box::pin(stream))
     }

@@ -20,7 +20,7 @@ use dam_api::id::{AssetId, CollectionId, CommentId, ContentHash, JobId, SourceId
 use dam_api::page::{Page, PageParams};
 use dam_api::service::{AuthContext, EventStream, LibraryService, WhoAmI};
 use dam_api::{ErrorBody, LibError, PeerAdvertise};
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::time::Duration;
@@ -131,6 +131,8 @@ fn topic_matches(topics: &[EventTopic], ev: &LibraryEvent) -> bool {
         // A catalog-wide reset is an asset-topic event: subscribers watching assets must drop
         // their caches and refetch (the whole catalog just changed underneath them).
         | LibraryEvent::CatalogReset => EventTopic::Assets,
+        // Lag spans unknown topics, so every filtered subscriber must see the resync marker.
+        LibraryEvent::StreamLagged => return true,
         LibraryEvent::SourceState { .. } => EventTopic::Sources,
         LibraryEvent::JobProgress(_) => EventTopic::Jobs,
     };
@@ -1275,22 +1277,45 @@ impl LibraryService for ApiClient {
         let ws_url = self.ws_url()?;
         let token = self.token.clone();
         let topics = req.topics;
-        let (tx, rx) = futures::channel::mpsc::unbounded::<LibraryEvent>();
+        const DELIVERY_CAPACITY: usize = 256;
+        let (mut tx, rx) = futures::channel::mpsc::channel::<LibraryEvent>(DELIVERY_CAPACITY);
 
         tokio::spawn(async move {
             let mut backoff = Duration::from_millis(500);
+            let mut needs_resync = false;
             loop {
                 match connect_ws(&ws_url, token.as_deref()).await {
                     Ok(mut ws) => {
+                        // A reconnect has an unknowable event gap even if the local queue never
+                        // filled. Make the resync contract explicit before accepting fresh frames.
+                        if needs_resync && tx.send(LibraryEvent::StreamLagged).await.is_err() {
+                            return;
+                        }
+                        needs_resync = false;
+                        let mut gap_signalled = false;
                         backoff = Duration::from_millis(500); // reset once connected
                         while let Some(msg) = ws.next().await {
                             match msg {
                                 Ok(tokio_tungstenite::tungstenite::Message::Text(txt)) => {
                                     match serde_json::from_str::<LibraryEvent>(txt.as_str()) {
                                         Ok(ev) if topic_matches(&topics, &ev) => {
-                                            // Receiver dropped → the subscription is gone; stop.
-                                            if tx.unbounded_send(ev).is_err() {
-                                                return;
+                                            if let Err(error) = tx.try_send(ev) {
+                                                if error.is_disconnected() {
+                                                    return;
+                                                }
+                                                // Delivery is deliberately bounded. Disconnect so
+                                                // upstream applies backpressure, then place exactly
+                                                // one resync marker behind the retained backlog.
+                                                let _ = ws.close(None).await;
+                                                if tx
+                                                    .send(LibraryEvent::StreamLagged)
+                                                    .await
+                                                    .is_err()
+                                                {
+                                                    return;
+                                                }
+                                                gap_signalled = true;
+                                                break;
                                             }
                                         }
                                         Ok(_) => {}
@@ -1303,8 +1328,16 @@ impl LibraryService for ApiClient {
                                 Ok(_) => {} // ping/pong/binary — ignore
                             }
                         }
+                        // Overflow already placed its marker behind the retained queue. Every other
+                        // disconnect may have missed remote frames before the next handshake.
+                        if !gap_signalled {
+                            needs_resync = true;
+                        }
                     }
-                    Err(e) => tracing::warn!(error = %e, "ws subscribe connect failed"),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "ws subscribe connect failed");
+                        needs_resync = true;
+                    }
                 }
                 if tx.is_closed() {
                     return;

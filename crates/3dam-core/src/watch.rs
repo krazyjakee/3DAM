@@ -22,7 +22,7 @@ use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, watch};
 
 /// Quiet window a burst of local FS events must settle for before a re-scan fires.
 const DEBOUNCE: Duration = Duration::from_millis(600);
@@ -130,7 +130,9 @@ impl WatchManager {
         let governor = self.governor.clone();
         let scratch = self.scratch.clone();
         self.rt.spawn_blocking(move || {
-            let (tx, mut rx) = mpsc::unbounded_channel::<()>();
+            // A watch channel retains one revision, not one item per callback. A 100k-file copy can
+            // therefore make this counter race ahead, but it can never allocate a 100k-entry queue.
+            let (tx, mut rx) = watch::channel(0_u64);
             let initial_scan = tx.clone();
             let mut watcher =
                 match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
@@ -140,7 +142,7 @@ impl WatchManager {
                     // very scan that produced them: an endless rescan-from-zero loop. Filter it out.
                     if let Ok(ev) = res {
                         if is_content_change(&ev.kind) {
-                            let _ = tx.send(());
+                            mark_dirty(&tx);
                         }
                     }
                 }) {
@@ -160,17 +162,10 @@ impl WatchManager {
             // Reconcile once after registration. A file can be created after `add_source` returns
             // but before the off-thread OS watch is live; that event cannot be replayed by notify.
             // The initial delta is idempotent and closes that otherwise permanent missed-event gap.
-            let _ = initial_scan.send(());
+            mark_dirty(&initial_scan);
 
             rt.spawn(async move {
-                while rx.recv().await.is_some() {
-                    // Coalesce the burst: keep resetting the quiet timer until it elapses.
-                    loop {
-                        tokio::select! {
-                            _ = tokio::time::sleep(DEBOUNCE) => break,
-                            more = rx.recv() => if more.is_none() { return },
-                        }
-                    }
+                while wait_for_quiet(&mut rx, DEBOUNCE).await {
                     trigger_delta(
                         &store, &secrets, &events, &in_flight, &governor, &scratch, id,
                     );
@@ -198,6 +193,24 @@ impl WatchManager {
                 );
             }
         });
+    }
+}
+
+/// Mark a watched source dirty without queueing one allocation per filesystem event.
+fn mark_dirty(tx: &watch::Sender<u64>) {
+    tx.send_modify(|revision| *revision = revision.wrapping_add(1));
+}
+
+/// Wait until at least one dirty revision arrives and no newer revision appears for `quiet`.
+async fn wait_for_quiet(rx: &mut watch::Receiver<u64>, quiet: Duration) -> bool {
+    if rx.changed().await.is_err() {
+        return false;
+    }
+    loop {
+        tokio::select! {
+            changed = rx.changed() => if changed.is_err() { return false },
+            _ = tokio::time::sleep(quiet) => return true,
+        }
     }
 }
 
@@ -280,12 +293,38 @@ fn trigger_delta(
 
 #[cfg(test)]
 mod tests {
-    use super::is_content_change;
+    use super::{is_content_change, mark_dirty, wait_for_quiet};
     use notify::event::{
         AccessKind, AccessMode, CreateKind, DataChange, MetadataKind, ModifyKind, RemoveKind,
         RenameMode,
     };
     use notify::EventKind;
+    use std::time::Duration;
+    use tokio::sync::watch;
+
+    #[tokio::test]
+    async fn hundred_thousand_dirty_events_coalesce_in_one_slot() {
+        let (tx, mut rx) = watch::channel(0_u64);
+        for _ in 0..100_000 {
+            mark_dirty(&tx);
+        }
+
+        assert!(wait_for_quiet(&mut rx, Duration::from_millis(1)).await);
+        assert_eq!(
+            *rx.borrow(),
+            100_000,
+            "the latest revision must survive the burst"
+        );
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(5),
+                wait_for_quiet(&mut rx, Duration::from_millis(1))
+            )
+            .await
+            .is_err(),
+            "one retained watch value must not replay 100k queued notifications"
+        );
+    }
 
     #[test]
     fn reads_never_trigger_a_rescan() {

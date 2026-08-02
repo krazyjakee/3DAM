@@ -5,7 +5,7 @@
 import { useEffect, useSyncExternalStore } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import type { LibraryEvent } from "./types";
-import { qk } from "./queries";
+import { LiveEventCacheBatcher } from "./live-event-cache";
 import { authenticatedFetch, csrfHeaders, wsUrl as resolveWsUrl } from "@/lib/server";
 
 // Browser WebSockets cannot attach Authorization. Mint a 30-second, one-use, WS-only ticket over
@@ -50,60 +50,9 @@ export function useLiveUpdates(): void {
     let socket: WebSocket | null = null;
     let retry = 0;
     let closed = false;
+    let hadGap = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
-
-    const onEvent = (ev: LibraryEvent) => {
-      switch (ev.type) {
-        case "asset_added":
-        case "asset_removed":
-        case "asset_changed":
-          qc.invalidateQueries({ queryKey: qk.assets });
-          qc.invalidateQueries({ queryKey: qk.stats });
-          qc.invalidateQueries({ queryKey: qk.duplicates });
-          // The open Inspector reads a single asset under ["asset", id] and its neighbours under
-          // ["similar", id] — distinct roots from the grid's ["assets"]. Invalidate them too so an
-          // analyze/convert that mutates the inspected asset refreshes the panel without a reload.
-          qc.invalidateQueries({ queryKey: ["asset"] });
-      // Discussion rides `asset_changed` (kind `commented`) so it inherits the server's
-      // per-subscriber visibility filter — see `ChangeKind::Commented` (issue #82).
-      qc.invalidateQueries({ queryKey: ["comments"] });
-          qc.invalidateQueries({ queryKey: ["similar"] });
-          // Add/remove reshapes the folder tree and its subtree counts (issue #66).
-          qc.invalidateQueries({ queryKey: ["folders"] });
-          break;
-        case "source_state":
-          qc.invalidateQueries({ queryKey: qk.sources });
-          break;
-        case "catalog_reset":
-          // A maintenance wipe/factory-reset cleared the whole catalog — invalidate everything so
-          // open grids/inspectors empty live rather than showing stale rows.
-          qc.invalidateQueries({ queryKey: qk.assets });
-          qc.invalidateQueries({ queryKey: qk.stats });
-          qc.invalidateQueries({ queryKey: qk.sources });
-          qc.invalidateQueries({ queryKey: qk.duplicates });
-          qc.invalidateQueries({ queryKey: qk.jobs });
-          qc.invalidateQueries({ queryKey: ["asset"] });
-          qc.invalidateQueries({ queryKey: ["similar"] });
-          qc.invalidateQueries({ queryKey: ["folders"] });
-          break;
-        case "job_progress":
-          qc.invalidateQueries({ queryKey: qk.jobs });
-          // A finished job (scan, analyze, convert…) changes the catalogue — refresh the grid +
-          // counts, plus the inspected asset and its neighbours so an analyze run surfaces its new
-          // attributes / tags / similarity results in the open Inspector without a manual reload.
-          if (ev.state === "done") {
-            qc.invalidateQueries({ queryKey: qk.assets });
-            qc.invalidateQueries({ queryKey: qk.stats });
-            qc.invalidateQueries({ queryKey: qk.sources });
-            qc.invalidateQueries({ queryKey: qk.duplicates });
-            qc.invalidateQueries({ queryKey: ["asset"] });
-            qc.invalidateQueries({ queryKey: ["similar"] });
-            // A finished scan/convert can add or move files — refresh the folder tree (issue #66).
-            qc.invalidateQueries({ queryKey: ["folders"] });
-          }
-          break;
-      }
-    };
+    const cache = new LiveEventCacheBatcher(qc);
 
     const connect = async () => {
       if (closed) return;
@@ -111,6 +60,7 @@ export function useLiveUpdates(): void {
         socket = new WebSocket(await wsUrl());
       } catch {
         if (closed) return;
+        hadGap = true;
         setWsConnected(false);
         const delay = Math.min(1000 * 2 ** retry, 15000);
         retry += 1;
@@ -120,10 +70,12 @@ export function useLiveUpdates(): void {
       socket.onopen = () => {
         retry = 0;
         setWsConnected(true);
+        if (hadGap) void cache.resync();
+        hadGap = false;
       };
       socket.onmessage = (msg) => {
         try {
-          onEvent(JSON.parse(msg.data) as LibraryEvent);
+          void cache.handle(JSON.parse(msg.data) as LibraryEvent);
         } catch {
           /* ignore malformed frames — fail-soft (DESIGN_GUIDELINES §2) */
         }
@@ -131,6 +83,7 @@ export function useLiveUpdates(): void {
       socket.onclose = () => {
         setWsConnected(false);
         if (closed) return;
+        hadGap = true;
         const delay = Math.min(1000 * 2 ** retry, 15000);
         retry += 1;
         timer = setTimeout(() => void connect(), delay);
@@ -142,6 +95,7 @@ export function useLiveUpdates(): void {
     return () => {
       closed = true;
       if (timer) clearTimeout(timer);
+      cache.dispose();
       socket?.close();
     };
   }, [qc]);

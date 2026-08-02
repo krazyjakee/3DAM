@@ -207,8 +207,9 @@ impl Visibility {
             return true;
         }
         match ev {
-            // A reset carries no ids — it says "your view is stale", which is true for everyone.
-            E::CatalogReset => true,
+            // Neither marker carries ids: both say "your view is stale", which is true for every
+            // visibility ceiling without exposing any catalog payload.
+            E::CatalogReset | E::StreamLagged => true,
             E::SourceState { id, .. } => self.allows_source(id),
             E::AssetAdded(a) => a.source_id.is_some_and(|s| self.allows_source(&s)),
             E::AssetChanged { source_id, .. } | E::AssetRemoved { source_id, .. } => {

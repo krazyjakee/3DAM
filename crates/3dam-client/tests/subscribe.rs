@@ -36,6 +36,29 @@ async fn spawn_ws_server(events: Vec<LibraryEvent>) -> u16 {
     port
 }
 
+/// Emit a large burst without retaining it in the test process. The client deliberately does not
+/// poll its returned stream until this producer has had time to overrun the bounded delivery queue.
+async fn spawn_burst_ws_server(count: usize) -> u16 {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        for _ in 0..count {
+            let event = LibraryEvent::AssetChanged {
+                id: AssetId::new(),
+                source_id: None,
+                kind: ChangeKind::Metadata,
+            };
+            let json = serde_json::to_string(&event).unwrap();
+            if ws.send(Message::Text(json.into())).await.is_err() {
+                break;
+            }
+        }
+    });
+    port
+}
+
 async fn client_for(port: u16) -> ApiClient {
     let base = format!("http://127.0.0.1:{port}").parse().unwrap();
     ApiClient::connect(base).await.unwrap()
@@ -139,4 +162,38 @@ async fn subscribe_honours_topic_filter() {
         LibraryEvent::AssetChanged { id: gid, .. } => assert_eq!(gid, id),
         other => panic!("expected the source event to be filtered out, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn slow_consumer_gets_bounded_backlog_then_explicit_lag() {
+    let port = spawn_burst_ws_server(100_000).await;
+    let client = client_for(port).await;
+    let mut stream = client
+        .subscribe(&AuthContext::embedded(), SubscribeRequest::default())
+        .await
+        .expect("subscribe should connect");
+
+    // Let the socket pump run while the returned stream is intentionally unpolled.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let delivered_before_lag = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut delivered = 0;
+        loop {
+            match stream
+                .next()
+                .await
+                .expect("subscription should remain open")
+            {
+                LibraryEvent::StreamLagged => break delivered,
+                _ => delivered += 1,
+            }
+        }
+    })
+    .await
+    .expect("bounded delivery must eventually announce lag");
+
+    assert!(
+        delivered_before_lag <= 258,
+        "100k inputs produced an unexpectedly large retained backlog: {delivered_before_lag}"
+    );
 }

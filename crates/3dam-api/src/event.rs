@@ -37,6 +37,9 @@ pub enum LibraryEvent {
         state: SourceState,
     },
     JobProgress(JobStatus),
+    /// This subscriber could not keep up or was disconnected long enough to miss events. No
+    /// per-item payload can make that gap safe: consumers must refresh their visible cache once.
+    StreamLagged,
     /// The whole catalog was reset by a maintenance wipe/factory-reset. Carries no ids — clients
     /// drop their caches and refetch everything rather than diffing thousands of removals.
     CatalogReset,
@@ -154,6 +157,7 @@ mod tests {
                 state: SourceState::Online,
             },
             LibraryEvent::JobProgress(job_status()),
+            LibraryEvent::StreamLagged,
             LibraryEvent::CatalogReset,
         ];
 
