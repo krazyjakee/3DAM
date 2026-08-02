@@ -451,6 +451,8 @@ struct CargoPackage {
 struct CargoDependency {
     name: String,
     optional: bool,
+    /// `None` is a normal dependency; `dev` dependencies do not belong to the shipped crate graph.
+    kind: Option<String>,
 }
 
 /// Direct internal dependency edges allowed by the current architecture (tech-spec 01 §2 and
@@ -509,7 +511,9 @@ fn dependency_drift(metadata: &CargoMetadata) -> DependencyDrift {
         .flat_map(|package| {
             let packages = &packages;
             package.dependencies.iter().filter_map(move |dependency| {
-                packages.contains(dependency.name.as_str()).then_some((
+                (dependency.kind.as_deref() != Some("dev")
+                    && packages.contains(dependency.name.as_str()))
+                .then_some((
                     package.name.as_str(),
                     dependency.name.as_str(),
                     dependency.optional,
@@ -772,6 +776,7 @@ mod tests {
                 .map(|name| CargoDependency {
                     name: (*name).to_owned(),
                     optional: false,
+                    kind: None,
                 })
                 .collect(),
         }
@@ -848,6 +853,22 @@ mod tests {
             unexpected,
             vec![("dam-api".to_owned(), "dam-server".to_owned(), false)]
         );
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn dependency_guard_ignores_test_only_internal_edges() {
+        let mut server = package("dam-server", &["dam-api", "dam-client"]);
+        server.dependencies[1].kind = Some("dev".into());
+        let metadata = CargoMetadata {
+            packages: vec![
+                server,
+                package("dam-api", &[]),
+                package("dam-client", &["dam-api"]),
+            ],
+        };
+        let (unexpected, missing) = dependency_drift(&metadata);
+        assert!(unexpected.is_empty());
         assert!(missing.is_empty());
     }
 
