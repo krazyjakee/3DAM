@@ -22,8 +22,8 @@ mod model_convert;
 mod video;
 
 pub use audio_features::{
-    compute_waveform_peaks, decode_mono, extract_audio_features, AudioFeatures, LoopSource,
-    WAVEFORM_BUCKETS,
+    compute_waveform_peaks, decode_mono, extract_audio_analysis, extract_audio_features,
+    AudioAnalysis, AudioFeatures, LoopSource, WAVEFORM_BUCKETS,
 };
 pub use document::{extract_text, text_descriptor, MAX_TEXT_BYTES, TEXT_DIM};
 pub use features::{extract_image_features, l2_normalise, ImageFeatures};

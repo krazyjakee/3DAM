@@ -345,60 +345,63 @@ fn analyze_audio(
     // envelope shape — the orthogonal "does it loop" and "what is it" axes a length threshold
     // conflates. Fail-soft: if the decode fails we fall back to a neutral duration split so the asset
     // still gets *a* class (never silently "loop", the old bug).
-    let (class, conf, mut extra): (&str, f32, Vec<(&str, f32)>) =
-        match dam_media::extract_audio_features(abs, &det.format) {
-            Ok(f) => {
-                let mut tags: Vec<(&str, f32)> = Vec::new();
-                if f.is_loop {
-                    tags.push(("loop", 0.6));
-                }
-                tags.push(if f.tonal {
-                    ("tonal", 0.6)
-                } else {
-                    ("atonal", 0.5)
-                });
-                if f.bpm.is_some() {
-                    tags.push(("rhythmic", 0.6));
-                }
-                tags.push(if f.sustained {
-                    ("sustained", 0.5)
-                } else {
-                    ("transient", 0.5)
-                });
-                suggest_audio_extras(store, &t.id, &f);
-                // Persist the continuous acoustic features for the inspector bars (issue #61).
-                if let Err(e) =
-                    store.set_audio_features(&t.id, f.loudness_lufs, f.brightness, f.harmonicity)
-                {
-                    tracing::warn!(asset = %t.id, error = %e, "set_audio_features failed");
-                }
-                let conf = if f.loop_source == dam_media::LoopSource::Metadata {
-                    0.95
-                } else {
-                    0.6
-                };
-                (f.class, conf, tags)
+    // Features and inspector peaks share this one bounded decode (issue #145). Keeping the combined
+    // result alive through both persistence steps avoids retaining a second PCM buffer or opening
+    // the source twice; only the compact outputs escape `dam-media`.
+    let analysis = dam_media::extract_audio_analysis(abs, &det.format);
+    let (class, conf, mut extra): (&str, f32, Vec<(&str, f32)>) = match analysis.as_ref() {
+        Ok(analysis) => {
+            let f = &analysis.features;
+            let mut tags: Vec<(&str, f32)> = Vec::new();
+            if f.is_loop {
+                tags.push(("loop", 0.6));
             }
-            Err(e) => {
-                tracing::warn!(asset = %t.id, error = %e, "audio feature extraction failed; duration fallback");
-                let (c, cf) = match a.duration_ms {
-                    Some(ms) if ms < 2_000 => ("one_shot", 0.4),
-                    _ => ("sfx", 0.3),
-                };
-                (c, cf, Vec::new())
+            tags.push(if f.tonal {
+                ("tonal", 0.6)
+            } else {
+                ("atonal", 0.5)
+            });
+            if f.bpm.is_some() {
+                tags.push(("rhythmic", 0.6));
             }
-        };
+            tags.push(if f.sustained {
+                ("sustained", 0.5)
+            } else {
+                ("transient", 0.5)
+            });
+            suggest_audio_extras(store, &t.id, f);
+            // Persist the continuous acoustic features for the inspector bars (issue #61).
+            if let Err(e) =
+                store.set_audio_features(&t.id, f.loudness_lufs, f.brightness, f.harmonicity)
+            {
+                tracing::warn!(asset = %t.id, error = %e, "set_audio_features failed");
+            }
+            let conf = if f.loop_source == dam_media::LoopSource::Metadata {
+                0.95
+            } else {
+                0.6
+            };
+            (f.class, conf, tags)
+        }
+        Err(e) => {
+            tracing::warn!(asset = %t.id, error = %e, "audio feature extraction failed; duration fallback");
+            let (c, cf) = match a.duration_ms {
+                Some(ms) if ms < 2_000 => ("one_shot", 0.4),
+                _ => ("sfx", 0.3),
+            };
+            (c, cf, Vec::new())
+        }
+    };
     store
         .set_media_class(&t.id, MediaType::Audio, class)
         .map_err(|e| e.to_string())?;
     extra.insert(0, (class, conf));
     suggest_all(store, &t.id, &extra);
-    // Waveform peaks for the inspector (issue #73): computed once here, server-side, so no client
-    // re-downloads + re-decodes the audio to draw the bars. Independent of feature extraction and
-    // fail-soft — a decode fault just leaves `peaks` null and the client falls back to its own decode.
-    match dam_media::compute_waveform_peaks(abs, &det.format) {
-        Ok(peaks) => {
-            if let Err(e) = store.set_audio_peaks(&t.id, &peaks) {
+    // Waveform peaks for the inspector (issue #73): derived during the same decode as features, so
+    // no client or second server pass re-downloads + re-decodes the audio to draw the bars.
+    match analysis {
+        Ok(analysis) => {
+            if let Err(e) = store.set_audio_peaks(&t.id, &analysis.waveform_peaks) {
                 tracing::warn!(asset = %t.id, error = %e, "set_audio_peaks failed");
             }
         }

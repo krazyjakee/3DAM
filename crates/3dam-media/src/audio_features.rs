@@ -17,7 +17,13 @@
 //! `crates/3dam-core/src/semantic.rs`. Everything below runs in the default offline build.
 
 use rustfft::{num_complex::Complex, FftPlanner};
+#[cfg(test)]
+use std::alloc::{GlobalAlloc, Layout, System};
+#[cfg(test)]
+use std::cell::Cell;
 use std::path::Path;
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
 use symphonia::core::formats::FormatOptions;
@@ -27,8 +33,49 @@ use symphonia::core::probe::Hint;
 
 use crate::HandlerError;
 
+// Dependency-free allocation instrumentation for the ignored issue-#145 benchmark below. It is
+// inert for normal tests; the benchmark enables it only around the analysis call.
+#[cfg(test)]
+struct MeasuringAllocator;
+
+#[cfg(test)]
+static MEASURE_ALLOCATIONS: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static MEASURED_ALLOCATION_CALLS: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static MEASURED_ALLOCATION_BYTES: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+unsafe impl GlobalAlloc for MeasuringAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let ptr = System.alloc(layout);
+        if MEASURE_ALLOCATIONS.load(AtomicOrdering::Relaxed) {
+            MEASURED_ALLOCATION_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
+            MEASURED_ALLOCATION_BYTES.fetch_add(layout.size() as u64, AtomicOrdering::Relaxed);
+        }
+        ptr
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        System.dealloc(ptr, layout);
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let ptr = System.realloc(ptr, layout, new_size);
+        if MEASURE_ALLOCATIONS.load(AtomicOrdering::Relaxed) {
+            MEASURED_ALLOCATION_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
+            MEASURED_ALLOCATION_BYTES.fetch_add(new_size as u64, AtomicOrdering::Relaxed);
+        }
+        ptr
+    }
+}
+
+#[cfg(test)]
+#[global_allocator]
+static TEST_ALLOCATOR: MeasuringAllocator = MeasuringAllocator;
+
 /// Every derived audio signal from a single decode (tech-spec 05 §4.2).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct AudioFeatures {
     /// Coarse content+structure class: `one_shot` | `loop` | `music` | `sfx`.
     pub class: &'static str,
@@ -61,6 +108,17 @@ pub struct AudioFeatures {
     pub harmonicity: f32,
 }
 
+/// Feature and inspector-waveform output produced from one bounded PCM decode.
+///
+/// Callers that need both outputs should prefer [`extract_audio_analysis`] over invoking
+/// [`extract_audio_features`] and [`compute_waveform_peaks`] separately. The individual helpers are
+/// retained for API compatibility, but necessarily perform their own decode.
+#[derive(Clone, Debug)]
+pub struct AudioAnalysis {
+    pub features: AudioFeatures,
+    pub waveform_peaks: Vec<f32>,
+}
+
 /// How loopability was decided (tech-spec 05 §4.2). Authored metadata outranks measurement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LoopSource {
@@ -80,6 +138,10 @@ const HOP: usize = 512;
 /// Cap the decode to bound memory on pathological inputs (a 10-min mono f32 buffer ≈ 115 MB). Longer
 /// files are analysed on their head; loops in game audio are short so this is a safe degrade.
 const MAX_SECONDS: usize = 600;
+/// Tempo only needs a representative onset history. Autocorrelating every frame of a ten-minute
+/// clip across every candidate lag adds millions of multiply-adds without improving a stable BPM;
+/// use the first two minutes and keep that pass independently bounded.
+const MAX_TEMPO_SECONDS: usize = 120;
 /// Seamlessness cutoff above which a clip with no authored loop points is still called a loop.
 const LOOP_THRESHOLD: f32 = 0.62;
 /// A loop must not decay to near-silence at its tail (that is a one-shot with a ring-out, not a loop).
@@ -91,11 +153,38 @@ const PITCH_CLASSES: [&str; 12] = [
     "c", "c#", "d", "d#", "e", "f", "f#", "g", "g#", "a", "a#", "b",
 ];
 
+#[cfg(test)]
+thread_local! {
+    static DECODE_CALLS: Cell<usize> = const { Cell::new(0) };
+}
+
 /// Decode `path` once and derive every audio signal. EXPENSIVE — only called by the analysis pass,
 /// never at ingest scale. Fail-soft is the caller's job: a decode error returns `Corrupt` and the
 /// asset keeps its cheap-tier metadata with no derived class (tech-spec 05 §2.3).
 pub fn extract_audio_features(path: &Path, format: &str) -> Result<AudioFeatures, HandlerError> {
     let (samples, sr) = decode_mono(path, format)?;
+    extract_audio_features_from_pcm(path, format, &samples, sr)
+}
+
+/// Decode `path` once and derive both the structural/acoustic features and inspector waveform.
+/// The decoded PCM is capped by [`MAX_SECONDS`] and released with this call; only the fixed-size
+/// waveform and compact feature record escape.
+pub fn extract_audio_analysis(path: &Path, format: &str) -> Result<AudioAnalysis, HandlerError> {
+    let (samples, sr) = decode_mono(path, format)?;
+    let features = extract_audio_features_from_pcm(path, format, &samples, sr)?;
+    let waveform_peaks = compute_waveform_peaks_from_pcm(&samples)?;
+    Ok(AudioAnalysis {
+        features,
+        waveform_peaks,
+    })
+}
+
+fn extract_audio_features_from_pcm(
+    path: &Path,
+    format: &str,
+    samples: &[f32],
+    sr: u32,
+) -> Result<AudioFeatures, HandlerError> {
     if samples.is_empty() || sr == 0 {
         return Err(HandlerError::Corrupt("no decodable audio frames".into()));
     }
@@ -107,18 +196,18 @@ pub fn extract_audio_features(path: &Path, format: &str) -> Result<AudioFeatures
 
     // One STFT pass yields the onset envelope (flux per frame), the chroma vector, and the first/last
     // frame magnitudes needed for the wrap-boundary seamlessness test.
-    let spec = stft_pass(&samples, sr);
+    let spec = stft_pass(samples, sr);
 
     let (tonal, key) = tonality(&spec.chroma);
     let onset_count = count_onsets(&spec.flux);
     let frame_rate = sr as f32 / HOP as f32;
     let bpm = estimate_bpm(&spec.flux, frame_rate);
-    let sustained = is_sustained(&samples, sr);
+    let sustained = is_sustained(samples, sr);
 
     let (loopability, loop_source) = if meta_loop {
         (1.0, LoopSource::Metadata)
     } else {
-        let score = seamlessness(&samples, &spec);
+        let score = seamlessness(samples, &spec);
         if score >= LOOP_THRESHOLD {
             (score, LoopSource::Seamless)
         } else {
@@ -131,7 +220,7 @@ pub fn extract_audio_features(path: &Path, format: &str) -> Result<AudioFeatures
 
     // Continuous acoustic features (issue #61). Loudness is integrated RMS in dBFS (floored so a
     // near-silent clip doesn't report -inf); brightness/harmonicity come from the STFT pass above.
-    let loudness_lufs = rms_dbfs(&samples);
+    let loudness_lufs = rms_dbfs(samples);
     let brightness = spec.brightness;
     let harmonicity = (1.0 - spec.flatness).clamp(0.0, 1.0);
 
@@ -202,6 +291,10 @@ pub const WAVEFORM_BUCKETS: usize = 256;
 /// then normalises so the loudest slice fills the height.
 pub fn compute_waveform_peaks(path: &Path, format: &str) -> Result<Vec<f32>, HandlerError> {
     let (mono, _sr) = decode_mono(path, format)?;
+    compute_waveform_peaks_from_pcm(&mono)
+}
+
+fn compute_waveform_peaks_from_pcm(mono: &[f32]) -> Result<Vec<f32>, HandlerError> {
     if mono.is_empty() {
         return Err(HandlerError::Corrupt("no audio samples to peak".into()));
     }
@@ -229,6 +322,9 @@ pub fn compute_waveform_peaks(path: &Path, format: &str) -> Result<Vec<f32>, Han
 /// samples and sample rate. The only audio path besides `convert` that fully decodes packets. Public
 /// so the semantic tier's mel front-end ([`crate::log_mel`]) can reuse the one decode path.
 pub fn decode_mono(path: &Path, format: &str) -> Result<(Vec<f32>, u32), HandlerError> {
+    #[cfg(test)]
+    DECODE_CALLS.with(|calls| calls.set(calls.get() + 1));
+
     let file = std::fs::File::open(path).map_err(HandlerError::Io)?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
     let mut hint = Hint::new();
@@ -252,13 +348,17 @@ pub fn decode_mono(path: &Path, format: &str) -> Result<(Vec<f32>, u32), Handler
         .codec_params
         .sample_rate
         .ok_or_else(|| HandlerError::Unsupported("unknown sample rate".into()))?;
+    let cap = (sr as usize).saturating_mul(MAX_SECONDS);
+    let expected_frames =
+        usize::try_from(track.codec_params.n_frames.unwrap_or(0)).unwrap_or(usize::MAX);
 
     let mut decoder = symphonia::default::get_codecs()
         .make(&track.codec_params, &DecoderOptions::default())
         .map_err(|e| HandlerError::Unsupported(e.to_string()))?;
 
-    let cap = sr as usize * MAX_SECONDS;
-    let mut mono: Vec<f32> = Vec::new();
+    // A single appropriately-sized allocation for containers that advertise their frame count.
+    // A bogus header cannot force an unbounded allocation because the analysis cap wins.
+    let mut mono: Vec<f32> = Vec::with_capacity(expected_frames.min(cap));
     let mut sbuf: Option<SampleBuffer<f32>> = None;
     loop {
         let packet = match reader.next_packet() {
@@ -284,7 +384,10 @@ pub fn decode_mono(path: &Path, format: &str) -> Result<(Vec<f32>, u32), Handler
                 }
                 if let Some(buf) = sbuf.as_mut() {
                     buf.copy_interleaved_ref(decoded);
-                    for frame in buf.samples().chunks(ch) {
+                    // Do not let the final decoded packet overshoot the documented cap. Besides
+                    // making the memory bound exact, this keeps every downstream O(n) pass bounded.
+                    let remaining = cap.saturating_sub(mono.len());
+                    for frame in buf.samples().chunks(ch).take(remaining) {
                         mono.push(frame.iter().sum::<f32>() / ch as f32);
                     }
                 }
@@ -324,16 +427,23 @@ fn stft_pass(samples: &[f32], sr: u32) -> StftPass {
     let window = hann(FRAME);
     let mut planner = FftPlanner::<f32>::new();
     let fft = planner.plan_fft_forward(FRAME);
-    let mut scratch = vec![Complex::new(0.0f32, 0.0); FRAME];
+    let mut fft_buf = vec![Complex::new(0.0f32, 0.0); FRAME];
+    // These magnitude buffers are allocated once and overwritten for every frame. Previously the
+    // loop allocated `mag` per frame and cloned it into first/last/previous accumulators.
+    let mut mag = vec![0.0f32; bins];
+    let mut prev_mag = vec![0.0f32; bins];
+    let mut first_mag = vec![0.0f32; bins];
+    let mut have_prev = false;
 
     // Precompute each FFT bin's pitch class (or None for out-of-range bins) once.
     let bin_pc: Vec<Option<usize>> = (0..bins).map(|k| bin_pitch_class(k, sr)).collect();
 
-    let mut flux: Vec<f32> = Vec::new();
+    let frame_count = samples
+        .len()
+        .checked_sub(FRAME)
+        .map_or(0, |remaining| remaining / HOP + 1);
+    let mut flux: Vec<f32> = Vec::with_capacity(frame_count.saturating_sub(1));
     let mut chroma = [0.0f32; 12];
-    let mut prev: Option<Vec<f32>> = None;
-    let mut first_mag: Vec<f32> = Vec::new();
-    let mut last_mag: Vec<f32> = Vec::new();
 
     // Brightness (spectral centroid) + harmonicity (spectral flatness) accumulate over energetic
     // frames — both are magnitude *ratios*, so the raw (unnormalised) FFT magnitudes are fine (issue
@@ -345,11 +455,13 @@ fn stft_pass(samples: &[f32], sr: u32) -> StftPass {
 
     let mut pos = 0;
     while pos + FRAME <= samples.len() {
-        for (i, s) in scratch.iter_mut().enumerate() {
+        for (i, s) in fft_buf.iter_mut().enumerate() {
             *s = Complex::new(samples[pos + i] * window[i], 0.0);
         }
-        fft.process(&mut scratch);
-        let mag: Vec<f32> = scratch[..bins].iter().map(|c| c.norm()).collect();
+        fft.process(&mut fft_buf);
+        for (m, c) in mag.iter_mut().zip(&fft_buf[..bins]) {
+            *m = c.norm();
+        }
 
         for (k, &m) in mag.iter().enumerate() {
             if let Some(pc) = bin_pc[k] {
@@ -370,15 +482,18 @@ fn stft_pass(samples: &[f32], sr: u32) -> StftPass {
             energetic_frames += 1;
         }
 
-        if let Some(p) = &prev {
-            let f: f32 = mag.iter().zip(p).map(|(m, pm)| (m - pm).max(0.0)).sum();
+        if have_prev {
+            let f: f32 = mag
+                .iter()
+                .zip(&prev_mag)
+                .map(|(m, pm)| (m - pm).max(0.0))
+                .sum();
             flux.push(f);
+        } else {
+            first_mag.copy_from_slice(&mag);
+            have_prev = true;
         }
-        if first_mag.is_empty() {
-            first_mag = mag.clone();
-        }
-        last_mag = mag.clone();
-        prev = Some(mag);
+        prev_mag.copy_from_slice(&mag);
         pos += HOP;
     }
 
@@ -386,8 +501,8 @@ fn stft_pass(samples: &[f32], sr: u32) -> StftPass {
     StftPass {
         flux,
         chroma,
-        first_mag,
-        last_mag,
+        first_mag: if have_prev { first_mag } else { Vec::new() },
+        last_mag: if have_prev { prev_mag } else { Vec::new() },
         brightness: (centroid_sum / n).clamp(0.0, 1.0) as f32,
         flatness: (flatness_sum / n).clamp(0.0, 1.0) as f32,
     }
@@ -452,6 +567,8 @@ fn count_onsets(flux: &[f32]) -> u32 {
 /// Estimate tempo by autocorrelating the onset envelope and taking the strongest lag in the 50–200
 /// BPM band. Returns `None` when no lag is prominent (arrhythmic / non-musical).
 fn estimate_bpm(flux: &[f32], frame_rate: f32) -> Option<f32> {
+    let max_frames = (frame_rate * MAX_TEMPO_SECONDS as f32).ceil() as usize;
+    let flux = &flux[..flux.len().min(max_frames)];
     if flux.len() < 16 {
         return None;
     }
@@ -487,23 +604,28 @@ fn estimate_bpm(flux: &[f32], frame_rate: f32) -> Option<f32> {
 /// Windowed RMS; a clip whose energy peaks early and decays to a fraction of that peak is transient.
 fn is_sustained(samples: &[f32], sr: u32) -> bool {
     let win = (sr as usize / 20).max(1); // ~50 ms
-    let rms: Vec<f32> = samples
-        .chunks(win)
-        .map(|c| (c.iter().map(|s| s * s).sum::<f32>() / c.len() as f32).sqrt())
-        .collect();
-    if rms.len() < 3 {
+    let mut chunks = 0usize;
+    let mut peak_idx = 0usize;
+    let mut peak = 0.0f32;
+    let mut tail = 0.0f32;
+    for c in samples.chunks(win) {
+        let value = (c.iter().map(|s| s * s).sum::<f32>() / c.len() as f32).sqrt();
+        // `Iterator::max_by` (used before this became a streaming pass) returns the last equal
+        // maximum; preserve that tie behaviour so classification values do not drift.
+        if value >= peak {
+            peak = value;
+            peak_idx = chunks;
+        }
+        tail = value;
+        chunks += 1;
+    }
+    if chunks < 3 {
         return false;
     }
-    let (peak_idx, &peak) = rms
-        .iter()
-        .enumerate()
-        .max_by(|a, b| a.1.total_cmp(b.1))
-        .unwrap();
     if peak <= f32::EPSILON {
         return false;
     }
-    let front_loaded = peak_idx < rms.len() / 4;
-    let tail = rms.last().copied().unwrap_or(0.0);
+    let front_loaded = peak_idx < chunks / 4;
     // Transient = attack near the front that decays away; anything else counts as sustained.
     !(front_loaded && tail < 0.3 * peak)
 }
@@ -627,11 +749,158 @@ mod tests {
         w.finalize().unwrap();
     }
 
+    fn write_benchmark_wav(path: &Path, duration_s: usize, sr: u32) {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: sr,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut w = hound::WavWriter::create(path, spec).unwrap();
+        // Stream the fixture to disk: generating a maximum-duration fixture must not itself retain
+        // another full waveform and distort the analysis process's peak RSS.
+        for i in 0..duration_s * sr as usize {
+            let phase = i % 200;
+            let sample = if phase < 100 { 12_000i16 } else { -12_000i16 };
+            w.write_sample(sample).unwrap();
+        }
+        w.finalize().unwrap();
+    }
+
+    fn peak_rss_kib() -> Option<u64> {
+        // Linux exposes the process high-water mark without an extra dependency. Other platforms
+        // still report all remaining benchmark fields and label RSS unavailable.
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        let line = status.lines().find(|line| line.starts_with("VmHWM:"))?;
+        line.split_whitespace().nth(1)?.parse().ok()
+    }
+
     fn sine(freq: f32, secs: f32, sr: u32) -> Vec<f32> {
         let n = (secs * sr as f32) as usize;
         (0..n)
             .map(|i| (2.0 * std::f32::consts::PI * freq * i as f32 / sr as f32).sin() * 0.6)
             .collect()
+    }
+
+    #[test]
+    fn combined_analysis_decodes_once_and_preserves_standalone_outputs() {
+        let sr = 44_100;
+        let p = tmp("shared-decode.wav");
+        write_wav(&p, &sine(441.0, 1.0, sr), sr);
+
+        DECODE_CALLS.with(|calls| calls.set(0));
+        let combined = extract_audio_analysis(&p, "wav").unwrap();
+        assert_eq!(
+            DECODE_CALLS.with(Cell::get),
+            1,
+            "combined path decodes once"
+        );
+
+        DECODE_CALLS.with(|calls| calls.set(0));
+        let standalone_features = extract_audio_features(&p, "wav").unwrap();
+        let standalone_peaks = compute_waveform_peaks(&p, "wav").unwrap();
+        assert_eq!(
+            DECODE_CALLS.with(Cell::get),
+            2,
+            "legacy standalone calls each decode"
+        );
+        assert_eq!(combined.features, standalone_features);
+        assert_eq!(combined.waveform_peaks, standalone_peaks);
+        assert_eq!(combined.waveform_peaks.len(), WAVEFORM_BUCKETS);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn decode_cap_is_exact_even_when_the_last_packet_crosses_it() {
+        // A tiny sample rate keeps this long-duration regression fixture small. Its decoded frame
+        // count exceeds the ten-minute bound, so the final packet must be truncated at the cap.
+        let sr = 8;
+        let p = tmp("over-cap.wav");
+        write_wav(&p, &vec![0.25; sr as usize * (MAX_SECONDS + 1)], sr);
+        let (decoded, decoded_sr) = decode_mono(&p, "wav").unwrap();
+        assert_eq!(decoded_sr, sr);
+        assert_eq!(decoded.len(), sr as usize * MAX_SECONDS);
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// Reproducible issue-#145 measurement harness. Each case runs in a fresh process so Linux's
+    /// lifetime peak RSS is comparable rather than cumulative. Run with:
+    ///
+    /// `cargo test -p dam-media audio_features::tests::audio_analysis_benchmark --release \
+    ///    -- --ignored --exact --nocapture --test-threads=1`
+    #[test]
+    #[ignore = "generates and analyses two 600-second/48 kHz fixtures"]
+    fn audio_analysis_benchmark() {
+        const MODE_ENV: &str = "DAM_AUDIO_BENCH_MODE";
+        const DURATION_ENV: &str = "DAM_AUDIO_BENCH_DURATION_S";
+
+        if let (Ok(mode), Ok(duration)) = (std::env::var(MODE_ENV), std::env::var(DURATION_ENV)) {
+            let duration_s: usize = duration.parse().unwrap();
+            let sr = 48_000;
+            let p = tmp(&format!("benchmark-{mode}-{duration_s}s.wav"));
+            write_benchmark_wav(&p, duration_s, sr);
+
+            DECODE_CALLS.with(|calls| calls.set(0));
+            MEASURED_ALLOCATION_CALLS.store(0, AtomicOrdering::Relaxed);
+            MEASURED_ALLOCATION_BYTES.store(0, AtomicOrdering::Relaxed);
+            MEASURE_ALLOCATIONS.store(true, AtomicOrdering::SeqCst);
+            let started = std::time::Instant::now();
+            match mode.as_str() {
+                "combined" => {
+                    std::hint::black_box(extract_audio_analysis(&p, "wav").unwrap());
+                }
+                "standalone" => {
+                    std::hint::black_box(extract_audio_features(&p, "wav").unwrap());
+                    std::hint::black_box(compute_waveform_peaks(&p, "wav").unwrap());
+                }
+                other => panic!("unknown benchmark mode {other}"),
+            }
+            let elapsed = started.elapsed();
+            MEASURE_ALLOCATIONS.store(false, AtomicOrdering::SeqCst);
+
+            let decodes = DECODE_CALLS.with(Cell::get);
+            let expected_decodes = if mode == "combined" { 1 } else { 2 };
+            assert_eq!(decodes, expected_decodes);
+            eprintln!(
+                "audio_analysis_benchmark mode={mode} duration_s={duration_s} sample_rate={sr} \
+                 decode_count={decodes} wall_ms={} allocation_calls={} allocated_bytes={} \
+                 peak_rss_kib={}",
+                elapsed.as_millis(),
+                MEASURED_ALLOCATION_CALLS.load(AtomicOrdering::Relaxed),
+                MEASURED_ALLOCATION_BYTES.load(AtomicOrdering::Relaxed),
+                peak_rss_kib()
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unavailable".to_string()),
+            );
+            std::fs::remove_file(&p).ok();
+            return;
+        }
+
+        let current_test = "audio_features::tests::audio_analysis_benchmark";
+        let exe = std::env::current_exe().unwrap();
+        for (fixture, duration_s) in [("short", 5usize), ("maximum", MAX_SECONDS)] {
+            for mode in ["combined", "standalone"] {
+                let output = std::process::Command::new(&exe)
+                    .args([
+                        "--ignored",
+                        "--exact",
+                        current_test,
+                        "--nocapture",
+                        "--test-threads=1",
+                    ])
+                    .env(MODE_ENV, mode)
+                    .env(DURATION_ENV, duration_s.to_string())
+                    .output()
+                    .unwrap();
+                eprint!("{}", String::from_utf8_lossy(&output.stdout));
+                eprint!("{}", String::from_utf8_lossy(&output.stderr));
+                assert!(
+                    output.status.success(),
+                    "{fixture}/{mode} benchmark child failed: {}",
+                    output.status
+                );
+            }
+        }
     }
 
     #[test]
