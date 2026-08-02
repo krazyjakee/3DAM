@@ -25,7 +25,7 @@ use std::path::Path;
 /// - `text`      1 — extracted body prose: the widest recall and the weakest per-hit evidence.
 ///
 /// These order results *within* a tier. They are deliberately **not** relied on to keep documents
-/// off the top — see [`AUTHORED_TIER`] for why that needs more than a weight.
+/// off the top — the materialized `authored_matches` posting list supplies that categorical tier.
 pub(crate) const FTS_RANK: &str = "bm25(asset_fts, 10.0, 5.0, 4.0, 3.0, 2.0, 1.0)";
 
 /// The **primary** sort key: 0 for a row matching in an *authored* column, 1 for an
@@ -58,10 +58,8 @@ pub(crate) const FTS_RANK: &str = "bm25(asset_fts, 10.0, 5.0, 4.0, 3.0, 2.0, 1.0
 ///
 /// `{col1 col2} : (expr)` is FTS5's column-filter syntax; the expression is parenthesised because
 /// the filter binds to the term that follows it, not to a whole boolean chain.
-pub(crate) const AUTHORED_TIER: &str =
-    "CASE WHEN asset.rowid IN (SELECT rowid FROM asset_fts WHERE asset_fts MATCH ?) THEN 0 ELSE 1 END ASC";
-
-/// Wrap a MATCH expression so it only searches the authored columns (see [`AUTHORED_TIER`]).
+/// Wrap a MATCH expression so it only searches the authored columns. The ranked matched-set CTE
+/// materializes this posting list once and joins it to the primary matches to derive tier 0/1.
 pub(crate) fn authored_scoped(match_expr: &str) -> String {
     format!("{{filename tokens tags note folder}} : ({match_expr})")
 }
@@ -233,8 +231,8 @@ impl SynonymMap {
 /// Build an FTS5 MATCH expression from raw query text, widened by `syn` (M1 + M3). Each query token
 /// becomes an OR-group of quoted prefix terms (the token + its synonyms); the groups are AND-ed, so
 /// `"AK47 metal"` requires a token from each group but "gun" alone expands to the whole weapon set.
-/// Returns `None` when the text yields no usable term (all punctuation) — the caller then falls back
-/// to a `LIKE` scan.
+/// Returns `None` when the text yields no usable term (all punctuation) — the caller then uses the
+/// indexed filename-substring seam or its strictly bounded short-query stage.
 pub fn fts_match_expr(text: &str, syn: &SynonymMap) -> Option<String> {
     // Use the raw whitespace/punctuation split for the *query* (not the camelCase splitter): a user
     // typing "ak47" wants the whole token, and prefix matching handles the rest.
@@ -266,6 +264,14 @@ fn prefix_term(tok: &str) -> String {
     format!("\"{}\"*", tok.replace('"', "\"\""))
 }
 
+/// Exact phrase for the filename-only trigram FTS index. FTS5's trigram tokenizer can answer a
+/// leading/in-word substring without scanning the catalog, but (by definition) cannot produce a
+/// posting list for fewer than three Unicode scalar values. Those short queries use the bounded
+/// candidate stage in `helpers.rs` instead.
+pub(crate) fn substring_match_expr(text: &str) -> Option<String> {
+    (text.chars().count() >= 3).then(|| format!("\"{}\"", text.replace('"', "\"\"")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,6 +300,14 @@ mod tests {
             from_ak.contains(&"gun".to_string()),
             "ak47→gun: {from_ak:?}"
         );
+    }
+
+    #[test]
+    fn trigram_expression_quotes_punctuation_and_rejects_short_terms() {
+        assert_eq!(substring_match_expr("k47").as_deref(), Some("\"k47\""));
+        assert_eq!(substring_match_expr("...").as_deref(), Some("\"...\""));
+        assert_eq!(substring_match_expr("a\"b").as_deref(), Some("\"a\"\"b\""));
+        assert!(substring_match_expr("..").is_none());
     }
 
     #[test]

@@ -28,79 +28,64 @@ impl Store {
             return self.query_hybrid(req, limit, offset, text_vec, vis);
         }
 
-        let (where_sql, binds) = build_where(req, &self.synonyms, vis)?;
+        let (count_where, count_binds) = build_where(req, &self.synonyms, vis)?;
+        let text = req.text.as_ref().filter(|text| !text.is_empty());
 
         let dir = match req.sort.dir {
             SortDir::Asc => "ASC",
             SortDir::Desc => "DESC",
         };
-        // ORDER BY, plus any binds it needs (only relevance, which references the search term). A
-        // relevance sort without a text query has nothing to rank, so it degrades to name order.
-        let rank_text = req.text.as_ref().filter(|t| !t.is_empty());
-        let rank_match = rank_text.and_then(|t| crate::search::fts_match_expr(t, &self.synonyms));
-        let (order_clause, order_binds): (String, Vec<Value>) = match req.sort.field {
-            SortField::Relevance if rank_match.is_some() => (
-                // FTS relevance (M1), two-level. First a categorical tier so a name/tag match
-                // always beats a document-body-only match (`AUTHORED_TIER` explains why a bm25
-                // weight can't do this); then bm25 within the tier (more negative = better). Rows
-                // matched only by the LIKE fallback have no bm25 row and COALESCE to a large
-                // sentinel so they sort last. Name length/name break ties.
-                format!(
-                    "{tier}, \
-                     COALESCE((SELECT {rank} FROM asset_fts \
-                        WHERE asset_fts.rowid = asset.rowid AND asset_fts MATCH ?), 1e9) ASC, \
-                        LENGTH(filename) ASC, filename ASC",
-                    tier = crate::search::AUTHORED_TIER,
-                    rank = crate::search::FTS_RANK
-                ),
-                {
-                    let m = rank_match.unwrap();
-                    // Bind order follows the clause: the tier's authored-scoped MATCH, then bm25's.
-                    vec![
-                        Value::Text(crate::search::authored_scoped(&m)),
-                        Value::Text(m),
-                    ]
-                },
-            ),
-            SortField::Relevance if rank_text.is_some() => (
-                // Text present but unindexable (punctuation-only) — the old substring proxy.
-                "INSTR(LOWER(filename), LOWER(?)) ASC, LENGTH(filename) ASC, filename ASC".into(),
-                vec![Value::Text(rank_text.unwrap().clone())],
-            ),
-            SortField::Relevance | SortField::Name => {
-                (format!("filename {dir}, asset.id ASC"), Vec::new())
+        // Text matches are materialized once and carry their tier + bm25 rank into ORDER BY. A
+        // relevance sort without text has nothing to rank, so it degrades to name order.
+        let order_clause = match req.sort.field {
+            SortField::Relevance if text.is_some() => {
+                "text_matches.tier ASC, text_matches.rank ASC, LENGTH(filename) ASC, filename ASC"
+                    .into()
             }
-            SortField::Size => (
+            SortField::Relevance | SortField::Name => format!("filename {dir}, asset.id ASC"),
+            SortField::Size => {
                 // Sort on the whole-asset size (mesh + external companion files), matching what the
                 // grid shows; COALESCE keeps non-models (no model_attr row) on their own size.
                 format!(
                     "(size_bytes + COALESCE(model_attr.dependency_bytes, 0)) {dir}, asset.id ASC"
-                ),
-                Vec::new(),
-            ),
-            SortField::Scanned => (format!("scanned_at {dir}, asset.id ASC"), Vec::new()),
+                )
+            }
+            SortField::Scanned => format!("scanned_at {dir}, asset.id ASC"),
         };
 
         let conn = self.conn.lock().unwrap();
 
         // Total for this filter (best-effort; cheap enough at slice scale).
-        let count_sql = format!("SELECT COUNT(*) FROM asset{where_sql}");
+        let count_sql = format!("SELECT COUNT(*) FROM asset{count_where}");
         let total: i64 = conn
-            .query_row(&count_sql, rusqlite::params_from_iter(binds.iter()), |r| {
-                r.get(0)
-            })
+            .query_row(
+                &count_sql,
+                rusqlite::params_from_iter(count_binds.iter()),
+                |r| r.get(0),
+            )
             .map_err(internal)?;
 
         // LEFT JOIN the per-type attr tables so each grid row carries a couple of cheap key
         // attributes (dimensions / duration / triangles) without an N+1 fetch. Column names stay
         // unambiguous across the joined tables, so the bare-name filters above keep working.
+        let (cte, from, page_where, mut page_binds) = if let Some(text) = text {
+            let ranked = ranked_text_matches(text, &self.synonyms);
+            let (where_sql, filter_binds) = build_where_without_text(req, vis)?;
+            let mut binds = ranked.binds;
+            binds.extend(filter_binds);
+            (
+                ranked.cte,
+                "text_matches JOIN asset ON asset.rowid = text_matches.rowid",
+                where_sql,
+                binds,
+            )
+        } else {
+            (String::new(), "asset", count_where, count_binds)
+        };
         let sql = format!(
-            "{GRID_SELECT} FROM asset {ATTR_JOINS} {where_sql} ORDER BY {order_clause} LIMIT ? OFFSET ?"
+            "{cte} {GRID_SELECT} FROM {from} {ATTR_JOINS} {page_where} \
+             ORDER BY {order_clause} LIMIT ? OFFSET ?"
         );
-        // Bind order is positional across the whole statement: WHERE binds, then the ORDER BY term,
-        // then LIMIT/OFFSET.
-        let mut page_binds = binds.clone();
-        page_binds.extend(order_binds);
         page_binds.push(Value::Integer(limit as i64));
         page_binds.push(Value::Integer(offset as i64));
 
@@ -151,29 +136,20 @@ impl Store {
         let conn = self.conn.lock().unwrap();
 
         // 1. Lexical candidates, best-first by bm25 (the M1 ranking), bounded.
-        let (where_sql, mut binds) = build_where(req, &self.synonyms, vis)?;
-        let rank_match = req
+        let text = req
             .text
-            .as_ref()
-            .and_then(|t| crate::search::fts_match_expr(t, &self.synonyms));
-        let order = if let Some(m) = rank_match {
-            // Same two-level ranking as the lexical page (tier, then weighted bm25) so the
-            // candidate list the fusion starts from is ordered the same way the user would see it.
-            binds.push(Value::Text(crate::search::authored_scoped(&m)));
-            binds.push(Value::Text(m));
-            format!(
-                "{tier}, \
-                 COALESCE((SELECT {rank} FROM asset_fts \
-                    WHERE asset_fts.rowid = asset.rowid AND asset_fts MATCH ?), 1e9) ASC, \
-                    LENGTH(filename) ASC, filename ASC",
-                tier = crate::search::AUTHORED_TIER,
-                rank = crate::search::FTS_RANK
-            )
-        } else {
-            "filename ASC, asset.id ASC".to_string()
-        };
+            .as_deref()
+            .expect("hybrid path requires query text");
+        let ranked = ranked_text_matches(text, &self.synonyms);
+        let (where_sql, filter_binds) = build_where_without_text(req, vis)?;
+        let mut binds = ranked.binds;
+        binds.extend(filter_binds);
         let sql = format!(
-            "SELECT asset.id FROM asset {ATTR_JOINS} {where_sql} ORDER BY {order} LIMIT {LEX_CAP}"
+            "{cte} SELECT asset.id FROM text_matches \
+             JOIN asset ON asset.rowid = text_matches.rowid {ATTR_JOINS} {where_sql} \
+             ORDER BY text_matches.tier ASC, text_matches.rank ASC, \
+                      LENGTH(filename) ASC, filename ASC LIMIT {LEX_CAP}",
+            cte = ranked.cte,
         );
         let lex_ids: Vec<AssetId> = {
             let mut stmt = conn.prepare(&sql).map_err(internal)?;
@@ -510,6 +486,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dam_api::page::PageParams;
     use dam_sources::SourceConnection;
 
     /// Unrestricted query — the test-local stand-in for the `Full`-forwarding wrapper that
@@ -910,6 +887,114 @@ mod tests {
         assert_eq!(search(&store, "ak47"), vec!["ak47_lowpoly.fbx"]);
     }
 
+    #[test]
+    fn filename_substring_and_punctuation_fallbacks_preserve_recall() {
+        let store = Store::open_in_memory().unwrap();
+        let source = store
+            .add_source(
+                &SourceConnection::LocalFs {
+                    root: "/tmp".into(),
+                },
+                "t",
+                false,
+            )
+            .unwrap();
+        for filename in ["AK47_LowPoly.fbx", "impact...final.wav", "ordinary.png"] {
+            store
+                .upsert_asset(&NewAsset {
+                    source_id: source,
+                    path: filename.into(),
+                    filename: filename.into(),
+                    content_hash: None,
+                    size_bytes: Some(1),
+                    source_modified_at: None,
+                    scanned_at: now_ms(),
+                    media_type: MediaType::Image,
+                    format: "bin".into(),
+                })
+                .unwrap();
+        }
+
+        assert_eq!(search(&store, "k47"), vec!["AK47_LowPoly.fbx"]);
+        assert_eq!(search(&store, "..."), vec!["impact...final.wav"]);
+        assert_eq!(
+            search(&store, ".."),
+            vec!["impact...final.wav"],
+            "sub-trigram punctuation stays available through the bounded candidate stage"
+        );
+    }
+
+    fn explain_ranked_text(store: &Store, text: &str) -> (String, Vec<String>) {
+        let req = QueryRequest {
+            text: Some(text.into()),
+            ..Default::default()
+        };
+        let ranked = ranked_text_matches(text, &store.synonyms);
+        let (where_sql, filter_binds) = build_where_without_text(&req, &Visibility::Full).unwrap();
+        let mut binds = ranked.binds;
+        binds.extend(filter_binds);
+        let sql = format!(
+            "{} SELECT asset.id FROM text_matches \
+             JOIN asset ON asset.rowid = text_matches.rowid {where_sql}",
+            ranked.cte
+        );
+        let conn = store.conn.lock().unwrap();
+        let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let details = statement
+            .query_map(rusqlite::params_from_iter(binds.iter()), |row| row.get(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .unwrap();
+        (sql, details)
+    }
+
+    #[test]
+    fn token_and_substring_plan_stays_on_virtual_indexes_and_ranks_once() {
+        let store = store_with("AK47_LowPoly.fbx");
+        let (sql, details) = explain_ranked_text(&store, "k47");
+        let plan = details.join("\n");
+        assert!(
+            plan.contains("asset_fts") && plan.contains("VIRTUAL TABLE INDEX"),
+            "primary token search did not use FTS: {plan}"
+        );
+        assert!(
+            plan.contains("asset_filename_trigram") && plan.contains("VIRTUAL TABLE INDEX"),
+            "substring fallback did not use trigram FTS: {plan}"
+        );
+        assert!(
+            !details.iter().any(|detail| detail == "SCAN asset"),
+            "text search regressed to an unbounded catalog scan: {plan}"
+        );
+        assert!(
+            !plan.contains("CORRELATED"),
+            "rank/search probes became per-row correlated subqueries: {plan}"
+        );
+        assert_eq!(
+            sql.matches("bm25(").count(),
+            1,
+            "bm25 must be computed once in the materialized FTS matched set"
+        );
+    }
+
+    #[test]
+    fn short_punctuation_plan_is_a_bounded_rowid_range_not_a_catalog_scan() {
+        let store = store_with("impact...final.wav");
+        let (_sql, details) = explain_ranked_text(&store, "..");
+        let plan = details.join("\n");
+        assert!(
+            details.iter().any(|detail| {
+                detail.contains("SEARCH short_asset USING INTEGER PRIMARY KEY (rowid>?)")
+            }),
+            "short fallback is not bounded by its indexed rowid window: {plan}"
+        );
+        assert!(
+            !details
+                .iter()
+                .any(|detail| detail == "SCAN asset" || detail == "SCAN short_asset"),
+            "short fallback regressed to an unbounded catalog scan: {plan}"
+        );
+    }
+
     /// M3: a synonym widens the query — searching "gun" finds a file named only "ak47".
     #[test]
     fn synonym_finds_related_asset() {
@@ -1043,6 +1128,95 @@ mod tests {
         let store = store_with("BrickWall_02.png");
         assert_eq!(search(&store, "brick"), vec!["BrickWall_02.png"]);
         assert_eq!(search(&store, "wall"), vec!["BrickWall_02.png"]);
+    }
+
+    fn large_search_fixture(rows: usize) -> Store {
+        let store = Store::open_in_memory().unwrap();
+        let source = store
+            .add_source(
+                &SourceConnection::LocalFs {
+                    root: "/benchmark".into(),
+                },
+                "benchmark",
+                false,
+            )
+            .unwrap();
+        {
+            let mut connection = store.conn.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            {
+                let mut insert = transaction
+                    .prepare_cached(
+                        "INSERT INTO asset(
+                            id, source_id, path, filename, size_bytes, scanned_at,
+                            media_type, format, created_at, updated_at
+                         ) VALUES (?1, ?2, ?3, ?3, 1, 0, 'image', 'png', 0, 0)",
+                    )
+                    .unwrap();
+                for index in 0..rows {
+                    let filename = if index % 997 == 0 {
+                        format!("needle_target_{index:07}.png")
+                    } else {
+                        format!("catalog_asset_{index:07}.png")
+                    };
+                    insert
+                        .execute(rusqlite::params![
+                            AssetId::new().as_bytes().to_vec(),
+                            source.as_bytes().to_vec(),
+                            filename
+                        ])
+                        .unwrap();
+                }
+            }
+            transaction.commit().unwrap();
+        }
+        store
+    }
+
+    fn first_page_p95(rows: usize, samples: usize) -> std::time::Duration {
+        let store = large_search_fixture(rows);
+        let request = QueryRequest {
+            text: Some("needle".into()),
+            sort: Sort {
+                field: SortField::Relevance,
+                ..Default::default()
+            },
+            page: PageParams {
+                after: None,
+                limit: 24,
+            },
+            ..Default::default()
+        };
+        let page = query_all(&store, &request).unwrap();
+        assert_eq!(page.items.len(), rows.div_ceil(997).min(24));
+
+        let mut timings = Vec::with_capacity(samples);
+        for _ in 0..samples {
+            let started = std::time::Instant::now();
+            std::hint::black_box(query_all(&store, &request).unwrap());
+            timings.push(started.elapsed());
+        }
+        timings.sort_unstable();
+        timings[(samples * 95 / 100).min(samples - 1)]
+    }
+
+    #[test]
+    fn scaled_first_page_search_p95_stays_bounded() {
+        let p95 = first_page_p95(20_000, 20);
+        eprintln!("20k indexed first-page search p95: {p95:?}");
+        assert!(
+            p95 < std::time::Duration::from_secs(2),
+            "20k first-page p95 regressed to {p95:?}"
+        );
+    }
+
+    /// Reproducible release benchmark for the product-scale catalog. Run explicitly with:
+    /// `cargo test -p dam-store million_asset_first_page_search_p95 -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "builds the explicit 1M-asset search fixture"]
+    fn million_asset_first_page_search_p95() {
+        let p95 = first_page_p95(1_000_000, 40);
+        eprintln!("1M indexed first-page search p95: {p95:?}");
     }
 
     /// M5: a Hybrid query pulls in the embedding neighbours of the lexical hit — a file that shares

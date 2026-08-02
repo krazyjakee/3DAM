@@ -205,8 +205,8 @@ pub const MIGRATIONS: &[&str] = &[
     // bm25 relevance, real token matching, and prefix queries. Two columns: `filename` (the raw
     // name) and `tokens` (filename-derived terms the analyse pass writes — M2 — so "ak47_lowpoly.fbx"
     // is findable as `ak47`). A standalone (not contentless) FTS table keyed by `asset.rowid`, kept
-    // in sync by triggers; the initial backfill seeds rows for an already-populated catalog. Search
-    // still degrades to LIKE for partial in-word substrings the tokenizer can't reach.
+    // in sync by triggers; the initial backfill seeds rows for an already-populated catalog. V19
+    // later gives partial in-word filename substrings their own trigram posting index.
     r#"
     CREATE VIRTUAL TABLE asset_fts USING fts5(
         filename,
@@ -586,6 +586,31 @@ pub const MIGRATIONS: &[&str] = &[
     ALTER TABLE job ADD COLUMN result TEXT;
     ALTER TABLE job ADD COLUMN collections TEXT;
     "#,
+    // ── V19: indexed filename substring fallback (issue #134) ────────────────────────────────
+    // Unicode FTS remains the primary lexical index. This second, filename-only FTS5 table uses
+    // the trigram tokenizer for the legacy in-word fallback (`k47` in `ak47_lowpoly.fbx`) without
+    // putting `filename LIKE '%…%'` beside every otherwise-indexed MATCH. The rowid is the same
+    // asset rowid used by `asset_fts`, so query-time UNIONs are index-to-index and join straight
+    // back to the catalog. Standalone storage keeps ordinary DELETE/UPDATE triggers simple.
+    r#"
+    CREATE VIRTUAL TABLE asset_filename_trigram USING fts5(
+        filename,
+        tokenize = "trigram remove_diacritics 1"
+    );
+
+    INSERT INTO asset_filename_trigram(rowid, filename)
+        SELECT rowid, filename FROM asset;
+
+    CREATE TRIGGER asset_filename_trigram_ai AFTER INSERT ON asset BEGIN
+        INSERT INTO asset_filename_trigram(rowid, filename) VALUES (new.rowid, new.filename);
+    END;
+    CREATE TRIGGER asset_filename_trigram_ad AFTER DELETE ON asset BEGIN
+        DELETE FROM asset_filename_trigram WHERE rowid = old.rowid;
+    END;
+    CREATE TRIGGER asset_filename_trigram_au AFTER UPDATE OF filename ON asset BEGIN
+        UPDATE asset_filename_trigram SET filename = new.filename WHERE rowid = new.rowid;
+    END;
+    "#,
 ];
 
 #[cfg(test)]
@@ -690,5 +715,56 @@ mod tests {
             .query_row("SELECT folder FROM asset_fts", [], |r| r.get(0))
             .unwrap();
         assert_eq!(folder, "", "a root-level file has no folder terms");
+    }
+
+    #[test]
+    fn filename_trigram_migration_backfills_and_tracks_asset_lifecycle() {
+        let conn = db_at(18);
+        conn.execute_batch(
+            "INSERT INTO source (id, name, kind, connection, created_at, updated_at)
+                VALUES (x'01', 's', 'local_fs', '/tmp', 0, 0);
+             INSERT INTO asset (id, source_id, path, filename, scanned_at, media_type, format,
+                                created_at, updated_at)
+                VALUES (x'02', x'01', 'AK47_LowPoly.fbx', 'AK47_LowPoly.fbx', 0,
+                        'model', 'fbx', 0, 0);",
+        )
+        .unwrap();
+
+        conn.execute_batch(MIGRATIONS[18]).unwrap();
+        let matches = |term: &str| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM asset_filename_trigram
+                 WHERE asset_filename_trigram MATCH ?1",
+                [format!("\"{term}\"")],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(matches("k47"), 1, "existing asset was not backfilled");
+
+        conn.execute_batch(
+            "INSERT INTO asset (id, source_id, path, filename, scanned_at, media_type, format,
+                                created_at, updated_at)
+                VALUES (x'03', x'01', 'impact...final.wav', 'impact...final.wav', 0,
+                        'audio', 'wav', 0, 0);",
+        )
+        .unwrap();
+        assert_eq!(matches("..."), 1, "insert trigger missed the filename");
+
+        conn.execute(
+            "UPDATE asset SET filename = 'renamed.mesh' WHERE id = x'02'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            matches("k47"),
+            0,
+            "update trigger retained the old filename"
+        );
+        assert_eq!(matches("name"), 1, "update trigger missed the new filename");
+
+        conn.execute("DELETE FROM asset WHERE id = x'03'", [])
+            .unwrap();
+        assert_eq!(matches("..."), 0, "delete trigger left a stale trigram row");
     }
 }

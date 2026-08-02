@@ -241,10 +241,136 @@ pub(crate) fn push_visibility(
 /// Build the shared `WHERE` clause (FTS text match + facet filters) and its bind values from a query
 /// request — the common prefix of both `query_assets` (paged) and `query_asset_ids` (unbounded).
 ///
-/// Text search hits the `asset_fts` inverted index (M1), widened by the synonym map (M3), expressed
-/// as a composable `asset.rowid IN (…)` subquery so it drops into both the JOINed page query and the
-/// bare `COUNT(*) FROM asset`. A `filename LIKE` OR-arm is kept so in-word substrings the tokenizer
-/// can't reach (e.g. a partial `k47`) never regress below the old scan's recall.
+/// Text search hits the `asset_fts` inverted index (M1), widened by the synonym map (M3), and unions
+/// that posting list with the filename-only trigram index for legacy in-word substring recall. Both
+/// arms are indexed; a sub-trigram punctuation query is restricted to the newest fixed rowid window.
+pub(crate) const SHORT_TEXT_CANDIDATES: i64 = 4_096;
+
+fn push_text_where(
+    text: &str,
+    syn: &crate::search::SynonymMap,
+    where_sql: &mut String,
+    binds: &mut Vec<Value>,
+) {
+    let tokenized = crate::search::fts_match_expr(text, syn);
+    let substring = crate::search::substring_match_expr(text);
+    match (tokenized, substring) {
+        (Some(m), Some(sub)) => {
+            where_sql.push_str(
+                " AND asset.rowid IN (\
+                    SELECT rowid FROM asset_fts WHERE asset_fts MATCH ? \
+                    UNION SELECT rowid FROM asset_filename_trigram \
+                          WHERE asset_filename_trigram MATCH ?)",
+            );
+            binds.push(Value::Text(m));
+            binds.push(Value::Text(sub));
+        }
+        (Some(m), None) => {
+            where_sql.push_str(
+                " AND asset.rowid IN (SELECT rowid FROM asset_fts WHERE asset_fts MATCH ?)",
+            );
+            binds.push(Value::Text(m));
+        }
+        (None, Some(sub)) => {
+            where_sql.push_str(
+                " AND asset.rowid IN (SELECT rowid FROM asset_filename_trigram \
+                 WHERE asset_filename_trigram MATCH ?)",
+            );
+            binds.push(Value::Text(sub));
+        }
+        (None, None) => {
+            // FTS5 trigram has no postings for one/two-character punctuation. Preserve the legacy
+            // behavior for ordinary/small catalogs without ever making it an unbounded scan: rowid
+            // is SQLite's integer primary key, so this is a range SEARCH over at most 4096 ids.
+            where_sql.push_str(&format!(
+                " AND asset.rowid IN (SELECT rowid FROM asset AS short_asset \
+                 WHERE short_asset.rowid > \
+                       COALESCE((SELECT MAX(rowid) FROM asset), 0) - {SHORT_TEXT_CANDIDATES} \
+                   AND short_asset.filename LIKE ? ESCAPE '\\')"
+            ));
+            binds.push(Value::Text(format!("%{}%", escape_like(text))));
+        }
+    }
+}
+
+/// The page/hybrid query's one-time ranked match set. Joining this CTE avoids correlated MATCH and
+/// bm25 probes in `ORDER BY`: the primary FTS posting list computes bm25 once, the authored tier is
+/// another materialized posting list, and trigram-only hits receive the final fallback tier.
+pub(crate) struct RankedTextMatches {
+    pub cte: String,
+    pub binds: Vec<Value>,
+}
+
+pub(crate) fn ranked_text_matches(
+    text: &str,
+    syn: &crate::search::SynonymMap,
+) -> RankedTextMatches {
+    let tokenized = crate::search::fts_match_expr(text, syn);
+    let substring = crate::search::substring_match_expr(text);
+    match (tokenized, substring) {
+        (Some(m), Some(sub)) => RankedTextMatches {
+            cte: format!(
+                "WITH fts_matches(rowid, rank) AS MATERIALIZED (\
+                    SELECT rowid, {rank} FROM asset_fts WHERE asset_fts MATCH ?\
+                 ), authored_matches(rowid) AS MATERIALIZED (\
+                    SELECT rowid FROM asset_fts WHERE asset_fts MATCH ?\
+                 ), substring_matches(rowid) AS MATERIALIZED (\
+                    SELECT rowid FROM asset_filename_trigram \
+                    WHERE asset_filename_trigram MATCH ?\
+                 ), text_matches(rowid, tier, rank) AS MATERIALIZED (\
+                    SELECT f.rowid, CASE WHEN a.rowid IS NULL THEN 1 ELSE 0 END, f.rank \
+                    FROM fts_matches f LEFT JOIN authored_matches a ON a.rowid = f.rowid \
+                    UNION ALL \
+                    SELECT s.rowid, 2, 1e9 FROM substring_matches s \
+                    LEFT JOIN fts_matches f ON f.rowid = s.rowid WHERE f.rowid IS NULL\
+                 )",
+                rank = crate::search::FTS_RANK
+            ),
+            binds: vec![
+                Value::Text(m.clone()),
+                Value::Text(crate::search::authored_scoped(&m)),
+                Value::Text(sub),
+            ],
+        },
+        (Some(m), None) => RankedTextMatches {
+            cte: format!(
+                "WITH fts_matches(rowid, rank) AS MATERIALIZED (\
+                    SELECT rowid, {rank} FROM asset_fts WHERE asset_fts MATCH ?\
+                 ), authored_matches(rowid) AS MATERIALIZED (\
+                    SELECT rowid FROM asset_fts WHERE asset_fts MATCH ?\
+                 ), text_matches(rowid, tier, rank) AS MATERIALIZED (\
+                    SELECT f.rowid, CASE WHEN a.rowid IS NULL THEN 1 ELSE 0 END, f.rank \
+                    FROM fts_matches f LEFT JOIN authored_matches a ON a.rowid = f.rowid\
+                 )",
+                rank = crate::search::FTS_RANK
+            ),
+            binds: vec![
+                Value::Text(m.clone()),
+                Value::Text(crate::search::authored_scoped(&m)),
+            ],
+        },
+        (None, Some(sub)) => RankedTextMatches {
+            cte: "WITH text_matches(rowid, tier, rank) AS MATERIALIZED (\
+                    SELECT rowid, 2, 1e9 FROM asset_filename_trigram \
+                    WHERE asset_filename_trigram MATCH ?\
+                  )"
+            .into(),
+            binds: vec![Value::Text(sub)],
+        },
+        (None, None) => RankedTextMatches {
+            cte: format!(
+                "WITH text_matches(rowid, tier, rank) AS MATERIALIZED (\
+                    SELECT rowid, 2, 1e9 FROM asset AS short_asset \
+                    WHERE short_asset.rowid > \
+                          COALESCE((SELECT MAX(rowid) FROM asset), 0) - {SHORT_TEXT_CANDIDATES} \
+                      AND short_asset.filename LIKE ? ESCAPE '\\'\
+                 )"
+            ),
+            binds: vec![Value::Text(format!("%{}%", escape_like(text)))],
+        },
+    }
+}
+
 pub(crate) fn build_where(
     req: &QueryRequest,
     syn: &crate::search::SynonymMap,
@@ -254,21 +380,25 @@ pub(crate) fn build_where(
     let mut binds: Vec<Value> = Vec::new();
     push_visibility(vis, "asset", &mut where_sql, &mut binds);
     if let Some(text) = req.text.as_ref().filter(|t| !t.is_empty()) {
-        if let Some(m) = crate::search::fts_match_expr(text, syn) {
-            where_sql.push_str(
-                " AND (asset.rowid IN (SELECT rowid FROM asset_fts WHERE asset_fts MATCH ?) \
-                 OR filename LIKE ?)",
-            );
-            binds.push(Value::Text(m));
-            binds.push(Value::Text(format!("%{}%", escape_like(text))));
-        } else {
-            // No usable FTS token (all punctuation) — fall back to the plain substring scan.
-            where_sql.push_str(" AND filename LIKE ?");
-            binds.push(Value::Text(format!("%{}%", escape_like(text))));
-        }
+        push_text_where(text, syn, &mut where_sql, &mut binds);
     }
     for f in &req.filters {
         apply_filter(f, &mut where_sql, &mut binds)?;
+    }
+    Ok((where_sql, binds))
+}
+
+/// Visibility + facets without text. Ranked page queries get their text restriction by joining the
+/// `text_matches` CTE, while counts/id exports continue to use [`build_where`].
+pub(crate) fn build_where_without_text(
+    req: &QueryRequest,
+    vis: &Visibility,
+) -> Result<(String, Vec<Value>), LibError> {
+    let mut where_sql = String::from(" WHERE 1=1");
+    let mut binds = Vec::new();
+    push_visibility(vis, "asset", &mut where_sql, &mut binds);
+    for filter in &req.filters {
+        apply_filter(filter, &mut where_sql, &mut binds)?;
     }
     Ok((where_sql, binds))
 }
