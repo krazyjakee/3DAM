@@ -7,6 +7,7 @@ description = "MediaHandler trait + format detection and per-media handlers (tec
 
 [dependencies]
 dam-api.workspace = true
+base64 = { workspace = true, optional = true }
 image = { workspace = true, features = ["png", "jpeg", "gif", "bmp", "tga", "tiff", "webp"] }
 # GPU texture containers (issue #49): DDS decode, KTX2 container, block-compressed payloads.
 dds.workspace = true
@@ -17,6 +18,9 @@ texture2ddecoder.workspace = true
 # raw FFI, which `russimp-ng` re-exports. `static-link` must match `dam-render`'s exactly, or Cargo
 # feature unification builds Assimp twice and a non-render build tries to link a system libassimp.
 russimp-ng = { workspace = true, features = ["static-link"], optional = true }
+# Pure-Rust KHR_draco_mesh_compression writer/reader. Kept behind model-convert so metadata-only
+# consumers neither compile it nor acquire a geometry-codec dependency.
+draco-gltf = { workspace = true, optional = true }
 symphonia.workspace = true
 hound.workspace = true
 rustfft.workspace = true
@@ -28,13 +32,14 @@ quick-xml.workspace = true
 encoding_rs.workspace = true
 
 [dev-dependencies]
+base64.workspace = true
 tempfile.workspace = true
 
 [features]
-# Transcode a 3D model to a self-contained GLB. Off by default: turning it on builds Assimp from
-# source (cmake/C++), which a library consumer that only wants metadata should not pay for. `serve`
-# and the CLI opt in, the same way `render` is opted into.
-model-convert = ["dep:russimp-ng"]
+# Transcode a 3D model to GLB, glTF, or OBJ, with optional Draco compression for the glTF family.
+# Off by default: turning it on builds Assimp from source (cmake/C++), which a library consumer that
+# only wants metadata should not pay for. `serve` and the CLI opt in, as they do for `render`.
+model-convert = ["dep:base64", "dep:draco-gltf", "dep:russimp-ng"]
 # Note on test coverage: `cargo test -p dam-media` alone runs none of the model-convert tests,
 # because the feature is off. They *do* run under `cargo test --workspace` — `dam-server` enables
 # `dam-core/model-convert`, and resolver-2 unifies features across the workspace's normal graph.

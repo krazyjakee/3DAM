@@ -131,10 +131,10 @@ fallback on GPU-less hosts per <a href="adr/0001-3d-render-backend.md">ADR 0001<
 stay interactive WASM islands; the web grid/inspector render real previews with a graceful fall-back
 to the honest typed tile whenever a render is unavailable. The <strong>convert pipeline</strong> (CLI-first,
 <code>3dam convert</code>) decodes via the same handlers and re-encodes non-destructively — image
-transcode/resize and audio→WAV — with dry-run planning, the <strong>source-safety invariant</strong> (never
-writes into a registered source), atomic temp-write-then-rename, and collision policy. Deeper codec and
-format coverage (DDS/KTX2, MP4/AAC decode, mesh optimise/compression, more encode targets) stages behind
-the same seams.</p>
+transcode/resize, AAC-in-MP4→WAV, and model export to GLB/glTF/OBJ — with dry-run planning, the
+<strong>source-safety invariant</strong> (never writes into a registered source), atomic family publishing,
+collision policy, and opt-in topology optimisation plus Draco geometry compression for glTF targets.
+DDS/KTX2 and FBX decode/preview are shipped; USD decode and FBX/USD encode remain explicit later work.</p>
 </div>
 
 <div class="log">

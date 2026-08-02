@@ -17,9 +17,8 @@ import type {
 
 const IMAGE_FORMATS = ["png", "jpg", "webp", "bmp", "tga", "tiff", "gif"];
 const AUDIO_FORMATS = ["wav"];
-/** 3D containers (issue #49). `glb` only: it is self-contained, where `gltf`/`obj` emit sidecar
- *  files the convert pipeline cannot yet write as one output — the server refuses those by name. */
-const MODEL_FORMATS = ["glb"];
+/** 3D containers (issue #49). Text glTF and OBJ are published with their `.bin`/`.mtl` companion. */
+const MODEL_FORMATS = ["glb", "gltf", "obj"];
 const LOSSY = new Set(["jpg", "webp"]);
 
 /** The media classes `convert` can target. Not every `MediaType` — video and documents have no
@@ -201,12 +200,12 @@ export function ConvertDialog({
                     checked={optimize}
                     onChange={(e) => setOptimize(e.target.checked)}
                   />
-                  Optimise mesh
+                  Optimise + compress mesh
                 </label>
                 <p className="mt-1 text-[10px] text-fg-dim">
                   Merges redundant materials and meshes, drops degenerate faces, and re-joins shared
-                  vertices — fewer draw calls for the same model. Node names and hierarchy may not
-                  survive; the original is never modified.
+                  vertices — fewer draw calls for the same model. GLB/glTF also uses Draco geometry
+                  compression. Node names and hierarchy may not survive; the original is unchanged.
                 </p>
               </div>
             )}

@@ -182,6 +182,69 @@ async fn a_model_converts_to_glb_without_touching_the_source() {
             glb.len(),
             "the container's declared length matches what was written"
         );
+
+        for (format, companion_ext) in [("gltf", "bin"), ("obj", "mtl")] {
+            let family_out = tmp.join(format!("out-{format}"));
+            let family = lib
+                .convert(
+                    &ctx,
+                    ConvertRequest {
+                        inputs: vec![model.id],
+                        target: ConvertTarget::Model {
+                            format: format.into(),
+                            optimize: false,
+                        },
+                        output_dir: family_out.to_string_lossy().into_owned(),
+                        dry_run: false,
+                        on_collision: CollisionRule::Fail,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(family.done, 1, "{format} family converts");
+            assert!(family_out.join(format!("tri.{format}")).exists());
+            assert!(
+                family_out.join(format!("tri.{companion_ext}")).exists(),
+                "{format} companion is published with its primary"
+            );
+        }
+
+        // A sidecar is part of the collision family even when the primary path is free. Suffixing
+        // selects a stem for both files, so it cannot overwrite an unrelated `tri.bin`.
+        let collision_out = tmp.join("out-gltf-collision");
+        std::fs::create_dir_all(&collision_out).unwrap();
+        std::fs::write(collision_out.join("tri.bin"), b"keep me").unwrap();
+        let collision_request = ConvertRequest {
+            inputs: vec![model.id],
+            target: ConvertTarget::Model {
+                format: "gltf".into(),
+                optimize: false,
+            },
+            output_dir: collision_out.to_string_lossy().into_owned(),
+            dry_run: false,
+            on_collision: CollisionRule::Fail,
+        };
+        let collision = lib.convert(&ctx, collision_request.clone()).await.unwrap();
+        assert_eq!(collision.collisions, 1);
+        assert!(!collision_out.join("tri.gltf").exists());
+        assert_eq!(
+            std::fs::read(collision_out.join("tri.bin")).unwrap(),
+            b"keep me"
+        );
+
+        let suffixed = lib
+            .convert(
+                &ctx,
+                ConvertRequest {
+                    on_collision: CollisionRule::Suffix,
+                    ..collision_request
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(suffixed.done, 1);
+        assert!(collision_out.join("tri-1.gltf").exists());
+        assert!(collision_out.join("tri-1.bin").exists());
     }
     #[cfg(not(feature = "model-convert"))]
     {
@@ -245,6 +308,9 @@ async fn a_model_converts_to_glb_without_touching_the_source() {
         assert_eq!(optimised.done, 1, "the optimised model converts");
         let glb = std::fs::read(opt_out.join("tri.glb")).unwrap();
         assert_eq!(&glb[0..4], b"glTF");
+        assert!(glb
+            .windows("KHR_draco_mesh_compression".len())
+            .any(|window| window == b"KHR_draco_mesh_compression"));
     }
     #[cfg(not(feature = "model-convert"))]
     {

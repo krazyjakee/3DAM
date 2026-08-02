@@ -1,4 +1,4 @@
-//! 3D container transcode — any Assimp-readable model to a self-contained **GLB** (issue #49,
+//! 3D container transcode — any Assimp-readable model to GLB, glTF, or OBJ (issue #49,
 //! tech-spec 08 §3.3).
 //!
 //! ## Why this is nearly free
@@ -8,14 +8,12 @@
 //! turns it on). `russimp-ng` re-exports the generated bindings, so the whole path is raw FFI over
 //! a library that is already linked — no new native dependency, no second cmake build.
 //!
-//! ## Why GLB only, for now
+//! ## Multi-file targets
 //!
-//! Assimp returns a *blob chain*, and the convert pipeline's encode seam is a single `Vec<u8>`
-//! (`dam-core::convert::encode` → `atomic_write`). `glb2` produces exactly one part, so it drops in
-//! untouched. `gltf2` is two (`.gltf` + `.bin`) and `obj` is two (`.obj` + `.mtl`), so both need a
-//! multi-file output seam — a change to the pipeline's non-destructive write discipline, which is
-//! not something to bolt on as a side effect of adding a format. Deferred deliberately; tech-spec
-//! 08 §3.3 lists them as v1 targets and they remain open.
+//! Assimp returns a blob chain: GLB is one part, textual glTF adds `.bin`, and OBJ adds `.mtl`.
+//! [`convert_bundle`] retains that structure and rebases Assimp's generic companion names to the
+//! requested output stem. The core pipeline stages and publishes the complete family together;
+//! writing only the primary would create a convincing but broken handoff.
 //!
 //! ## The texture trap
 //!
@@ -26,7 +24,8 @@
 //!
 //! ## What this is, and is not
 //!
-//! It is "give me a self-contained GLB of this model" — for preview, web delivery, or handoff. The
+//! It is "give me a portable open-format copy of this model" — for preview, web delivery, or
+//! handoff. GLB is self-contained; glTF and OBJ carry their companions as an explicit bundle. The
 //! output is **indexed**, which is not automatic here: see the `aiCopyScene` comment in `convert`
 //! for the flag interaction that otherwise triples the vertex count.
 //! It is **not** lossless interchange. Assimp's exporters re-interpret: a one-material textured
@@ -35,23 +34,22 @@
 //! non-destructive by construction — the original is never touched (tech-spec 08 §5.1) — so a
 //! lossy convert is always an addition, never a replacement.
 //!
-//! ## Optimisation, and what it is not
+//! ## Optimisation and compression
 //!
 //! `optimize` adds [`OPTIMISE_FLAGS`] to the import: redundant materials go, meshes and nodes are
 //! merged, degenerate faces are deleted, and the vertices a merge duplicates are re-joined. That is
-//! *topological* optimisation — fewer draw calls and fewer vertices for the same picture.
-//!
-//! It is **not** mesh compression. `KHR_draco_mesh_compression` is the obvious next step and is not
-//! reachable from here: this tree force-enables Assimp's bundled Draco (see
-//! `crates/3dam-render/assimp-draco.cmake` and ADR 0011), but only Assimp's glTF2 *reader* consults
-//! it — `glTF2Exporter.cpp` contains no Draco path at all, so there is nothing to switch on. Adding
-//! Draco or meshopt encoding means a new encoder dependency and a decision about who is expected to
-//! read the output; that is its own slice, deliberately not this one.
+//! *topological* optimisation — fewer draw calls and fewer vertices for the same picture. For the
+//! glTF family, the result is then encoded as required `KHR_draco_mesh_compression` by the
+//! document-preserving `draco-gltf` encoder, with ordinary geometry removed. Assimp's exporter is
+//! decode-only for Draco; keeping this as a separate post-export stage makes that limitation clear.
+//! OBJ has no equivalent standard compression extension, so its optimise path is topology-only.
 
+use std::collections::HashSet;
 use std::ffi::CString;
 use std::path::Path;
 
-use crate::HandlerError;
+use crate::{HandlerError, ModelCompanion, ModelOutput};
+use base64::Engine as _;
 
 /// Assimp post-processing applied at import.
 ///
@@ -115,12 +113,24 @@ const AI_PRIMITIVE_TYPE_POINT_AND_LINE: i32 = 0x1 | 0x2;
 
 /// Target formats this module accepts, mapped to Assimp's exporter ids.
 ///
-/// Only single-part exporters: see the module docs on why `gltf`/`obj` are not here yet.
+/// Assimp exporter ids used by the single- and multi-file encode seams.
 fn exporter_id(target: &str) -> Option<&'static str> {
     match target {
         "glb" => Some("glb2"),
+        "gltf" => Some("gltf2"),
+        "obj" => Some("obj"),
         _ => None,
     }
+}
+
+/// Platform-independent filename validation. `Path::components()` on Unix deliberately treats a
+/// backslash as ordinary text, but a bundle created there may later be unpacked on Windows.
+fn is_safe_file_component(value: &str) -> bool {
+    !value.is_empty()
+        && value != "."
+        && value != ".."
+        && !value.contains(['/', '\\'])
+        && !value.chars().any(char::is_control)
 }
 
 /// Is `target` a 3D container this build can write?
@@ -207,9 +217,31 @@ impl Drop for Blob {
 ///
 /// EXPENSIVE tier — the convert pipeline only, never at ingest.
 pub fn convert(path: &Path, target_format: &str, optimize: bool) -> Result<Vec<u8>, HandlerError> {
+    let output = convert_bundle(path, target_format, optimize, "model")?;
+    if !output.companions.is_empty() {
+        return Err(HandlerError::Unsupported(format!(
+            "'{target_format}' is a multi-file model target; use the bundle encode seam"
+        )));
+    }
+    Ok(output.primary)
+}
+
+/// Transcode to a complete output family. `output_stem` must be a file stem, not a path.
+pub fn convert_bundle(
+    path: &Path,
+    target_format: &str,
+    optimize: bool,
+    output_stem: &str,
+) -> Result<ModelOutput, HandlerError> {
+    if !is_safe_file_component(output_stem) {
+        return Err(HandlerError::Unsupported(
+            "model output stem must be one safe path component".into(),
+        ));
+    }
     let id = exporter_id(target_format).ok_or_else(|| {
         HandlerError::Unsupported(format!(
-            "3D target '{target_format}' is not supported (this build writes: glb)"
+            "3D target '{target_format}' is not supported (this build writes: glb, gltf, obj; \
+             FBX and USD encode are post-v1)"
         ))
     })?;
 
@@ -309,40 +341,246 @@ pub fn convert(path: &Path, target_format: &str, optimize: bool) -> Result<Vec<u
     let blob = Blob(blob);
 
     // SAFETY: a non-null blob has a valid `data`/`size`, and `next` chains further parts.
-    let (bytes, extra_parts) = unsafe {
-        let head = &*blob.0;
-        let mut parts = 0usize;
-        let mut next = head.next;
-        while !next.is_null() {
-            parts += 1;
-            next = (*next).next;
+    let mut parts = Vec::new();
+    // SAFETY: the blob guard keeps the entire linked chain live. Null data at zero size is handled
+    // explicitly because `from_raw_parts(null, 0)` is undefined behaviour.
+    unsafe {
+        let mut current = blob.0;
+        while !current.is_null() {
+            let part = &*current;
+            let bytes = if part.data.is_null() || part.size == 0 {
+                Vec::new()
+            } else {
+                std::slice::from_raw_parts(part.data as *const u8, part.size).to_vec()
+            };
+            let name_len = (part.name.length as usize).min(part.name.data.len());
+            let name = String::from_utf8_lossy(std::slice::from_raw_parts(
+                part.name.data.as_ptr() as *const u8,
+                name_len,
+            ))
+            .into_owned();
+            parts.push((name, bytes));
+            current = part.next;
         }
-        // A blob that was created but never written has `data == null, size == 0`, and
-        // `from_raw_parts(null, 0)` is UB even at zero length — so the null case is handled
-        // rather than relying on the emptiness check further down.
-        let data = if head.data.is_null() || head.size == 0 {
-            Vec::new()
-        } else {
-            std::slice::from_raw_parts(head.data as *const u8, head.size).to_vec()
-        };
-        (data, parts)
-    };
-
-    // A chained blob means the exporter wanted to write sidecars (`.bin`, `.mtl`). Writing only
-    // the first part would produce a file that looks fine and references data that does not exist,
-    // which is worse than refusing. `glb2` is single-part, so this should be unreachable — it
-    // exists so that adding a format to `exporter_id` without extending the seam fails loudly.
-    if extra_parts > 0 {
-        return Err(HandlerError::Unsupported(format!(
-            "'{target_format}' produces {} files, which this pipeline cannot yet write as one \
-             output (issue #49)",
-            extra_parts + 1
-        )));
     }
-    if bytes.is_empty() {
+    let Some((_, primary)) = parts.first().cloned() else {
+        return Err(HandlerError::Encode(
+            "Assimp produced no output blobs".into(),
+        ));
+    };
+    if primary.is_empty() {
         return Err(HandlerError::Encode("Assimp produced an empty file".into()));
     }
-    Ok(bytes)
+    let mut companions = Vec::new();
+    let mut renames = Vec::new();
+    let mut planned_names = HashSet::new();
+    for (index, (original, bytes)) in parts.into_iter().skip(1).enumerate() {
+        if bytes.is_empty() {
+            return Err(HandlerError::Encode(format!(
+                "Assimp produced an empty companion blob {original:?}"
+            )));
+        }
+        if !is_safe_file_component(&original) {
+            return Err(HandlerError::Encode(format!(
+                "Assimp produced an unsafe companion name {original:?}"
+            )));
+        }
+        let original_path = Path::new(&original);
+        let original_name = original_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| {
+                HandlerError::Encode(format!(
+                    "Assimp produced an unsafe companion name {original:?}"
+                ))
+            })?;
+        // Assimp's in-memory exporter uses a bare `bin`/`mtl` blob name while writing
+        // `$blobfile.bin`/`$blobfile.mtl` into the primary. Other exporters use the complete name.
+        let bare_extension = matches!(original.as_str(), "bin" | "mtl");
+        let extension = original_path
+            .extension()
+            .and_then(|value| value.to_str())
+            .or_else(|| bare_extension.then_some(original.as_str()))
+            .unwrap_or("part");
+        let name = if index == 0 || matches!(extension, "bin" | "mtl") {
+            format!("{output_stem}.{extension}")
+        } else {
+            format!("{output_stem}-{original_name}")
+        };
+        if !planned_names.insert(name.clone()) {
+            return Err(HandlerError::Encode(format!(
+                "Assimp companion names collide after rebasing at {name:?}"
+            )));
+        }
+        let reference = if bare_extension {
+            format!("$blobfile.{original}")
+        } else {
+            original
+        };
+        renames.push((reference, name.clone()));
+        companions.push(ModelCompanion { name, bytes });
+    }
+
+    let mut output = ModelOutput {
+        primary,
+        companions,
+    };
+    for (from, to) in renames {
+        replace_text_reference(&mut output.primary, &from, &to);
+        for companion in &mut output.companions {
+            if matches!(
+                Path::new(&companion.name)
+                    .extension()
+                    .and_then(|value| value.to_str()),
+                Some("gltf" | "obj" | "mtl")
+            ) {
+                replace_text_reference(&mut companion.bytes, &from, &to);
+            }
+        }
+    }
+    if optimize && matches!(target_format, "glb" | "gltf") {
+        compress_draco(output, target_format, output_stem)
+    } else {
+        Ok(output)
+    }
+}
+
+fn replace_text_reference(bytes: &mut Vec<u8>, from: &str, to: &str) {
+    if from.is_empty() || from == to {
+        return;
+    }
+    let mut replaced = Vec::with_capacity(bytes.len());
+    let mut rest = bytes.as_slice();
+    while let Some(offset) = rest
+        .windows(from.len())
+        .position(|window| window == from.as_bytes())
+    {
+        replaced.extend_from_slice(&rest[..offset]);
+        replaced.extend_from_slice(to.as_bytes());
+        rest = &rest[offset + from.len()..];
+    }
+    replaced.extend_from_slice(rest);
+    *bytes = replaced;
+}
+
+/// Apply real geometry compression after Assimp has produced standards-compliant glTF. The
+/// document-preserving encoder removes ordinary primitive geometry in `DracoOnly` mode, marks
+/// `KHR_draco_mesh_compression` required, and validates the rewritten graph before serialization.
+fn compress_draco(
+    output: ModelOutput,
+    target_format: &str,
+    output_stem: &str,
+) -> Result<ModelOutput, HandlerError> {
+    let mut import = if target_format == "glb" {
+        draco_gltf::import_slice(&output.primary, None).map_err(|error| {
+            HandlerError::Encode(format!("read exported GLB for Draco: {error}"))
+        })?
+    } else {
+        let mut json: serde_json::Value = serde_json::from_slice(&output.primary)
+            .map_err(|error| HandlerError::Encode(format!("read exported glTF JSON: {error}")))?;
+        let buffers = json
+            .get_mut("buffers")
+            .and_then(serde_json::Value::as_array_mut)
+            .ok_or_else(|| HandlerError::Encode("exported glTF has no buffers".into()))?;
+        for buffer in buffers {
+            let uri = buffer
+                .get("uri")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| HandlerError::Encode("exported glTF buffer has no URI".into()))?;
+            let bytes = output
+                .companions
+                .iter()
+                .find(|part| part.name == uri)
+                .map(|part| part.bytes.as_slice())
+                .ok_or_else(|| {
+                    HandlerError::Encode(format!(
+                        "exported glTF references missing companion {uri:?}"
+                    ))
+                })?;
+            let embedded = format!(
+                "data:application/octet-stream;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(bytes)
+            );
+            buffer["uri"] = serde_json::Value::String(embedded);
+        }
+        let embedded = serde_json::to_vec(&json)
+            .map_err(|error| HandlerError::Encode(format!("embed glTF buffers: {error}")))?;
+        draco_gltf::import_slice(&embedded, None).map_err(|error| {
+            HandlerError::Encode(format!("read exported glTF for Draco: {error}"))
+        })?
+    };
+
+    let work: Vec<_> = import
+        .document
+        .meshes()
+        .into_iter()
+        .map(|mesh| {
+            let count = mesh
+                .value()
+                .get("primitives")
+                .and_then(draco_gltf::JsonValue::as_array)
+                .map_or(0, |primitives| primitives.len());
+            (mesh.index(), count)
+        })
+        .collect();
+    let mut compressed = 0usize;
+    for (mesh, primitive_count) in work {
+        for primitive in 0..primitive_count {
+            import
+                .compress_primitive(mesh, primitive, draco_gltf::CompressionOptions::default())
+                .map_err(|error| {
+                    HandlerError::Encode(format!("Draco-compress primitive: {error}"))
+                })?;
+            compressed += 1;
+        }
+    }
+    if compressed == 0 {
+        return Err(HandlerError::Encode(
+            "Draco compression found no mesh primitives".into(),
+        ));
+    }
+
+    if target_format == "glb" {
+        let primary = import
+            .to_bytes(draco_gltf::OutputFormat::GlbV2)
+            .map_err(|error| HandlerError::Encode(format!("write Draco GLB: {error}")))?;
+        return Ok(ModelOutput {
+            primary,
+            companions: Vec::new(),
+        });
+    }
+
+    let portable = import
+        .to_gltf_output()
+        .map_err(|error| HandlerError::Encode(format!("write Draco glTF: {error}")))?;
+    let mut primary = portable.json;
+    let mut companions = Vec::with_capacity(portable.resources.len());
+    let mut names = HashSet::new();
+    for (index, resource) in portable.resources.into_iter().enumerate() {
+        let extension = Path::new(&resource.uri)
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("bin");
+        let name = if index == 0 {
+            format!("{output_stem}.{extension}")
+        } else {
+            format!("{output_stem}-{index}.{extension}")
+        };
+        if !names.insert(name.clone()) {
+            return Err(HandlerError::Encode(format!(
+                "Draco glTF companion names collide at {name:?}"
+            )));
+        }
+        replace_text_reference(&mut primary, &resource.uri, &name);
+        companions.push(ModelCompanion {
+            name,
+            bytes: resource.bytes,
+        });
+    }
+    Ok(ModelOutput {
+        primary,
+        companions,
+    })
 }
 
 #[cfg(test)]
@@ -425,6 +663,26 @@ mod tests {
             }
         }
         o
+    }
+
+    fn large_grid_obj(side: usize) -> String {
+        let mut obj = String::new();
+        for y in 0..=side {
+            for x in 0..=side {
+                obj.push_str(&format!("v {x} {y} 0\n"));
+            }
+        }
+        let row = side + 1;
+        for y in 0..side {
+            for x in 0..side {
+                let a = y * row + x + 1;
+                let b = a + 1;
+                let c = a + row;
+                let d = c + 1;
+                obj.push_str(&format!("f {a} {b} {d}\nf {a} {d} {c}\n"));
+            }
+        }
+        obj
     }
 
     /// Parse a GLB's JSON chunk — the only part of the container these assertions read.
@@ -587,6 +845,17 @@ mod tests {
         let (_d, p) = write("two-groups.obj", two_group_obj().as_bytes());
         let bytes = convert(&p, "glb", true).unwrap();
 
+        assert!(bytes
+            .windows("KHR_draco_mesh_compression".len())
+            .any(|window| window == b"KHR_draco_mesh_compression"));
+        let draco = draco_gltf::import_slice(&bytes, None).unwrap();
+        let decoded: Vec<_> = draco
+            .draco_primitives()
+            .map(|primitive| draco.decode_draco_primitive(primitive).unwrap())
+            .collect();
+        assert_eq!(decoded.len(), 1, "the merged primitive is Draco-compressed");
+        assert_eq!(decoded[0].num_faces(), 4, "all faces survive compression");
+
         let (_d2, out) = write("out.glb", &bytes);
         let out_c = CString::new(out.as_os_str().as_encoded_bytes()).unwrap();
         // SAFETY: same import/release discipline as `convert`; released before the assertions so a
@@ -603,6 +872,28 @@ mod tests {
         };
         assert!(ok, "the optimised GLB did not re-import");
         assert_eq!(meshes, 1, "one merged mesh survives the round trip");
+    }
+
+    #[test]
+    fn draco_compression_reduces_a_nontrivial_glb_and_preserves_faces() {
+        let side = 32;
+        let (_dir, path) = write("grid.obj", large_grid_obj(side).as_bytes());
+        let plain = convert(&path, "glb", false).unwrap();
+        let compressed = convert(&path, "glb", true).unwrap();
+        assert!(
+            compressed.len() < plain.len(),
+            "Draco did not reduce the grid GLB: {} -> {} bytes",
+            plain.len(),
+            compressed.len()
+        );
+
+        let decoded = draco_gltf::import_slice(&compressed, None).unwrap();
+        let meshes: Vec<_> = decoded
+            .draco_primitives()
+            .map(|primitive| decoded.decode_draco_primitive(primitive).unwrap())
+            .collect();
+        assert_eq!(meshes.len(), 1);
+        assert_eq!(meshes[0].num_faces(), side * side * 2);
     }
 
     /// Optimisation must not turn a refusal into a success (or a panic) — the property-store import
@@ -626,10 +917,7 @@ mod tests {
     #[test]
     fn an_unsupported_target_is_refused_by_name() {
         let (_d, p) = write("tri.obj", TRIANGLE_OBJ.as_bytes());
-        // `gltf` and `obj` are real Assimp exporters, but both emit sidecars the single-`Vec<u8>`
-        // convert seam cannot write — so they must be refused *here*, clearly, rather than
-        // producing a first part that silently references a file nobody wrote.
-        for target in ["gltf", "obj", "fbx", "png"] {
+        for target in ["fbx", "usd", "png"] {
             let err = match convert(&p, target, false) {
                 Err(e) => e,
                 Ok(_) => panic!("{target} must be refused, but it converted"),
@@ -640,7 +928,105 @@ mod tests {
             );
         }
         assert!(supports_target("glb"));
-        assert!(!supports_target("gltf"));
+        assert!(supports_target("gltf"));
+        assert!(supports_target("obj"));
+        assert!(!supports_target("fbx"));
+        assert!(!supports_target("usd"));
+    }
+
+    #[test]
+    fn bundle_names_are_platform_independently_safe() {
+        for safe in ["triangle", "model 01", "mødel"] {
+            assert!(is_safe_file_component(safe));
+        }
+        for unsafe_name in ["", ".", "..", "../evil", "..\\evil", "a/b", "a\\b", "a\0b"] {
+            assert!(
+                !is_safe_file_component(unsafe_name),
+                "accepted {unsafe_name:?}"
+            );
+        }
+
+        let (_d, path) = write("tri.obj", TRIANGLE_OBJ.as_bytes());
+        for stem in ["..", "../evil", "..\\evil", "nested/name", "nested\\name"] {
+            let error = convert_bundle(&path, "gltf", false, stem).unwrap_err();
+            assert!(error.to_string().contains("safe path component"));
+        }
+    }
+
+    #[test]
+    fn gltf_and_obj_bundles_include_rebased_companions_and_reimport() {
+        let (_d, p) = write("tri.obj", TRIANGLE_OBJ.as_bytes());
+        for target in ["gltf", "obj"] {
+            let bundle = convert_bundle(&p, target, false, "triangle")
+                .unwrap_or_else(|error| panic!("{target} bundle failed: {error}"));
+            assert!(!bundle.primary.is_empty());
+            assert!(!bundle.companions.is_empty(), "{target} needs a sidecar");
+            assert!(bundle
+                .companions
+                .iter()
+                .all(|part| part.name.starts_with("triangle.")));
+            for part in &bundle.companions {
+                assert!(
+                    bundle
+                        .primary
+                        .windows(part.name.len())
+                        .any(|window| window == part.name.as_bytes())
+                        || target == "obj",
+                    "{target} primary does not reference {}",
+                    part.name
+                );
+            }
+
+            let dir = tempfile::tempdir().unwrap();
+            let primary = dir.path().join(format!("triangle.{target}"));
+            std::fs::write(&primary, &bundle.primary).unwrap();
+            for part in bundle.companions {
+                std::fs::write(dir.path().join(part.name), part.bytes).unwrap();
+            }
+            let primary_c = CString::new(primary.as_os_str().as_encoded_bytes()).unwrap();
+            let imported = unsafe {
+                let scene =
+                    russimp_ng::sys::aiImportFile(primary_c.as_ptr(), AI_PROCESS_TRIANGULATE);
+                if scene.is_null() {
+                    false
+                } else {
+                    let has_mesh = (*scene).mNumMeshes > 0;
+                    russimp_ng::sys::aiReleaseImport(scene);
+                    has_mesh
+                }
+            };
+            assert!(imported, "{target} bundle did not re-import");
+        }
+    }
+
+    #[test]
+    fn optimised_text_gltf_keeps_a_rebased_draco_companion_and_decodes() {
+        let (_source_dir, path) = write("tri.obj", TRIANGLE_OBJ.as_bytes());
+        let bundle = convert_bundle(&path, "gltf", true, "compressed-triangle").unwrap();
+        assert!(bundle
+            .primary
+            .windows("KHR_draco_mesh_compression".len())
+            .any(|window| window == b"KHR_draco_mesh_compression"));
+        assert_eq!(bundle.companions.len(), 1);
+        assert_eq!(bundle.companions[0].name, "compressed-triangle.bin");
+        assert!(bundle
+            .primary
+            .windows(bundle.companions[0].name.len())
+            .any(|window| window == bundle.companions[0].name.as_bytes()));
+
+        let output_dir = tempfile::tempdir().unwrap();
+        let primary = output_dir.path().join("compressed-triangle.gltf");
+        std::fs::write(&primary, bundle.primary).unwrap();
+        for companion in bundle.companions {
+            std::fs::write(output_dir.path().join(companion.name), companion.bytes).unwrap();
+        }
+        let import = draco_gltf::import(&primary).unwrap();
+        let decoded: Vec<_> = import
+            .draco_primitives()
+            .map(|primitive| import.decode_draco_primitive(primitive).unwrap())
+            .collect();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].num_faces(), 1);
     }
 
     /// Fail-soft, per the handler contract: a file that is not a model is a per-item error, never

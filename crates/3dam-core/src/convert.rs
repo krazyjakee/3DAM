@@ -14,6 +14,7 @@ use dam_api::LibError;
 use dam_store::Store;
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Run a convert plan against the store. `dry_run` writes nothing.
@@ -198,7 +199,7 @@ fn plan_and_maybe_encode(
     let base_output = output_dir.join(format!("{stem}.{ext}"));
 
     // Resolve collisions per the rule (§5.3).
-    let (planned, skip) = match resolve_collision(&base_output, req.on_collision) {
+    let (planned, skip) = match resolve_collision(&base_output, req.on_collision, &req.target) {
         CollisionOutcome::Path(p) => (p, false),
         CollisionOutcome::Skip => (base_output.clone(), true),
         CollisionOutcome::Fail => {
@@ -271,21 +272,27 @@ fn plan_and_maybe_encode(
 
     // Encode into memory, then write atomically under output_dir. The temp download (if any) lives
     // exactly as long as this item — one asset's worth of scratch, whatever the batch size.
-    match encode(fetched.path(), &asset.summary.format, &req.target) {
-        Ok(bytes) => match atomic_write(&planned, &bytes) {
-            Ok(()) => {
-                let out_len = bytes.len() as u64;
-                ConvertItemReport {
-                    input,
-                    input_path: abs_input.to_string_lossy().into_owned(),
-                    planned_output: planned_str,
-                    disposition: Disposition::Done,
-                    input_bytes,
-                    output_bytes: Some(out_len),
-                    ratio: (input_bytes > 0).then(|| out_len as f32 / input_bytes as f32),
-                    error: None,
-                }
-            }
+    let output_stem = planned
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("output");
+    match encode(
+        fetched.path(),
+        &asset.summary.format,
+        &req.target,
+        output_stem,
+    ) {
+        Ok(output) => match atomic_write_output(&planned, output) {
+            Ok(out_len) => ConvertItemReport {
+                input,
+                input_path: abs_input.to_string_lossy().into_owned(),
+                planned_output: planned_str,
+                disposition: Disposition::Done,
+                input_bytes,
+                output_bytes: Some(out_len),
+                ratio: (input_bytes > 0).then(|| out_len as f32 / input_bytes as f32),
+                error: None,
+            },
             Err(e) => failed_item(
                 input,
                 abs_input.to_string_lossy().into_owned(),
@@ -307,24 +314,32 @@ fn encode(
     abs_input: &Path,
     source_format: &str,
     target: &ConvertTarget,
-) -> Result<Vec<u8>, dam_media::HandlerError> {
+    output_stem: &str,
+) -> Result<EncodedOutput, dam_media::HandlerError> {
     match target {
         ConvertTarget::Image {
             format,
             max_edge,
             quality,
-        } => dam_media::convert_image(abs_input, format, *max_edge, *quality),
+        } => dam_media::convert_image(abs_input, format, *max_edge, *quality)
+            .map(EncodedOutput::Single),
         ConvertTarget::Audio { format } => {
-            dam_media::convert_audio(abs_input, source_format, format)
+            dam_media::convert_audio(abs_input, source_format, format).map(EncodedOutput::Single)
         }
         // 3D container transcode (issue #49). `source_format` is deliberately unused: Assimp
         // identifies the input from its own contents, and trusting the catalogued extension over
         // the file's signature would be the wrong call for a family where mislabelled extensions
         // are common.
         ConvertTarget::Model { format, optimize } => {
-            dam_media::convert_model(abs_input, format, *optimize)
+            dam_media::convert_model_bundle(abs_input, format, *optimize, output_stem)
+                .map(EncodedOutput::Model)
         }
     }
+}
+
+enum EncodedOutput {
+    Single(Vec<u8>),
+    Model(dam_media::ModelOutput),
 }
 
 fn output_ext(target: &ConvertTarget) -> String {
@@ -340,8 +355,8 @@ enum CollisionOutcome {
     Fail,
 }
 
-fn resolve_collision(base: &Path, rule: CollisionRule) -> CollisionOutcome {
-    if !base.exists() {
+fn resolve_collision(base: &Path, rule: CollisionRule, target: &ConvertTarget) -> CollisionOutcome {
+    if !output_family(base, target).iter().any(|path| path.exists()) {
         return CollisionOutcome::Path(base.to_path_buf());
     }
     match rule {
@@ -360,11 +375,147 @@ fn resolve_collision(base: &Path, rule: CollisionRule) -> CollisionOutcome {
             let dir = base.parent().unwrap_or_else(|| Path::new("."));
             for n in 1..10_000 {
                 let candidate = dir.join(format!("{stem}-{n}.{ext}"));
-                if !candidate.exists() {
+                if !output_family(&candidate, target)
+                    .iter()
+                    .any(|path| path.exists())
+                {
                     return CollisionOutcome::Path(candidate);
                 }
             }
             CollisionOutcome::Fail
+        }
+    }
+}
+
+/// Paths known from the target alone. Additional exporter blobs are still committed atomically by
+/// [`atomic_write_output`].
+fn output_family(primary: &Path, target: &ConvertTarget) -> Vec<PathBuf> {
+    let mut paths = vec![primary.to_path_buf()];
+    let companion_ext = match target {
+        ConvertTarget::Model { format, .. } if format == "gltf" => Some("bin"),
+        ConvertTarget::Model { format, .. } if format == "obj" => Some("mtl"),
+        _ => None,
+    };
+    if let Some(extension) = companion_ext {
+        paths.push(primary.with_extension(extension));
+    }
+    paths
+}
+
+static WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn atomic_write_output(path: &Path, output: EncodedOutput) -> Result<u64, String> {
+    match output {
+        EncodedOutput::Single(bytes) => {
+            atomic_write(path, &bytes)?;
+            Ok(bytes.len() as u64)
+        }
+        EncodedOutput::Model(model) => atomic_write_model(path, model),
+    }
+}
+
+/// Stage a complete model family, move overwritten files aside, then publish every part. Any normal
+/// error rolls back files already published and restores the prior family.
+fn atomic_write_model(path: &Path, model: dam_media::ModelOutput) -> Result<u64, String> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+
+    let mut parts = vec![(path.to_path_buf(), model.primary)];
+    for companion in model.companions {
+        if !is_safe_file_component(&companion.name) {
+            return Err(format!(
+                "model encoder produced unsafe companion name {:?}",
+                companion.name
+            ));
+        }
+        parts.push((dir.join(companion.name), companion.bytes));
+    }
+    let mut finals = std::collections::HashSet::new();
+    if parts
+        .iter()
+        .any(|(final_path, _)| !finals.insert(final_path.clone()))
+    {
+        return Err("model encoder produced duplicate output names".into());
+    }
+
+    let sequence = WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let token = format!("{}-{sequence}", std::process::id());
+    let mut staged: Vec<(PathBuf, PathBuf)> = Vec::with_capacity(parts.len());
+    let total_bytes = parts.iter().map(|(_, bytes)| bytes.len() as u64).sum();
+    for (index, (final_path, bytes)) in parts.iter().enumerate() {
+        let file_name = final_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("out");
+        let temp = dir.join(format!(".{file_name}.{token}-{index}.tmp"));
+        if let Err(error) = std::fs::write(&temp, bytes) {
+            cleanup_paths(staged.iter().map(|(path, _)| path));
+            return Err(format!("write model temp {}: {error}", temp.display()));
+        }
+        staged.push((temp, final_path.clone()));
+    }
+
+    let mut backups = Vec::new();
+    for (index, (_, final_path)) in staged.iter().enumerate() {
+        if final_path.exists() {
+            let file_name = final_path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("out");
+            let backup = dir.join(format!(".{file_name}.{token}-{index}.bak"));
+            if let Err(error) = std::fs::rename(final_path, &backup) {
+                restore_backups(&backups);
+                cleanup_paths(staged.iter().map(|(temp, _)| temp));
+                return Err(format!("back up {}: {error}", final_path.display()));
+            }
+            backups.push((backup, final_path.clone()));
+        }
+    }
+
+    let mut published = Vec::new();
+    for (temp, final_path) in &staged {
+        if let Err(error) = std::fs::rename(temp, final_path) {
+            cleanup_paths(published.iter());
+            restore_backups(&backups);
+            cleanup_paths(staged.iter().map(|(remaining, _)| remaining));
+            return Err(format!(
+                "publish model family at {}: {error}",
+                final_path.display()
+            ));
+        }
+        published.push(final_path.clone());
+    }
+    cleanup_paths(backups.iter().map(|(backup, _)| backup));
+    Ok(total_bytes)
+}
+
+fn is_safe_file_component(value: &str) -> bool {
+    !value.is_empty()
+        && value != "."
+        && value != ".."
+        && !value.contains(['/', '\\'])
+        && !value.chars().any(char::is_control)
+}
+
+fn cleanup_paths<'a>(paths: impl IntoIterator<Item = &'a PathBuf>) {
+    for path in paths {
+        if let Err(error) = std::fs::remove_file(path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(path = %path.display(), %error, "convert cleanup failed");
+            }
+        }
+    }
+}
+
+fn restore_backups(backups: &[(PathBuf, PathBuf)]) {
+    for (backup, final_path) in backups.iter().rev() {
+        if let Err(error) = std::fs::rename(backup, final_path) {
+            tracing::error!(
+                backup = %backup.display(),
+                path = %final_path.display(),
+                %error,
+                "convert rollback failed"
+            );
         }
     }
 }
@@ -483,6 +634,90 @@ mod tests {
     use super::*;
     use dam_api::id::ContentHash;
     use dam_sources::SourceConnection;
+
+    fn model_target(format: &str) -> ConvertTarget {
+        ConvertTarget::Model {
+            format: format.into(),
+            optimize: false,
+        }
+    }
+
+    #[test]
+    fn model_collisions_include_the_known_companion_family() {
+        let temp = tempfile::tempdir().unwrap();
+        let primary = temp.path().join("triangle.gltf");
+        std::fs::write(primary.with_extension("bin"), b"occupied").unwrap();
+
+        assert!(matches!(
+            resolve_collision(&primary, CollisionRule::Fail, &model_target("gltf")),
+            CollisionOutcome::Fail
+        ));
+        std::fs::write(temp.path().join("triangle-1.bin"), b"occupied").unwrap();
+        let CollisionOutcome::Path(suffixed) =
+            resolve_collision(&primary, CollisionRule::Suffix, &model_target("gltf"))
+        else {
+            panic!("suffix should find a free family");
+        };
+        assert_eq!(suffixed.file_name().unwrap(), "triangle-2.gltf");
+    }
+
+    #[test]
+    fn model_family_write_replaces_every_part_and_rejects_unsafe_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let primary = temp.path().join("triangle.gltf");
+        let companion = temp.path().join("triangle.bin");
+        std::fs::write(&primary, b"old primary").unwrap();
+        std::fs::write(&companion, b"old companion").unwrap();
+
+        let bytes = atomic_write_model(
+            &primary,
+            dam_media::ModelOutput {
+                primary: b"new primary".to_vec(),
+                companions: vec![dam_media::ModelCompanion {
+                    name: "triangle.bin".into(),
+                    bytes: b"new companion".to_vec(),
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(bytes, 24);
+        assert_eq!(std::fs::read(&primary).unwrap(), b"new primary");
+        assert_eq!(std::fs::read(&companion).unwrap(), b"new companion");
+
+        for hostile in ["../evil.bin", "..\\evil.bin", "nested/file.bin"] {
+            let error = atomic_write_model(
+                &primary,
+                dam_media::ModelOutput {
+                    primary: Vec::new(),
+                    companions: vec![dam_media::ModelCompanion {
+                        name: hostile.into(),
+                        bytes: Vec::new(),
+                    }],
+                },
+            )
+            .unwrap_err();
+            assert!(error.contains("unsafe companion"));
+        }
+
+        let duplicate = atomic_write_model(
+            &primary,
+            dam_media::ModelOutput {
+                primary: Vec::new(),
+                companions: vec![
+                    dam_media::ModelCompanion {
+                        name: "same.bin".into(),
+                        bytes: Vec::new(),
+                    },
+                    dam_media::ModelCompanion {
+                        name: "same.bin".into(),
+                        bytes: Vec::new(),
+                    },
+                ],
+            },
+        )
+        .unwrap_err();
+        assert!(duplicate.contains("duplicate output names"));
+    }
 
     #[test]
     fn cancellation_returns_completed_and_failed_item_detail() {

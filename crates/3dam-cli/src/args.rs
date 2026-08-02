@@ -155,9 +155,9 @@ pub(crate) enum Cmd {
         /// JPEG quality 1..=100 (lossy image targets only).
         #[arg(long)]
         quality: Option<u8>,
-        /// 3D: optimise the mesh while transcoding — merge redundant materials and meshes, drop
-        /// degenerate faces, re-join shared vertices. Collapses the node graph, so names and
-        /// hierarchy may not survive; the original is never touched either way.
+        /// 3D: optimise while transcoding — merge meshes/materials, remove degenerates and re-join
+        /// vertices; glTF/GLB geometry is also Draco-compressed. Collapses the node graph, so names
+        /// and hierarchy may not survive; the original is never touched either way.
         #[arg(long)]
         optimize: bool,
         /// Collision handling: `fail` (default) | `suffix` | `skip` | `overwrite`.

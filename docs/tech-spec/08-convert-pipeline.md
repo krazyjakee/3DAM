@@ -232,7 +232,7 @@ decode) are 04's.
 |-------|-------------|--------------------|-----------|-------|
 | Audio | `AudioTarget` | codec, sample rate, bit depth, channels, quality/bitrate, loudness-normalise | `symphonia` decode (04) → format encoders (WAV/FLAC native; Ogg/Vorbis/Opus, MP3/AAC via bindings) | Resample + dither on bit-depth reduction; optional loudness normalise reuses the analysis loudness (05). |
 | Image | `ImageTarget` | format, dimensions/resize, quality, compression, mip generation, colour space, premultiply-alpha | `image`/`imageproc` decode (04) → PNG/JPEG/WebP encoders; **KTX2/Basis** (UASTC/ETC1S) via `ktx2` + `basis-universal`/`intel_tex` for GPU textures | PNG↔KTX2 is the headline path (PRODUCT_SPEC §6.5); mip + block-compression are texture-pipeline params. |
-| 3D | `ModelTarget` | container format, mesh optimisation flags, quantisation, Draco/meshopt compression, texture handling, scene flattening | `gltf`/loaders decode (04) → glTF/GLB writer; **`meshopt`** for optimise+compress (PRODUCT_SPEC §7) | FBX↔glTF is the headline path; mesh optimisation is a distinct stage from container transcode (§3.3). |
+| 3D | `ModelTarget` | container format, mesh optimisation/compression flag; richer quantisation, texture, and scene controls remain design | Assimp decode/export (04) → GLB/glTF/OBJ; **`draco-gltf`** compression for GLB/glTF | FBX→glTF is the headline v1 path; FBX encode and USD are explicitly later (§3.3). |
 
 ### 3.1 Audio
 
@@ -270,40 +270,38 @@ constrained by `format` and checked at submission.
 
 ### 3.3 3D — two distinct stages
 
-3D conversion separates **container transcode** (FBX→glTF) from **mesh optimisation/compression**
-(`meshopt`), because they are independently useful: you can optimise a mesh in-place (glTF→glTF)
-or transcode without touching geometry.
+3D conversion separates **container transcode** (FBX→glTF) from **mesh optimisation/compression**,
+because they are independently useful: you can optimise a mesh in-place (glTF→glTF) or transcode
+without touching geometry.
 
-> **Status (issue #49).** The **container transcode** stage is implemented, for the single target
-> `glb`, as `ConvertTarget::Model { format, optimize }`.
+> **Status (issue #49).** The **container transcode** stage is implemented for `glb`, textual
+> `gltf`, and `obj` as `ConvertTarget::Model { format, optimize }`. GLB is one file; glTF and OBJ
+> are published with their rebased `.bin`/`.mtl` companions. Collision checks cover the complete
+> known family, and commit stages, backs up, and publishes the family as one rollback-safe unit.
 >
-> **Mesh optimisation** is implemented as the opt-in `optimize` flag on that target — the second
-> stage's *topological* half. It runs a curated set of Assimp post-processing steps at import
+> **Mesh optimisation and compression** are implemented as the opt-in `optimize` flag. It runs a
+> curated set of Assimp post-processing steps at import
 > (`RemoveRedundantMaterials`, `OptimizeGraph`, `OptimizeMeshes`, `FindDegenerates` + `SortByPType`
 > configured to delete rather than demote, `ImproveCacheLocality`), which merges draw calls and
 > re-joins the vertices a merge duplicates. It is off by default because it collapses the node
 > graph: geometry survives, names and hierarchy may not. The steps have to be *import*-time — Assimp
 > orders `OptimizeMeshes` before `JoinIdenticalVertices` in one chain, so the join that recovers the
-> duplicated vertices only happens if the merge ran in the same pass.
->
-> **Mesh compression is still not implemented.** `KHR_draco_mesh_compression` is unreachable from
-> the current encoder: this tree force-enables Assimp's bundled Draco (ADR 0011), but only Assimp's
-> glTF2 *reader* consults it — the exporter has no Draco path. Draco or `meshopt` encoding means a
-> new encoder dependency, so it stays a later slice. The remaining `ModelTarget` fields below
-> (`quantise`, `compression`, `textures`, `flatten`) likewise remain design; the shipped DTO carries
-> only `format` + `optimize` so there is no half-wired knob.
+> duplicated vertices only happens if the merge ran in the same pass. For GLB/glTF, the resulting
+> primitives are then encoded by the pure-Rust `draco-gltf` path as required
+> `KHR_draco_mesh_compression`, with ordinary geometry removed. OBJ has no corresponding compressed
+> geometry extension, so the same flag applies its topology half only. The remaining structured
+> `ModelTarget` fields below (`quantise`, codec selection, textures, flatten) remain design.
 >
 > **The encoder is Assimp's own exporter**, reached through `russimp-ng`'s raw FFI. Assimp is
 > already linked for import (thumbnails, ADR 0011) and its exporters are compiled in, so this added
 > no native dependency. It is behind `dam-media/model-convert` because turning it on builds Assimp
 > from source; `serve` opts in, exactly as it does for `render`.
 >
-> **Why `glb` alone.** Assimp returns an export *blob chain*, and this pipeline's encode seam is a
-> single `Vec<u8>` that `atomic_write` commits (§5.2). `glb2` is one part; `gltf2` is two
-> (`.gltf` + `.bin`) and `obj` is two (`.obj` + `.mtl`). Emitting only the first part would write a
-> file referencing data nobody wrote, so both are **refused by name** with an explanation rather
-> than half-produced. Supporting them means extending the seam to multi-file outputs — a change to
-> the atomic-write discipline, not a format addition, and therefore its own slice.
+> **Multi-file outputs are one commit family.** Assimp returns an export blob chain: `glb2` is one
+> part, `gltf2` adds `.bin`, and `obj` adds `.mtl`. Companion names are rebased to the output stem;
+> collision resolution considers the known family, then every part is staged before old files are
+> backed up and the new family published. A normal write failure removes newly published parts and
+> restores the backups, so the pipeline never reports a convincing but broken primary-only export.
 >
 > **The export goes through `aiCopyScene`**, and that is load-bearing rather than tidiness. Assimp's
 > exporter computes its post-processing as `(enforced | requested) & ~already_applied_by_the_importer`
@@ -348,7 +346,8 @@ pub struct MeshOptimise {
 
 `FBX` is a **decode-only** source in v1 (via 04's loader); the encode targets are the open glTF
 family plus OBJ, matching PRODUCT_SPEC §6.5's FBX↔glTF framing where the "↔" back to FBX is a
-documented later target, not v1 scope (§7 Open questions).
+documented later target, not v1 scope (§7 Open questions). USD decode and FBX/USD encode are
+explicitly post-v1; requests for those targets return `Unsupported` by name.
 
 ### 3.4 Textures inside a 3D convert
 

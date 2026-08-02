@@ -75,6 +75,21 @@ pub struct ThumbPng {
     pub height: u32,
 }
 
+/// One encoded 3D container plus any companion files its format requires. GLB has no companions;
+/// textual glTF carries a `.bin`, and OBJ carries an `.mtl`. Names are safe single path components
+/// already rebased to the requested output stem.
+#[derive(Clone, Debug)]
+pub struct ModelOutput {
+    pub primary: Vec<u8>,
+    pub companions: Vec<ModelCompanion>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ModelCompanion {
+    pub name: String,
+    pub bytes: Vec<u8>,
+}
+
 /// Lowercased final extension of a path, if any.
 fn ext(path: &Path) -> Option<String> {
     path.extension()
@@ -352,8 +367,8 @@ pub fn convert_audio(
 
 /// EXPENSIVE tier: transcode a 3D model to a target container (convert pipeline, tech-spec 08 §3.3).
 ///
-/// `optimize` opts into mesh optimisation (merge redundant materials/meshes, drop degenerate faces,
-/// re-join shared vertices) — see `model_convert`'s module docs for what it does and does not do.
+/// `optimize` opts into topology optimisation and, for GLB/glTF, Draco geometry compression. See
+/// `model_convert`'s module docs for the structural trade-offs.
 ///
 /// Behind the `model-convert` feature, because enabling it compiles Assimp from source. Without it
 /// the surface still exists and answers `Unsupported`, so a build that cannot do this says so
@@ -370,6 +385,29 @@ pub fn convert_model(
     #[cfg(not(feature = "model-convert"))]
     {
         let _ = (path, optimize);
+        Err(HandlerError::Unsupported(format!(
+            "3D convert to '{target_format}' is not compiled into this build (feature \
+             `model-convert`)"
+        )))
+    }
+}
+
+/// Multi-file form of [`convert_model`], used by the convert pipeline for the full v1 target set.
+/// `output_stem` is applied to generated sidecars so two assets converted into one directory never
+/// fight over Assimp's generic `$blobfile.bin` / `$blobfile.mtl` names.
+pub fn convert_model_bundle(
+    path: &Path,
+    target_format: &str,
+    optimize: bool,
+    output_stem: &str,
+) -> Result<ModelOutput, HandlerError> {
+    #[cfg(feature = "model-convert")]
+    {
+        model_convert::convert_bundle(path, target_format, optimize, output_stem)
+    }
+    #[cfg(not(feature = "model-convert"))]
+    {
+        let _ = (path, optimize, output_stem);
         Err(HandlerError::Unsupported(format!(
             "3D convert to '{target_format}' is not compiled into this build (feature \
              `model-convert`)"

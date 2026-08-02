@@ -54,16 +54,9 @@ pub(crate) fn build_convert_target(to: &str) -> anyhow::Result<ConvertTarget> {
             format: to,
             optimize: false,
         }),
-        // `gltf`/`obj` are real v1 targets that need a multi-file output seam; name them
-        // specifically so the answer is "not yet" rather than "no such format".
-        "gltf" | "obj" => Err(anyhow::anyhow!(
-            "3D target '{to}' is not available yet: it writes sidecar files ({}) that the convert \
-             pipeline cannot emit as one output. Use `glb`, which is self-contained (issue #49)",
-            if to == "gltf" { ".bin" } else { ".mtl" }
-        )),
         other => Err(anyhow::anyhow!(
             "unsupported target format '{other}' (image: png|jpg|webp|bmp|tga|tiff|gif; \
-             audio: wav; 3D: glb)"
+             audio: wav; 3D in a full build: glb|gltf|obj; FBX/USD encode are post-v1)"
         )),
     }
 }

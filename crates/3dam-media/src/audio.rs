@@ -163,3 +163,60 @@ pub fn convert_to_wav<W: std::io::Write + std::io::Seek>(
         .map_err(|e| HandlerError::Encode(e.to_string()))?;
     Ok(frames)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine as _;
+
+    // 200 ms, mono, 8 kHz AAC-LC in an ISO-BMFF/M4A container. Generated once with ffmpeg; tests
+    // decode these committed bytes and have no runtime dependency on an external codec binary.
+    const AAC_MP4: &str = "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";
+
+    fn fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tone.m4a");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(AAC_MP4)
+            .unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn aac_in_mp4_has_metadata_pcm_convert_and_waveform_preview() {
+        let (_dir, path) = fixture();
+        let attrs = metadata(&path, "m4a");
+        assert_eq!(attrs.container.as_deref(), Some("mp4"));
+        assert_eq!(attrs.codec.as_deref(), Some("aac"));
+        assert_eq!(attrs.sample_rate, Some(8_000));
+        assert!(attrs.duration_ms.is_some_and(|duration| duration > 0));
+
+        let wav = crate::convert_audio(&path, "m4a", "wav").unwrap();
+        assert_eq!(&wav[..4], b"RIFF");
+        let reader = hound::WavReader::new(std::io::Cursor::new(wav)).unwrap();
+        assert_eq!(reader.spec().sample_rate, 8_000);
+        assert!(reader.into_samples::<i16>().next().unwrap().is_ok());
+
+        let peaks = crate::compute_waveform_peaks(&path, "m4a").unwrap();
+        assert_eq!(peaks.len(), crate::audio_features::WAVEFORM_BUCKETS);
+        assert!(peaks.iter().all(|value| value.is_finite()));
+        assert!(peaks.iter().any(|value| *value > 0.0));
+    }
+
+    #[test]
+    fn corrupt_aac_mp4_fails_softly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broken.m4a");
+        std::fs::write(&path, b"not an mp4").unwrap();
+
+        let attrs = metadata(&path, "m4a");
+        assert!(attrs.duration_ms.is_none());
+        assert!(attrs.sample_rate.is_none());
+        assert!(attrs.channels.is_none());
+        assert!(attrs.codec.is_none());
+        assert!(attrs.container.is_none());
+        assert!(crate::convert_audio(&path, "m4a", "wav").is_err());
+        assert!(crate::compute_waveform_peaks(&path, "m4a").is_err());
+    }
+}

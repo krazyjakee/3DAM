@@ -344,10 +344,9 @@ per-asset data-quality flag in the UI/CLI, never as a failed scan.
 
 ## 7. Format / codec support matrix (v1 vs later)
 
-Concrete first-cut coverage per media type, keyed to the §7 candidate crates (PRODUCT_SPEC) and the
-MoGen-confirmed versions (`../3d-handler-notes.md` §5). "v1" = ships in the first media-depth pass;
-"Later" = staged behind the same handler once v1 lands. This matrix is the open question below —
-it is a plan, not a frozen list.
+Concrete shipped coverage per media type. "Later" is explicitly outside the v1 line frozen by
+[ADR 0009](../adr/0009-v1-scope-decisions.md); a recognised but unavailable decoder remains a
+fail-soft per-item result rather than aborting a scan or batch.
 
 ### 7.1 Audio (`symphonia` decode · `rustfft`/`realfft` features · `cpal`/`rodio` playback)
 
@@ -358,7 +357,7 @@ it is a plan, not a frozen list.
 | Ogg Vorbis | ✅ | ✅ | `OggS` magic; Vorbis identification header |
 | MP3 | ✅ | ✅ | ID3 + frame header; `symphonia` |
 | Opus (Ogg) | ✅ | ✅ | via `symphonia` |
-| AAC / M4A (MP4) | ✅ | Later | ISOBMFF `ftyp` sniff cheap in v1; decode staged |
+| AAC / M4A (MP4) | ✅ | ✅ | `symphonia` ISOBMFF + AAC decode; waveform preview and audio→WAV use the same PCM path |
 | AIFF / CAF | Later | Later | container scan straightforward; staged |
 | Playback (`cpal`/`rodio`) | — | v1 for the v1-decode set | scrubbable waveform playback (§6.4) |
 
@@ -372,10 +371,11 @@ it is a plan, not a frozen list.
 | TGA | ✅ | ✅ | common in game texture packs |
 | BMP | ✅ | ✅ | |
 | GIF | ✅ | ✅ | first-frame thumbnail |
-| DDS | ✅ | ✅ | header (dims, format, mip count) cheap; BC1–BC7 + ASTC + uncompressed decode via the `dds` crate (issue #49) |
-| KTX2 | ✅ | ✅ / partial | header always (the container parses without touching payload); decode for uncompressed RGBA/BGRA + **BC1–BC7**. **ASTC, ETC2/EAC, and any supercompressed payload (Basis/ETC1S/UASTC, Zstd, ZLIB) get metadata only** |
+| DDS | ✅ | ✅ | header (dims, format, mip count) cheap; uncompressed + BC1–BC7 + ASTC decode (issue #49) |
+| KTX2 | ✅ | ✅ / partial | uncompressed RGBA/BGRA, **BC1–BC7, ETC2/EAC, and 2D LDR ASTC** decode; supercompressed Basis/ETC1S/UASTC, Zstd/ZLIB, HDR, and 3D payloads remain metadata-only and fail softly at preview/convert |
 | KTX (v1) | ✅ (recognised) | — | different container/magic; reported as undecoded rather than as a corrupt KTX2 |
-| TIFF / EXR / HDR | Later | Later | HDR/linear handling staged; EXR matters for VFX-adjacent packs |
+| TIFF | ✅ | ✅ | `image` decode and raster preview/convert |
+| EXR / HDR | Later | Later | HDR/linear handling staged; EXR matters for VFX-adjacent packs |
 | SVG | — | — | out of scope v1 (vector, not raster asset) |
 
 Colour space / linear handling matters for the tileability test and normal maps (PRODUCT_SPEC §5);
@@ -392,16 +392,16 @@ Two notes on the texture containers (issue #49), because both are easy to get su
   header has no such field, so the answer is `None` rather than a guess: defaulting it to linear
   would mislabel every legacy albedo, and defaulting to sRGB would mislabel every normal map.
 
-### 7.3 3D model (`gltf` decode · `fbxcel` for FBX · custom OBJ/STL/PLY readers)
+### 7.3 3D model (bounded structural metadata · Assimp full decode/render)
 
 | Format | Cheap metadata (v1) | Full decode + preview (v1) | Notes |
 |---|---|---|---|
 | glTF (`.gltf`) | ✅ | ✅ | JSON parse for counts; `gltf` crate (`import, names, utils`) for decode |
 | GLB (`.glb`) | ✅ | ✅ | **two-tier read** — JSON-chunk scan cheap, BIN decode on preview (`../3d-handler-notes.md` §1) |
-| FBX | ✅ | ✅ | `fbxcel` 0.9; header/section scan cheap; the FBX↔glTF convert pair (08) |
+| FBX | ✅ | ✅ | bounded header/section scan cheap; Assimp full decode and textured preview; decode-only in v1 |
 | OBJ (+ MTL) | ✅ | ✅ | extension-ordered structural sniff (§3.2); counts from a bounded line scan |
 | STL (bin + ascii) | ✅ | ✅ | tri count from header (bin) / bounded scan (ascii) |
-| PLY | ✅ | Later | header element counts cheap; decode staged |
+| PLY | ✅ | ✅ | header element counts cheap; Assimp full decode and preview |
 | USD / USDZ | Later | Later | high value, heavier dependency; staged |
 | glTF Draco-compressed | ✅ (counts) | Later | JSON counts still cheap; Draco geometry decode staged |
 
@@ -471,11 +471,9 @@ The **shape embedding** those multi-view renders feed is owned by
 > counts are marked approximate when accessor counts are absent, and the one-bounded-trailer-seek
 > budget stands. Kept below as rationale.
 
-- **Format-coverage matrix for v1 vs later** (carried from PRODUCT_SPEC §10): which loaders and
-  codecs actually ship in the first pass. §7 is a first cut; the exact v1 line (e.g. whether MP4/AAC
-  audio, DDS/KTX2 image decode, and PLY/USD 3D land in v1 or stage later) is not frozen and depends
-  on crate maturity and spikes. The cheap-tier sniff for a format is cheap to add ahead of its
-  decoder, so a format can appear in the catalog (metadata-only) before its preview/convert support.
+- **Format-coverage rationale.** The cheap-tier sniff can land ahead of an expensive decoder, so a
+  recognised later/cost-tier format can appear in the catalog (metadata-only) while preview/convert
+  answers `Unsupported`. The frozen v1 boundary itself is the table above and ADR 0009.
 - **Cheap-tier trailer reads.** A few formats carry needed data in a trailer (or require a second
   seek). The read budget (§4.2) assumes one bounded trailer seek is acceptable at ingest scale;
   formats that would need more than that may have to defer some "cheap" fields to the expensive tier.

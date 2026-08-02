@@ -1857,8 +1857,10 @@ dependencies = [
 name = "dam-media"
 version = "0.1.1"
 dependencies = [
+ "base64 0.22.1",
  "dam-api",
  "dds",
+ "draco-gltf",
  "encoding_rs",
  "hound",
  "image",
@@ -2404,6 +2406,37 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8b14ccef22fc6f5a8f4d7d768562a182c04ce9a3b3157b91390b52ddfdf1a76"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "draco-core"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9077a2eb6707dbbf6df0f4ab9892809d6be3a19e13f8e83d784ab9622066e5ef"
+dependencies = [
+ "bytemuck",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "draco-gltf"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4286ec03e6a093ae8f771a2c2e11e59d327c868c6f3cc9e6e37353112d859ba9"
+dependencies = [
+ "draco-core",
+ "draco-io",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "draco-io"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "038cc545dd6dd88f765ed629f3050ba8276a7036d19fc2bd1817fe8ba441efad"
+dependencies = [
+ "draco-core",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

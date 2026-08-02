@@ -69,6 +69,7 @@ rusqlite = { version = "0.39", features = ["backup", "bundled"] }
 # stay on blake3 (high-entropy keys need no KDF); argon2 is for low-entropy user passwords only.
 argon2 = "0.5"
 base64 = "0.22"
+draco-gltf = "0.2"
 
 # http / server / client
 axum = { version = "0.8", features = ["ws"] }

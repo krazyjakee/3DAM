@@ -1039,13 +1039,12 @@ pub enum ConvertTarget {
     },
     /// 3D container transcode (issue #49, tech-spec 08 §3.3).
     Model {
-        /// `glb` in v1. `gltf` and `obj` are named v1 targets but emit sidecars (`.bin`, `.mtl`),
-        /// which the single-buffer encode seam cannot write as one output yet — so they are
-        /// refused by name rather than silently producing a first part that references a file
-        /// nobody wrote.
+        /// `glb`, `gltf`, or `obj` in v1. Multi-file targets publish their `.bin`/`.mtl`
+        /// companions with the primary; FBX/USD encode are post-v1.
         format: String,
         /// Optimise the mesh while transcoding: merge redundant materials and meshes, drop
-        /// degenerate faces, and re-join the vertices a merge duplicates (issue #49, §3.3).
+        /// degenerate faces, and re-join the vertices a merge duplicates. glTF-family targets
+        /// additionally encode geometry with `KHR_draco_mesh_compression` (issue #49, §3.3).
         ///
         /// Off by default, and it stays a separate knob from `format` because the two are
         /// independently useful — a container transcode is expected to preserve what it was given,
