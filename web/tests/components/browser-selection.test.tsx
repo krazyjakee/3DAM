@@ -2,6 +2,7 @@ import { HttpResponse, http } from "msw";
 import { fireEvent, screen, waitFor } from "@testing-library/react";
 import { expect, test } from "vitest";
 import { Browser } from "../../src/components/Browser";
+import { SelectionProvider } from "../../src/lib/selection";
 import { asset, assetPage, assetSummary } from "./fixtures";
 import { renderApp } from "./render";
 import { server } from "./server";
@@ -12,7 +13,9 @@ test("the browser collapses exact copies and keeps selection behavior on visible
   const other = assetSummary({ id: "asset-c", name: "Snare.wav", media: "audio", format: "wav" });
 
   server.use(
-    http.post("http://localhost/api/v1/query", () => HttpResponse.json(assetPage([first, copy, other]))),
+    http.post("http://localhost/api/v1/query", () =>
+      HttpResponse.json({ ...assetPage([first, copy, other]), total: 100 }),
+    ),
     http.post("http://localhost/api/v1/duplicates", () =>
       HttpResponse.json([
         {
@@ -40,7 +43,12 @@ test("the browser collapses exact copies and keeps selection behavior on visible
     }),
   );
 
-  renderApp(<Browser />, { route: "/?view=table" });
+  renderApp(
+    <SelectionProvider>
+      <Browser />
+    </SelectionProvider>,
+    { route: "/?view=table" },
+  );
 
   const representative = await screen.findByRole("button", { name: /Kick one\.wav.*1 duplicate/i });
   const secondVisible = screen.getByRole("button", { name: /Snare\.wav/i });
@@ -54,4 +62,16 @@ test("the browser collapses exact copies and keeps selection behavior on visible
     expect(representative).toHaveAttribute("aria-pressed", "true");
     expect(secondVisible).toHaveAttribute("aria-pressed", "true");
   });
+
+  expect(screen.getByRole("button", { name: "Select visible" })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Select loaded (2)" })).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Select all 100 query results" }));
+  expect(await screen.findByText("100 query results selected")).toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole("button", { name: "Grid view" }));
+  expect(await screen.findByText("100 query results selected")).toBeInTheDocument();
+  expect(await screen.findByRole("button", { name: /Kick one\.wav.*1 duplicate/i })).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
 });

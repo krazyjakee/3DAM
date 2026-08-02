@@ -5,6 +5,7 @@ import { useResizableWidth, type Resizable } from "@/lib/use-resizable";
 import { splitterWidthForKey } from "@/lib/splitter-keyboard";
 import { useViewState } from "@/lib/view-state";
 import { useFocusTrap } from "@/lib/use-focus-trap";
+import { SelectionProvider, useSelection } from "@/lib/selection";
 import {
   dispatchShortcut,
   emitShortcut,
@@ -28,8 +29,17 @@ import { Drawer } from "./Drawer";
  *  selection bar's "Inspect" affordance — issue #33), and the splitters are hidden since there is
  *  nothing to resize. */
 export function Workspace() {
+  return (
+    <SelectionProvider>
+      <WorkspaceContent />
+    </SelectionProvider>
+  );
+}
+
+function WorkspaceContent() {
   useLiveUpdates(); // one WebSocket keeps every region live (tech-spec 09 §A.3)
   const { state, patch } = useViewState();
+  const selection = useSelection();
   const [navOpen, setNavOpen] = useState(false);
   const [showShortcuts, setShowShortcuts] = useState(false);
   // Below `lg` the inspector is an opt-in overlay: selecting highlights in place, and this flag —
@@ -89,7 +99,7 @@ export function Workspace() {
           }
         },
         "focus-browser": () => focusRegion("[data-shortcut-region='browser']"),
-        "focus-inspector": state.selected
+        "focus-inspector": selection.focused
           ? () => {
               const panel = visibleRegion("[data-shortcut-region='inspector']");
               const focusedInside = panel?.contains(document.activeElement) ?? false;
@@ -105,10 +115,10 @@ export function Workspace() {
           : undefined,
         "toggle-view": () => patch({ view: state.view === "grid" ? "table" : "grid" }),
         "show-shortcuts": () => setShowShortcuts(true),
-        "find-similar": state.selected ? () => emitShortcut("find-similar") : undefined,
-        "toggle-favourite": state.selected ? () => emitShortcut("toggle-favourite") : undefined,
+        "find-similar": selection.focused ? () => emitShortcut("find-similar") : undefined,
+        "toggle-favourite": selection.focused ? () => emitShortcut("toggle-favourite") : undefined,
         "action-menu":
-          state.selected && !focusedAssetCell ? () => emitShortcut("action-menu") : undefined,
+          selection.focused && !focusedAssetCell ? () => emitShortcut("action-menu") : undefined,
         // Y/N are handled by the focused suggestion chip so only that one review action fires.
       });
       if (handled) event.preventDefault();
@@ -124,7 +134,7 @@ export function Workspace() {
     navOpen,
     patch,
     showShortcuts,
-    state.selected,
+    selection.focused,
     state.view,
   ]);
 
@@ -182,7 +192,10 @@ export function Workspace() {
       </div>
       {/* Narrow-screen selection bar: a tapped asset stays highlighted in the grid; "Inspect" raises
           the detail drawer on demand (issue #33 item 3). Absent on `lg`, where the rail is always up. */}
-      <SelectionBar onInspect={() => setInspectOpen(true)} />
+      <MobileSelectionBar
+        onInspect={() => setInspectOpen(true)}
+        onClear={() => setInspectOpen(false)}
+      />
       <StatusBar />
       {showShortcuts && <ShortcutHelp onClose={() => setShowShortcuts(false)} />}
     </div>
@@ -272,23 +285,40 @@ function ShortcutKey({ id }: { id: ShortcutId }) {
  *  confirms the selection and offers an explicit "Inspect" — so a glance-tap highlights in place
  *  instead of throwing the full-screen inspector over the grid. Hidden entirely on `lg` (persistent
  *  rail) and when nothing is selected. */
-function SelectionBar({ onInspect }: { onInspect: () => void }) {
-  const { state, patch } = useViewState();
-  if (!state.selected) return null;
+export function MobileSelectionBar({
+  onInspect,
+  onClear,
+}: {
+  onInspect: () => void;
+  onClear?: () => void;
+}) {
+  const selection = useSelection();
+  if (selection.count === 0) return null;
+  const label =
+    selection.selected.kind === "results"
+      ? `${selection.count.toLocaleString()} ${
+          selection.selected.selector.kind === "collection" ? "collection" : "query"
+        } results selected`
+      : `${selection.count.toLocaleString()} asset${selection.count === 1 ? "" : "s"} selected`;
   return (
     <div className="flex items-center gap-2 border-t border-border bg-surface px-3 py-2 lg:hidden">
-      <span className="min-w-0 flex-1 truncate text-xs text-fg-muted">1 asset selected</span>
-      <button
-        className="btn btn-accent"
-        onClick={onInspect}
-        title={`Inspect selected asset (${shortcutLabel("focus-inspector")})`}
-        aria-keyshortcuts="Control+3 Meta+3"
-      >
-        <PanelRightOpen size={13} /> Inspect
-      </button>
+      <span className="min-w-0 flex-1 truncate text-xs text-fg-muted">{label}</span>
+      {selection.focused && (
+        <button
+          className="btn btn-accent"
+          onClick={onInspect}
+          title={`Inspect focused asset (${shortcutLabel("focus-inspector")})`}
+          aria-keyshortcuts="Control+3 Meta+3"
+        >
+          <PanelRightOpen size={13} /> Inspect
+        </button>
+      )}
       <button
         className="btn coarse:min-w-11 coarse:justify-center"
-        onClick={() => patch({ selected: null })}
+        onClick={() => {
+          selection.clear();
+          onClear?.();
+        }}
         aria-label="Clear selection"
         title="Clear selection"
       >

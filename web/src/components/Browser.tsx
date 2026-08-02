@@ -50,11 +50,17 @@ import { LicenseBadge } from "./LicenseBadge";
 import { MediaBadge } from "./MediaBadge";
 import { PeerBadge } from "./PeerBadge";
 import { ContextMenu, useLongPress, type MenuState } from "./ContextMenu";
-import { ExportDialog } from "./ExportDialog";
+import { ExportDialog, type ExportScope } from "./ExportDialog";
 import { ConvertDialog } from "./ConvertDialog";
 import { AdvancedSearch } from "./AdvancedSearch";
 import { ActiveFilters } from "./ActiveFilters";
 import { Centered } from "@/lib/ui";
+import {
+  assetSelectionKey,
+  useSelection,
+  type ResultSelector,
+  type SelectionModel,
+} from "@/lib/selection";
 import {
   browseWindowMetrics,
   flattenBrowsePages,
@@ -117,6 +123,19 @@ export function Browser({
   onShowShortcuts?: () => void;
 }) {
   const { state, patch, request } = useViewState();
+  const selection = useSelection();
+  const {
+    reconcile,
+    selectExplicit,
+    selectAsset,
+    focusAsset,
+    isSelected,
+    clear,
+    count: selectionCount,
+    selected: selectionScope,
+    explicitAssets,
+  } = selection;
+  const browserRef = useRef<HTMLElement>(null);
   // Debounce the *derived* search text so the field stays instant but `/query` only refetches once
   // typing settles (issue #33). The other facets apply immediately; only free-text is debounced.
   const debouncedText = useDebounced(state.q, 300);
@@ -128,17 +147,16 @@ export function Browser({
   // A search is pending while the field's text hasn't yet been applied to the query.
   const searching = state.q.trim() !== debouncedText.trim();
   const [menu, setMenu] = useState<MenuState | null>(null);
-  // Multi-selection lives here (Browser-local, not the URL): the ids to batch-act on. Distinct from
-  // the single Inspector focus (`state.selected`). `anchor` is the pivot for shift-range.
-  const [selection, setSelection] = useState<Set<string>>(new Set());
-  const [anchor, setAnchor] = useState<string | null>(null);
-  const selectedAsset = useAsset(state.selected, state.owner);
+  const selectedAsset = useAsset(selection.focused?.id ?? null, selection.focused?.owner);
 
   // `useAssets` retains only a small page LRU. Everything derived here is consequently bounded by
   // that window instead of growing with the lifetime scroll history.
   const items = useMemo(() => flattenBrowsePages(assets.data?.pages), [assets.data?.pages]);
   const total = assets.data?.pages.find((page) => page.total !== null)?.total ?? null;
-  const byId = useMemo(() => new Map(items.map((a) => [a.id, a])), [items]);
+  const bySelectionKey = useMemo(
+    () => new Map(items.map((asset) => [assetSelectionKey(asset), asset])),
+    [items],
+  );
 
   // Federation fan-out (issue #39): a query page comes back `partial.complete === false` when a
   // peer missed the merge deadline — the list under-represents the federated library, a degradation
@@ -185,6 +203,28 @@ export function Browser({
     [items, dups.data],
   );
 
+  const resultSelector = useMemo<ResultSelector>(
+    () =>
+      state.collection
+        ? { kind: "collection", collection: state.collection }
+        : { kind: "query", query: searchReq },
+    [state.collection, searchReq],
+  );
+  // View mode is deliberately absent: grid/table is presentation, not a new result set.
+  const browseSelectionScope = useMemo(
+    () => JSON.stringify([state.collection, request]),
+    [state.collection, request],
+  );
+  useEffect(() => {
+    reconcile({
+      browseScope: browseSelectionScope,
+      loaded: items,
+      visible,
+      selector: resultSelector,
+      total,
+    });
+  }, [browseSelectionScope, items, visible, resultSelector, total, reconcile]);
+
   const firstPageParam = assets.data?.pageParams[0] as BrowsePageParam | undefined;
   const windowMetrics = browseWindowMetrics(
     firstPageParam,
@@ -192,25 +232,21 @@ export function Browser({
     assets.hasNextPage,
   );
 
-  // Selected summaries outlive page eviction so batch actions and the selection bar do not blink
-  // out while their rows are off-screen. This cache is bounded by the explicit selection itself.
-  const selectedCache = useRef<Map<string, AssetSummary>>(new Map());
-  const clearSelection = useCallback(() => {
-    setSelection(new Set());
-    setAnchor(null);
-    selectedCache.current.clear();
-  }, []);
-  const selectAll = useCallback(() => {
-    selectedCache.current = new Map(visible.map((asset) => [asset.id, asset]));
-    setSelection(new Set(visible.map((a) => a.id)));
-  }, [visible]);
-  const selectedAssets = useMemo(
-    () =>
-      [...selection]
-        .map((id) => byId.get(id) ?? selectedCache.current.get(id))
-        .filter((a): a is AssetSummary => !!a),
-    [selection, byId],
-  );
+  const selectVisible = useCallback(() => {
+    const nodes = browserRef.current?.querySelectorAll<HTMLElement>("[data-selection-key]") ?? [];
+    const keys = new Set(
+      [...nodes]
+        .filter((node) => {
+          const viewport = node.closest<HTMLElement>("[role='group'][aria-label='Assets']");
+          if (!viewport) return false;
+          const cell = node.getBoundingClientRect();
+          const frame = viewport.getBoundingClientRect();
+          return cell.bottom > frame.top && cell.top < frame.bottom;
+        })
+        .map((node) => node.dataset.selectionKey ?? ""),
+    );
+    selectExplicit(visible.filter((asset) => keys.has(assetSelectionKey(asset))));
+  }, [visible, selectExplicit]);
   // Convert targets set from the context menu (single/multi); rendered as a dialog at Browser root.
   const [convertTargets, setConvertTargets] = useState<AssetSummary[] | null>(null);
 
@@ -218,66 +254,34 @@ export function Browser({
   // the anchor. Every click also sets the Inspector focus so the detail panel tracks the last click.
   const onItemClick = useCallback(
     (asset: AssetSummary, mods: ClickMods) => {
-      const id = asset.id;
-      selectedCache.current.set(id, asset);
-      patch({ selected: id, owner: typeof asset.origin === "object" ? asset.source_id : null });
-      if (mods.shift && anchor) {
-        const ids = visible.map((a) => a.id);
-        const a = ids.indexOf(anchor);
-        const b = ids.indexOf(id);
-        if (a >= 0 && b >= 0) {
-          const [lo, hi] = a < b ? [a, b] : [b, a];
-          const range = ids.slice(lo, hi + 1);
-          for (const item of visible.slice(lo, hi + 1))
-            selectedCache.current.set(item.id, item);
-          setSelection((prev) => new Set([...prev, ...range]));
-        }
-      } else if (mods.meta) {
-        setSelection((prev) => {
-          const next = new Set(prev);
-          if (next.has(id)) {
-            next.delete(id);
-            selectedCache.current.delete(id);
-          } else {
-            next.add(id);
-          }
-          return next;
-        });
-        setAnchor(id);
-      } else {
-        selectedCache.current = new Map([[id, asset]]);
-        setSelection(new Set([id]));
-        setAnchor(id);
-      }
+      selectAsset(asset, mods, visible);
     },
-    [anchor, visible, patch],
+    [selectAsset, visible],
   );
 
   // Double-click / double-tap = activate: focus the asset in the Inspector and, for audio, start
   // playback immediately (issue #52). Non-audio just opens in the Inspector's viewer.
   const onItemActivate = useCallback(
     (asset: AssetSummary) => {
-      patch({
-        selected: asset.id,
-        owner: typeof asset.origin === "object" ? asset.source_id : null,
-      });
+      focusAsset(asset);
       if (asset.media === "audio") requestAutoplay(asset.id);
     },
-    [patch],
+    [focusAsset],
   );
 
   // Right-click / long-press targets the whole selection when the clicked item is part of a
   // multi-selection; otherwise just that item (issue #22).
   const openMenu = useCallback(
     (asset: AssetSummary, x: number, y: number) => {
-      const targetIds =
-        selection.has(asset.id) && selection.size > 1 ? [...selection] : [asset.id];
-      const targets = targetIds
-        .map((id) => byId.get(id) ?? selectedCache.current.get(id))
-        .filter((a): a is AssetSummary => !!a);
+      const targets =
+        selectionScope.kind === "explicit" &&
+        isSelected(asset) &&
+        selectionCount > 1
+          ? explicitAssets
+          : [asset];
       setMenu({ assets: targets.length ? targets : [asset], x, y });
     },
-    [selection, byId],
+    [selectionScope, isSelected, selectionCount, explicitAssets],
   );
 
   useEffect(() => {
@@ -286,7 +290,9 @@ export function Browser({
       const asset = selectedAsset.data?.summary;
       if (!asset) return;
       if (id === "action-menu") {
-        const cell = document.querySelector<HTMLElement>(`[data-asset-id="${CSS.escape(asset.id)}"]`);
+        const cell = document.querySelector<HTMLElement>(
+          `[data-selection-key="${CSS.escape(assetSelectionKey(asset))}"]`,
+        );
         const rect = cell?.getBoundingClientRect();
         openMenu(
           asset,
@@ -313,7 +319,7 @@ export function Browser({
         asset?.media === "audio" &&
         (!focusedCell || focusedCell.dataset.assetId === asset.id);
       const focusedAsset = focusedCell
-        ? byId.get(focusedCell.dataset.assetId ?? "")
+        ? bySelectionKey.get(focusedCell.dataset.selectionKey ?? "")
         : undefined;
       const handled = dispatchShortcut(event, {
         "play-pause":
@@ -338,7 +344,7 @@ export function Browser({
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [byId, openMenu, selectedAsset.data?.summary]);
+  }, [bySelectionKey, openMenu, selectedAsset.data?.summary]);
 
   // Keyboard: Ctrl/Cmd+A selects all, Escape clears — but never while typing in the search box.
   useEffect(() => {
@@ -347,17 +353,17 @@ export function Browser({
       if (isEditableTarget(e.target)) return;
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "a") {
         e.preventDefault();
-        selectAll();
-      } else if (e.key === "Escape" && selection.size > 0) {
-        clearSelection();
+        selectExplicit(visible);
+      } else if (e.key === "Escape" && selectionCount > 0) {
+        clear();
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [selectAll, clearSelection, selection.size]);
+  }, [selectExplicit, clear, selectionCount, visible]);
 
   const listProps = {
-    selection,
+    isSelected,
     dupCounts,
     onItemClick,
     onItemActivate,
@@ -375,6 +381,7 @@ export function Browser({
   return (
     // The centre browse region is the page's main landmark (a11y hardening, issue #44).
     <main
+      ref={browserRef}
       className="browser-shell flex h-full min-w-0 flex-1 flex-col bg-bg"
       aria-label="Asset browser"
       data-shortcut-region="browser"
@@ -389,7 +396,7 @@ export function Browser({
       />
       <ActiveFilters
         onClearAll={() => {
-          clearSelection();
+          selection.clear();
           patch({
             q: "",
             media: null,
@@ -427,11 +434,14 @@ export function Browser({
           </span>
         </div>
       )}
-      {selection.size > 1 && (
+      {(selection.count > 1 || selection.selected.kind === "results") && (
         <SelectionBar
-          assets={selectedAssets}
-          onSelectAll={selectAll}
-          onClear={clearSelection}
+          selection={selection}
+          loaded={visible}
+          onSelectVisible={selectVisible}
+          resultSelector={resultSelector}
+          total={total}
+          resultComplete={droppedPeers === null}
         />
       )}
       <div className="min-h-0 flex-1">
@@ -532,13 +542,19 @@ function Breadcrumb() {
 /** Batch-action affordance for a multi-selection (issue #10 enabler). Feature actions hang off here;
  *  today: analyze all, add all to a collection, select-all, clear. */
 function SelectionBar({
-  assets,
-  onSelectAll,
-  onClear,
+  selection,
+  loaded,
+  onSelectVisible,
+  resultSelector,
+  total,
+  resultComplete,
 }: {
-  assets: AssetSummary[];
-  onSelectAll: () => void;
-  onClear: () => void;
+  selection: SelectionModel;
+  loaded: AssetSummary[];
+  onSelectVisible: () => void;
+  resultSelector: ResultSelector;
+  total: number | null;
+  resultComplete: boolean;
 }) {
   const analyze = useAnalyze();
   const collections = useCollections();
@@ -549,15 +565,29 @@ function SelectionBar({
   const [showConvert, setShowConvert] = useState(false);
   // Federated selections are read-only references (tech-spec 07 §7.4): batch actions run against
   // the local subset, and disable when nothing selected is ours.
+  const resultWide = selection.selected.kind === "results";
+  const assets = selection.explicitAssets;
   const locals = localOnly(assets);
   const localIds = locals.map((a) => a.id);
   const peerCount = assets.length - locals.length;
   const peerOnly = locals.length === 0;
+  const explicitOnlyTitle = resultWide
+    ? "This action needs explicit loaded assets; clear result-wide selection first"
+    : undefined;
+  const resultLabel = resultSelector.kind === "collection" ? "collection" : "query";
+  const summary = resultWide
+    ? `${selection.count.toLocaleString()} ${resultLabel} results selected`
+    : `${selection.count.toLocaleString()} selected`;
+  const exportScope: ExportScope = selection.selected.kind === "results"
+    ? selection.selected.selector.kind === "collection"
+      ? { collection: selection.selected.selector.collection }
+      : { query: selection.selected.selector.query }
+    : { assets: localIds };
 
   return (
     <div className="browser-selection-bar border-b border-border bg-surface px-3 py-1.5 text-xs">
       <div className="browser-selection-summary flex min-w-0 items-center gap-2">
-        <span className="shrink-0 font-medium text-fg tabular-nums">{assets.length} selected</span>
+        <span className="shrink-0 font-medium text-fg tabular-nums">{summary}</span>
         {peerCount > 0 && (
           <span className="truncate text-fg-dim" title={PEER_READONLY_SET}>
             {peerCount} federated (read-only)
@@ -569,8 +599,8 @@ function SelectionBar({
           className="btn disabled:cursor-not-allowed disabled:opacity-40"
           onClick={() => analyze.mutate({ assets: localIds })}
           {...gate({
-            disabled: analyze.isPending || peerOnly,
-            title: peerOnly ? PEER_READONLY_SET : undefined,
+            disabled: analyze.isPending || peerOnly || resultWide,
+            title: explicitOnlyTitle ?? (peerOnly ? PEER_READONLY_SET : undefined),
           })}
         >
           <Sparkles size={12} /> Analyze
@@ -578,14 +608,17 @@ function SelectionBar({
         <button
           className="btn disabled:cursor-not-allowed disabled:opacity-40"
           onClick={() => setShowConvert(true)}
-          {...gate({ disabled: peerOnly, title: peerOnly ? PEER_READONLY_SET : undefined })}
+          {...gate({
+            disabled: peerOnly || resultWide,
+            title: explicitOnlyTitle ?? (peerOnly ? PEER_READONLY_SET : undefined),
+          })}
         >
           <FileCog size={12} /> Convert
         </button>
         <button
           className="btn disabled:cursor-not-allowed disabled:opacity-40"
           onClick={() => setShowExport(true)}
-          {...gate({ disabled: peerOnly, title: peerOnly ? PEER_READONLY_SET : undefined })}
+          {...gate({ disabled: !resultWide && peerOnly, title: peerOnly && !resultWide ? PEER_READONLY_SET : undefined })}
         >
           <FileDown size={12} /> Export
         </button>
@@ -593,25 +626,25 @@ function SelectionBar({
           <ConvertDialog assets={locals} onClose={() => setShowConvert(false)} />
         )}
         {showExport && (
-          <ExportDialog scope={{ assets: localIds }} onClose={() => setShowExport(false)} />
+          <ExportDialog scope={exportScope} onClose={() => setShowExport(false)} />
         )}
         <select
           className="field max-w-full w-auto disabled:cursor-not-allowed disabled:opacity-40"
           aria-label="Add selection to collection"
           value=""
-          disabled={manual.length === 0 || members.isPending || !canWrite || peerOnly}
+          disabled={manual.length === 0 || members.isPending || !canWrite || peerOnly || resultWide}
           onChange={(e) => {
             if (e.target.value) members.mutate({ id: e.target.value, members: { add: localIds } });
             e.currentTarget.value = "";
           }}
           title={
-            peerOnly
+            explicitOnlyTitle ?? (peerOnly
               ? PEER_READONLY_SET
               : !canWrite
                 ? AUTH_COPY.needsWrite
                 : manual.length === 0
                   ? "No manual collections yet"
-                  : "Add selection to a collection"
+                  : "Add selection to a collection")
           }
         >
           <option value="" disabled>
@@ -625,14 +658,34 @@ function SelectionBar({
         </select>
         <button
           className="text-fg-dim hover:text-fg coarse:min-h-11"
-          onClick={onSelectAll}
+          onClick={onSelectVisible}
         >
-          Select all
+          Select visible
         </button>
+        <button
+          className="text-fg-dim hover:text-fg coarse:min-h-11"
+          onClick={() => selection.selectExplicit(loaded)}
+        >
+          Select loaded ({loaded.length.toLocaleString()})
+        </button>
+        {total !== null && total > loaded.length && (
+          <button
+            className="text-fg-dim hover:text-fg disabled:cursor-not-allowed disabled:opacity-40 coarse:min-h-11"
+            disabled={!resultComplete}
+            title={
+              resultComplete
+                ? `Use the server-side ${resultLabel} selector; IDs are not materialized in the browser`
+                : "Results are partial because a peer did not answer; retry before selecting all"
+            }
+            onClick={() => selection.selectResults(resultSelector, total, loaded)}
+          >
+            Select all {total.toLocaleString()} {resultLabel} results
+          </button>
+        )}
       </div>
       <button
         className="browser-selection-clear flex shrink-0 items-center gap-1 text-fg-dim hover:text-fg coarse:min-h-11"
-        onClick={onClear}
+        onClick={selection.clear}
       >
         <X size={13} /> Clear
       </button>
@@ -843,7 +896,7 @@ function ViewBtn({
 
 interface ListProps {
   items: AssetSummary[];
-  selection: Set<string>;
+  isSelected: (asset: AssetSummary) => boolean;
   /** assetId → count of hidden byte-identical copies, for the red duplicate badge. */
   dupCounts: Map<string, number>;
   onItemClick: (asset: AssetSummary, mods: ClickMods) => void;
@@ -952,7 +1005,7 @@ function useRovingFocus(
 /** Windowed grid — a 100k+ library scrolls at 60fps (DESIGN_GUIDELINES §1.1, §3.1). */
 function Grid({
   items,
-  selection,
+  isSelected,
   dupCounts,
   onItemClick,
   onItemActivate,
@@ -1035,10 +1088,10 @@ function Grid({
                 if (!a) return <div key={`empty-${absoluteIndex}`} aria-hidden="true" />;
                 return (
                   <GridCell
-                    key={a.id}
+                    key={assetSelectionKey(a)}
                     asset={a}
                     index={localIndex}
-                    active={selection.has(a.id)}
+                    active={isSelected(a)}
                     focusable={localIndex === focusIndex}
                     onFocusIndex={setFocusIndex}
                     dupCount={dupCounts.get(a.id)}
@@ -1184,6 +1237,7 @@ function GridCell({
     <button
       data-index={index}
       data-asset-id={asset.id}
+      data-selection-key={assetSelectionKey(asset)}
       aria-pressed={active}
       aria-label={itemAriaLabel(asset, dupCount)}
       aria-keyshortcuts="Shift+F10"
@@ -1232,7 +1286,7 @@ function GridCell({
 /** Windowed table — same query, toggle preserves selection + filter (tech-spec 09 §B.1). */
 function Table({
   items,
-  selection,
+  isSelected,
   dupCounts,
   onItemClick,
   onItemActivate,
@@ -1307,10 +1361,10 @@ function Table({
           if (!a) return null;
           return (
             <TableRow
-              key={a.id}
+              key={assetSelectionKey(a)}
               asset={a}
               index={localIndex}
-              active={selection.has(a.id)}
+              active={isSelected(a)}
               focusable={localIndex === focusIndex}
               onFocusIndex={setFocusIndex}
               dupCount={dupCounts.get(a.id)}
@@ -1364,6 +1418,7 @@ function TableRow({
     <button
       data-index={index}
       data-asset-id={asset.id}
+      data-selection-key={assetSelectionKey(asset)}
       aria-pressed={active}
       aria-label={itemAriaLabel(asset, dupCount)}
       aria-keyshortcuts="Shift+F10"
