@@ -126,6 +126,49 @@ async fn call(
     (st, v)
 }
 
+/// Post one upload body as a signed-in browser. Upload deliberately uses a raw streaming body, not
+/// JSON, so the ordinary `call` helper cannot exercise its auth/share boundary.
+async fn upload_call(
+    app: &axum::Router,
+    session: &Session,
+    source: &str,
+    name: &str,
+    bytes: Vec<u8>,
+) -> (StatusCode, Value) {
+    upload_body_call(app, session, source, name, Body::from(bytes)).await
+}
+
+async fn upload_body_call(
+    app: &axum::Router,
+    session: &Session,
+    source: &str,
+    name: &str,
+    body: Body,
+) -> (StatusCode, Value) {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri(format!("/api/v1/upload?source={source}&name={name}"))
+        .header("content-type", "application/octet-stream");
+    for (name, value) in session.headers() {
+        request = request.header(name, value);
+    }
+    let response = app
+        .clone()
+        .oneshot(request.body(body).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let value = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    };
+    (status, value)
+}
+
 /// Parse `dam_session` out of the reply's Set-Cookie headers and pair it with the body's csrf.
 fn session_from_reply(headers: &HeaderMap, body: &Value) -> Session {
     let cookie = headers
@@ -1399,6 +1442,172 @@ async fn read_share_does_not_grant_write() {
     )
     .await;
     assert_eq!(st, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn upload_source_picker_and_route_follow_write_grants_immediately() {
+    let (app, store, _lib, admin, vera, shared, secret, _vid) = leak_world().await;
+    store
+        .set_flag(
+            dam_api::admin::FlagKey::Upload,
+            dam_api::admin::SetFlag {
+                value: dam_api::admin::FlagValue::Bool(true),
+                expected_version: None,
+                confirm: true,
+            },
+            "test",
+        )
+        .unwrap();
+
+    let staged = unique_tmp().with_extension("png");
+    write_png(&staged, [90, 120, 180]);
+    let bytes = std::fs::read(&staged).unwrap();
+
+    // Vera can read the source, but her viewer role lacks Write. The source remains visible while
+    // the picker gives the capability reason, and the route refuses the same caller.
+    let (st, sources) = call(&app, "GET", "/api/v1/sources", Some(&vera), None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(sources.as_array().unwrap().len(), 1);
+    assert_eq!(sources[0]["id"], shared);
+    assert_eq!(sources[0]["writable"], false);
+    assert_eq!(
+        sources[0]["writable_reason"],
+        "read-only — write scope is required"
+    );
+    let (st, _) = upload_call(&app, &vera, &shared, "viewer.png", bytes.clone()).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+
+    let erin_id = create_account(&app, &admin, "upload-editor", "editor").await;
+    let read_share = share(
+        &app,
+        &admin,
+        "source",
+        &shared,
+        ("account_id", &erin_id),
+        "read",
+    )
+    .await;
+    let erin = login(&app, "upload-editor", "password123").await;
+
+    // Write scope + a read share is still read-only, both in the picker and at the write boundary.
+    let (st, sources) = call(&app, "GET", "/api/v1/sources", Some(&erin), None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(sources.as_array().unwrap().len(), 1);
+    assert_eq!(sources[0]["writable"], false);
+    assert_eq!(
+        sources[0]["writable_reason"],
+        "read-only — a write share is required"
+    );
+    let (st, source) = call(
+        &app,
+        "GET",
+        &format!("/api/v1/sources/{shared}"),
+        Some(&erin),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(source["writable"], false);
+    let body_polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let poll_marker = body_polled.clone();
+    let guarded_body = Body::from_stream(futures::stream::once(async move {
+        poll_marker.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(b"must not be read"))
+    }));
+    let (st, _) = upload_body_call(&app, &erin, &shared, "read-share.png", guarded_body).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    assert!(
+        !body_polled.load(std::sync::atomic::Ordering::SeqCst),
+        "a known-forbidden upload body must not be polled"
+    );
+
+    // An unshared destination is absent, including at the direct upload route.
+    let (st, _) = upload_call(&app, &erin, &secret, "hidden.png", bytes.clone()).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    // Replacing the read grant with a write grant takes effect on the very next request: no login
+    // refresh or server restart is needed.
+    let (st, _) = call(
+        &app,
+        "DELETE",
+        &format!("/admin/api/shares/{read_share}"),
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    let write_share = share(
+        &app,
+        &admin,
+        "source",
+        &shared,
+        ("account_id", &erin_id),
+        "write",
+    )
+    .await;
+    let (st, sources) = call(&app, "GET", "/api/v1/sources", Some(&erin), None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(sources[0]["writable"], true);
+    assert!(sources[0].get("writable_reason").is_none());
+    let (st, source) = call(
+        &app,
+        "GET",
+        &format!("/api/v1/sources/{shared}"),
+        Some(&erin),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(source["writable"], true);
+    let (st, uploaded) = upload_call(&app, &erin, &shared, "granted.png", bytes.clone()).await;
+    assert_eq!(st, StatusCode::OK, "{uploaded}");
+    assert!(uploaded["asset"].is_string(), "explicit ingest: {uploaded}");
+
+    // Revocation also applies on the next list/get/upload request. Since the write share carried
+    // the read reach too, the source disappears rather than leaking its current backend state.
+    let (st, _) = call(
+        &app,
+        "DELETE",
+        &format!("/admin/api/shares/{write_share}"),
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    let (st, sources) = call(&app, "GET", "/api/v1/sources", Some(&erin), None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(sources.as_array().unwrap().is_empty());
+    let (st, _) = call(
+        &app,
+        "GET",
+        &format!("/api/v1/sources/{shared}"),
+        Some(&erin),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _) = upload_call(&app, &erin, &shared, "revoked.png", bytes).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    let audit = store.list_audit(100).unwrap();
+    assert!(
+        audit
+            .iter()
+            .any(|entry| entry.action == "source.upload" && entry.actor.contains("upload-editor")),
+        "the granted source write is attributed: {audit:?}"
+    );
+    assert!(
+        audit.iter().any(|entry| {
+            entry.action == "source.upload.refused"
+                && entry.actor.contains("upload-editor")
+                && entry
+                    .detail
+                    .as_ref()
+                    .and_then(|detail| detail["bytes"].as_u64())
+                    == Some(0)
+        }),
+        "pre-body per-source grant refusals are attributed with zero bytes: {audit:?}"
+    );
 }
 
 #[tokio::test]

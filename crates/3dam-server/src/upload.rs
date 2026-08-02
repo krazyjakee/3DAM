@@ -103,6 +103,38 @@ async fn upload(
             p.source
         )))
     })?;
+    let target = format!("{}/{}", p.folder.trim_end_matches('/'), p.name);
+    let actor = actor_of(&ctx);
+
+    // Authorise and probe the destination before polling the request body. The engine repeats the
+    // visibility/write-grant check after staging — that is the TOCTOU authority if a share is
+    // revoked while bytes are in flight — but a caller who is already forbidden must not be able
+    // to make the server receive and persist a multi-gigabyte body before learning that fact.
+    // `get_source` filters hidden sources before probing their backend, preserving the 404/no-leak
+    // contract. Its `writable` answer already intersects backend capability with caller scope and
+    // the per-source grant; the explicit grant branch keeps a readable source's refusal a 403.
+    let destination = match st.lib.get_source(&ctx, &source).await {
+        Ok(destination) => destination,
+        Err(error) => {
+            audit_refused(&st, &actor, &target, source, 0, &error);
+            return Err(ApiError(error));
+        }
+    };
+    if !ctx.visibility.allows_source_write(&source) {
+        let error = LibError::Forbidden(
+            "no write access to this source (a write share is required)".into(),
+        );
+        audit_refused(&st, &actor, &target, source, 0, &error);
+        return Err(ApiError(error));
+    }
+    if !destination.writable {
+        let error = LibError::Unsupported(format!(
+            "source {:?} cannot accept uploads",
+            destination.name
+        ));
+        audit_refused(&st, &actor, &target, source, 0, &error);
+        return Err(ApiError(error));
+    }
 
     let ceiling = st.max_upload_bytes;
 
@@ -145,8 +177,6 @@ async fn upload(
         name: p.name,
         collision: p.collision,
     };
-    let target = format!("{}/{}", req.folder.trim_end_matches('/'), req.name);
-    let actor = actor_of(&ctx);
     let outcome = match st.lib.upload(&ctx, req, staged.path()).await {
         Ok(o) => o,
         Err(e) => {
@@ -154,16 +184,7 @@ async fn upload(
             // traversal-shaped name or a peer destination is what an audit log is read for after
             // the fact. Recording only successes would leave exactly the attempts worth reviewing
             // invisible.
-            let _ = st.store.audit(
-                &actor,
-                "source.upload.refused",
-                Some(&target),
-                Some(serde_json::json!({
-                    "source": source.to_string(),
-                    "bytes": written,
-                    "reason": e.to_string(),
-                })),
-            );
+            audit_refused(&st, &actor, &target, source, written, &e);
             return Err(ApiError(e));
         }
     };
@@ -183,6 +204,26 @@ async fn upload(
     );
 
     Ok(Json(outcome))
+}
+
+fn audit_refused(
+    st: &AppState,
+    actor: &str,
+    target: &str,
+    source: SourceId,
+    bytes: u64,
+    error: &LibError,
+) {
+    let _ = st.store.audit(
+        actor,
+        "source.upload.refused",
+        Some(target),
+        Some(serde_json::json!({
+            "source": source.to_string(),
+            "bytes": bytes,
+            "reason": error.to_string(),
+        })),
+    );
 }
 
 fn too_large(len: u64, ceiling: u64) -> LibError {

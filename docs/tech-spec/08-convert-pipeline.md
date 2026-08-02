@@ -528,12 +528,13 @@ token already issued. Nor did `network_writes` cover it: that is a *network ceil
 implicit-trust callers, so a verified write token passes it, and it says nothing at all about a
 loopback deployment.
 
-The gate is therefore three, narrowing:
+The gate is therefore four, narrowing:
 
 | Gate | Question | Refusal |
 |---|---|---|
 | `[flags] upload` | Does this **deployment** accept writes into a source? | `404` — the route is absent (off ⇒ the surface disappears) |
 | `Scope::Write` | May this **caller** write? | `401` / `403` |
+| source `write` share | May this restricted caller write into this **specific source**? | `403`; an unshared source remains absent (`404`) |
 | `network_writes` | May an **implicit-trust** caller write from beyond localhost? | `403` |
 
 The first is a 404 rather than a 403 deliberately, and the distinction is which question is being
@@ -542,6 +543,12 @@ they chose not to run, and hand a client an Upload view whose every request fail
 upload?" is a per-caller answer that still comes back as a plain 401/403 once past the flag, so the
 under-scoped caller keeps their explanation. The flag gate sits outside the auth gate, so the
 answer while uploads are off does not vary with the credential presented.
+
+For a restricted account, `Scope::Write` and the per-source `write` share are independent gates:
+neither implies the other. Source listing intersects both with the backend's actual write
+capability, so the Upload picker disables a readable source with an explicit scope/share reason.
+An entirely unshared source is filtered before backend writability is exposed. Federated sources
+remain read-only even if a stale or misconfigured grant names one.
 
 Successful and *refused* uploads are both audited (`source.upload` / `source.upload.refused`) —
 being the only way bytes enter a source, the refused attempts are exactly the ones an audit log is

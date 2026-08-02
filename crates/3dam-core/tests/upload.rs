@@ -11,7 +11,7 @@
 
 use dam_api::dto::*;
 use dam_api::id::SourceId;
-use dam_api::service::{AuthContext, LibraryService};
+use dam_api::service::{AuthContext, LibraryService, Scope, Scopes, Visibility, VisibilityScope};
 use dam_api::LibError;
 use dam_core::EmbeddedLibrary;
 use std::path::{Path, PathBuf};
@@ -76,6 +76,119 @@ fn req(source: SourceId, folder: &str, name: &str, collision: UploadCollision) -
         name: name.into(),
         collision,
     }
+}
+
+fn restricted_ctx(source: SourceId, write_scope: bool, write_grant: bool) -> AuthContext {
+    let mut visibility = VisibilityScope::default();
+    visibility.sources.insert(source);
+    if write_grant {
+        visibility.write_sources.insert(source);
+    }
+    let mut scopes = Scopes::none().with(Scope::Read);
+    if write_scope {
+        scopes = scopes.with(Scope::Write);
+    }
+    AuthContext::connected(
+        Some("upload-test".into()),
+        scopes,
+        Visibility::Restricted(visibility),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn source_write_access_needs_scope_and_grant_without_leaking_hidden_sources() {
+    let (lib, sid, src, staged) = fixture().await;
+
+    // A hidden source remains absent. In particular, source listing must not reveal whether its
+    // backend or filesystem happens to be writable.
+    let hidden = AuthContext::connected(
+        Some("hidden".into()),
+        Scopes::none().with(Scope::Read).with(Scope::Write),
+        Visibility::Restricted(VisibilityScope::default()),
+    );
+    assert!(lib.list_sources(&hidden).await.unwrap().is_empty());
+    assert!(matches!(
+        lib.get_source(&hidden, &sid).await.unwrap_err(),
+        LibError::NotFound(_)
+    ));
+    assert!(matches!(
+        lib.upload(
+            &hidden,
+            req(sid, "", "hidden.png", UploadCollision::Fail),
+            &staged,
+        )
+        .await
+        .unwrap_err(),
+        LibError::NotFound(_)
+    ));
+
+    // A viewer can hold a source write grant but still lacks the global Write capability.
+    let viewer = restricted_ctx(sid, false, true);
+    let listed = lib.list_sources(&viewer).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert!(!listed[0].writable);
+    assert_eq!(
+        listed[0].writable_reason.as_deref(),
+        Some("read-only — write scope is required")
+    );
+    assert!(matches!(
+        lib.upload(
+            &viewer,
+            req(sid, "", "viewer.png", UploadCollision::Fail),
+            &staged,
+        )
+        .await
+        .unwrap_err(),
+        LibError::Forbidden(_)
+    ));
+
+    // Conversely, an editor with only a read share can browse but cannot choose or write here.
+    let read_share = restricted_ctx(sid, true, false);
+    let listed = lib.list_sources(&read_share).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert!(!listed[0].writable);
+    assert_eq!(
+        listed[0].writable_reason.as_deref(),
+        Some("read-only — a write share is required")
+    );
+    let got = lib.get_source(&read_share, &sid).await.unwrap();
+    assert!(!got.writable);
+    assert_eq!(got.writable_reason, listed[0].writable_reason);
+    assert!(matches!(
+        lib.upload(
+            &read_share,
+            req(sid, "", "read-share.png", UploadCollision::Fail),
+            &staged,
+        )
+        .await
+        .unwrap_err(),
+        LibError::Forbidden(_)
+    ));
+
+    // Both gates together expose the destination and permit the existing create-only upload path.
+    let writer = restricted_ctx(sid, true, true);
+    let listed = lib.list_sources(&writer).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert!(listed[0].writable);
+    assert!(listed[0].writable_reason.is_none());
+    assert!(lib.get_source(&writer, &sid).await.unwrap().writable);
+    let out = lib
+        .upload(
+            &writer,
+            req(sid, "", "granted.png", UploadCollision::Fail),
+            &staged,
+        )
+        .await
+        .unwrap();
+    assert!(
+        out.asset.is_some(),
+        "the granted upload is explicitly ingested"
+    );
+    assert!(src.join("granted.png").exists());
+
+    assert!(!src.join("hidden.png").exists());
+    assert!(!src.join("viewer.png").exists());
+    assert!(!src.join("read-share.png").exists());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

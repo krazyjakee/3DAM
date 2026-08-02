@@ -319,6 +319,7 @@ impl Store {
             // this row-mapper runs under the connection lock and must not do. The engine fills it
             // in after the query (`EmbeddedLibrary::mark_writable`), where the probe is off-lock.
             writable: false,
+            writable_reason: None,
         })
     }
 

@@ -51,6 +51,7 @@ let seq = 0;
 function unwritableReason(s: SourceInfo): string | null {
   if (s.kind === "federated") return "a peer's library is read-only";
   if (s.writable) return null;
+  if (s.writable_reason) return s.writable_reason;
   // SFTP and SMB *do* have a write side (issue #80 slice 7), so an unwritable one is a property of
   // this build rather than of the protocol: the backend was compiled out, or it is an SMB share on a
   // non-default port, which `SmbSource::connect` refuses outright. Neither is fixable by the user

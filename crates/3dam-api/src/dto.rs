@@ -754,6 +754,10 @@ pub struct SourceInfo {
     /// reads as read-only rather than advertising a write that would fail.
     #[serde(default)]
     pub writable: bool,
+    /// Why an otherwise visible source is not an upload destination. In particular, this names a
+    /// missing per-source write grant separately from backend/filesystem writability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writable_reason: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]

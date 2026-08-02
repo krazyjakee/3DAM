@@ -607,6 +607,8 @@ export interface SourceInfo {
    * Optional so an older server reads as read-only rather than advertising a write that would fail.
    */
   writable?: boolean;
+  /** Explicit authorization/backend reason when `writable` is false. */
+  writable_reason?: string | null;
 }
 /**
  * How an upload resolves a name that is already taken (issue #80).

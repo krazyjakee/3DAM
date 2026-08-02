@@ -1747,11 +1747,15 @@ impl LibraryService for EmbeddedLibrary {
         req: UploadRequest,
         staged: &std::path::Path,
     ) -> Result<UploadOutcome, LibError> {
-        // Writing into a source is a library-wide capability today. When #42's per-source `write`
-        // grant lands this relaxes to a single predicate — "full visibility *or* a write grant on
-        // `req.source`" — rather than a retrofit; until then a restricted identity that can merely
-        // *see* a source must not be able to put files in it.
-        Self::require_full_visibility(ctx, "upload")?;
+        ctx.require(Scope::Write)?;
+        if !ctx.visibility.allows_source(&req.source) {
+            return Err(LibError::NotFound(format!("source {}", req.source)));
+        }
+        if !ctx.visibility.allows_source_write(&req.source) {
+            return Err(LibError::Forbidden(
+                "no write access to this source (a write share is required)".into(),
+            ));
+        }
 
         let scratch = self.scratch();
         let staged = staged.to_path_buf();
@@ -1780,6 +1784,15 @@ impl LibraryService for EmbeddedLibrary {
             .filter(|s| ctx.visibility.allows_source(&s.id))
             .collect();
         self.mark_writable(&mut visible).await;
+        for source in &mut visible {
+            if !ctx.scopes.has(Scope::Write) {
+                source.writable = false;
+                source.writable_reason = Some("read-only — write scope is required".into());
+            } else if !ctx.visibility.allows_source_write(&source.id) {
+                source.writable = false;
+                source.writable_reason = Some("read-only — a write share is required".into());
+            }
+        }
         Ok(visible)
     }
 
@@ -1795,6 +1808,13 @@ impl LibraryService for EmbeddedLibrary {
             })
             .await?;
         self.mark_writable(std::slice::from_mut(&mut info)).await;
+        if !ctx.scopes.has(Scope::Write) {
+            info.writable = false;
+            info.writable_reason = Some("read-only — write scope is required".into());
+        } else if !ctx.visibility.allows_source_write(&info.id) {
+            info.writable = false;
+            info.writable_reason = Some("read-only — a write share is required".into());
+        }
         Ok(info)
     }
 
