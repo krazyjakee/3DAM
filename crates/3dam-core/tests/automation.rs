@@ -203,6 +203,7 @@ async fn analyze_similar_dedup_and_review() {
                 media: None,
                 limit: 50,
                 after: None,
+                review: DupReviewFilter::Pending,
             },
         )
         .await
@@ -210,7 +211,7 @@ async fn analyze_similar_dedup_and_review() {
     assert_eq!(exact.items.len(), 1, "one exact-dup group");
     let g = &exact.items[0];
     assert_eq!(g.members.len(), 2, "d + d_copy");
-    let names: Vec<&str> = g.members.iter().map(|m| m.name.as_str()).collect();
+    let names: Vec<&str> = g.members.iter().map(|m| m.asset.name.as_str()).collect();
     assert!(names.contains(&"d.png") && names.contains(&"d_copy.png"));
 
     let oversized_membership = lib
@@ -235,13 +236,14 @@ async fn analyze_similar_dedup_and_review() {
                 media: Some(MediaType::Image),
                 limit: 50,
                 after: None,
+                review: DupReviewFilter::Pending,
             },
         )
         .await
         .unwrap();
     assert!(
         near.items.iter().any(|grp| {
-            let m: Vec<AssetId> = grp.members.iter().map(|x| x.id).collect();
+            let m: Vec<AssetId> = grp.members.iter().map(|x| x.asset.id).collect();
             m.contains(&id_a) && m.contains(&id_b)
         }),
         "a and b form a near-dup group: {near:?}"

@@ -427,6 +427,7 @@ impl McpAdapter {
                     media,
                     limit: a.limit.unwrap_or(50),
                     after: None,
+                    review: DupReviewFilter::Pending,
                 };
                 to_value(&lib.list_duplicates(ctx, req).await?)
             }

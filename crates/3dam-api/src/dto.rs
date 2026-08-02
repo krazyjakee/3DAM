@@ -1305,6 +1305,10 @@ pub struct DupRequest {
     /// Opaque continuation returned by the previous duplicate-review page.
     #[serde(default)]
     pub after: Option<crate::Cursor>,
+    /// Which durable review queue to show. Pending is the default working queue; reviewed groups
+    /// remain reachable so a decision can be inspected or reopened after refresh.
+    #[serde(default)]
+    pub review: DupReviewFilter,
 }
 
 fn default_dup_limit() -> u32 {
@@ -1343,6 +1347,59 @@ pub struct DupGroupMembersRequest {
     pub limit: u32,
 }
 
+/// One duplicate-review member with the comparison context deliberately omitted from ordinary
+/// browse summaries. This is still metadata-only: no source bytes are read.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DupMember {
+    pub asset: AssetSummary,
+    pub path: String,
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analyzed_at: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DupReviewState {
+    #[default]
+    Pending,
+    Resolved,
+    Dismissed,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DupReviewFilter {
+    #[default]
+    Pending,
+    Resolved,
+    Dismissed,
+    All,
+}
+
+/// Persist one review decision. Choosing a keep is non-destructive and leaves the group pending;
+/// resolve/dismiss move it out of the default queue, while Pending reopens it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DupReviewRequest {
+    pub review: String,
+    pub state: DupReviewState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep: Option<AssetId>,
+    /// Catalog-only removals committed in the same transaction as the review state. `block` is
+    /// content-addressed and can therefore remove every exact copy; source files remain untouched.
+    #[serde(default)]
+    pub removals: Vec<DupReviewRemoval>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DupReviewRemoval {
+    pub asset: AssetId,
+    #[serde(default)]
+    pub block: bool,
+}
+
 /// A cluster of duplicates for the review view (§4.3). Never auto-deleted — 3DAM only groups.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DupGroup {
@@ -1351,7 +1408,11 @@ pub struct DupGroup {
     /// Exact-group key used to continue member pagination. `None` for computed near groups.
     #[serde(default)]
     pub group: Option<String>,
-    pub members: Vec<AssetSummary>,
+    /// Stable identity for the current group, used by the durable review record.
+    pub review: String,
+    #[serde(default)]
+    pub review_state: DupReviewState,
+    pub members: Vec<DupMember>,
     /// Visible members in the complete group. `members` is capped for bounded responses.
     pub total_members: u32,
     /// Continue this group's member list without reloading its first summaries.
@@ -1361,6 +1422,12 @@ pub struct DupGroup {
     pub signal: String,
     /// A suggested "keep" (highest resolution / most-permissive / largest); the user disposes.
     pub suggested_keep: AssetId,
+    /// Why the automated choice won. Separate from `signal`, which explains why the members were
+    /// grouped rather than why one is preferable to keep.
+    pub suggested_keep_reason: String,
+    /// A user override, persisted independently of the suggestion. `None` means use the suggestion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chosen_keep: Option<AssetId>,
 }
 
 /// Accept or reject one auto-suggested tag (the one-action lifecycle, §1.4). Accept promotes the

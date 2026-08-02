@@ -50,6 +50,12 @@ pub struct ManualTagEditOutcome {
     pub changed_assets: Vec<(AssetId, Option<SourceId>)>,
 }
 
+/// Catalog rows removed by one transactional duplicate-review decision, with source attribution
+/// captured before the delete so the engine can emit visibility-safe live events afterwards.
+pub struct DuplicateReviewOutcome {
+    pub removed_assets: Vec<(AssetId, SourceId)>,
+}
+
 /// One asset the analysis pass must (re-)process — enough to locate the file and decode it, plus the
 /// content hash that keys the extractor cache (tech-spec 05 §7.1). Produced by [`Store::list_analysis_targets`].
 pub struct AnalysisTarget {

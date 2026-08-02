@@ -306,6 +306,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/api/v1/advertise", get(advertise))
         .route("/api/v1/similar-by-vector", post(similar_by_vector))
         .route("/api/v1/duplicates", post(list_duplicates))
+        .route("/api/v1/duplicates/review", post(review_duplicate))
         .route("/api/v1/duplicates/membership", post(duplicate_membership))
         .route(
             "/api/v1/duplicates/group-members",
@@ -1647,8 +1648,17 @@ async fn duplicate_group_members(
     Reader(ctx): Reader,
     State(st): State<AppState>,
     Json(req): Json<DupGroupMembersRequest>,
-) -> Result<Json<dam_api::Page<AssetSummary>>, ApiError> {
+) -> Result<Json<dam_api::Page<DupMember>>, ApiError> {
     Ok(Json(st.lib.duplicate_group_members(&ctx, req).await?))
+}
+
+async fn review_duplicate(
+    Writer(ctx): Writer,
+    State(st): State<AppState>,
+    Json(req): Json<DupReviewRequest>,
+) -> Result<StatusCode, ApiError> {
+    st.lib.review_duplicate(&ctx, req).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn duplicate_group(

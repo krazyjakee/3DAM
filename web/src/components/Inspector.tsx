@@ -811,13 +811,13 @@ function DuplicatesSection({ asset }: { asset: Asset }) {
       <div className="grid grid-cols-3 gap-1.5">
         {group.members.map((m) => (
           <DuplicateTile
-            key={m.id}
-            member={m}
-            keep={m.id === group.suggested_keep}
-            current={m.id === id}
+            key={m.asset.id}
+            member={m.asset}
+            keep={(group.chosen_keep ?? group.suggested_keep) === m.asset.id}
+            current={m.asset.id === id}
             onOpen={() => patch({
-              selected: m.id,
-              owner: typeof m.origin === "object" ? m.source_id : null,
+              selected: m.asset.id,
+              owner: typeof m.asset.origin === "object" ? m.asset.source_id : null,
             })}
           />
         ))}

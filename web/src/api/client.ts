@@ -17,9 +17,11 @@ import type {
   ConvertRequest,
   DupGroup,
   DupGroupMembersRequest,
+  DupMember,
   DupMembership,
   DupMembershipRequest,
   DupRequest,
+  DupReviewRequest,
   ExportReport,
   ExportRequest,
   JobId,
@@ -215,7 +217,9 @@ export const api = {
     send<DupMembership[]>("POST", `${API}/duplicates/membership`, req),
   duplicateGroup: (id: AssetId) => get<DupGroup | null>(`${API}/assets/${id}/duplicates`),
   duplicateGroupMembers: (req: DupGroupMembersRequest) =>
-    send<Page<AssetSummary>>("POST", `${API}/duplicates/group-members`, req),
+    send<Page<DupMember>>("POST", `${API}/duplicates/group-members`, req),
+  reviewDuplicate: (req: DupReviewRequest) =>
+    send<void>("POST", `${API}/duplicates/review`, req),
 
   /** Export a manifest (json/csv/sidecar) for a selection / collection / query to a server path. */
   exportAssets: (req: ExportRequest) => send<ExportReport>("POST", `${API}/export`, req),

@@ -664,7 +664,16 @@ pub trait LibraryService: Send + Sync {
         &self,
         ctx: &AuthContext,
         req: DupGroupMembersRequest,
-    ) -> Result<Page<AssetSummary>, LibError>;
+    ) -> Result<Page<DupMember>, LibError>;
+
+    /// Persist a duplicate review decision and atomically apply its explicitly requested
+    /// catalog-only removals. Blocking may purge every catalog row with identical bytes; neither
+    /// removal mode deletes source files.
+    async fn review_duplicate(
+        &self,
+        ctx: &AuthContext,
+        req: DupReviewRequest,
+    ) -> Result<(), LibError>;
 
     /// Accept or reject one auto-suggested tag (§1.4). Reversible; a reject is remembered so the same
     /// extractor version won't re-suggest it.

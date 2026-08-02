@@ -6,6 +6,21 @@ use std::collections::BTreeMap;
 /// Planner pages stay small enough for flat memory and prompt cancellation while amortizing the
 /// SQLite query and producer/consumer hand-off.
 pub const ANALYSIS_PLAN_BATCH_MAX: usize = 512;
+const NEAR_DUP_COSINE: f32 = 0.92;
+const NEAR_DUP_CANDIDATE_MAX: usize = 2_000;
+type NearCandidate = (AssetId, String, String, Vec<f32>);
+type NearComponent = (String, String, Vec<AssetId>);
+type NearPartitions = BTreeMap<(String, String, usize), Vec<(AssetId, Vec<f32>)>>;
+
+struct DupGroupSeed<'a> {
+    kind: DupKind,
+    ids: &'a [AssetId],
+    total_members: u32,
+    group: Option<String>,
+    members_cursor: Option<Cursor>,
+    signal: &'a str,
+    review: &'a str,
+}
 
 #[derive(Clone, Copy)]
 enum PlanKind {
@@ -1062,8 +1077,6 @@ impl Store {
         req: &DupRequest,
         vis: &Visibility,
     ) -> Result<Page<DupGroup>, LibError> {
-        const NEAR_COS: f32 = 0.92; // conservative "strong near-dup" band (§4.2; tuned later, §8)
-        const NEAR_CANDIDATE_MAX: usize = 2_000;
         let conn = self.conn.lock().unwrap();
         let mut groups: Vec<DupGroup> = Vec::new();
         let limit = req.limit.clamp(1, DUP_GROUP_PAGE_MAX) as usize;
@@ -1156,7 +1169,7 @@ impl Store {
                         size_by_id.insert(id, size);
                         all_ids.push(id);
                     }
-                    let summaries = Self::summaries_for_ids(&conn, &all_ids, &[], vis)?;
+                    let member_details = Self::duplicate_members_for_ids(&conn, &all_ids, vis)?;
                     for (hash, total_members) in exact {
                         let ids = ids_by_hash.remove(&hash).unwrap_or_default();
                         let group_key = encode_hex(&hash);
@@ -1164,24 +1177,36 @@ impl Store {
                             .then(|| member_cursor(&ids, &size_by_id))
                             .flatten();
                         if let Some(group) = Self::build_dup_group_from_summaries(
-                            DupKind::Exact,
-                            &ids,
-                            total_members,
-                            Some(group_key),
-                            members_cursor,
-                            "identical bytes (same content hash)",
-                            &summaries,
+                            DupGroupSeed {
+                                kind: DupKind::Exact,
+                                ids: &ids,
+                                total_members,
+                                group: Some(group_key),
+                                members_cursor,
+                                signal: "identical bytes (same content hash)",
+                                review: &format!("exact:{}", encode_hex(&hash)),
+                            },
+                            &member_details,
                         ) {
-                            groups.push(group);
+                            if let Some(group) =
+                                Self::apply_duplicate_review(&conn, group, req.review)?
+                            {
+                                groups.push(group);
+                            }
                         }
                     }
                 }
             }
             DupKind::Near => {
-                let offset = decode_near_dup_cursor(req.after.as_ref(), NEAR_CANDIDATE_MAX)?;
-                // Load embeddings for the requested media (or all), union-find over cosine ≥ threshold.
+                let offset = decode_near_dup_cursor(req.after.as_ref(), NEAR_DUP_CANDIDATE_MAX)?;
+                // Compare only embeddings from the same declared space and media. The old flat
+                // candidate list compared unrelated dimensions (for example image stats against
+                // document text) whenever "All media" was selected, manufacturing groups from a
+                // signal that had no meaning. A media appears in near review only if it has rows in
+                // a real embedding space; exact review remains independent and covers all five.
                 let mut sql = String::from(
-                    "SELECT e.asset_id, e.vec FROM embedding e JOIN asset a ON a.id = e.asset_id",
+                    "SELECT e.asset_id, e.space_id, e.media_type, e.vec
+                       FROM embedding e JOIN asset a ON a.id = e.asset_id",
                 );
                 let mut where_sql = String::from(" WHERE 1=1");
                 let mut binds: Vec<Value> = Vec::new();
@@ -1191,88 +1216,203 @@ impl Store {
                 }
                 push_visibility(vis, "a", &mut where_sql, &mut binds);
                 sql.push_str(&where_sql);
-                sql.push_str(" ORDER BY e.asset_id LIMIT ?");
-                binds.push(Value::Integer((NEAR_CANDIDATE_MAX + 1) as i64));
+                sql.push_str(" ORDER BY e.media_type, e.space_id, e.asset_id LIMIT ?");
+                binds.push(Value::Integer((NEAR_DUP_CANDIDATE_MAX + 1) as i64));
                 let mut stmt = conn.prepare(&sql).map_err(internal)?;
                 let rows = stmt
                     .query_map(rusqlite::params_from_iter(binds.iter()), |r| {
-                        Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?))
+                        Ok((
+                            r.get::<_, Vec<u8>>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, Vec<u8>>(3)?,
+                        ))
                     })
                     .map_err(internal)?;
-                let mut ids: Vec<AssetId> = Vec::new();
-                let mut vecs: Vec<Vec<f32>> = Vec::new();
+                let mut candidates = Vec::new();
                 for r in rows {
-                    let (id_blob, vbytes) = r.map_err(internal)?;
-                    ids.push(blob_to_asset_id(&id_blob));
-                    vecs.push(bytes_to_f32(&vbytes));
+                    let (id_blob, space, media, vbytes) = r.map_err(internal)?;
+                    candidates.push((
+                        blob_to_asset_id(&id_blob),
+                        space,
+                        media,
+                        bytes_to_f32(&vbytes),
+                    ));
                 }
-                if ids.len() > NEAR_CANDIDATE_MAX {
-                    ids.truncate(NEAR_CANDIDATE_MAX);
-                    vecs.truncate(NEAR_CANDIDATE_MAX);
+                if candidates.len() > NEAR_DUP_CANDIDATE_MAX {
+                    candidates.truncate(NEAR_DUP_CANDIDATE_MAX);
                     partial.complete = false;
                     partial.warnings.push(dam_api::ItemWarning {
                         subject: "near-duplicates".into(),
                         code: "duplicate_candidates_capped".into(),
                         message: format!(
-                            "near-duplicate analysis is capped at {NEAR_CANDIDATE_MAX} candidates"
+                            "near-duplicate analysis is capped at {NEAR_DUP_CANDIDATE_MAX} candidates"
                         ),
                     });
                 }
-                let mut uf = UnionFind::new(ids.len());
-                for i in 0..vecs.len() {
-                    for j in (i + 1)..vecs.len() {
-                        if cosine(&vecs[i], &vecs[j]) >= NEAR_COS {
-                            uf.union(i, j);
+
+                let computed = near_components(candidates);
+                let remaining = computed.get(offset..).unwrap_or_default();
+                let all_ids: Vec<AssetId> = remaining
+                    .iter()
+                    .flat_map(|(_, _, ids)| ids.iter().take(DUP_GROUP_MEMBER_MAX).copied())
+                    .collect();
+                let member_details = Self::duplicate_members_for_ids(&conn, &all_ids, vis)?;
+                let mut consumed = 0usize;
+                for (_media, space, ids) in remaining {
+                    consumed += 1;
+                    let member_ids: Vec<AssetId> =
+                        ids.iter().take(DUP_GROUP_MEMBER_MAX).copied().collect();
+                    let review = near_review_id(space, ids);
+                    if let Some(g) = Self::build_dup_group_from_summaries(
+                        DupGroupSeed {
+                            kind: DupKind::Near,
+                            ids: &member_ids,
+                            total_members: ids.len() as u32,
+                            group: None,
+                            members_cursor: None,
+                            signal: &format!("{space} embedding cosine ≥ {NEAR_DUP_COSINE:.2}"),
+                            review: &review,
+                        },
+                        &member_details,
+                    ) {
+                        if let Some(group) = Self::apply_duplicate_review(&conn, g, req.review)? {
+                            groups.push(group);
+                            if groups.len() == limit {
+                                break;
+                            }
                         }
                     }
                 }
-                let components: Vec<Vec<usize>> = uf
-                    .components()
-                    .into_iter()
-                    .filter(|comp| comp.len() >= 2)
-                    .skip(offset)
-                    .take(limit + 1)
-                    .collect();
-                has_more = components.len() > limit;
-                let components = &components[..components.len().min(limit)];
-                let all_ids: Vec<AssetId> = components
-                    .iter()
-                    .flat_map(|comp| {
-                        comp.iter()
-                            .take(DUP_GROUP_MEMBER_MAX)
-                            .map(|&index| ids[index])
-                    })
-                    .collect();
-                let summaries = Self::summaries_for_ids(&conn, &all_ids, &[], vis)?;
-                for comp in components {
-                    if comp.len() < 2 {
-                        continue;
-                    }
-                    let member_ids: Vec<AssetId> = comp
-                        .iter()
-                        .take(DUP_GROUP_MEMBER_MAX)
-                        .map(|&i| ids[i])
-                        .collect();
-                    if let Some(g) = Self::build_dup_group_from_summaries(
-                        DupKind::Near,
-                        &member_ids,
-                        comp.len() as u32,
-                        None,
-                        None,
-                        &format!("embedding cosine ≥ {NEAR_COS:.2}"),
-                        &summaries,
-                    ) {
-                        groups.push(g);
-                    }
-                }
+                let next_offset = offset.saturating_add(consumed);
+                has_more = next_offset < computed.len();
                 if has_more {
-                    next_cursor = Some(Cursor(format!("near:{}", offset + groups.len())));
+                    next_cursor = Some(Cursor(format!("near:{next_offset}")));
                 }
             }
         }
         let mut page = Page::new(groups, next_cursor);
         page.partial = partial;
         Ok(page)
+    }
+
+    /// Persist review metadata and any requested catalog-only removals in one SQLite transaction.
+    /// Blocking remains content-addressed: it removes every catalog row with the same hash and
+    /// records that hash for future scans, but never opens or deletes a source file.
+    pub fn review_duplicate(
+        &self,
+        req: &DupReviewRequest,
+    ) -> Result<DuplicateReviewOutcome, LibError> {
+        if req.review.len() > 96
+            || !(req.review.starts_with("exact:") || req.review.starts_with("near:"))
+        {
+            return Err(LibError::BadRequest("invalid duplicate review id".into()));
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(internal)?;
+
+        let group_members = duplicate_review_members(&tx, &req.review)?;
+
+        if let Some(keep) = req.keep {
+            if !group_members.contains(&keep) {
+                return Err(LibError::BadRequest(format!(
+                    "keep asset {keep} is not a member of {}",
+                    req.review
+                )));
+            }
+        }
+
+        let mut removed = BTreeMap::<AssetId, SourceId>::new();
+        for removal in &req.removals {
+            if !group_members.contains(&removal.asset) {
+                return Err(LibError::BadRequest(format!(
+                    "removal asset {} is not a member of {}",
+                    removal.asset, req.review
+                )));
+            }
+            let row: Option<(Option<Vec<u8>>, String, Vec<u8>)> = tx
+                .query_row(
+                    "SELECT content_hash, filename, source_id FROM asset WHERE id = ?1",
+                    params![removal.asset.as_bytes().to_vec()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()
+                .map_err(internal)?;
+            let (hash, filename, source_blob) =
+                row.ok_or_else(|| LibError::NotFound(format!("asset {}", removal.asset)))?;
+
+            if removal.block {
+                if let Some(hash) = hash {
+                    let mut stmt = tx
+                        .prepare("SELECT id, source_id FROM asset WHERE content_hash = ?1")
+                        .map_err(internal)?;
+                    let rows = stmt
+                        .query_map(params![hash.clone()], |row| {
+                            Ok((
+                                blob_to_asset_id(&row.get::<_, Vec<u8>>(0)?),
+                                blob_to_source_id(&row.get::<_, Vec<u8>>(1)?),
+                            ))
+                        })
+                        .map_err(internal)?;
+                    for row in rows {
+                        let (id, source) = row.map_err(internal)?;
+                        removed.insert(id, source);
+                    }
+                    drop(stmt);
+                    tx.execute(
+                        "DELETE FROM asset WHERE content_hash = ?1",
+                        params![hash.clone()],
+                    )
+                    .map_err(internal)?;
+                    tx.execute(
+                        "INSERT INTO blocklist (content_hash, label, blocked_at)
+                         VALUES (?1, ?2, ?3)
+                         ON CONFLICT(content_hash) DO UPDATE SET label = excluded.label",
+                        params![hash, filename, now_ms()],
+                    )
+                    .map_err(internal)?;
+                    continue;
+                }
+            }
+
+            let source = <[u8; 16]>::try_from(source_blob.as_slice())
+                .ok()
+                .map(SourceId::from_bytes)
+                .ok_or_else(|| LibError::Internal("invalid source id in asset row".into()))?;
+            tx.execute(
+                "DELETE FROM asset WHERE id = ?1",
+                params![removal.asset.as_bytes().to_vec()],
+            )
+            .map_err(internal)?;
+            removed.insert(removal.asset, source);
+        }
+
+        let state = match req.state {
+            DupReviewState::Pending => "pending",
+            DupReviewState::Resolved => "resolved",
+            DupReviewState::Dismissed => "dismissed",
+        };
+        tx.execute(
+            "INSERT INTO duplicate_review (review_key, state, chosen_keep, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(review_key) DO UPDATE SET
+                 state = excluded.state,
+                 chosen_keep = COALESCE(excluded.chosen_keep, duplicate_review.chosen_keep),
+                 updated_at = excluded.updated_at",
+            params![
+                req.review,
+                state,
+                req.keep.map(|id| id.as_bytes().to_vec()),
+                now_ms()
+            ],
+        )
+        .map_err(internal)?;
+        tx.commit().map_err(internal)?;
+        Ok(DuplicateReviewOutcome {
+            removed_assets: removed.into_iter().collect(),
+        })
     }
 
     /// Set-based exact-duplicate membership for the currently retained browse rows. The request is
@@ -1362,16 +1502,23 @@ impl Store {
                     .map(|(id, size)| Cursor(format!("members:{size}:{id}")))
             })
             .flatten();
-        let summaries = Self::summaries_for_ids(&conn, &ids, &[], vis)?;
-        Ok(Self::build_dup_group_from_summaries(
-            DupKind::Exact,
-            &ids,
-            membership.count,
-            Some(membership.group),
-            members_cursor,
-            "identical bytes (same content hash)",
-            &summaries,
-        ))
+        let member_details = Self::duplicate_members_for_ids(&conn, &ids, vis)?;
+        let group = Self::build_dup_group_from_summaries(
+            DupGroupSeed {
+                kind: DupKind::Exact,
+                ids: &ids,
+                total_members: membership.count,
+                group: Some(membership.group.clone()),
+                members_cursor,
+                signal: "identical bytes (same content hash)",
+                review: &format!("exact:{}", membership.group),
+            },
+            &member_details,
+        );
+        group
+            .map(|group| Self::apply_duplicate_review(&conn, group, DupReviewFilter::All))
+            .transpose()
+            .map(Option::flatten)
     }
 
     /// Continue one exact group's member summaries with a stable `(size, id)` keyset.
@@ -1379,7 +1526,7 @@ impl Store {
         &self,
         req: &DupGroupMembersRequest,
         vis: &Visibility,
-    ) -> Result<Page<AssetSummary>, LibError> {
+    ) -> Result<Page<DupMember>, LibError> {
         let hash = decode_hash_hex(&req.group)?;
         let after = decode_dup_member_cursor(req.after.as_ref())?;
         let limit = req.limit.clamp(1, DUP_GROUP_PAGE_MAX) as usize;
@@ -1416,10 +1563,10 @@ impl Store {
         let has_more = ordered.len() > limit;
         ordered.truncate(limit);
         let ids: Vec<AssetId> = ordered.iter().map(|(id, _)| *id).collect();
-        let summaries = Self::summaries_for_ids(&conn, &ids, &[], vis)?;
-        let items: Vec<AssetSummary> = ids
+        let members = Self::duplicate_members_for_ids(&conn, &ids, vis)?;
+        let items: Vec<DupMember> = ids
             .iter()
-            .filter_map(|id| summaries.get(id).cloned())
+            .filter_map(|id| members.get(id).cloned())
             .collect();
         let cursor = has_more
             .then(|| {
@@ -1431,45 +1578,138 @@ impl Store {
         Ok(Page::new(items, cursor))
     }
 
-    /// Build a `DupGroup` from member ids: load summaries, pick the suggested keep (largest bytes,
-    /// then highest pixel count for images). Skips groups that collapse to <2 resolvable members —
+    /// Build a `DupGroup` from member ids: load review-specific comparison metadata and pick the
+    /// suggested keep by license, size, and modification time. Skips groups that collapse to fewer
+    /// than two resolvable members —
     /// which also re-forms visibility-filtered groups (issue #42 leak audit): a duplicate pair
     /// spanning a shared and an unshared source collapses to one visible member, and a group of one
     /// is not a duplicate, so the hidden file's existence never shows.
     fn build_dup_group_from_summaries(
-        kind: DupKind,
-        ids: &[AssetId],
-        total_members: u32,
-        group: Option<String>,
-        members_cursor: Option<Cursor>,
-        signal: &str,
-        map: &std::collections::HashMap<AssetId, AssetSummary>,
+        seed: DupGroupSeed<'_>,
+        map: &std::collections::HashMap<AssetId, DupMember>,
     ) -> Option<DupGroup> {
-        let mut members: Vec<AssetSummary> =
-            ids.iter().filter_map(|i| map.get(i).cloned()).collect();
+        let mut members: Vec<DupMember> = seed
+            .ids
+            .iter()
+            .filter_map(|id| map.get(id).cloned())
+            .collect();
         if members.len() < 2 {
             return None;
         }
-        // Suggested keep: the biggest file (a decent proxy for highest fidelity, §4.3).
-        if kind == DupKind::Near {
-            members.sort_by_key(|member| (std::cmp::Reverse(member.size), member.id));
+        // Near components arrive in signal order; make their presentation stable and fidelity-led.
+        if seed.kind == DupKind::Near {
+            members.sort_by_key(|member| (std::cmp::Reverse(member.asset.size), member.asset.id));
         }
         let suggested_keep = members
             .iter()
-            .max_by_key(|member| member.size)
+            .max_by_key(|member| {
+                (
+                    license_rank(member.asset.license.status),
+                    member.asset.size,
+                    member.modified_at.unwrap_or(i64::MIN),
+                    member.asset.id,
+                )
+            })
             .expect("duplicate group has members")
+            .asset
             .id;
-        let media = members[0].media;
+        let winner = members
+            .iter()
+            .find(|member| member.asset.id == suggested_keep)
+            .expect("suggested keep is a member");
+        let suggested_keep_reason = format!(
+            "Best license ({}); ties prefer the larger file, newer modified date, then stable catalog order.",
+            winner.asset.license.status.as_str()
+        );
+        let media = members[0].asset.media;
         Some(DupGroup {
-            kind,
+            kind: seed.kind,
             media,
-            group,
+            group: seed.group,
+            review: seed.review.to_string(),
+            review_state: DupReviewState::Pending,
             members,
-            total_members,
-            members_cursor,
-            signal: signal.to_string(),
+            total_members: seed.total_members,
+            members_cursor: seed.members_cursor,
+            signal: seed.signal.to_string(),
             suggested_keep,
+            suggested_keep_reason,
+            chosen_keep: None,
         })
+    }
+
+    fn apply_duplicate_review(
+        conn: &Connection,
+        mut group: DupGroup,
+        filter: DupReviewFilter,
+    ) -> Result<Option<DupGroup>, LibError> {
+        let saved: Option<(String, Option<Vec<u8>>)> = conn
+            .query_row(
+                "SELECT state, chosen_keep FROM duplicate_review WHERE review_key = ?1",
+                params![group.review],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(internal)?;
+        if let Some((state, keep)) = saved {
+            group.review_state = match state.as_str() {
+                "resolved" => DupReviewState::Resolved,
+                "dismissed" => DupReviewState::Dismissed,
+                _ => DupReviewState::Pending,
+            };
+            group.chosen_keep = keep.and_then(|bytes| {
+                <[u8; 16]>::try_from(bytes.as_slice())
+                    .ok()
+                    .map(AssetId::from_bytes)
+            });
+        }
+        let included = match filter {
+            DupReviewFilter::All => true,
+            DupReviewFilter::Pending => group.review_state == DupReviewState::Pending,
+            DupReviewFilter::Resolved => group.review_state == DupReviewState::Resolved,
+            DupReviewFilter::Dismissed => group.review_state == DupReviewState::Dismissed,
+        };
+        Ok(included.then_some(group))
+    }
+
+    /// Hydrate the metadata whose only consumer is duplicate review. Keeping these columns off
+    /// `AssetSummary` avoids adding path/source/timestamps to every ordinary browse row.
+    fn duplicate_members_for_ids(
+        conn: &Connection,
+        ids: &[AssetId],
+        vis: &Visibility,
+    ) -> Result<std::collections::HashMap<AssetId, DupMember>, LibError> {
+        let mut map = std::collections::HashMap::new();
+        if ids.is_empty() {
+            return Ok(map);
+        }
+        let mut where_sql = String::from(" WHERE 1=1");
+        let mut binds = Vec::new();
+        push_visibility(vis, "asset", &mut where_sql, &mut binds);
+        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        where_sql.push_str(&format!(" AND asset.id IN ({placeholders})"));
+        binds.extend(ids.iter().map(|id| Value::Blob(id.as_bytes().to_vec())));
+        let sql = format!(
+            "{GRID_SELECT}, asset.path, source.name, asset.source_modified_at, asset.analysed_at
+               FROM asset JOIN source ON source.id = asset.source_id {ATTR_JOINS} {where_sql}"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(internal)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(binds.iter()), |row| {
+                Ok(DupMember {
+                    asset: row_to_summary(row)?,
+                    path: row.get(16)?,
+                    source: row.get(17)?,
+                    modified_at: row.get(18)?,
+                    analyzed_at: row.get(19)?,
+                })
+            })
+            .map_err(internal)?;
+        for row in rows {
+            let member = row.map_err(internal)?;
+            map.insert(member.asset.id, member);
+        }
+        Ok(map)
     }
 
     /// Fetch summaries for a set of ids, applying the same faceted filters as text search (§3.3)
@@ -1515,6 +1755,132 @@ pub(crate) fn bytes_to_f32(b: &[u8]) -> Vec<f32> {
     b.chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
+}
+
+fn license_rank(status: LicenseStatus) -> u8 {
+    match status {
+        LicenseStatus::Permissive => 3,
+        LicenseStatus::Attribution => 2,
+        LicenseStatus::Unknown => 1,
+        LicenseStatus::Restricted => 0,
+    }
+}
+
+fn near_components(candidates: Vec<NearCandidate>) -> Vec<NearComponent> {
+    let mut partitions = NearPartitions::new();
+    for (id, space, media, vector) in candidates {
+        // Empty vectors carry no signal and must not become a partition whose cosine
+        // implementation treats every pair as zero-length neighbours.
+        if !vector.is_empty() {
+            partitions
+                .entry((media, space, vector.len()))
+                .or_default()
+                .push((id, vector));
+        }
+    }
+
+    let mut computed = Vec::new();
+    for ((media, space, _dimension), partition) in partitions {
+        let mut uf = UnionFind::new(partition.len());
+        for i in 0..partition.len() {
+            for j in (i + 1)..partition.len() {
+                if cosine(&partition[i].1, &partition[j].1) >= NEAR_DUP_COSINE {
+                    uf.union(i, j);
+                }
+            }
+        }
+        for component in uf
+            .components()
+            .into_iter()
+            .filter(|component| component.len() >= 2)
+        {
+            let mut ids: Vec<AssetId> = component
+                .into_iter()
+                .map(|index| partition[index].0)
+                .collect();
+            ids.sort_unstable();
+            ids.dedup();
+            if ids.len() >= 2 {
+                computed.push((media.clone(), space.clone(), ids));
+            }
+        }
+    }
+    computed.sort_by(|a, b| (&a.0, &a.1, &a.2).cmp(&(&b.0, &b.1, &b.2)));
+    computed
+}
+
+fn near_review_id(space: &str, ids: &[AssetId]) -> String {
+    let mut hash = blake3::Hasher::new();
+    hash.update(space.as_bytes());
+    for id in ids {
+        hash.update(id.as_bytes());
+    }
+    format!("near:{}", hash.finalize().to_hex())
+}
+
+/// Resolve a review id back to its current server-computed membership. Mutations must never trust
+/// caller-supplied asset ids: an exact review proves the content hash, while a near review is
+/// reconstructed from the same bounded, media/space/dimension-partitioned signal set as listing.
+fn duplicate_review_members(
+    conn: &Connection,
+    review: &str,
+) -> Result<std::collections::BTreeSet<AssetId>, LibError> {
+    if let Some(encoded_hash) = review.strip_prefix("exact:") {
+        let hash = decode_hash_hex(encoded_hash)?;
+        if hash.len() != 32 {
+            return Err(LibError::BadRequest("invalid duplicate review id".into()));
+        }
+        let mut stmt = conn
+            .prepare("SELECT id FROM asset WHERE content_hash = ?1 ORDER BY id")
+            .map_err(internal)?;
+        let rows = stmt
+            .query_map(params![hash], |row| {
+                Ok(blob_to_asset_id(&row.get::<_, Vec<u8>>(0)?))
+            })
+            .map_err(internal)?;
+        let members = rows
+            .collect::<rusqlite::Result<std::collections::BTreeSet<_>>>()
+            .map_err(internal)?;
+        if members.len() < 2 {
+            return Err(LibError::BadRequest(
+                "duplicate review group is no longer available".into(),
+            ));
+        }
+        return Ok(members);
+    }
+
+    if !review.starts_with("near:") || review.len() != "near:".len() + 64 {
+        return Err(LibError::BadRequest("invalid duplicate review id".into()));
+    }
+    let mut stmt = conn
+        .prepare(
+            "SELECT e.asset_id, e.space_id, e.media_type, e.vec
+             FROM embedding e JOIN asset a ON a.id = e.asset_id
+             ORDER BY e.media_type, e.space_id, e.asset_id LIMIT ?1",
+        )
+        .map_err(internal)?;
+    let rows = stmt
+        .query_map(params![(NEAR_DUP_CANDIDATE_MAX + 1) as i64], |row| {
+            Ok((
+                blob_to_asset_id(&row.get::<_, Vec<u8>>(0)?),
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                bytes_to_f32(&row.get::<_, Vec<u8>>(3)?),
+            ))
+        })
+        .map_err(internal)?;
+    let mut candidates = rows
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(internal)?;
+    candidates.truncate(NEAR_DUP_CANDIDATE_MAX);
+    for (_media, space, ids) in near_components(candidates) {
+        if near_review_id(&space, &ids) == review {
+            return Ok(ids.into_iter().collect());
+        }
+    }
+    Err(LibError::BadRequest(
+        "duplicate review group is no longer available".into(),
+    ))
 }
 
 fn decode_exact_dup_cursor(cursor: Option<&Cursor>) -> Result<Option<(u32, Vec<u8>)>, LibError> {
@@ -1712,6 +2078,39 @@ mod tests {
         .unwrap()
     }
 
+    fn duplicate_request(kind: DupKind, media: Option<MediaType>) -> DupRequest {
+        DupRequest {
+            kind,
+            media,
+            limit: 20,
+            after: None,
+            review: DupReviewFilter::Pending,
+        }
+    }
+
+    fn insert_test_asset(
+        store: &Store,
+        source_id: SourceId,
+        path: &str,
+        media_type: MediaType,
+        content_hash: Option<ContentHash>,
+    ) -> AssetId {
+        store
+            .upsert_asset(&NewAsset {
+                source_id,
+                path: path.into(),
+                filename: path.into(),
+                content_hash,
+                size_bytes: Some(path.len() as i64),
+                source_modified_at: Some(1_700_000_000_000),
+                scanned_at: now_ms(),
+                media_type,
+                format: path.rsplit('.').next().unwrap_or("bin").into(),
+            })
+            .unwrap()
+            .0
+    }
+
     #[test]
     fn manual_tag_edit_preview_is_reversible_idempotent_and_preserves_suggestions() {
         let store = duplicate_store(1, 1);
@@ -1863,6 +2262,7 @@ mod tests {
                     media: None,
                     limit: u32::MAX,
                     after: None,
+                    review: DupReviewFilter::Pending,
                 },
                 &Visibility::Full,
             )
@@ -1879,6 +2279,7 @@ mod tests {
                     media: None,
                     limit: u32::MAX,
                     after: Some(cursor),
+                    review: DupReviewFilter::Pending,
                 },
                 &Visibility::Full,
             )
@@ -1892,10 +2293,262 @@ mod tests {
                 media: None,
                 limit: 10,
                 after: Some(Cursor("999999999999999999999".into())),
+                review: DupReviewFilter::Pending,
             },
             &Visibility::Full,
         );
         assert!(matches!(invalid, Err(LibError::BadRequest(_))));
+    }
+
+    #[test]
+    fn exact_duplicate_review_covers_every_catalogued_media_type() {
+        let store = Store::open_in_memory().unwrap();
+        let source = store
+            .add_source(
+                &SourceConnection::LocalFs {
+                    root: "/all-media".into(),
+                },
+                "all media",
+                false,
+            )
+            .unwrap();
+        let media = [
+            (MediaType::Image, "png"),
+            (MediaType::Audio, "wav"),
+            (MediaType::Model, "glb"),
+            (MediaType::Video, "mp4"),
+            (MediaType::Document, "pdf"),
+        ];
+        for (index, (kind, extension)) in media.into_iter().enumerate() {
+            let hash = ContentHash([(index + 1) as u8; 32]);
+            insert_test_asset(
+                &store,
+                source,
+                &format!("{index}-a.{extension}"),
+                kind,
+                Some(hash),
+            );
+            insert_test_asset(
+                &store,
+                source,
+                &format!("{index}-b.{extension}"),
+                kind,
+                Some(hash),
+            );
+
+            let page = store
+                .duplicates(
+                    &duplicate_request(DupKind::Exact, Some(kind)),
+                    &Visibility::Full,
+                )
+                .unwrap();
+            assert_eq!(page.items.len(), 1, "missing exact {kind:?} duplicate");
+            assert_eq!(page.items[0].media, kind);
+            assert_eq!(page.items[0].members.len(), 2);
+        }
+    }
+
+    #[test]
+    fn near_duplicate_review_only_compares_valid_media_space_signals() {
+        let store = Store::open_in_memory().unwrap();
+        let source = store
+            .add_source(
+                &SourceConnection::LocalFs {
+                    root: "/near-signals".into(),
+                },
+                "near signals",
+                false,
+            )
+            .unwrap();
+        let image = insert_test_asset(&store, source, "image-a.png", MediaType::Image, None);
+        let document = insert_test_asset(&store, source, "document.pdf", MediaType::Document, None);
+        let other_space =
+            insert_test_asset(&store, source, "image-other.png", MediaType::Image, None);
+        store
+            .set_embedding(&image, "shared", MediaType::Image, &[1.0, 0.0], "test@1")
+            .unwrap();
+        store
+            .set_embedding(
+                &document,
+                "shared",
+                MediaType::Document,
+                &[1.0, 0.0],
+                "test@1",
+            )
+            .unwrap();
+        store
+            .set_embedding(
+                &other_space,
+                "other",
+                MediaType::Image,
+                &[1.0, 0.0],
+                "test@1",
+            )
+            .unwrap();
+        assert!(store
+            .duplicates(&duplicate_request(DupKind::Near, None), &Visibility::Full)
+            .unwrap()
+            .items
+            .is_empty());
+
+        let matching = insert_test_asset(&store, source, "image-b.png", MediaType::Image, None);
+        store
+            .set_embedding(
+                &matching,
+                "shared",
+                MediaType::Image,
+                &[0.99, 0.01],
+                "test@1",
+            )
+            .unwrap();
+        let first = store
+            .duplicates(&duplicate_request(DupKind::Near, None), &Visibility::Full)
+            .unwrap();
+        let second = store
+            .duplicates(&duplicate_request(DupKind::Near, None), &Visibility::Full)
+            .unwrap();
+        assert_eq!(first.items.len(), 1);
+        assert_eq!(first.items[0].review, second.items[0].review);
+        let ids: std::collections::BTreeSet<_> = first.items[0]
+            .members
+            .iter()
+            .map(|member| member.asset.id)
+            .collect();
+        assert_eq!(ids, [image, matching].into_iter().collect());
+    }
+
+    #[test]
+    fn duplicate_review_state_persists_and_rejects_cross_group_targets_atomically() {
+        let store = duplicate_store(2, 2);
+        let pending = store
+            .duplicates(&duplicate_request(DupKind::Exact, None), &Visibility::Full)
+            .unwrap();
+        let group = &pending.items[0];
+        let keep = group.members[0].asset.id;
+        let remove = group.members[1].asset.id;
+        let outside = pending.items[1].members[0].asset.id;
+
+        let failed = store.review_duplicate(&DupReviewRequest {
+            review: group.review.clone(),
+            state: DupReviewState::Resolved,
+            keep: Some(keep),
+            removals: vec![
+                DupReviewRemoval {
+                    asset: remove,
+                    block: false,
+                },
+                DupReviewRemoval {
+                    asset: outside,
+                    block: false,
+                },
+            ],
+        });
+        assert!(matches!(failed, Err(LibError::BadRequest(_))));
+        assert!(
+            store.get_asset(&remove).is_ok(),
+            "failed decision must roll back deletion"
+        );
+
+        store
+            .review_duplicate(&DupReviewRequest {
+                review: group.review.clone(),
+                state: DupReviewState::Resolved,
+                keep: Some(keep),
+                removals: Vec::new(),
+            })
+            .unwrap();
+        assert!(store
+            .duplicates(&duplicate_request(DupKind::Exact, None), &Visibility::Full)
+            .unwrap()
+            .items
+            .iter()
+            .all(|item| item.review != group.review));
+        let resolved = store
+            .duplicates(
+                &DupRequest {
+                    review: DupReviewFilter::Resolved,
+                    ..duplicate_request(DupKind::Exact, None)
+                },
+                &Visibility::Full,
+            )
+            .unwrap();
+        let saved = resolved
+            .items
+            .iter()
+            .find(|item| item.review == group.review)
+            .expect("resolved group survives navigation/refetch");
+        assert_eq!(saved.chosen_keep, Some(keep));
+
+        store
+            .review_duplicate(&DupReviewRequest {
+                review: group.review.clone(),
+                state: DupReviewState::Pending,
+                keep: Some(keep),
+                removals: vec![DupReviewRemoval {
+                    asset: remove,
+                    block: false,
+                }],
+            })
+            .unwrap();
+        assert!(matches!(
+            store.get_asset(&remove),
+            Err(LibError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn near_review_pagination_consumes_filtered_groups_without_repeating_cursor() {
+        let store = Store::open_in_memory().unwrap();
+        let source = store
+            .add_source(
+                &SourceConnection::LocalFs {
+                    root: "/near-pages".into(),
+                },
+                "near pages",
+                false,
+            )
+            .unwrap();
+        for space in ["a", "b", "c"] {
+            for member in 0..2 {
+                let id = insert_test_asset(
+                    &store,
+                    source,
+                    &format!("{space}-{member}.png"),
+                    MediaType::Image,
+                    None,
+                );
+                store
+                    .set_embedding(&id, space, MediaType::Image, &[1.0, 0.0], "test@1")
+                    .unwrap();
+            }
+        }
+        let all = store
+            .duplicates(&duplicate_request(DupKind::Near, None), &Visibility::Full)
+            .unwrap();
+        assert_eq!(all.items.len(), 3);
+        for group in all.items.iter().take(2) {
+            store
+                .review_duplicate(&DupReviewRequest {
+                    review: group.review.clone(),
+                    state: DupReviewState::Resolved,
+                    keep: Some(group.suggested_keep),
+                    removals: Vec::new(),
+                })
+                .unwrap();
+        }
+
+        let page = store
+            .duplicates(
+                &DupRequest {
+                    limit: 1,
+                    ..duplicate_request(DupKind::Near, None)
+                },
+                &Visibility::Full,
+            )
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].review, all.items[2].review);
+        assert!(page.cursor.is_none(), "all raw components were consumed");
     }
 
     #[test]
@@ -1918,7 +2571,7 @@ mod tests {
         assert_eq!(group.total_members as usize, DUP_GROUP_MEMBER_MAX + 7);
         assert_eq!(group.members.len(), DUP_GROUP_MEMBER_MAX);
         let group_key = group.group.clone().unwrap();
-        let mut seen: Vec<AssetId> = group.members.iter().map(|member| member.id).collect();
+        let mut seen: Vec<AssetId> = group.members.iter().map(|member| member.asset.id).collect();
         let mut cursor = group.members_cursor;
         while let Some(after) = cursor {
             let page = store
@@ -1931,7 +2584,7 @@ mod tests {
                     &Visibility::Full,
                 )
                 .unwrap();
-            seen.extend(page.items.iter().map(|member| member.id));
+            seen.extend(page.items.iter().map(|member| member.asset.id));
             cursor = page.cursor;
         }
         let expected: Vec<AssetId> = {

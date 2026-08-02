@@ -17,6 +17,7 @@ serde_json.workspace = true
 serde.workspace = true
 base64.workspace = true
 tracing.workspace = true
+blake3.workspace = true
 # Optional HNSW ANN index (semantic-search M6). Off by default: the brute-force cosine scan is exact
 # and adequate at v1 scale. The `ann` feature swaps in an approximate index for large embedding
 # spaces (100k+), keeping brute-force as the fallback.

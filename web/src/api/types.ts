@@ -516,6 +516,7 @@ export interface DupRequest {
   media?: MediaType;
   limit?: number;
   after?: string | null;
+  review?: DupReviewFilter;
 }
 
 export interface DupMembershipRequest {
@@ -534,12 +535,37 @@ export interface DupGroupMembersRequest {
   limit?: number;
 }
 
+export interface DupMember {
+  asset: AssetSummary;
+  path: string;
+  source: string;
+  modified_at?: number | null;
+  analyzed_at?: number | null;
+}
+
+export type DupReviewState = "pending" | "resolved" | "dismissed";
+export type DupReviewFilter = DupReviewState | "all";
+
+export interface DupReviewRemoval {
+  asset: AssetId;
+  block?: boolean;
+}
+
+export interface DupReviewRequest {
+  review: string;
+  state: DupReviewState;
+  keep?: AssetId | null;
+  removals?: DupReviewRemoval[];
+}
+
 /** A cluster of duplicates for the review view. 3DAM only *groups* — nothing is auto-deleted. */
 export interface DupGroup {
   kind: DupKind;
   media: MediaType;
   group: string | null;
-  members: AssetSummary[];
+  review: string;
+  review_state: DupReviewState;
+  members: DupMember[];
   /** Complete visible group size; `members` is capped by the server. */
   total_members: number;
   members_cursor: string | null;
@@ -547,6 +573,8 @@ export interface DupGroup {
   signal: string;
   /** A suggested "keep" (highest resolution / largest); the user disposes. */
   suggested_keep: AssetId;
+  suggested_keep_reason: string;
+  chosen_keep?: AssetId | null;
 }
 
 // ── find similar (phase 3: cosine over embeddings) ──────────────────────────

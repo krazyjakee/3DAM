@@ -516,6 +516,7 @@ pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                         media,
                         limit,
                         after: None,
+                        review: DupReviewFilter::Pending,
                     },
                 )
                 .await?;

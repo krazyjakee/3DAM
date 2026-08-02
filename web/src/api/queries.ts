@@ -28,6 +28,7 @@ import type {
   ContentHash,
   ConvertRequest,
   DupRequest,
+  DupReviewRequest,
   ExportRequest,
   FavoriteRequest,
   JobId,
@@ -384,6 +385,25 @@ export function useDuplicates(req: DupRequest) {
     queryFn: ({ pageParam }) => api.listDuplicates({ ...req, after: pageParam }),
     initialPageParam: null as string | null,
     getNextPageParam: (last) => last.cursor ?? undefined,
+  });
+}
+
+/** Persist a keep/resolve/dismiss decision and any explicit catalog-only removals atomically. */
+export function useReviewDuplicate() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (req: DupReviewRequest) => api.reviewDuplicate(req),
+    meta: { errorPrefix: "Couldn’t update duplicate review" },
+    onSuccess: (_data, req) => {
+      qc.invalidateQueries({ queryKey: qk.duplicates });
+      if (req.removals?.length) {
+        qc.invalidateQueries({ queryKey: qk.assets });
+        qc.invalidateQueries({ queryKey: qk.stats });
+      }
+      if (req.removals?.some((removal) => removal.block)) {
+        qc.invalidateQueries({ queryKey: qk.blocklist });
+      }
+    },
   });
 }
 

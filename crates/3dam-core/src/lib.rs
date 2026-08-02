@@ -2663,10 +2663,42 @@ impl LibraryService for EmbeddedLibrary {
         &self,
         ctx: &AuthContext,
         req: DupGroupMembersRequest,
-    ) -> Result<Page<AssetSummary>, LibError> {
+    ) -> Result<Page<DupMember>, LibError> {
         let vis = ctx.visibility.clone();
         self.db(move |s| s.duplicate_group_members(&req, &vis))
             .await
+    }
+
+    async fn review_duplicate(
+        &self,
+        ctx: &AuthContext,
+        req: DupReviewRequest,
+    ) -> Result<(), LibError> {
+        ctx.require(Scope::Write)?;
+        // Review state is library-wide: allowing a restricted editor to dismiss a group would hide
+        // it from unrelated reviewers. Full visibility also makes blocklist-wide consequences
+        // explicit and matches the existing remove+block authority boundary.
+        Self::require_full_visibility(ctx, "reviewing duplicate groups")?;
+        if req.removals.len() > DUP_GROUP_MEMBER_MAX {
+            return Err(LibError::BadRequest(format!(
+                "a duplicate decision can remove at most {DUP_GROUP_MEMBER_MAX} assets"
+            )));
+        }
+        for removal in &req.removals {
+            self.require_asset_writable(ctx, &removal.asset).await?;
+        }
+        let outcome = self.db(move |store| store.review_duplicate(&req)).await?;
+        for (id, source_id) in outcome.removed_assets {
+            reliability::publish_event(
+                &self.events,
+                LibraryEvent::AssetRemoved {
+                    id,
+                    source_id: Some(source_id),
+                },
+                "publish duplicate review removal",
+            );
+        }
+        Ok(())
     }
 
     async fn review_suggestion(

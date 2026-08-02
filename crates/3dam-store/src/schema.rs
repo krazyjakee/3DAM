@@ -864,6 +864,18 @@ pub const MIGRATIONS: &[&str] = &[
         ON asset(derivative_version, source_id, id)
         WHERE media_type IN ('image','video','model');
     "#,
+    // ── V24: durable duplicate-review decisions (issue #111) ───────────────────────────────
+    // Review metadata is library state, not deletion state. The chosen keep is advisory; catalog
+    // removal remains an explicit operation and the source file is never touched.
+    r#"
+    CREATE TABLE duplicate_review (
+        review_key   TEXT PRIMARY KEY,
+        state        TEXT NOT NULL CHECK(state IN ('pending','resolved','dismissed')),
+        chosen_keep  BLOB,
+        updated_at   INTEGER NOT NULL
+    ) STRICT;
+    CREATE INDEX idx_duplicate_review_state ON duplicate_review(state, updated_at);
+    "#,
 ];
 
 #[cfg(test)]

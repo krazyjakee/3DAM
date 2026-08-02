@@ -1081,8 +1081,16 @@ impl LibraryService for ApiClient {
         &self,
         _ctx: &AuthContext,
         req: DupGroupMembersRequest,
-    ) -> Result<Page<AssetSummary>, LibError> {
+    ) -> Result<Page<DupMember>, LibError> {
         self.post("/api/v1/duplicates/group-members", &req).await
+    }
+
+    async fn review_duplicate(
+        &self,
+        _ctx: &AuthContext,
+        req: DupReviewRequest,
+    ) -> Result<(), LibError> {
+        self.post("/api/v1/duplicates/review", &req).await
     }
 
     async fn review_suggestion(

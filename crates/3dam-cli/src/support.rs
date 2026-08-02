@@ -15,12 +15,18 @@ pub(crate) fn print_dedup(groups: &[DupGroup]) {
             g.signal
         );
         for m in &g.members {
-            let keep = if m.id == g.suggested_keep {
+            let keep = if m.asset.id == g.suggested_keep {
                 " ← keep"
             } else {
                 ""
             };
-            println!("  {}  {:>10}  {}{}", m.id, human_size(m.size), m.name, keep);
+            println!(
+                "  {}  {:>10}  {}{}",
+                m.asset.id,
+                human_size(m.asset.size),
+                m.asset.name,
+                keep
+            );
         }
     }
     println!("{} group(s)", groups.len());

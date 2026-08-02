@@ -1,39 +1,51 @@
-// Duplicate / dedupe review surface (issue #8; tech-spec 05 §4). A read-only review of the groups
-// the analysis pass linked — exact (byte-identical content hash) or near (pHash / embedding). 3DAM
-// only *groups*; it never auto-deletes. Each group suggests a "keep"; disposing of the rest
-// (remove + block from re-scan, issue #21) is a separate, deliberate step — right-click / long-press
-// any member for the same per-item context menu as the Browser tiles/rows (analyze, convert, add to
-// collection, copy path, remove / remove + block). Blocked hashes are managed on the /blocklist surface.
+// Duplicate review (issues #8/#111): visible, keyboard/touch-operable decisions over durable
+// review queues. Catalog removal is explicit and confirmed; source files are never deleted.
 
-import { useCallback, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import { Link } from "react-router";
-import { Copy } from "lucide-react";
+import { Ban, Check, CheckCircle2, Copy, RotateCcw, Trash2, XCircle } from "lucide-react";
 import { api } from "@/api/client";
-import { useDuplicates } from "@/api/queries";
-import type { AssetSummary, DupGroup, DupKind, MediaType } from "@/api/types";
+import { useCan, useDuplicates, useReviewDuplicate } from "@/api/queries";
+import type {
+  DupGroup,
+  DupKind,
+  DupMember,
+  DupReviewFilter,
+  DupReviewRequest,
+  MediaType,
+} from "@/api/types";
 import { bytes, mediaLabel } from "@/lib/format";
-import { shortcutForEvent } from "@/lib/shortcuts";
+import { useDialogs } from "@/lib/dialogs";
 import { CenteredCard } from "@/lib/ui";
 import { Thumbnail } from "./Thumbnail";
 import { LicenseBadge } from "./LicenseBadge";
-import { ContextMenu, useLongPress, type MenuState } from "./ContextMenu";
-import { ConvertDialog } from "./ConvertDialog";
 
 const KINDS: { key: DupKind; label: string; hint: string }[] = [
   { key: "exact", label: "Exact", hint: "Byte-identical (content hash)" },
-  { key: "near", label: "Near", hint: "Perceptually close (pHash / embedding)" },
+  { key: "near", label: "Near", hint: "Only comparable assets in the same embedding space" },
 ];
 const MEDIA: { key: MediaType | ""; label: string }[] = [
   { key: "", label: "All media" },
   { key: "image", label: "Images" },
   { key: "audio", label: "Audio" },
   { key: "model", label: "3D Models" },
+  { key: "video", label: "Videos" },
+  { key: "document", label: "Documents" },
+];
+const REVIEW: { key: DupReviewFilter; label: string }[] = [
+  { key: "pending", label: "Pending review" },
+  { key: "resolved", label: "Resolved" },
+  { key: "dismissed", label: "Dismissed" },
+  { key: "all", label: "All states" },
 ];
 
 export function Duplicates() {
   const [kind, setKind] = useState<DupKind>("exact");
   const [media, setMedia] = useState<MediaType | "">("");
-  const groups = useDuplicates({ kind, media: media || undefined });
+  const [reviewFilter, setReviewFilter] = useState<DupReviewFilter>("pending");
+  const groups = useDuplicates({ kind, media: media || undefined, review: reviewFilter });
+  const review = useReviewDuplicate();
+  const canWrite = useCan("write");
   const data = groups.data?.pages.flatMap((page) => page.items) ?? [];
   const partialWarnings = [
     ...new Set(
@@ -43,17 +55,8 @@ export function Duplicates() {
     ),
   ];
 
-  // Same per-item context menu as the Browser tiles/rows (issue #20). The Duplicates page has no
-  // multi-selection, so the target is always the single right-clicked / long-pressed member.
-  const [menu, setMenu] = useState<MenuState | null>(null);
-  const [convertTargets, setConvertTargets] = useState<AssetSummary[] | null>(null);
-  const openMenu = useCallback(
-    (asset: AssetSummary, x: number, y: number) => setMenu({ assets: [asset], x, y }),
-    [],
-  );
-
   return (
-    <div className="mx-auto flex min-h-dvh max-w-4xl flex-col gap-5 p-6 text-sm">
+    <div className="mx-auto flex min-h-dvh max-w-6xl flex-col gap-5 p-4 text-sm sm:p-6">
       <header className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-2">
           <Copy size={18} className="text-accent" />
@@ -65,26 +68,25 @@ export function Duplicates() {
       </header>
 
       <p className="text-xs text-fg-dim">
-        Groups the analysis pass linked. 3DAM only groups — nothing is deleted. Each group marks a
-        suggested <span className="text-accent">Keep</span>; open a member to inspect it, or
-        right-click for actions.
+        Compare metadata, choose the copy to keep, then resolve or dismiss the group. Remove actions
+        change only 3DAM’s catalog—source files stay on disk. Decisions persist across navigation and
+        refresh.
       </p>
 
-      {/* controls: tier + media filter */}
       <div className="flex flex-wrap items-center gap-2">
         <div className="flex overflow-hidden rounded border border-border">
-          {KINDS.map((k) => (
+          {KINDS.map((item) => (
             <button
-              key={k.key}
-              onClick={() => setKind(k.key)}
-              title={k.hint}
+              key={item.key}
+              onClick={() => setKind(item.key)}
+              title={item.hint}
               className="px-3 py-1 text-xs coarse:min-h-11"
               style={{
-                background: kind === k.key ? "var(--color-accent)" : "var(--color-surface-2)",
-                color: kind === k.key ? "var(--color-accent-fg)" : "var(--color-fg-muted)",
+                background: kind === item.key ? "var(--color-accent)" : "var(--color-surface-2)",
+                color: kind === item.key ? "var(--color-accent-fg)" : "var(--color-fg-muted)",
               }}
             >
-              {k.label}
+              {item.label}
             </button>
           ))}
         </div>
@@ -92,11 +94,23 @@ export function Duplicates() {
           className="field w-auto"
           aria-label="Filter by media type"
           value={media}
-          onChange={(e) => setMedia(e.target.value as MediaType | "")}
+          onChange={(event) => setMedia(event.target.value as MediaType | "")}
         >
-          {MEDIA.map((m) => (
-            <option key={m.key} value={m.key}>
-              {m.label}
+          {MEDIA.map((item) => (
+            <option key={item.key} value={item.key}>
+              {item.label}
+            </option>
+          ))}
+        </select>
+        <select
+          className="field w-auto"
+          aria-label="Filter by review state"
+          value={reviewFilter}
+          onChange={(event) => setReviewFilter(event.target.value as DupReviewFilter)}
+        >
+          {REVIEW.map((item) => (
+            <option key={item.key} value={item.key}>
+              {item.label}
             </option>
           ))}
         </select>
@@ -105,6 +119,15 @@ export function Duplicates() {
         </span>
       </div>
 
+      {kind === "near" && (
+        <p className="rounded border border-border bg-surface-2 px-3 py-2 text-[11px] text-fg-dim">
+          Near review compares only assets with a valid signal in the same media embedding space.
+          Media without an analysis signal are omitted rather than cross-ranked.
+        </p>
+      )}
+      {!canWrite && (
+        <CenteredCard>Review decisions require write access. Comparison remains read-only.</CenteredCard>
+      )}
       {partialWarnings.map((warning) => (
         <CenteredCard key={warning}>{warning}</CenteredCard>
       ))}
@@ -115,16 +138,17 @@ export function Duplicates() {
         <CenteredCard tone="danger">Failed to load — is `3dam serve` running?</CenteredCard>
       ) : data.length === 0 ? (
         <CenteredCard>
-          No {kind} duplicates{media ? ` among ${mediaLabel[media]}` : ""}. Run the analysis pass to
-          populate near-duplicate signals.
+          No {kind} duplicates{media ? ` among ${mediaLabel[media]}` : ""} in this review state.
         </CenteredCard>
       ) : (
         <div className="flex flex-col gap-4">
-          {data.map((g) => (
+          {data.map((group) => (
             <GroupCard
-              key={g.group ?? `${g.kind}:${g.suggested_keep}`}
-              group={g}
-              onContext={openMenu}
+              key={group.review}
+              group={group}
+              canWrite={canWrite}
+              busy={review.isPending}
+              decide={(request) => review.mutateAsync(request)}
             />
           ))}
           {groups.hasNextPage && (
@@ -138,47 +162,41 @@ export function Duplicates() {
           )}
         </div>
       )}
-
-      <ContextMenu
-        menu={menu}
-        onClose={() => setMenu(null)}
-        onConvert={(assets) => setConvertTargets(assets)}
-      />
-      {convertTargets && (
-        <ConvertDialog assets={convertTargets} onClose={() => setConvertTargets(null)} />
-      )}
     </div>
   );
 }
 
 function GroupCard({
   group,
-  onContext,
+  canWrite,
+  busy,
+  decide,
 }: {
   group: DupGroup;
-  onContext: (asset: AssetSummary, x: number, y: number) => void;
+  canWrite: boolean;
+  busy: boolean;
+  decide: (request: DupReviewRequest) => Promise<void>;
 }) {
+  const { confirm } = useDialogs();
   const [members, setMembers] = useState(group.members);
   const [memberCursor, setMemberCursor] = useState(group.members_cursor);
   const [loadingMembers, setLoadingMembers] = useState(false);
   const [memberError, setMemberError] = useState(false);
+  const chosenKeep = group.chosen_keep ?? group.suggested_keep;
 
   useEffect(() => {
     setMembers(group.members);
     setMemberCursor(group.members_cursor);
     setLoadingMembers(false);
     setMemberError(false);
-  }, [group.group, group.members, group.members_cursor]);
+  }, [group.review, group.members, group.members_cursor]);
 
   const loadMembers = async () => {
     if (!group.group || !memberCursor || loadingMembers) return;
     setLoadingMembers(true);
     setMemberError(false);
     try {
-      const page = await api.duplicateGroupMembers({
-        group: group.group,
-        after: memberCursor,
-      });
+      const page = await api.duplicateGroupMembers({ group: group.group, after: memberCursor });
       setMembers((current) => [...current, ...page.items]);
       setMemberCursor(page.cursor);
     } catch {
@@ -188,24 +206,109 @@ function GroupCard({
     }
   };
 
+  const chooseKeep = (member: DupMember) =>
+    decide({ review: group.review, state: "pending", keep: member.asset.id });
+
+  const remove = async (member: DupMember, block: boolean) => {
+    const exactBlock = block && group.kind === "exact";
+    const accepted = await confirm({
+      title: block ? "Remove and block these bytes?" : "Remove this catalog record?",
+      message: exactBlock
+        ? `This blocks the shared content hash and removes every byte-identical catalog row in this group, including the chosen Keep. Source files are not deleted. Future scans will skip these bytes.`
+        : block
+          ? `This removes ${member.asset.name} and every byte-identical catalog row, then blocks those bytes from future scans. Source files are not deleted.`
+          : `This removes only ${member.asset.name} from 3DAM’s catalog. Its source file remains on disk and a later scan may import it again.`,
+      confirmLabel: block ? "Remove + block" : "Remove from catalog",
+      danger: true,
+    });
+    if (!accepted) return;
+    await decide({
+      review: group.review,
+      state: "pending",
+      keep: chosenKeep,
+      removals: [{ asset: member.asset.id, block }],
+    });
+  };
+
+  const changeState = (state: "pending" | "resolved" | "dismissed") =>
+    decide({ review: group.review, state, keep: chosenKeep });
+
   return (
-    <section className="rounded border border-border bg-surface p-3">
-      <div className="mb-2 flex items-center justify-between gap-2">
-        <span className="text-[11px] text-fg-dim">
-          {mediaLabel[group.media]} · {group.total_members} items
-        </span>
-        {/* the pairwise signal is the explanation (DESIGN_GUIDELINES §1.2) */}
-        <span className="rounded bg-surface-2 px-1.5 py-0.5 font-mono text-[10px] text-fg-muted">
-          {group.signal}
-        </span>
+    <section
+      className="rounded border border-border bg-surface p-3 focus-visible:outline-2 focus-visible:outline-accent"
+      tabIndex={0}
+      aria-label={`${group.media} duplicate group, ${group.review_state}`}
+      onKeyDown={(event) => {
+        if (event.target !== event.currentTarget || !canWrite || busy) return;
+        if (event.key === "Enter" && group.review_state === "pending") {
+          event.preventDefault();
+          void changeState("resolved");
+        } else if (event.key.toLowerCase() === "d" && group.review_state === "pending") {
+          event.preventDefault();
+          void changeState("dismissed");
+        }
+      }}
+    >
+      <div className="mb-3 flex flex-wrap items-start justify-between gap-2">
+        <div>
+          <p className="text-[11px] text-fg-dim">
+            {mediaLabel[group.media]} · {group.total_members} items · {group.review_state}
+          </p>
+          <p className="mt-1 text-xs text-fg-muted">Grouped by: {group.signal}</p>
+          <p className="mt-0.5 text-[11px] text-fg-dim">
+            Suggested keep: {group.suggested_keep_reason}
+            {group.chosen_keep && group.chosen_keep !== group.suggested_keep
+              ? " You overrode this suggestion."
+              : ""}
+          </p>
+        </div>
+        <div className="flex flex-wrap gap-1.5">
+          {group.review_state === "pending" ? (
+            <>
+              <button
+                className="btn coarse:min-h-11"
+                aria-keyshortcuts="Enter"
+                disabled={!canWrite || busy}
+                onClick={() => void changeState("resolved")}
+              >
+                <CheckCircle2 size={13} /> Resolve <Shortcut>Enter</Shortcut>
+              </button>
+              <button
+                className="btn coarse:min-h-11"
+                aria-keyshortcuts="D"
+                disabled={!canWrite || busy}
+                onClick={() => void changeState("dismissed")}
+              >
+                <XCircle size={13} /> Dismiss <Shortcut>D</Shortcut>
+              </button>
+            </>
+          ) : (
+            <button
+              className="btn coarse:min-h-11"
+              disabled={!canWrite || busy}
+              onClick={() => void changeState("pending")}
+            >
+              <RotateCcw size={13} /> Reopen
+            </button>
+          )}
+        </div>
       </div>
-      <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-        {members.map((m) => (
-          <MemberTile
-            key={m.id}
-            asset={m}
-            keep={m.id === group.suggested_keep}
-            onContext={onContext}
+
+      <p className="mb-2 text-[10px] text-fg-dim">
+        Focus a member card and press K to keep, R to remove, or B to remove + block.
+      </p>
+      <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-3">
+        {members.map((member) => (
+          <MemberCard
+            key={member.asset.id}
+            member={member}
+            selectedKeep={member.asset.id === chosenKeep}
+            suggested={member.asset.id === group.suggested_keep}
+            canWrite={canWrite && group.review_state === "pending"}
+            busy={busy}
+            onKeep={() => chooseKeep(member)}
+            onRemove={() => remove(member, false)}
+            onBlock={() => remove(member, true)}
           />
         ))}
       </div>
@@ -226,55 +329,122 @@ function GroupCard({
   );
 }
 
-function MemberTile({
-  asset,
-  keep,
-  onContext,
+function MemberCard({
+  member,
+  selectedKeep,
+  suggested,
+  canWrite,
+  busy,
+  onKeep,
+  onRemove,
+  onBlock,
 }: {
-  asset: AssetSummary;
-  keep: boolean;
-  onContext: (asset: AssetSummary, x: number, y: number) => void;
+  member: DupMember;
+  selectedKeep: boolean;
+  suggested: boolean;
+  canWrite: boolean;
+  busy: boolean;
+  onKeep: () => void;
+  onRemove: () => Promise<void>;
+  onBlock: () => Promise<void>;
 }) {
-  const longPress = useLongPress((x, y) => onContext(asset, x, y));
+  const asset = member.asset;
+  const origin = typeof asset.origin === "object" ? `Peer ${asset.origin.peer}` : "Local";
+  const attributes = Object.values(asset.key_attrs).join(" · ") || "No media attributes";
   return (
-    <Link
-      to={`/?sel=${asset.id}`}
-      data-asset-id={asset.id}
-      aria-keyshortcuts="Shift+F10"
+    <article
+      tabIndex={0}
+      className="overflow-hidden rounded border border-border bg-surface-2 focus-visible:outline-2 focus-visible:outline-accent"
+      aria-label={`${asset.name}${selectedKeep ? ", chosen keep" : ""}`}
       onKeyDown={(event) => {
-        if (shortcutForEvent(event.nativeEvent) !== "action-menu") return;
-        event.preventDefault();
-        const rect = event.currentTarget.getBoundingClientRect();
-        onContext(asset, rect.left + Math.min(24, rect.width / 2), rect.top + 24);
+        if (event.target !== event.currentTarget || !canWrite || busy) return;
+        const key = event.key.toLowerCase();
+        if (key === "k") {
+          event.preventDefault();
+          onKeep();
+        } else if (key === "r") {
+          event.preventDefault();
+          void onRemove();
+        } else if (key === "b") {
+          event.preventDefault();
+          void onBlock();
+        }
       }}
-      onContextMenu={(e) => {
-        e.preventDefault();
-        onContext(asset, e.clientX, e.clientY);
-      }}
-      {...longPress}
-      className="group flex flex-col overflow-hidden rounded border text-left transition-colors"
-      style={{
-        borderColor: keep ? "var(--color-accent)" : "var(--color-border)",
-      }}
-      title={`${asset.name} · ${bytes(asset.size)}`}
     >
-      <div className="relative aspect-square">
-        <Thumbnail asset={asset} size={48} />
-        {keep && (
-          <span className="absolute top-1 left-1 rounded bg-accent px-1 py-0.5 text-[9px] font-semibold text-accent-fg">
-            Keep
-          </span>
-        )}
+      <div className="flex gap-3 p-2">
+        <Link to={`/?sel=${asset.id}`} className="relative h-24 w-24 shrink-0 overflow-hidden rounded">
+          <Thumbnail asset={asset} size={48} />
+          {selectedKeep && (
+            <span className="absolute top-1 left-1 rounded bg-accent px-1 py-0.5 text-[9px] font-semibold text-accent-fg">
+              {suggested ? "Suggested keep" : "Chosen keep"}
+            </span>
+          )}
+        </Link>
+        <dl className="min-w-0 flex-1 space-y-1 text-[10px]">
+          <Comparison label="Name" value={asset.name} />
+          <Comparison label="Path" value={member.path} mono />
+          <Comparison label="Source" value={`${member.source} · ${origin}`} />
+          <Comparison label="Size" value={bytes(asset.size)} />
+          <Comparison label="Media" value={attributes} />
+          <Comparison label="Modified" value={formatDate(member.modified_at)} />
+          <div className="flex items-center justify-between gap-2">
+            <dt className="text-fg-dim">License</dt>
+            <dd><LicenseBadge badge={asset.license} /></dd>
+          </div>
+          <Comparison
+            label="Analysis"
+            value={member.analyzed_at ? `Analyzed ${formatDate(member.analyzed_at)}` : "Not analyzed"}
+          />
+        </dl>
       </div>
-      <div className="flex items-center justify-between gap-1 border-t border-border px-1.5 py-1">
-        <span className="truncate text-[11px] text-fg" title={asset.name}>
-          {asset.name}
-        </span>
+      <div className="grid grid-cols-3 gap-1 border-t border-border p-1.5">
+        <button
+          className="btn min-w-0 justify-center coarse:min-h-11"
+          aria-keyshortcuts="K"
+          disabled={!canWrite || busy || selectedKeep}
+          onClick={onKeep}
+        >
+          <Check size={12} /> Keep <Shortcut>K</Shortcut>
+        </button>
+        <button
+          className="btn min-w-0 justify-center text-danger coarse:min-h-11"
+          aria-keyshortcuts="R"
+          disabled={!canWrite || busy || selectedKeep}
+          onClick={() => void onRemove()}
+        >
+          <Trash2 size={12} /> Remove <Shortcut>R</Shortcut>
+        </button>
+        <button
+          className="btn min-w-0 justify-center text-danger coarse:min-h-11"
+          aria-keyshortcuts="B"
+          disabled={!canWrite || busy}
+          onClick={() => void onBlock()}
+        >
+          <Ban size={12} /> Remove + block <Shortcut>B</Shortcut>
+        </button>
       </div>
-      <div className="flex items-center justify-between px-1.5 pb-1">
-        <LicenseBadge badge={asset.license} />
-        <span className="text-[10px] text-fg-dim tabular-nums">{bytes(asset.size)}</span>
-      </div>
-    </Link>
+    </article>
+  );
+}
+
+function Comparison({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) {
+  return (
+    <div className="flex items-start justify-between gap-2">
+      <dt className="shrink-0 text-fg-dim">{label}</dt>
+      <dd className={`min-w-0 truncate text-right text-fg-muted${mono ? " font-mono" : ""}`} title={value}>
+        {value}
+      </dd>
+    </div>
+  );
+}
+
+function Shortcut({ children }: { children: React.ReactNode }) {
+  return <kbd className="ml-1 text-[9px] text-fg-dim">{children}</kbd>;
+}
+
+function formatDate(value?: number | null): string {
+  if (!value) return "Unknown";
+  return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(
+    new Date(value),
   );
 }
