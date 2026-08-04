@@ -410,6 +410,16 @@ impl Store {
     /// at scan (cheap tier), so this is an UPDATE; if absent (e.g. a directly-analysed asset), upsert.
     pub fn set_image_analysis(&self, id: &AssetId, a: &ImageAnalysis) -> Result<(), LibError> {
         let conn = self.write();
+        Self::set_image_analysis_in(&conn, id, a)
+    }
+
+    /// The image-signal upsert on a caller-owned connection (issue #138's analysis batch runs it
+    /// inside one item savepoint alongside the rest of that asset's derivation).
+    pub(crate) fn set_image_analysis_in(
+        conn: &Connection,
+        id: &AssetId,
+        a: &ImageAnalysis,
+    ) -> Result<(), LibError> {
         let key = id.as_bytes().to_vec();
         let phash_blob = a.phash.to_le_bytes().to_vec();
         let colors = serde_json::to_string(&a.dominant_colors).unwrap_or_else(|_| "[]".into());
@@ -434,6 +444,16 @@ impl Store {
         class: &str,
     ) -> Result<(), LibError> {
         let conn = self.write();
+        Self::set_media_class_in(&conn, id, media, class)
+    }
+
+    /// The class upsert on a caller-owned connection.
+    pub(crate) fn set_media_class_in(
+        conn: &Connection,
+        id: &AssetId,
+        media: MediaType,
+        class: &str,
+    ) -> Result<(), LibError> {
         let key = id.as_bytes().to_vec();
         // Every attr table carries the same `class` column; pick the table for the media type.
         let sql = match media {
@@ -457,6 +477,17 @@ impl Store {
         harmonicity: f32,
     ) -> Result<(), LibError> {
         let conn = self.write();
+        Self::set_audio_features_in(&conn, id, loudness_lufs, brightness, harmonicity)
+    }
+
+    /// The acoustic-feature upsert on a caller-owned connection.
+    pub(crate) fn set_audio_features_in(
+        conn: &Connection,
+        id: &AssetId,
+        loudness_lufs: f32,
+        brightness: f32,
+        harmonicity: f32,
+    ) -> Result<(), LibError> {
         conn.execute(
             "INSERT INTO audio_attr (asset_id, loudness_lufs, brightness, harmonicity)
              VALUES (?1, ?2, ?3, ?4)
@@ -478,8 +509,17 @@ impl Store {
     /// both clients draw the bars without decoding the audio. Upsert (the cheap-tier row exists from
     /// scan); a no-op-safe part of the analysis pass.
     pub fn set_audio_peaks(&self, id: &AssetId, peaks: &[f32]) -> Result<(), LibError> {
-        let json = serde_json::to_string(peaks).map_err(internal)?;
         let conn = self.write();
+        Self::set_audio_peaks_in(&conn, id, peaks)
+    }
+
+    /// The waveform-peak upsert on a caller-owned connection.
+    pub(crate) fn set_audio_peaks_in(
+        conn: &Connection,
+        id: &AssetId,
+        peaks: &[f32],
+    ) -> Result<(), LibError> {
+        let json = serde_json::to_string(peaks).map_err(internal)?;
         conn.execute(
             "INSERT INTO audio_attr (asset_id, waveform_peaks) VALUES (?1, ?2)
              ON CONFLICT(asset_id) DO UPDATE SET waveform_peaks=excluded.waveform_peaks",
@@ -499,6 +539,23 @@ impl Store {
         extractor: &str,
     ) -> Result<(), LibError> {
         let conn = self.write();
+        Self::set_embedding_in(&conn, id, space_id, media, vec, extractor)?;
+        // Invalidate any cached ANN index (M6): the space's vectors just changed.
+        self.embed_gen
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// The vector upsert on a caller-owned connection. Like [`Self::upsert_asset_in`] it leaves
+    /// `embed_gen` alone: the batch bumps once, after its transaction has actually committed.
+    pub(crate) fn set_embedding_in(
+        conn: &Connection,
+        id: &AssetId,
+        space_id: &str,
+        media: MediaType,
+        vec: &[f32],
+        extractor: &str,
+    ) -> Result<(), LibError> {
         let mut bytes = Vec::with_capacity(vec.len() * 4);
         for f in vec {
             bytes.extend_from_slice(&f.to_le_bytes());
@@ -519,9 +576,6 @@ impl Store {
             ],
         )
         .map_err(internal)?;
-        // Invalidate any cached ANN index (M6): the space's vectors just changed.
-        self.embed_gen
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -531,22 +585,42 @@ impl Store {
     /// has. A no-op when there was nothing there.
     pub fn clear_embedding(&self, id: &AssetId, space_id: &str) -> Result<(), LibError> {
         let conn = self.write();
-        let n = conn
-            .execute(
-                "DELETE FROM embedding WHERE asset_id = ?1 AND space_id = ?2",
-                params![id.as_bytes().to_vec(), space_id],
-            )
-            .map_err(internal)?;
-        if n > 0 {
+        if Self::clear_embedding_in(&conn, id, space_id)? {
             self.embed_gen
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         Ok(())
     }
 
+    /// The delete on a caller-owned connection; `true` when a vector actually went away, which is
+    /// the caller's cue to bump `embed_gen` once its transaction commits.
+    pub(crate) fn clear_embedding_in(
+        conn: &Connection,
+        id: &AssetId,
+        space_id: &str,
+    ) -> Result<bool, LibError> {
+        let n = conn
+            .execute(
+                "DELETE FROM embedding WHERE asset_id = ?1 AND space_id = ?2",
+                params![id.as_bytes().to_vec(), space_id],
+            )
+            .map_err(internal)?;
+        Ok(n > 0)
+    }
+
     /// Record that an asset is now analysed at `version` (the Plan gate reads this, §7.2).
     pub fn mark_analysed(&self, id: &AssetId, version: i64) -> Result<(), LibError> {
         let conn = self.write();
+        Self::mark_analysed_in(&conn, id, version)
+    }
+
+    /// The version stamp on a caller-owned connection — the last statement of an analysis batch
+    /// item, so that a failure anywhere above it leaves the asset legitimately due for re-analysis.
+    pub(crate) fn mark_analysed_in(
+        conn: &Connection,
+        id: &AssetId,
+        version: i64,
+    ) -> Result<(), LibError> {
         conn.execute(
             "UPDATE asset SET analysis_version = ?2, analysed_at = ?3, updated_at = ?3 WHERE id = ?1",
             params![id.as_bytes().to_vec(), version, now_ms()],
@@ -588,7 +662,7 @@ impl Store {
     /// Rewrite an asset's `tags` FTS column to confirmed tag names only. Pending automation remains
     /// discoverable in Inspector but cannot silently power full-text results before review.
     /// Best-effort: an FTS hiccup must never sink the tag write that triggered it.
-    fn reindex_asset_tags(conn: &Connection, id: &AssetId) {
+    pub(crate) fn reindex_asset_tags(conn: &Connection, id: &AssetId) {
         let _ = conn.execute(
             "UPDATE asset_fts SET tags = COALESCE((
                 SELECT group_concat(t.name, ' ') FROM asset_tag at
@@ -608,6 +682,15 @@ impl Store {
     /// already are, and as V10's own migration does.
     pub fn set_document_text(&self, id: &AssetId, text: &str) -> Result<(), LibError> {
         let conn = self.write();
+        Self::set_document_text_in(&conn, id, text)
+    }
+
+    /// The index write on a caller-owned connection.
+    pub(crate) fn set_document_text_in(
+        conn: &Connection,
+        id: &AssetId,
+        text: &str,
+    ) -> Result<(), LibError> {
         conn.execute(
             "UPDATE asset_fts SET text = ?2
              WHERE rowid = (SELECT rowid FROM asset WHERE id = ?1)",
@@ -618,7 +701,7 @@ impl Store {
     }
 
     /// Intern a tag name, returning its id (case-insensitive unique).
-    fn intern_tag(conn: &Connection, name: &str) -> Result<Vec<u8>, LibError> {
+    pub(crate) fn intern_tag(conn: &Connection, name: &str) -> Result<Vec<u8>, LibError> {
         if let Some(id) = conn
             .query_row(
                 "SELECT id FROM tag WHERE name = ?1 COLLATE NOCASE",
@@ -649,8 +732,34 @@ impl Store {
         extractor: &str,
         explanation: &str,
     ) -> Result<(), LibError> {
-        let conn = self.write();
-        let tag_id = Self::intern_tag(&conn, name)?;
+        let mut conn = self.write();
+        // Intern + insert + reindex is three statements against three tables; a concurrent reader
+        // must not see the `asset_tag` row before the index that describes it (db.rs).
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(internal)?;
+        let tag_id = Self::intern_tag(&tx, name)?;
+        Self::suggest_tag_in(&tx, id, &tag_id, confidence, extractor, explanation)?;
+        Self::reindex_asset_tags(&tx, id);
+        tx.commit().map_err(internal)?;
+        Ok(())
+    }
+
+    /// The suggestion row itself, on a caller-owned connection and against an **already interned**
+    /// tag id.
+    ///
+    /// Interning is the caller's job precisely because a batch has to hoist it: a `tag_id` read
+    /// inside an item savepoint that later rolls back would be a dangling foreign key for every
+    /// other item that reused it. The FTS reindex is likewise the caller's, so a batch can do it
+    /// once per asset instead of once per suggestion.
+    pub(crate) fn suggest_tag_in(
+        conn: &Connection,
+        id: &AssetId,
+        tag_id: &[u8],
+        confidence: f32,
+        extractor: &str,
+        explanation: &str,
+    ) -> Result<(), LibError> {
         conn.execute(
             "INSERT INTO asset_tag
                 (asset_id, tag_id, state, source, confidence, extractor, created_at, explanation)
@@ -670,7 +779,6 @@ impl Store {
             ],
         )
         .map_err(internal)?;
-        Self::reindex_asset_tags(&conn, id);
         Ok(())
     }
 

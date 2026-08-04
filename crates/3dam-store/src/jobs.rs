@@ -105,11 +105,25 @@ impl Store {
         total: Option<u64>,
         current: Option<&str>,
     ) -> Result<(), LibError> {
+        let conn = self.write();
+        Self::update_job_progress_in(&conn, id, state, done, total, current)
+    }
+
+    /// The progress UPDATE on a caller-owned connection. A batch (issue #138) runs it inside the
+    /// same transaction as the rows it is reporting, so "N assets persisted" and "N assets done"
+    /// can never disagree after a crash.
+    pub(crate) fn update_job_progress_in(
+        conn: &Connection,
+        id: &JobId,
+        state: JobState,
+        done: u64,
+        total: Option<u64>,
+        current: Option<&str>,
+    ) -> Result<(), LibError> {
         let progress = match total {
             Some(t) if t > 0 => (done as f64 / t as f64).min(1.0),
             _ => 0.0,
         };
-        let conn = self.write();
         conn.execute(
             "UPDATE job SET state = ?2, done = ?3, total = ?4, current = ?5, progress = ?6, updated_at = ?7
              WHERE id = ?1 AND (?2 <> 'running' OR state <> 'cancelled')",
@@ -220,6 +234,13 @@ impl Store {
     /// `get_job` when a caller opens one history detail.
     pub fn get_job_summary(&self, id: &JobId) -> Result<JobStatus, LibError> {
         let conn = self.read()?;
+        Self::job_summary_in(&conn, id)
+    }
+
+    /// The same lightweight read on a caller-owned connection. A batch reads its job back on the
+    /// **writer** connection immediately after commit — a second guard would trip the nested-guard
+    /// check in `db.rs`, and a pooled reader could not be trusted to have caught up yet anyway.
+    pub(crate) fn job_summary_in(conn: &Connection, id: &JobId) -> Result<JobStatus, LibError> {
         conn.query_row(
             "SELECT id, kind, state, done, total, current, error, sources, created_at, updated_at,
                     summary, warnings, initiator, result_artifacts, NULL AS result, collections

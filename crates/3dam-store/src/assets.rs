@@ -2,20 +2,52 @@
 use super::*;
 use crate::helpers::*;
 
+/// What one in-transaction [`Store::upsert_asset_in`] did.
+pub(crate) struct UpsertOutcome {
+    pub(crate) id: AssetId,
+    pub(crate) inserted: bool,
+    /// The upsert deleted this row's embeddings (a reclassification). The ANN cache generation
+    /// must be bumped by whoever commits, never before.
+    pub(crate) dropped_embeddings: bool,
+}
+
 impl Store {
     // ── assets ─────────────────────────────────────────────────────────────
 
     /// Insert a new asset or reconcile an existing `(source_id, path)` row (delta re-scan).
     /// Returns the id and whether it was newly inserted.
+    ///
+    /// One immediate transaction for the whole upsert. A media-type change deletes the old attr
+    /// rows between statements, and readers now run concurrently (#137) — without this a browse
+    /// query could catch an asset whose `media_type` no longer matches any surviving attr row,
+    /// breaking `GRID_SELECT`'s "exactly one non-NULL join" invariant. The work itself lives in
+    /// [`Self::upsert_asset_in`] so a scan batch (issue #138) can run many of them inside one
+    /// transaction of its own; this wrapper is the single-shot form.
     pub fn upsert_asset(&self, a: &NewAsset) -> Result<(AssetId, bool), LibError> {
         let mut conn = self.write();
-        // One immediate transaction for the whole upsert. A media-type change deletes the old
-        // attr rows between statements, and readers now run concurrently (#137) — without this a
-        // browse query could catch an asset whose `media_type` no longer matches any surviving
-        // attr row, breaking `GRID_SELECT`'s "exactly one non-NULL join" invariant.
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(internal)?;
+        let out = Self::upsert_asset_in(&tx, a)?;
+        tx.commit().map_err(internal)?;
+        if out.dropped_embeddings {
+            self.embed_gen
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok((out.id, out.inserted))
+    }
+
+    /// The upsert itself, on a caller-owned transaction.
+    ///
+    /// Deliberately opens **no** transaction and bumps **no** generation: both belong to whoever
+    /// owns the enclosing statement group. `dropped_embeddings` travels back in
+    /// [`UpsertOutcome`] instead of being applied here, because bumping `embed_gen` for a write
+    /// that then rolls back (an item savepoint, a batch abort) would discard a still-valid cached
+    /// ANN index for nothing.
+    pub(crate) fn upsert_asset_in(
+        tx: &Connection,
+        a: &NewAsset,
+    ) -> Result<UpsertOutcome, LibError> {
         // The previous hash and media type come back with the id: both decide whether the derived
         // layer this row already carries is still about the same file (see below).
         let existing: Option<(Vec<u8>, Option<Vec<u8>>, String)> = tx
@@ -44,10 +76,29 @@ impl Store {
             // becoming available between scans) is the same problem plus one: the derived rows are
             // in the wrong tables entirely.
             let media_changed = prev_media != a.media_type.as_str();
+            // One UPDATE, not three. The two gate resets below used to be separate statements
+            // against the same row, and both `analysed_at` and `media_type` are watched by
+            // `aggregate_asset_au` (V26) — so a plain re-scan fired the aggregate triggers twice
+            // for one logical change. Folding them in makes the trigger fire once with the same
+            // net arithmetic (the triggers reason on old→new transitions, so `-old + new` over one
+            // step equals the sum over two), and `derivative_version` rides along because it is
+            // free once the statement exists.
+            let mut sets = String::from(
+                "content_hash = ?2, filename = ?3, size_bytes = ?4,
+                 source_modified_at = ?5, scanned_at = ?6, media_type = ?7, format = ?8,
+                 updated_at = ?9, flags = flags & -2",
+            );
+            if content_changed || media_changed {
+                // Re-open the analyse gate (`analysis_version < PIPELINE_VERSION`, §7.2). The scan
+                // has already refreshed the cheap tier; without this the expensive tier would keep
+                // the stale derivation forever, because the version alone still looks current.
+                sets.push_str(", analysis_version = 0, analysed_at = NULL");
+            }
+            if derivative_key_changed || media_changed {
+                sets.push_str(", derivative_version = 0");
+            }
             tx.execute(
-                "UPDATE asset SET content_hash = ?2, filename = ?3, size_bytes = ?4,
-                    source_modified_at = ?5, scanned_at = ?6, media_type = ?7, format = ?8,
-                    updated_at = ?9, flags = flags & -2 WHERE id = ?1",
+                &format!("UPDATE asset SET {sets} WHERE id = ?1"),
                 params![
                     id_blob,
                     hash_blob,
@@ -84,23 +135,6 @@ impl Store {
                 dropped_embeddings = true;
                 tx.execute(
                     "UPDATE asset_fts SET text = '' WHERE rowid = (SELECT rowid FROM asset WHERE id = ?1)",
-                    params![id_blob],
-                )
-                .map_err(internal)?;
-            }
-            if content_changed || media_changed {
-                // Re-open the analyse gate (`analysis_version < PIPELINE_VERSION`, §7.2). The scan
-                // has already refreshed the cheap tier; without this the expensive tier would keep
-                // the stale derivation forever, because the version alone still looks current.
-                tx.execute(
-                    "UPDATE asset SET analysis_version = 0, analysed_at = NULL WHERE id = ?1",
-                    params![id_blob],
-                )
-                .map_err(internal)?;
-            }
-            if derivative_key_changed || media_changed {
-                tx.execute(
-                    "UPDATE asset SET derivative_version = 0 WHERE id = ?1",
                     params![id_blob],
                 )
                 .map_err(internal)?;
@@ -144,16 +178,13 @@ impl Store {
              WHERE rowid = (SELECT rowid FROM asset WHERE id = ?1)",
             params![id.as_bytes().to_vec(), tokens, folder],
         );
-        tx.commit().map_err(internal)?;
-        if dropped_embeddings {
-            self.embed_gen
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        Ok((id, is_new))
+        Ok(UpsertOutcome {
+            id,
+            inserted: is_new,
+            dropped_embeddings,
+        })
     }
 
-    /// Persist the cheap-tier media attributes into the per-type attr table (tech-spec 02 §3.2,
-    /// 04 §5). Idempotent upsert keyed by `asset_id`; called after each `upsert_asset` during a scan.
     /// Set or clear an asset's favourite mark (issue #63) — bit 1 of the `flags` bitset, left
     /// untouched by scan upserts (which only ever touch bit 0). A no-op on a missing id.
     pub fn set_favorite(&self, id: &AssetId, on: bool) -> Result<(), LibError> {
@@ -399,8 +430,21 @@ impl Store {
         Ok(())
     }
 
+    /// Persist the cheap-tier media attributes into the per-type attr table (tech-spec 02 §3.2,
+    /// 04 §5). Idempotent upsert keyed by `asset_id`; called after each `upsert_asset` during a scan.
     pub fn set_media_attrs(&self, id: &AssetId, attrs: &MediaAttributes) -> Result<(), LibError> {
         let conn = self.write();
+        Self::set_media_attrs_in(&conn, id, attrs)
+    }
+
+    /// The attribute upsert on a caller-owned connection/transaction — one statement, so the
+    /// single-shot wrapper above needs no transaction of its own, and a scan batch (issue #138)
+    /// can fold it into the item's savepoint.
+    pub(crate) fn set_media_attrs_in(
+        conn: &Connection,
+        id: &AssetId,
+        attrs: &MediaAttributes,
+    ) -> Result<(), LibError> {
         let key = id.as_bytes().to_vec();
         match attrs {
             MediaAttributes::Audio(a) => {

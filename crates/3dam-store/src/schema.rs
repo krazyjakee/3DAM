@@ -1093,66 +1093,58 @@ pub const MIGRATIONS: &[&str] = &[
 ];
 
 #[cfg(test)]
-mod tests {
-    use super::MIGRATIONS;
-    use rusqlite::{Connection, OptionalExtension};
+fn rows2(conn: &rusqlite::Connection, sql: &str) -> Vec<(Vec<u8>, String, i64, i64)> {
+    conn.prepare(sql)
+        .unwrap()
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+}
 
-    /// Apply the first `n` migrations to a fresh in-memory database.
-    fn db_at(n: usize) -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        for step in &MIGRATIONS[..n] {
-            conn.execute_batch(step).unwrap();
-        }
-        conn
-    }
+/// Compare every aggregate dimension to authoritative base-table counts. Keeping this as one
+/// reusable assertion makes each lifecycle transition below prove all dimensions, rather than
+/// only the counter most likely to have changed.
+///
+/// Crate-visible (test builds only) because the V26 aggregates are exactly what a partially failed
+/// batch would silently corrupt: `batch.rs` asserts against this same recipe rather than growing a
+/// second, subtly different copy of it.
+#[cfg(test)]
+pub(crate) fn assert_aggregate_integrity(conn: &rusqlite::Connection) {
+    let actual: (i64, i64, i64) = conn
+        .query_row(
+            "SELECT asset_count, unanalyzed_count, source_count FROM library_stat",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    let expected: (i64, i64, i64) = conn
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM asset),
+                        (SELECT COUNT(*) FROM asset WHERE analysed_at IS NULL),
+                        (SELECT COUNT(*) FROM source)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(actual, expected, "library aggregate drifted");
 
-    fn rows2(conn: &Connection, sql: &str) -> Vec<(Vec<u8>, String, i64, i64)> {
+    let pairs = |sql: &str| -> Vec<(String, i64)> {
         conn.prepare(sql)
             .unwrap()
-            .query_map([], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-            })
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap()
-    }
-
-    /// Compare every aggregate dimension to authoritative base-table counts. Keeping this as one
-    /// reusable assertion makes each lifecycle transition below prove all dimensions, rather than
-    /// only the counter most likely to have changed.
-    fn assert_aggregate_integrity(conn: &Connection) {
-        let actual: (i64, i64, i64) = conn
-            .query_row(
-                "SELECT asset_count, unanalyzed_count, source_count FROM library_stat",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        let expected: (i64, i64, i64) = conn
-            .query_row(
-                "SELECT (SELECT COUNT(*) FROM asset),
-                        (SELECT COUNT(*) FROM asset WHERE analysed_at IS NULL),
-                        (SELECT COUNT(*) FROM source)",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(actual, expected, "library aggregate drifted");
-
-        let pairs = |sql: &str| -> Vec<(String, i64)> {
-            conn.prepare(sql)
-                .unwrap()
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-                .unwrap()
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .unwrap()
-        };
-        assert_eq!(
-            pairs("SELECT media_type, asset_count FROM media_stat ORDER BY media_type"),
-            pairs("SELECT media_type, COUNT(*) FROM asset GROUP BY media_type ORDER BY media_type"),
-            "media aggregate drifted"
-        );
-        assert_eq!(
+    };
+    assert_eq!(
+        pairs("SELECT media_type, asset_count FROM media_stat ORDER BY media_type"),
+        pairs("SELECT media_type, COUNT(*) FROM asset GROUP BY media_type ORDER BY media_type"),
+        "media aggregate drifted"
+    );
+    assert_eq!(
             rows2(
                 conn,
                 "SELECT source_id, '', asset_count, unanalyzed_count FROM source_stat ORDER BY source_id"
@@ -1164,50 +1156,64 @@ mod tests {
             ),
             "source aggregate drifted"
         );
-        assert_eq!(
-            rows2(
-                conn,
-                "SELECT source_id, media_type, asset_count, 0 FROM source_media_stat
+    assert_eq!(
+        rows2(
+            conn,
+            "SELECT source_id, media_type, asset_count, 0 FROM source_media_stat
                   ORDER BY source_id, media_type"
-            ),
-            rows2(
-                conn,
-                "SELECT source_id, media_type, COUNT(*), 0 FROM asset
+        ),
+        rows2(
+            conn,
+            "SELECT source_id, media_type, COUNT(*), 0 FROM asset
                   GROUP BY source_id, media_type ORDER BY source_id, media_type"
-            ),
-            "source/media aggregate drifted"
-        );
-        assert_eq!(
-            rows2(
-                conn,
-                "SELECT tag_id, '', asset_count, manual_count FROM tag_stat ORDER BY tag_id"
-            ),
-            rows2(
-                conn,
-                "SELECT t.id, '', COUNT(at.asset_id) FILTER (WHERE at.state='confirmed'),
+        ),
+        "source/media aggregate drifted"
+    );
+    assert_eq!(
+        rows2(
+            conn,
+            "SELECT tag_id, '', asset_count, manual_count FROM tag_stat ORDER BY tag_id"
+        ),
+        rows2(
+            conn,
+            "SELECT t.id, '', COUNT(at.asset_id) FILTER (WHERE at.state='confirmed'),
                         COUNT(at.asset_id) FILTER (
                             WHERE at.state='confirmed' AND at.source='user')
                    FROM tag t LEFT JOIN asset_tag at ON at.tag_id=t.id
                   GROUP BY t.id ORDER BY t.id"
-            ),
-            "tag aggregate drifted"
-        );
-        assert_eq!(
-            rows2(
-                conn,
-                "SELECT source_id, hex(tag_id), asset_count, manual_count FROM source_tag_stat
+        ),
+        "tag aggregate drifted"
+    );
+    assert_eq!(
+        rows2(
+            conn,
+            "SELECT source_id, hex(tag_id), asset_count, manual_count FROM source_tag_stat
                   ORDER BY source_id, tag_id"
-            ),
-            rows2(
-                conn,
-                "SELECT a.source_id, hex(at.tag_id), COUNT(*),
+        ),
+        rows2(
+            conn,
+            "SELECT a.source_id, hex(at.tag_id), COUNT(*),
                         COUNT(*) FILTER (WHERE at.source='user')
                    FROM asset_tag at JOIN asset a ON a.id=at.asset_id
                   WHERE at.state='confirmed' GROUP BY a.source_id, at.tag_id
                   ORDER BY a.source_id, at.tag_id"
-            ),
-            "source/tag aggregate drifted"
-        );
+        ),
+        "source/tag aggregate drifted"
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{assert_aggregate_integrity, MIGRATIONS};
+    use rusqlite::{Connection, OptionalExtension};
+
+    /// Apply the first `n` migrations to a fresh in-memory database.
+    fn db_at(n: usize) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        for step in &MIGRATIONS[..n] {
+            conn.execute_batch(step).unwrap();
+        }
+        conn
     }
 
     /// An FTS5 rebuild has to carry the index-only columns across, and the only way to know it does

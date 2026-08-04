@@ -419,6 +419,17 @@ impl Store {
         generation: i64,
     ) -> Result<Option<SourceChangeToken>, LibError> {
         let conn = self.write();
+        Self::observe_source_path_in(&conn, source_id, path, generation)
+    }
+
+    /// The stamp itself, on a caller-owned connection/transaction, so a probe chunk or a scan
+    /// batch (issue #138) can run a whole slice of paths inside one transaction.
+    pub(crate) fn observe_source_path_in(
+        conn: &Connection,
+        source_id: &SourceId,
+        path: &str,
+        generation: i64,
+    ) -> Result<Option<SourceChangeToken>, LibError> {
         conn.query_row(
             "UPDATE asset
                 SET seen_generation = max(seen_generation, ?3), flags = flags & -2

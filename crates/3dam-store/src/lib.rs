@@ -257,6 +257,7 @@ impl Store {
 // `Store` type. Shared free helpers (SQL filter building, blob↔id conversions) live in `helpers`.
 mod analysis;
 mod assets;
+mod batch;
 mod blocklist;
 mod collections;
 mod export;
@@ -267,4 +268,9 @@ mod query;
 pub mod search;
 mod sources;
 
+pub use batch::{
+    AnalysisBatchContext, AnalysisBatchOutcome, AnalysisItemOutcome, AnalysisWrite,
+    AudioFeatureWrite, EmbeddingWrite, ScanBatchContext, ScanBatchOutcome, ScanItemOutcome,
+    ScanWrite, TagSuggestion,
+};
 pub use export::{ExportAssetRow, ExportSelection, ExportStreamStats};

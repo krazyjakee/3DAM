@@ -111,6 +111,13 @@ impl Store {
     /// primary-key lookup).
     pub fn is_blocked(&self, hash: &ContentHash) -> Result<bool, LibError> {
         let conn = self.read()?;
+        Self::is_blocked_in(&conn, hash)
+    }
+
+    /// The gate on a caller-owned connection. A scan batch (issue #138) asks it from *inside* its
+    /// write transaction, which both saves a read checkout per asset and closes the window where a
+    /// hash blocked mid-batch still gets catalogued.
+    pub(crate) fn is_blocked_in(conn: &Connection, hash: &ContentHash) -> Result<bool, LibError> {
         let found: Option<i64> = conn
             .query_row(
                 "SELECT 1 FROM blocklist WHERE content_hash = ?1",
