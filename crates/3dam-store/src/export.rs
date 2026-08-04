@@ -73,7 +73,7 @@ impl Store {
                 .map(|id| Value::Blob(id.as_bytes().to_vec()))
                 .collect::<Vec<_>>();
             let sql = format!("SELECT DISTINCT source_id FROM asset WHERE id IN ({placeholders})");
-            let conn = self.conn.lock().unwrap();
+            let conn = self.write();
             let mut statement = conn.prepare(&sql).map_err(internal)?;
             let rows = statement
                 .query_map(rusqlite::params_from_iter(binds.iter()), |row| {
@@ -107,7 +107,7 @@ impl Store {
                  SELECT COUNT(*) FROM selected JOIN asset ON asset.id = selected.asset_id
                  {where_sql}"
             );
-            let conn = self.conn.lock().unwrap();
+            let conn = self.write();
             let visible: i64 = conn
                 .query_row(&sql, rusqlite::params_from_iter(binds.iter()), |row| {
                     row.get(0)
@@ -245,7 +245,7 @@ impl Store {
              LEFT JOIN asset_note ON asset_note.asset_id = asset.id
              {where_sql} ORDER BY cm.added_at DESC, asset.id ASC LIMIT ?"
         );
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         let mut stmt = conn.prepare(&sql).map_err(internal)?;
         let rows = stmt
             .query_map(rusqlite::params_from_iter(binds.iter()), |r| {
@@ -284,7 +284,7 @@ impl Store {
         sql: &str,
         binds: &[Value],
     ) -> Result<Vec<ExportAssetRow>, LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         let mut stmt = conn.prepare(sql).map_err(internal)?;
         let rows = stmt
             .query_map(rusqlite::params_from_iter(binds.iter()), row_to_export)

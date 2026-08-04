@@ -41,7 +41,7 @@ impl Store {
         // `SourceConnection` structurally omits runtime credential fields; `auth_ref` is the only
         // persisted auth value, and is an opaque identifier rather than credential material.
         let conn_json = serde_json::to_string(connection).map_err(internal)?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         conn.execute(
             "INSERT INTO source (id, name, kind, connection, auth_ref, online, watch, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, ?7)",
@@ -62,7 +62,7 @@ impl Store {
     /// The secret-free connection plus its opaque credential reference. The engine resolves that
     /// reference immediately before opening a backend; clients only see `SourceInfo.uri`.
     pub fn get_source_connection(&self, id: &SourceId) -> Result<SourceConnection, LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         let (blob, auth_ref): (String, Option<String>) = conn
             .query_row(
                 "SELECT connection, auth_ref FROM source WHERE id = ?1",
@@ -82,7 +82,7 @@ impl Store {
     pub fn source_connections(
         &self,
     ) -> Result<Vec<(SourceId, SourceConnection, Option<String>)>, LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         let mut stmt = conn
             .prepare("SELECT id, connection, auth_ref FROM source ORDER BY created_at")
             .map_err(internal)?;
@@ -101,7 +101,7 @@ impl Store {
     }
 
     pub fn source_credentials_migrated(&self) -> Result<bool, LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM host_migration WHERE key = 'source_credentials_v1')",
             [],
@@ -111,7 +111,7 @@ impl Store {
     }
 
     pub fn mark_source_credentials_migrated(&self) -> Result<(), LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         conn.execute(
             "INSERT INTO host_migration (key, completed_at) VALUES ('source_credentials_v1', ?1)
              ON CONFLICT(key) DO UPDATE SET completed_at = excluded.completed_at",
@@ -148,7 +148,10 @@ impl Store {
                 ))
             })
             .collect::<Result<Vec<_>, LibError>>()?;
-        let mut conn = self.conn.lock().unwrap();
+        // Exclusive: the scrub below checkpoints the WAL to truncation and VACUUMs, both of which
+        // need every other connection out of the way (a pooled reader would make the checkpoint
+        // report `busy` and fail the migration).
+        let mut conn = self.exclusive();
         // Deleted/updated SQLite payload can otherwise survive in free pages. `secure_delete`
         // zeros cells changed below; the checkpoint + VACUUM in `scrub_source_storage_locked`
         // removes older copies from the WAL and rebuilds the main file without free-page remnants.
@@ -170,7 +173,8 @@ impl Store {
     /// failed before checkpoint/VACUUM. Idempotent and invoked only while the host migration marker
     /// is absent, never on ordinary opens.
     pub fn scrub_source_storage(&self) -> Result<(), LibError> {
-        let conn = self.conn.lock().unwrap();
+        // Exclusive for the same reason as `rewrite_source_credentials`: checkpoint + VACUUM.
+        let conn = self.exclusive();
         Self::scrub_source_storage_locked(&conn)
     }
 
@@ -193,7 +197,7 @@ impl Store {
     }
 
     pub fn pending_source_credential_cleanup(&self) -> Result<Vec<String>, LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         let mut stmt = conn
             .prepare("SELECT auth_ref FROM host_secret_cleanup ORDER BY auth_ref")
             .map_err(internal)?;
@@ -204,7 +208,7 @@ impl Store {
     }
 
     pub fn complete_source_credential_cleanup(&self, auth_ref: &str) -> Result<(), LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         conn.execute(
             "DELETE FROM host_secret_cleanup WHERE auth_ref = ?1",
             params![auth_ref],
@@ -214,7 +218,7 @@ impl Store {
     }
 
     pub fn list_sources(&self) -> Result<Vec<SourceInfo>, LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         let mut stmt = conn
             .prepare(
                 "SELECT s.id, s.name, s.kind, s.connection, s.online, s.last_scanned_at,
@@ -236,7 +240,7 @@ impl Store {
         source: &SourceId,
         prefix: &str,
     ) -> Result<Vec<FolderEntry>, LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         let mut stmt = conn
             .prepare(
                 "SELECT name, descendant_asset_count FROM folder
@@ -256,7 +260,7 @@ impl Store {
     }
 
     pub fn get_source(&self, id: &SourceId) -> Result<Option<SourceInfo>, LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         conn.query_row(
             "SELECT s.id, s.name, s.kind, s.connection, s.online, s.last_scanned_at,
                     s.last_error, s.watch, COALESCE(ss.asset_count, 0)
@@ -319,7 +323,7 @@ impl Store {
     }
 
     pub fn remove_source(&self, id: &SourceId, keep_metadata: bool) -> Result<(), LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         if keep_metadata {
             // Mark offline but keep cached rows (fail-soft, PRODUCT_SPEC §6.1).
             conn.execute(
@@ -354,7 +358,7 @@ impl Store {
     }
 
     pub fn set_source_scanned(&self, id: &SourceId, at: i64) -> Result<(), LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         conn.execute(
             "UPDATE source SET last_scanned_at = ?2, last_error = NULL, online = 1, updated_at = ?2 WHERE id = ?1",
             params![id.as_bytes().to_vec(), at],
@@ -364,7 +368,7 @@ impl Store {
     }
 
     pub fn set_source_error(&self, id: &SourceId, err: &str) -> Result<(), LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         conn.execute(
             "UPDATE source SET last_error = ?2, updated_at = ?3 WHERE id = ?1",
             params![id.as_bytes().to_vec(), err, now_ms()],
@@ -376,7 +380,7 @@ impl Store {
     /// Start one streamed enumeration and return its source-local generation. The increment is a
     /// transaction so two concurrent scans cannot receive the same generation.
     pub fn begin_source_scan(&self, source_id: &SourceId) -> Result<i64, LibError> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.write();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(internal)?;
@@ -410,7 +414,7 @@ impl Store {
         path: &str,
         generation: i64,
     ) -> Result<Option<SourceChangeToken>, LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         conn.query_row(
             "UPDATE asset
                 SET seen_generation = max(seen_generation, ?3), flags = flags & -2
@@ -434,7 +438,7 @@ impl Store {
         generation: i64,
         scanned_at: i64,
     ) -> Result<Option<u64>, LibError> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.write();
         let tx = conn.transaction().map_err(internal)?;
         let current = tx
             .query_row(
@@ -478,7 +482,7 @@ impl Store {
         if paths.is_empty() {
             return Ok(0);
         }
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.write();
         let tx = conn.transaction().map_err(internal)?;
         let now = now_ms();
         let mut n = 0u64;
@@ -533,9 +537,7 @@ mod tests {
 
     fn missing(store: &Store, source: SourceId, path: &str) -> bool {
         store
-            .conn
-            .lock()
-            .unwrap()
+            .write()
             .query_row(
                 "SELECT (flags & 1) <> 0 FROM asset WHERE source_id = ?1 AND path = ?2",
                 params![source.as_bytes().to_vec(), path],
@@ -587,9 +589,7 @@ mod tests {
             None
         );
         let b_seen: i64 = store
-            .conn
-            .lock()
-            .unwrap()
+            .write()
             .query_row(
                 "SELECT seen_generation FROM asset WHERE source_id = ?1 AND path = 'b.png'",
                 params![source.as_bytes().to_vec()],
@@ -602,9 +602,7 @@ mod tests {
             None
         );
         let last_scanned: Option<i64> = store
-            .conn
-            .lock()
-            .unwrap()
+            .write()
             .query_row(
                 "SELECT last_scanned_at FROM source WHERE id = ?1",
                 params![source.as_bytes().to_vec()],
@@ -658,9 +656,7 @@ mod tests {
         let generation = store.begin_source_scan(&source).unwrap();
         store.upsert_asset(&scanned(source, "new.png")).unwrap();
         let seen: i64 = store
-            .conn
-            .lock()
-            .unwrap()
+            .write()
             .query_row(
                 "SELECT seen_generation FROM asset WHERE source_id = ?1 AND path = 'new.png'",
                 params![source.as_bytes().to_vec()],
@@ -689,7 +685,7 @@ mod tests {
             )
             .unwrap();
         {
-            let mut connection = store.conn.lock().unwrap();
+            let mut connection = store.write();
             let transaction = connection.transaction().unwrap();
             let mut insert = transaction
                 .prepare_cached(

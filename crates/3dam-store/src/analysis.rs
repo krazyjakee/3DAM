@@ -181,7 +181,7 @@ impl Store {
         force: bool,
         ids: &[AssetId],
     ) -> Result<AnalysisPlanSummary, LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         let (where_sql, binds) = plan_where(
             PlanKind::Analysis {
                 current_version,
@@ -298,7 +298,7 @@ impl Store {
         limit: usize,
     ) -> Result<AnalysisPlanBatch, LibError> {
         let limit = limit.clamp(1, ANALYSIS_PLAN_BATCH_MAX);
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         let (mut where_sql, mut binds) = plan_where(kind, ids);
         if let Some(cursor) = after {
             push_plan_cursor(&mut where_sql, &mut binds, kind, cursor, false);
@@ -371,7 +371,7 @@ impl Store {
         derivative_version: i64,
         expected_hash: Option<ContentHash>,
     ) -> Result<bool, LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         conn.execute(
             "UPDATE asset SET derivative_version=?2 WHERE id=?1 AND content_hash IS ?3",
             params![
@@ -386,7 +386,7 @@ impl Store {
 
     /// Reset explicitly purged derivative slices to pending.
     pub fn mark_derivatives_pending(&self, ids: &[AssetId]) -> Result<(), LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         let mut statement = conn
             .prepare("UPDATE asset SET derivative_version=0 WHERE id=?1")
             .map_err(internal)?;
@@ -400,7 +400,7 @@ impl Store {
 
     /// Reset all local derivative slices after an operator clears a cache tier.
     pub fn mark_all_derivatives_pending(&self) -> Result<(), LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         conn.execute("UPDATE asset SET derivative_version=0", [])
             .map_err(internal)?;
         Ok(())
@@ -409,7 +409,7 @@ impl Store {
     /// Persist the derived image signals (§5, §6) into the existing `image_attr` row. The row is created
     /// at scan (cheap tier), so this is an UPDATE; if absent (e.g. a directly-analysed asset), upsert.
     pub fn set_image_analysis(&self, id: &AssetId, a: &ImageAnalysis) -> Result<(), LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         let key = id.as_bytes().to_vec();
         let phash_blob = a.phash.to_le_bytes().to_vec();
         let colors = serde_json::to_string(&a.dominant_colors).unwrap_or_else(|_| "[]".into());
@@ -433,7 +433,7 @@ impl Store {
         media: MediaType,
         class: &str,
     ) -> Result<(), LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         let key = id.as_bytes().to_vec();
         // Every attr table carries the same `class` column; pick the table for the media type.
         let sql = match media {
@@ -456,7 +456,7 @@ impl Store {
         brightness: f32,
         harmonicity: f32,
     ) -> Result<(), LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         conn.execute(
             "INSERT INTO audio_attr (asset_id, loudness_lufs, brightness, harmonicity)
              VALUES (?1, ?2, ?3, ?4)
@@ -479,7 +479,7 @@ impl Store {
     /// scan); a no-op-safe part of the analysis pass.
     pub fn set_audio_peaks(&self, id: &AssetId, peaks: &[f32]) -> Result<(), LibError> {
         let json = serde_json::to_string(peaks).map_err(internal)?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         conn.execute(
             "INSERT INTO audio_attr (asset_id, waveform_peaks) VALUES (?1, ?2)
              ON CONFLICT(asset_id) DO UPDATE SET waveform_peaks=excluded.waveform_peaks",
@@ -498,7 +498,7 @@ impl Store {
         vec: &[f32],
         extractor: &str,
     ) -> Result<(), LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         let mut bytes = Vec::with_capacity(vec.len() * 4);
         for f in vec {
             bytes.extend_from_slice(&f.to_le_bytes());
@@ -530,7 +530,7 @@ impl Store {
     /// text): leaving the previous one indexed would keep ranking the asset on content it no longer
     /// has. A no-op when there was nothing there.
     pub fn clear_embedding(&self, id: &AssetId, space_id: &str) -> Result<(), LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         let n = conn
             .execute(
                 "DELETE FROM embedding WHERE asset_id = ?1 AND space_id = ?2",
@@ -546,7 +546,7 @@ impl Store {
 
     /// Record that an asset is now analysed at `version` (the Plan gate reads this, §7.2).
     pub fn mark_analysed(&self, id: &AssetId, version: i64) -> Result<(), LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         conn.execute(
             "UPDATE asset SET analysis_version = ?2, analysed_at = ?3, updated_at = ?3 WHERE id = ?1",
             params![id.as_bytes().to_vec(), version, now_ms()],
@@ -607,7 +607,7 @@ impl Store {
     /// to be stashed and restored on any future FTS rebuild — exactly as `tokens` and `tags`
     /// already are, and as V10's own migration does.
     pub fn set_document_text(&self, id: &AssetId, text: &str) -> Result<(), LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         conn.execute(
             "UPDATE asset_fts SET text = ?2
              WHERE rowid = (SELECT rowid FROM asset WHERE id = ?1)",
@@ -649,7 +649,7 @@ impl Store {
         extractor: &str,
         explanation: &str,
     ) -> Result<(), LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         let tag_id = Self::intern_tag(&conn, name)?;
         conn.execute(
             "INSERT INTO asset_tag
@@ -683,7 +683,7 @@ impl Store {
         name: &str,
         action: ReviewAction,
     ) -> Result<(), LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         let current: Option<String> = conn
             .query_row(
                 "SELECT at.state FROM asset_tag at JOIN tag t ON t.id = at.tag_id
@@ -725,7 +725,7 @@ impl Store {
         if ids.is_empty() {
             return Ok(std::collections::HashSet::new());
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         let mut where_sql = String::from(" WHERE 1=1");
         let mut binds = Vec::new();
         push_visibility(vis, "asset", &mut where_sql, &mut binds);
@@ -750,7 +750,7 @@ impl Store {
         limit: u32,
         vis: &Visibility,
     ) -> Result<Vec<TagInfo>, LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         // Whole-source grants can be answered exactly by the maintained source×tag rows. Manual
         // collection grants remain on the visibility-join path below because a collection may
         // overlap a source grant and the union must count an asset once.
@@ -849,7 +849,7 @@ impl Store {
         remove: &[String],
         dry_run: bool,
     ) -> Result<ManualTagEditOutcome, LibError> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.write();
         let tx = conn.transaction().map_err(internal)?;
         let mut result = TagEditResult {
             matched: ids.len() as u64,
@@ -937,7 +937,7 @@ impl Store {
         filters: &[Filter],
         vis: &Visibility,
     ) -> Result<(String, Vec<(AssetSummary, f32)>), LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         // Query vector + its space.
         let query: Option<(String, Vec<u8>)> = conn
             .query_row(
@@ -1004,7 +1004,7 @@ impl Store {
     /// The stored embedding for one asset — `(space_id, vector)`, or `None` when not yet analysed.
     /// The federated fan-out ships this vector to matched-space peers (phase 6, issue #40).
     pub fn embedding_for(&self, id: &AssetId) -> Result<Option<(String, Vec<f32>)>, LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         let row: Option<(String, Vec<u8>)> = conn
             .query_row(
                 "SELECT space_id, vec FROM embedding WHERE asset_id = ?1",
@@ -1029,7 +1029,7 @@ impl Store {
         filters: &[Filter],
         vis: &Visibility,
     ) -> Result<Vec<(AssetSummary, f32)>, LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         let dim: Option<i64> = conn
             .query_row(
                 "SELECT LENGTH(vec) / 4 FROM embedding WHERE space_id = ?1 LIMIT 1",
@@ -1174,7 +1174,7 @@ impl Store {
         req: &DupRequest,
         vis: &Visibility,
     ) -> Result<Page<DupGroup>, LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         let mut groups: Vec<DupGroup> = Vec::new();
         let limit = req.limit.clamp(1, DUP_GROUP_PAGE_MAX) as usize;
         let has_more;
@@ -1405,7 +1405,7 @@ impl Store {
         {
             return Err(LibError::BadRequest("invalid duplicate review id".into()));
         }
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.write();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(internal)?;
@@ -1522,7 +1522,7 @@ impl Store {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         let requested_ph = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let mut requested_where =
             format!(" WHERE asset.content_hash IS NOT NULL AND asset.id IN ({requested_ph})");
@@ -1570,7 +1570,7 @@ impl Store {
             return Ok(None);
         };
         let hash = decode_hash_hex(&membership.group)?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         let mut where_sql = String::from(" WHERE asset.content_hash = ?");
         let mut binds = vec![Value::Blob(hash)];
         push_visibility(vis, "asset", &mut where_sql, &mut binds);
@@ -1627,7 +1627,7 @@ impl Store {
         let hash = decode_hash_hex(&req.group)?;
         let after = decode_dup_member_cursor(req.after.as_ref())?;
         let limit = req.limit.clamp(1, DUP_GROUP_PAGE_MAX) as usize;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         let mut where_sql = String::from(" WHERE asset.content_hash = ?");
         let mut binds = vec![Value::Blob(hash)];
         push_visibility(vis, "asset", &mut where_sql, &mut binds);
@@ -2168,7 +2168,7 @@ mod tests {
     }
 
     fn first_asset(store: &Store) -> AssetId {
-        let conn = store.conn.lock().unwrap();
+        let conn = store.write();
         conn.query_row("SELECT id FROM asset LIMIT 1", [], |row| {
             Ok(blob_to_asset_id(&row.get::<_, Vec<u8>>(0)?))
         })
@@ -2225,7 +2225,7 @@ mod tests {
             (1, 1, 0)
         );
         let tags = {
-            let conn = store.conn.lock().unwrap();
+            let conn = store.write();
             Store::load_tags(&conn, id.as_bytes())
         };
         assert_eq!(
@@ -2252,7 +2252,7 @@ mod tests {
             .result;
         assert_eq!((removed.changed, removed.removals), (1, 1));
         let tags = {
-            let conn = store.conn.lock().unwrap();
+            let conn = store.write();
             Store::load_tags(&conn, id.as_bytes())
         };
         assert_eq!(tags.len(), 1);
@@ -2281,7 +2281,7 @@ mod tests {
             .edit_manual_tags(&[id], &["convert-me".into()], &[], false)
             .unwrap();
         let tags = {
-            let conn = store.conn.lock().unwrap();
+            let conn = store.write();
             Store::load_tags(&conn, id.as_bytes())
         };
         assert_eq!(tags[0].source, "user");
@@ -2311,7 +2311,7 @@ mod tests {
             .suggest_tag(&id, "texture", 0.95, "image@2", "v2 visual classifier")
             .unwrap();
         let decided = {
-            let conn = store.conn.lock().unwrap();
+            let conn = store.write();
             Store::load_tags(&conn, id.as_bytes()).remove(0)
         };
         assert_eq!(decided.state, SuggestionState::Confirmed);
@@ -2325,7 +2325,7 @@ mod tests {
             .suggest_tag(&id, "texture", 0.95, "image@2", "v2 visual classifier")
             .unwrap();
         let reopened = {
-            let conn = store.conn.lock().unwrap();
+            let conn = store.write();
             Store::load_tags(&conn, id.as_bytes()).remove(0)
         };
         assert_eq!(reopened.state, SuggestionState::Pending);
@@ -2707,7 +2707,7 @@ mod tests {
     fn duplicate_group_hydration_has_a_hard_member_cap() {
         let store = duplicate_store(1, DUP_GROUP_MEMBER_MAX + 7);
         let id = {
-            let conn = store.conn.lock().unwrap();
+            let conn = store.write();
             conn.query_row("SELECT id FROM asset LIMIT 1", [], |row| {
                 Ok(blob_to_asset_id(&row.get::<_, Vec<u8>>(0)?))
             })
@@ -2740,7 +2740,7 @@ mod tests {
             cursor = page.cursor;
         }
         let expected: Vec<AssetId> = {
-            let conn = store.conn.lock().unwrap();
+            let conn = store.write();
             let mut stmt = conn
                 .prepare(
                     "SELECT id FROM asset
@@ -2782,7 +2782,7 @@ mod tests {
                     .unwrap()
             })
             .collect();
-        let mut conn = store.conn.lock().unwrap();
+        let mut conn = store.write();
         let transaction = conn.transaction().unwrap();
         {
             let mut insert = transaction
@@ -2870,7 +2870,7 @@ mod tests {
         );
 
         let query_plans = {
-            let conn = store.conn.lock().unwrap();
+            let conn = store.write();
             [
                 "EXPLAIN QUERY PLAN SELECT a.id FROM asset a INDEXED BY idx_asset_derivative_pending JOIN source s ON s.id=a.source_id
                  WHERE s.kind <> 'federated' AND a.derivative_version < 1
@@ -3126,7 +3126,7 @@ mod tests {
     fn an_unparseable_connection_drops_the_target() {
         let (store, _) = store_with_asset_on(&sftp_conn(), "remote");
         {
-            let conn = store.conn.lock().unwrap();
+            let conn = store.write();
             conn.execute("UPDATE source SET connection = 'not json'", [])
                 .unwrap();
         }

@@ -23,6 +23,11 @@ blake3.workspace = true
 # spaces (100k+), keeping brute-force as the fallback.
 instant-distance = { version = "0.6.1", optional = true }
 
+[dev-dependencies]
+# The connection-pool tests (src/db.rs) need a real file-backed catalog; in-memory stores are
+# single-connection by construction and cannot exercise pooling.
+tempfile.workspace = true
+
 [features]
 # HNSW nearest-neighbour acceleration for similarity/hybrid search (M6). See src/ann.rs.
 ann = ["dep:instant-distance"]

@@ -1629,13 +1629,13 @@ mod tests {
             .unwrap();
         let store = crate::Store::from_conn(conn, crate::search::SynonymMap::builtin()).unwrap();
         {
-            let conn = store.conn.lock().unwrap();
+            let conn = store.write();
             conn.execute("UPDATE library_stat SET asset_count=999", [])
                 .unwrap();
             conn.execute("DELETE FROM source_tag_stat", []).unwrap();
         }
         store.repair_aggregates().unwrap();
         store.repair_aggregates().unwrap();
-        assert_aggregate_integrity(&store.conn.lock().unwrap());
+        assert_aggregate_integrity(&store.write());
     }
 }

@@ -17,7 +17,9 @@ impl Store {
     /// `PRAGMA user_version` are preserved (rows deleted, tables kept), so the DB stays openable by
     /// this build. Deletes in one transaction, then `VACUUM`s (outside the tx) to shrink the file.
     pub fn wipe_catalog(&self) -> Result<WipeReport, LibError> {
-        let mut conn = self.conn.lock().unwrap();
+        // Exclusive: this ends in a `VACUUM`, which rewrites the database file and cannot run while
+        // any pooled reader holds a snapshot.
+        let mut conn = self.exclusive();
         // Snapshot the headline counts before the wipe, for the report + audit detail.
         let count = |c: &Connection, t: &str| -> Result<u64, LibError> {
             c.query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| {
@@ -80,7 +82,7 @@ impl Store {
     /// the analysis pass writes, and mark every asset due for re-analysis (`analysis_version = 0`).
     /// The next `analyze` run re-derives everything.
     pub fn clear_analysis(&self) -> Result<ClearAnalysisReport, LibError> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.write();
         let count = |c: &Connection, sql: &str| -> Result<u64, LibError> {
             c.query_row(sql, [], |r| r.get::<_, i64>(0))
                 .map(|n| n as u64)
@@ -144,7 +146,7 @@ impl Store {
     /// database. The delete + backfill is one immediate transaction, so readers observe either the
     /// old complete snapshot or the repaired complete snapshot, never an empty intermediate state.
     pub fn repair_aggregates(&self) -> Result<(), LibError> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.write();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(internal)?;
@@ -190,7 +192,8 @@ impl Store {
     /// Compact `library.db` in place (`VACUUM`), reclaiming pages freed by deletes. Sizing the file
     /// is the caller's job (the engine holds `data_dir`); this just runs the reclaim.
     pub fn vacuum(&self) -> Result<(), LibError> {
-        let conn = self.conn.lock().unwrap();
+        // Exclusive: `VACUUM` rebuilds the file, so in-flight readers are drained first.
+        let conn = self.exclusive();
         conn.execute("VACUUM", []).map_err(internal)?;
         Ok(())
     }

@@ -1,9 +1,14 @@
 //! `dam-store` — the SQLite metadata store (tech-spec 02). Private to `3dam-core`; no front-end
 //! links it (dependency rule 4, tech-spec 01 §2). Methods are synchronous and internally locked;
 //! `3dam-core` calls them from a blocking context off the async runtime (tech-spec 14).
+//!
+//! Connection ownership — one writer, a pooled set of readers, and the maintenance gate that
+//! drains both — lives in [`db`]; every method here reaches SQLite through [`Store::read`],
+//! [`Store::write`], or [`Store::exclusive`] rather than a bare connection.
 
 #[cfg(feature = "ann")]
 mod ann;
+mod db;
 mod schema;
 
 use dam_api::dto::*;
@@ -12,10 +17,10 @@ use dam_api::page::{Cursor, Page};
 use dam_api::service::Visibility;
 use dam_api::LibError;
 use dam_sources::SourceConnection;
+use db::Db;
 use rusqlite::types::Value;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::path::Path;
-use std::sync::Mutex;
 use uuid::Uuid;
 
 const QUERY_MAX_LIMIT: u32 = 500;
@@ -131,7 +136,8 @@ pub struct ImageAnalysis {
 }
 
 pub struct Store {
-    conn: Mutex<Connection>,
+    /// Connection ownership: one writer, a lazy read pool, and the maintenance gate (see [`db`]).
+    db: Db,
     /// Query-expansion vocabulary for text search (semantic-search M3). Built-in defaults plus any
     /// user `synonyms.txt`; loaded once at open so a query never touches the filesystem.
     synonyms: search::SynonymMap,
@@ -141,7 +147,8 @@ pub struct Store {
     /// Per-space HNSW index cache (semantic-search M6): `space_id → (generation, index)`. Rebuilt
     /// lazily when `embed_gen` has moved on. Only compiled under the `ann` feature.
     #[cfg(feature = "ann")]
-    ann_cache: Mutex<std::collections::HashMap<String, (u64, std::sync::Arc<ann::AnnIndex>)>>,
+    ann_cache:
+        std::sync::Mutex<std::collections::HashMap<String, (u64, std::sync::Arc<ann::AnnIndex>)>>,
 }
 
 impl Store {
@@ -149,8 +156,7 @@ impl Store {
     pub fn open(data_dir: &Path) -> Result<Store, LibError> {
         std::fs::create_dir_all(data_dir).map_err(internal)?;
         let db_path = data_dir.join("library.db");
-        let conn = Connection::open(&db_path).map_err(internal)?;
-        Self::from_conn(conn, search::SynonymMap::load(data_dir))
+        Self::open_at(&db_path, search::SynonymMap::load(data_dir))
     }
 
     /// Open an in-memory store (tests).
@@ -159,28 +165,45 @@ impl Store {
         Self::from_conn(conn, search::SynonymMap::builtin())
     }
 
+    /// The file-backed constructor: a writer connection plus a (lazily filled) read pool.
+    fn open_at(path: &Path, synonyms: search::SynonymMap) -> Result<Store, LibError> {
+        Self::build(Db::open_file(path)?, synonyms)
+    }
+
+    /// Adopt an already-open connection as a single-connection catalog. Only `:memory:` databases
+    /// arrive this way: a second `:memory:` handle would be a *different* database, so this store
+    /// cannot be pooled and its reads share the writer's connection (see [`db`]).
     fn from_conn(conn: Connection, synonyms: search::SynonymMap) -> Result<Store, LibError> {
-        // One data dir can legitimately be open in two processes (the desktop shell and a CLI run).
-        // WAL lets their readers overlap, but writers still serialise, and rusqlite's default is to
-        // fail instantly with `SQLITE_BUSY` rather than wait. Waiting is what we want everywhere:
-        // the contended windows here are short (a migration step, a scan batch), and a spurious
-        // "database is locked" would surface as a failed job.
-        conn.busy_timeout(BUSY_TIMEOUT).map_err(internal)?;
-        conn.pragma_update(None, "journal_mode", "WAL")
-            .map_err(internal)?;
-        conn.pragma_update(None, "synchronous", "NORMAL")
-            .map_err(internal)?;
-        conn.pragma_update(None, "foreign_keys", "ON")
-            .map_err(internal)?;
+        Self::build(Db::in_memory(conn)?, synonyms)
+    }
+
+    fn build(db: Db, synonyms: search::SynonymMap) -> Result<Store, LibError> {
         let store = Store {
-            conn: Mutex::new(conn),
+            db,
             synonyms,
             embed_gen: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "ann")]
-            ann_cache: Mutex::new(std::collections::HashMap::new()),
+            ann_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         store.migrate()?;
         Ok(store)
+    }
+
+    /// Borrow a read-only connection for the duration of one query (see [`db::Db::read`]).
+    #[allow(dead_code)] // Call sites move over in step 2 of issue #137.
+    pub(crate) fn read(&self) -> Result<db::ReadGuard<'_>, LibError> {
+        self.db.read()
+    }
+
+    /// Borrow the writer connection. Readers keep running alongside it.
+    pub(crate) fn write(&self) -> db::WriteGuard<'_> {
+        self.db.write()
+    }
+
+    /// Borrow the whole catalog with readers drained — `VACUUM`, `wal_checkpoint(TRUNCATE)`,
+    /// migrations.
+    pub(crate) fn exclusive(&self) -> db::ExclusiveGuard<'_> {
+        self.db.exclusive()
     }
 
     /// Apply pending schema steps, forward-only (`PRAGMA user_version`).
@@ -194,7 +217,9 @@ impl Store {
     /// write lock applies the step; the other waits out `busy_timeout`, sees the new version, and
     /// skips. Idempotent either way.
     fn migrate(&self) -> Result<(), LibError> {
-        let mut conn = self.conn.lock().unwrap();
+        // Exclusive: a schema step rewrites tables under everyone's feet, so no reader may hold a
+        // snapshot across it (and on first open there are no pooled readers to drain anyway).
+        let mut conn = self.exclusive();
         let current: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .map_err(internal)?;

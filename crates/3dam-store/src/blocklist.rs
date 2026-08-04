@@ -15,7 +15,7 @@ impl Store {
     /// group) and records that hash on the blocklist — capturing the filename as a display label — so
     /// future scans skip it. Returns `NotFound` if the id is unknown.
     pub fn remove_asset(&self, id: &AssetId, block: bool) -> Result<(), LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         // Read the hash + filename before the row is gone — needed for a meaningful blocklist entry.
         let row: Option<(Option<Vec<u8>>, String)> = conn
             .query_row(
@@ -56,7 +56,7 @@ impl Store {
 
     /// Every blocked content hash, newest first — the "removed + blocked" management surface.
     pub fn list_blocklist(&self) -> Result<Vec<BlockEntry>, LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         let mut stmt = conn
             .prepare(
                 "SELECT content_hash, label, blocked_at FROM blocklist ORDER BY blocked_at DESC",
@@ -86,7 +86,7 @@ impl Store {
 
     /// Lift a block so the content can be re-imported by a later scan. `NotFound` if not blocked.
     pub fn unblock(&self, hash: &ContentHash) -> Result<(), LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         let n = conn
             .execute(
                 "DELETE FROM blocklist WHERE content_hash = ?1",
@@ -102,7 +102,7 @@ impl Store {
     /// Whether a content hash is on the blocklist — the scan-time gate (hot path; single indexed
     /// primary-key lookup).
     pub fn is_blocked(&self, hash: &ContentHash) -> Result<bool, LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         let found: Option<i64> = conn
             .query_row(
                 "SELECT 1 FROM blocklist WHERE content_hash = ?1",

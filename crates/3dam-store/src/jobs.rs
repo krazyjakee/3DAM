@@ -40,7 +40,7 @@ impl Store {
         } else {
             None
         };
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         conn.execute(
             "INSERT INTO job (id, kind, state, params, progress, done, total, created_at, updated_at,
                               sources, initiator, collections)
@@ -78,7 +78,7 @@ impl Store {
             .map(serde_json::to_string)
             .transpose()
             .map_err(internal)?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         let changed = conn
             .execute(
                 "UPDATE job SET state = ?2, summary = ?3, warnings = ?4, result = ?5,
@@ -109,7 +109,7 @@ impl Store {
             Some(t) if t > 0 => (done as f64 / t as f64).min(1.0),
             _ => 0.0,
         };
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         conn.execute(
             "UPDATE job SET state = ?2, done = ?3, total = ?4, current = ?5, progress = ?6, updated_at = ?7
              WHERE id = ?1 AND (?2 <> 'running' OR state <> 'cancelled')",
@@ -133,7 +133,7 @@ impl Store {
         state: JobState,
         error: Option<&str>,
     ) -> Result<(), LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         conn.execute(
             "UPDATE job SET state = ?2, error = ?3, updated_at = ?4
              WHERE id = ?1 AND (?2 NOT IN ('done', 'failed') OR state <> 'cancelled')",
@@ -151,7 +151,7 @@ impl Store {
     /// Attach request attribution after submission. The server learns the authenticated actor at
     /// its boundary, while automatic/watch jobs are attributed at creation time.
     pub fn set_job_initiator(&self, id: &JobId, initiator: &str) -> Result<(), LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         conn.execute(
             "UPDATE job SET initiator = ?2 WHERE id = ?1",
             params![id.as_bytes().to_vec(), initiator],
@@ -174,7 +174,7 @@ impl Store {
             ));
         }
         let encoded = serde_json::to_string(artifacts).map_err(internal)?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         conn.execute(
             "UPDATE job SET result_artifacts = ?2, updated_at = ?3 WHERE id = ?1",
             params![id.as_bytes().to_vec(), encoded, now_ms()],
@@ -192,7 +192,7 @@ impl Store {
         warnings: &[String],
     ) -> Result<(), LibError> {
         let warnings_json = serde_json::to_string(warnings).map_err(internal)?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         conn.execute(
             "UPDATE job SET state = 'done', summary = ?2, warnings = ?3, error = NULL,
                             updated_at = ?4 WHERE id = ?1 AND state <> 'cancelled'",
@@ -203,7 +203,7 @@ impl Store {
     }
 
     pub fn get_job(&self, id: &JobId) -> Result<JobStatus, LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         conn.query_row(
             "SELECT id, kind, state, done, total, current, error, sources, created_at, updated_at,
                     summary, warnings, initiator, result_artifacts, result, collections
@@ -219,7 +219,7 @@ impl Store {
     /// Lightweight event/list shape. The full structured result is intentionally fetched only by
     /// `get_job` when a caller opens one history detail.
     pub fn get_job_summary(&self, id: &JobId) -> Result<JobStatus, LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         conn.query_row(
             "SELECT id, kind, state, done, total, current, error, sources, created_at, updated_at,
                     summary, warnings, initiator, result_artifacts, NULL AS result, collections
@@ -241,7 +241,7 @@ impl Store {
     ) -> Result<Page<JobStatus>, LibError> {
         let limit = req.page.clamped(QUERY_MAX_LIMIT);
         let offset = decode_offset(req.page.after.as_ref())?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         let mut stmt = conn
             .prepare(
                 "SELECT id, kind, state, done, total, current, error, sources, created_at, updated_at,
@@ -473,12 +473,7 @@ mod tests {
         let job = store
             .create_job(JobKind::Analyze, "{}", Some(1), &[])
             .unwrap();
-        store
-            .conn
-            .lock()
-            .unwrap()
-            .execute("DROP TABLE job", [])
-            .unwrap();
+        store.write().execute("DROP TABLE job", []).unwrap();
 
         assert!(store
             .set_job_state(&job, JobState::Failed, Some("analysis failed"))
@@ -571,7 +566,7 @@ mod tests {
             .create_job(JobKind::Scan, "{}", None, &[visible])
             .unwrap();
         {
-            let conn = store.conn.lock().unwrap();
+            let conn = store.write();
             for (id, at) in [(&oldest, 1_i64), (&middle, 2), (&newest, 3)] {
                 conn.execute(
                     "UPDATE job SET created_at = ?2, updated_at = ?2 WHERE id = ?1",

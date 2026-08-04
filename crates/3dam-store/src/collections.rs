@@ -13,7 +13,7 @@ impl Store {
     ) -> Result<CollectionId, LibError> {
         let id = CollectionId::new();
         let now = now_ms();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         conn.execute(
             "INSERT INTO collection (id, name, kind, query, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
@@ -33,7 +33,7 @@ impl Store {
     /// manual folders behave differently from smart folders, whose live count the engine already
     /// computes under the caller's ceiling.
     pub fn list_collections_vis(&self, vis: &Visibility) -> Result<Vec<Collection>, LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         // The count subquery sits in the SELECT list, so its binds precede the WHERE clause's.
         let (count_sql, count_binds) = Self::member_count_sql(vis);
         let mut where_sql = String::new();
@@ -99,7 +99,7 @@ impl Store {
         if scope.sources.is_empty() {
             return Ok(false);
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         let ph = scope
             .sources
             .iter()
@@ -129,7 +129,7 @@ impl Store {
         id: &CollectionId,
         vis: &Visibility,
     ) -> Result<Collection, LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         let (count_sql, mut binds) = Self::member_count_sql(vis);
         binds.push(Value::Blob(id.as_bytes().to_vec()));
         let sql = format!(
@@ -197,7 +197,7 @@ impl Store {
         name: Option<&str>,
         query_json: Option<&str>,
     ) -> Result<(), LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         let n = conn
             .execute(
                 "UPDATE collection
@@ -215,7 +215,7 @@ impl Store {
     }
 
     pub fn delete_collection(&self, id: &CollectionId) -> Result<(), LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         let n = conn
             .execute(
                 "DELETE FROM collection WHERE id = ?1",
@@ -235,7 +235,7 @@ impl Store {
         add: &[AssetId],
         remove: &[AssetId],
     ) -> Result<(), LibError> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.write();
         let tx = conn.transaction().map_err(internal)?;
         // The collection must exist and be manual (a smart folder's set is query-driven).
         let kind: Option<String> = tx
@@ -285,7 +285,7 @@ impl Store {
         limit: u32,
         vis: &Visibility,
     ) -> Result<Vec<AssetSummary>, LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         let mut vis_sql = String::new();
         let mut vis_binds: Vec<Value> = Vec::new();
         push_visibility(vis, "asset", &mut vis_sql, &mut vis_binds);
@@ -310,7 +310,7 @@ impl Store {
         if vis.restricted().is_none() {
             return Ok(true);
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         let mut where_sql = String::from("SELECT 1 FROM asset WHERE asset.id = ?");
         let mut binds: Vec<Value> = vec![Value::Blob(id.as_bytes().to_vec())];
         push_visibility(vis, "asset", &mut where_sql, &mut binds);
@@ -336,7 +336,7 @@ impl Store {
         id: &AssetId,
         vis: &Visibility,
     ) -> Result<Vec<CollectionId>, LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         let mut binds: Vec<Value> = vec![Value::Blob(id.as_bytes().to_vec())];
         let mut where_sql =
             String::from("SELECT collection_id FROM collection_member WHERE asset_id = ?");

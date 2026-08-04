@@ -8,7 +8,7 @@ impl Store {
     /// Insert a new asset or reconcile an existing `(source_id, path)` row (delta re-scan).
     /// Returns the id and whether it was newly inserted.
     pub fn upsert_asset(&self, a: &NewAsset) -> Result<(AssetId, bool), LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         // The previous hash and media type come back with the id: both decide whether the derived
         // layer this row already carries is still about the same file (see below).
         let existing: Option<(Vec<u8>, Option<Vec<u8>>, String)> = conn
@@ -141,7 +141,7 @@ impl Store {
     /// Set or clear an asset's favourite mark (issue #63) — bit 1 of the `flags` bitset, left
     /// untouched by scan upserts (which only ever touch bit 0). A no-op on a missing id.
     pub fn set_favorite(&self, id: &AssetId, on: bool) -> Result<(), LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         let flag = crate::helpers::FAVORITE_FLAG;
         // `flags | flag` sets the bit; `flags & ~flag` clears just that bit, preserving the rest.
         let sql = if on {
@@ -158,7 +158,7 @@ impl Store {
 
     /// The asset's free-text note, or `None` if it has never had one (or it was cleared).
     pub fn get_note(&self, id: &AssetId) -> Result<Option<Note>, LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         Self::read_note(&conn, id.as_bytes())
     }
 
@@ -177,7 +177,7 @@ impl Store {
         body: &str,
         by: Option<&str>,
     ) -> Result<Option<Note>, LibError> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.write();
         let key = id.as_bytes().to_vec();
         let exists: bool = conn
             .query_row(
@@ -252,7 +252,7 @@ impl Store {
     /// Every message on an asset, oldest first. Tombstones are included with an empty body — the
     /// thread has to stay coherent for anyone who replied to a since-deleted message.
     pub fn list_comments(&self, asset: &AssetId) -> Result<Vec<Comment>, LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         // UUIDv7 ids sort chronologically, so the primary key is the timeline.
         let mut stmt = conn
             .prepare(
@@ -270,7 +270,7 @@ impl Store {
     /// One message, or `NotFound`. Used by the edit/delete guards, which need the author and the
     /// owning asset before they can decide anything.
     pub fn get_comment(&self, id: &CommentId) -> Result<Comment, LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         conn.query_row(
             "SELECT comment_id, asset_id, author, body, created_at, edited_at, deleted_at, reply_to
              FROM asset_comment WHERE comment_id = ?1",
@@ -291,7 +291,7 @@ impl Store {
         body: &str,
         reply_to: Option<CommentId>,
     ) -> Result<Comment, LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         let asset_blob = asset.as_bytes().to_vec();
         let exists: bool = conn
             .query_row(
@@ -354,7 +354,7 @@ impl Store {
     /// Replace a message's text and stamp `edited_at`. Refuses a tombstone: editing a deleted
     /// message would resurrect it without anyone having posted anything.
     pub fn edit_comment(&self, id: &CommentId, body: &str) -> Result<(), LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         let n = conn
             .execute(
                 "UPDATE asset_comment SET body = ?2, edited_at = ?3
@@ -371,7 +371,7 @@ impl Store {
     /// Soft-delete: blank the body, stamp `deleted_at`, keep the row so replies keep their parent.
     /// Idempotent — deleting an already-deleted message is a no-op, not an error.
     pub fn delete_comment(&self, id: &CommentId) -> Result<(), LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         conn.execute(
             "UPDATE asset_comment SET body = '', deleted_at = ?2
              WHERE comment_id = ?1 AND deleted_at IS NULL",
@@ -382,7 +382,7 @@ impl Store {
     }
 
     pub fn set_media_attrs(&self, id: &AssetId, attrs: &MediaAttributes) -> Result<(), LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         let key = id.as_bytes().to_vec();
         match attrs {
             MediaAttributes::Audio(a) => {
@@ -642,7 +642,7 @@ impl Store {
     /// a whole [`Self::get_asset`], and so a *removal* can capture the source **before** the row
     /// disappears (issue #42). `None` for an unknown id.
     pub fn asset_source(&self, id: &AssetId) -> Result<Option<SourceId>, LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         conn.query_row(
             "SELECT source_id FROM asset WHERE id = ?1",
             params![id.as_bytes().to_vec()],
@@ -653,7 +653,7 @@ impl Store {
     }
 
     pub fn get_asset(&self, id: &AssetId) -> Result<Asset, LibError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write();
         let asset = conn
             .query_row(
                 "SELECT id, content_hash, source_id, path, filename, size_bytes,
@@ -830,12 +830,7 @@ mod tests {
     }
 
     fn count(store: &Store, sql: &str) -> i64 {
-        store
-            .conn
-            .lock()
-            .unwrap()
-            .query_row(sql, [], |r| r.get(0))
-            .unwrap()
+        store.write().query_row(sql, [], |r| r.get(0)).unwrap()
     }
 
     /// The analyse gate is `analysis_version < PIPELINE_VERSION`, and a re-scan of an edited file
