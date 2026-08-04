@@ -57,6 +57,30 @@ use tokio::sync::broadcast;
 
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
 
+/// Per-target warnings a bulk metadata edit will itemise before collapsing the rest into one
+/// summary row. Bulk results stay summary-shaped: a 1000-id request must not answer with 1000 rows.
+const BULK_WARNING_MAX: usize = 50;
+
+/// Reject a bulk-edit request that names no selector or more than one. `noun` names the edit in the
+/// message ("tag edit", "license edit").
+fn require_single_selector(
+    assets: &[AssetId],
+    collection: Option<&CollectionId>,
+    query: Option<&QueryRequest>,
+    noun: &str,
+) -> Result<(), LibError> {
+    let selectors = usize::from(!assets.is_empty())
+        + usize::from(collection.is_some())
+        + usize::from(query.is_some());
+    if selectors == 1 {
+        Ok(())
+    } else {
+        Err(LibError::BadRequest(format!(
+            "{noun} requires exactly one assets, collection, or query selector"
+        )))
+    }
+}
+
 /// Clamp for a thumbnail's long edge (tech-spec 04 §6.4). Small enough that generation stays cheap
 /// and the cache stays compact; large enough for a crisp inspector preview.
 const THUMB_MIN_EDGE: u32 = 16;
@@ -971,6 +995,139 @@ impl EmbeddedLibrary {
                 "no write access to this collection (a write share is required)".into(),
             ))
         }
+    }
+
+    /// Resolve a bulk-edit selection into `(readable, writable)` id lists, de-duplicated and in
+    /// selection order.
+    ///
+    /// Shared by every bulk metadata mutation (`edit_tags`, `set_license`) so they cannot drift
+    /// apart on the part that decides *who may be written*. Exactly one selector must be present;
+    /// explicit ids win, then a collection (manual members or a smart folder's live query), then a
+    /// raw query — matching export selection.
+    ///
+    /// The two sets are computed with two passes of the same reachability predicate: `readable`
+    /// under the caller's ceiling, `writable` under its [`Visibility::write_view`]. Keeping them
+    /// separate is what lets a caller be told "you can see this but not edit it"
+    /// (`target_read_only`) rather than "no such asset" (`target_unavailable`).
+    ///
+    /// Ids the local catalog does not hold simply fall out of both sets: `visible_asset_ids` only
+    /// returns rows that exist. Peer-owned assets are therefore excluded structurally — federation
+    /// proxies reads rather than mirroring rows, so a peer id is never in the local `asset` table
+    /// and no local write path can reach it (PRODUCT_SPEC §5: federated assets are read-only,
+    /// origin-attributed).
+    async fn resolve_bulk_targets(
+        &self,
+        ctx: &AuthContext,
+        assets: Vec<AssetId>,
+        collection: Option<CollectionId>,
+        query: Option<QueryRequest>,
+    ) -> Result<(Vec<AssetId>, Vec<AssetId>), LibError> {
+        let read_vis = ctx.visibility.clone();
+        let write_vis = ctx.visibility.write_view();
+        self.db(move |store| {
+            let candidates = if !assets.is_empty() {
+                assets
+            } else if let Some(collection) = collection {
+                if !store.collection_visible(&collection, &read_vis)? {
+                    return Err(LibError::NotFound(format!("collection {collection}")));
+                }
+                let record = store.get_collection(&collection, &read_vis)?;
+                match record.kind {
+                    CollectionKind::Manual => store.collection_member_ids(&collection)?,
+                    CollectionKind::Smart => {
+                        store.query_asset_ids(&record.query.unwrap_or_default(), &read_vis)?
+                    }
+                }
+            } else {
+                store.query_asset_ids(&query.expect("selector validated"), &read_vis)?
+            };
+            let filter = |visibility: &Visibility| -> Result<Vec<AssetId>, LibError> {
+                let mut visible = HashSet::new();
+                for chunk in candidates.chunks(500) {
+                    visible.extend(store.visible_asset_ids(chunk, visibility)?);
+                }
+                let mut seen = HashSet::new();
+                Ok(candidates
+                    .iter()
+                    .copied()
+                    .filter(|id| visible.contains(id) && seen.insert(*id))
+                    .collect())
+            };
+            let readable = filter(&read_vis)?;
+            let writable_set: HashSet<_> = filter(&write_vis)?.into_iter().collect();
+            let writable: Vec<AssetId> = readable
+                .iter()
+                .copied()
+                .filter(|id| writable_set.contains(id))
+                .collect();
+            Ok((readable, writable))
+        })
+        .await
+    }
+
+    /// Bounded per-target warnings for a bulk edit, shared by every bulk metadata mutation.
+    ///
+    /// An explicit selection names ids the caller believes in, so each excluded one earns its own
+    /// warning — capped at [`BULK_WARNING_MAX`], with a summary row standing in for the remainder
+    /// so a 1000-id request can never return a 1000-row response. A server-resolved selection
+    /// (collection/query) names nothing, so exclusions collapse into a single count: the caller
+    /// never asserted those ids and cannot act on them individually.
+    fn bulk_target_warnings(
+        explicit: &[AssetId],
+        readable: &[AssetId],
+        writable: &[AssetId],
+    ) -> Vec<ItemWarning> {
+        let mut warnings = Vec::new();
+        if explicit.is_empty() {
+            if readable.len() > writable.len() {
+                warnings.push(ItemWarning {
+                    subject: "selection".into(),
+                    code: "targets_excluded".into(),
+                    message: format!(
+                        "{} readable local targets were excluded because they require a write share",
+                        readable.len() - writable.len()
+                    ),
+                });
+            }
+            return warnings;
+        }
+        let readable_set: HashSet<_> = readable.iter().copied().collect();
+        let writable_set: HashSet<_> = writable.iter().copied().collect();
+        for id in explicit {
+            let warning = if !readable_set.contains(id) {
+                Some((
+                    "target_unavailable",
+                    "Asset is unavailable or outside your read scope",
+                ))
+            } else if !writable_set.contains(id) {
+                Some((
+                    "target_read_only",
+                    "Asset is readable but requires a write share",
+                ))
+            } else {
+                None
+            };
+            if let Some((code, message)) = warning {
+                if warnings.len() < BULK_WARNING_MAX {
+                    warnings.push(ItemWarning {
+                        subject: id.to_string(),
+                        code: code.into(),
+                        message: message.into(),
+                    });
+                }
+            }
+        }
+        let excluded = explicit.len().saturating_sub(writable.len());
+        if excluded > warnings.len() {
+            warnings.push(ItemWarning {
+                subject: "selection".into(),
+                code: "warnings_truncated".into(),
+                message: format!(
+                    "{excluded} targets were excluded; individual warning details are capped at {BULK_WARNING_MAX}"
+                ),
+            });
+        }
+        warnings
     }
 
     /// The local-index query path under a visibility ceiling (issue #42) — the ceiling composes into the
@@ -2913,17 +3070,14 @@ impl LibraryService for EmbeddedLibrary {
     ) -> Result<TagEditResult, LibError> {
         const TAG_NAME_MAX: usize = 64;
         const TAG_DELTA_MAX: usize = 50;
-        const WARNING_MAX: usize = 50;
 
         ctx.require(Scope::Write)?;
-        let selectors = usize::from(!req.assets.is_empty())
-            + usize::from(req.collection.is_some())
-            + usize::from(req.query.is_some());
-        if selectors != 1 {
-            return Err(LibError::BadRequest(
-                "tag edit requires exactly one assets, collection, or query selector".into(),
-            ));
-        }
+        require_single_selector(
+            &req.assets,
+            req.collection.as_ref(),
+            req.query.as_ref(),
+            "tag edit",
+        )?;
         if req.assets.len() > TAG_EDIT_EXPLICIT_MAX {
             return Err(LibError::BadRequest(format!(
                 "tag edit accepts at most {TAG_EDIT_EXPLICIT_MAX} explicit assets"
@@ -2960,103 +3114,10 @@ impl LibraryService for EmbeddedLibrary {
             )));
         }
 
-        let read_vis = ctx.visibility.clone();
-        let write_vis = ctx.visibility.write_view();
-        let explicit = !req.assets.is_empty();
-        let selector = req.clone();
         let (readable, writable) = self
-            .db(move |store| {
-                let candidates = if !selector.assets.is_empty() {
-                    selector.assets.clone()
-                } else if let Some(collection) = selector.collection {
-                    if !store.collection_visible(&collection, &read_vis)? {
-                        return Err(LibError::NotFound(format!("collection {collection}")));
-                    }
-                    let record = store.get_collection(&collection, &read_vis)?;
-                    match record.kind {
-                        CollectionKind::Manual => store.collection_member_ids(&collection)?,
-                        CollectionKind::Smart => {
-                            store.query_asset_ids(&record.query.unwrap_or_default(), &read_vis)?
-                        }
-                    }
-                } else {
-                    store.query_asset_ids(
-                        selector.query.as_ref().expect("selector validated"),
-                        &read_vis,
-                    )?
-                };
-                let filter = |visibility: &Visibility| -> Result<Vec<AssetId>, LibError> {
-                    let mut visible = std::collections::HashSet::new();
-                    for chunk in candidates.chunks(500) {
-                        visible.extend(store.visible_asset_ids(chunk, visibility)?);
-                    }
-                    let mut seen = std::collections::HashSet::new();
-                    Ok(candidates
-                        .iter()
-                        .copied()
-                        .filter(|id| visible.contains(id) && seen.insert(*id))
-                        .collect())
-                };
-                let readable = filter(&read_vis)?;
-                let writable_set: std::collections::HashSet<_> =
-                    filter(&write_vis)?.into_iter().collect();
-                let writable: Vec<AssetId> = readable
-                    .iter()
-                    .copied()
-                    .filter(|id| writable_set.contains(id))
-                    .collect();
-                Ok((readable, writable))
-            })
+            .resolve_bulk_targets(ctx, req.assets.clone(), req.collection, req.query.clone())
             .await?;
-
-        let readable_set: std::collections::HashSet<_> = readable.iter().copied().collect();
-        let writable_set: std::collections::HashSet<_> = writable.iter().copied().collect();
-        let mut warnings = Vec::new();
-        if explicit {
-            for id in &req.assets {
-                let warning = if !readable_set.contains(id) {
-                    Some((
-                        "target_unavailable",
-                        "Asset is unavailable or outside your read scope",
-                    ))
-                } else if !writable_set.contains(id) {
-                    Some((
-                        "target_read_only",
-                        "Asset is readable but requires a write share",
-                    ))
-                } else {
-                    None
-                };
-                if let Some((code, message)) = warning {
-                    if warnings.len() < WARNING_MAX {
-                        warnings.push(ItemWarning {
-                            subject: id.to_string(),
-                            code: code.into(),
-                            message: message.into(),
-                        });
-                    }
-                }
-            }
-            let excluded = req.assets.len().saturating_sub(writable.len());
-            if excluded > warnings.len() {
-                warnings.push(ItemWarning {
-                    subject: "selection".into(),
-                    code: "warnings_truncated".into(),
-                    message: format!(
-                        "{excluded} targets were excluded; individual warning details are capped at {WARNING_MAX}"
-                    ),
-                });
-            }
-        } else if readable.len() > writable.len() {
-            warnings.push(ItemWarning {
-                subject: "selection".into(),
-                code: "targets_excluded".into(),
-                message: format!(
-                    "{} readable local targets were excluded because they require a write share",
-                    readable.len() - writable.len()
-                ),
-            });
-        }
+        let warnings = Self::bulk_target_warnings(&req.assets, &readable, &writable);
 
         let add = req.add.clone();
         let remove = req.remove.clone();
@@ -3117,6 +3178,105 @@ impl LibraryService for EmbeddedLibrary {
             "publish favourite change",
         );
         Ok(())
+    }
+
+    /// Apply a rights patch across a selection (issue #106).
+    ///
+    /// Deliberately the same shape as [`edit_tags`](Self::edit_tags) — same three selectors, same
+    /// `(readable, writable)` split, same bounded warnings — because correcting an extractor's
+    /// licence guess is a bulk act, and a bulk act that silently skips half its targets is worse
+    /// than one that refuses. Both share [`Self::resolve_bulk_targets`] so the authorization half
+    /// cannot drift.
+    ///
+    /// Two things are *not* computed here. `license_status` is derived by the store at write time
+    /// from the patched id and rights (tech-spec 02 §5, ADR 0009 §1), so a caller can never assert
+    /// "permissive" without naming a licence. And a dry run reports the authorized selection size
+    /// as its `changed` rather than a true per-row diff — that diff only exists inside the write —
+    /// so it reads as "at most this many rows will change", and its `status` mix is left empty
+    /// rather than guessed.
+    async fn set_license(
+        &self,
+        ctx: &AuthContext,
+        req: SetLicenseRequest,
+    ) -> Result<LicenseEditResult, LibError> {
+        ctx.require(Scope::Write)?;
+        require_single_selector(
+            &req.assets,
+            req.collection.as_ref(),
+            req.query.as_ref(),
+            "license edit",
+        )?;
+        if req.assets.len() > LICENSE_EDIT_EXPLICIT_MAX {
+            return Err(LibError::BadRequest(format!(
+                "license edit accepts at most {LICENSE_EDIT_EXPLICIT_MAX} explicit assets"
+            )));
+        }
+
+        let (readable, writable) = self
+            .resolve_bulk_targets(ctx, req.assets.clone(), req.collection, req.query.clone())
+            .await?;
+        let warnings = Self::bulk_target_warnings(&req.assets, &readable, &writable);
+        let mut result = LicenseEditResult {
+            matched: writable.len() as u64,
+            warnings,
+            ..LicenseEditResult::default()
+        };
+
+        // An all-absent patch is a legitimate no-op — the caller still learns what its selector
+        // resolved to and which targets it could not have written. Nothing reaches the store.
+        if req.license.is_empty() {
+            return Ok(result);
+        }
+        if req.dry_run {
+            result.changed = writable.len() as u64;
+            return Ok(result);
+        }
+
+        let patch = req.license.clone();
+        let changed = self
+            .db(move |store| {
+                let changed = store.set_license(&writable, &patch)?;
+                // Source attribution for the events below. Resolved on the same blocking thread,
+                // after the write guard is gone, so the event fan-out costs no extra round trip
+                // per asset from the async side.
+                changed
+                    .into_iter()
+                    .map(|(id, status)| store.asset_source(&id).map(|source| (id, status, source)))
+                    .collect::<Result<Vec<_>, LibError>>()
+            })
+            .await?;
+
+        result.changed = changed.len() as u64;
+        // Fixed-order tally (permissive → attribution → restricted → unknown) rather than a map:
+        // the mix is four buckets, and a stable order lets a client render it without sorting.
+        const MIX: [LicenseStatus; 4] = [
+            LicenseStatus::Permissive,
+            LicenseStatus::Attribution,
+            LicenseStatus::Restricted,
+            LicenseStatus::Unknown,
+        ];
+        let mut mix = [0u64; MIX.len()];
+        for (id, status, source_id) in changed {
+            if let Some(slot) = MIX.iter().position(|candidate| *candidate == status) {
+                mix[slot] += 1;
+            }
+            reliability::publish_event(
+                &self.events,
+                LibraryEvent::AssetChanged {
+                    id,
+                    source_id,
+                    kind: ChangeKind::LicenseSet,
+                },
+                "publish license edit",
+            );
+        }
+        result.status = MIX
+            .into_iter()
+            .zip(mix)
+            .filter(|(_, count)| *count > 0)
+            .map(|(status, count)| LicenseStatusCount { status, count })
+            .collect();
+        Ok(result)
     }
 
     async fn get_note(&self, ctx: &AuthContext, id: &AssetId) -> Result<Option<Note>, LibError> {

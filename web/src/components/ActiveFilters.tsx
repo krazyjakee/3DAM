@@ -2,6 +2,7 @@ import { X } from "lucide-react";
 import { useCollections, useSources } from "@/api/queries";
 import type { FacetField, Filter, FilterValue, MediaType } from "@/api/types";
 import { bytes, licenseLabel, mediaLabel } from "@/lib/format";
+import { usageRightPhrase } from "@/lib/license";
 import { useViewState } from "@/lib/view-state";
 
 const FIELD_LABELS: Record<FacetField, string> = {
@@ -102,6 +103,17 @@ function humanValue(value: FilterValue, field: FacetField, media: MediaType | nu
 }
 
 function describeFilter(filter: Filter, media: MediaType | null): string {
+  // `usage_right` carries its direction in the *op* — `eq` asserts the right is granted, `ne` that
+  // it is known to be denied. Both must be spelled out: rendering the value alone would give
+  // "commercial eq" and "commercial ne" an identical chip, which on a safety field is worse than
+  // showing nothing. The generic path below can't do it, because "Usage right is not commercial"
+  // reads as a category exclusion rather than a claim about a permission.
+  if (filter.field === "usage_right" && "str" in filter.value) {
+    return (
+      usageRightPhrase(filter.value.str, filter.op, "chip") ??
+      `Usage right: ${filter.value.str} (${filter.op})`
+    );
+  }
   const field = FIELD_LABELS[filter.field];
   const value = humanValue(filter.value, filter.field, media);
   switch (filter.op) {

@@ -702,6 +702,23 @@ pub trait LibraryService: Send + Sync {
     /// `flags` bitset so it survives re-scans.
     async fn set_favorite(&self, ctx: &AuthContext, req: FavoriteRequest) -> Result<(), LibError>;
 
+    // ── license / rights (first-class field, PRODUCT_SPEC §5) ────────────────
+    /// Preview or apply a rights patch over one explicit or server-resolved selection (issue #106).
+    ///
+    /// Shaped like [`edit_tags`](Self::edit_tags), not like a single-asset setter: correcting an
+    /// extractor's guess is a bulk act ("everything under `kenney/` is CC0"), so it needs the same
+    /// three selectors, the same bounded partial-failure warnings, and the same `dry_run` preview.
+    /// `Scope::Write`, plus a write share on each target's source. Emits one
+    /// `AssetChanged { kind: LicenseSet }` per asset that actually changed.
+    ///
+    /// [`LicenseStatus`] is derived at write time from the patched id and rights — the request
+    /// cannot assert it (see [`LicenseInput`]).
+    async fn set_license(
+        &self,
+        ctx: &AuthContext,
+        req: SetLicenseRequest,
+    ) -> Result<LicenseEditResult, LibError>;
+
     // ── notes (issue #81) ────────────────────────────────────────────────────
     /// The user's free-text note on an asset, or `None` if there isn't one. `Scope::Read`.
     ///

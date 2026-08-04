@@ -658,8 +658,14 @@ pub(crate) fn apply_filter(
         License => {
             eq_or_in(f, "license_status", where_sql, binds)?;
         }
-        // A usage right is a granted-permission flag (`rights_*` = 1) on the asset row. The value
-        // names which right; presence of the filter means "must be granted".
+        // A usage right is a tri-state flag (`1` granted / `0` denied / `NULL` unknown) on the
+        // asset row. The value names which right; the op says which way it must be settled.
+        //
+        // `Ne` compiles to `= 0`, deliberately *not* `<> 1`. The safe-to-ship query needs
+        // "attribution is known not to be required" (PRODUCT_SPEC §5), and `<> 1` would also
+        // match `NULL` — sweeping every asset whose terms nobody has established into a result
+        // set the user reads as cleared. That is the silent-permissive failure the tri-state
+        // columns exist to prevent, so an unknown right matches neither direction.
         UsageRight => {
             let col = match &f.value {
                 FilterValue::Str(s) => match s.as_str() {
@@ -675,7 +681,16 @@ pub(crate) fn apply_filter(
                     ))
                 }
             };
-            where_sql.push_str(&format!(" AND {col} = 1"));
+            let granted = match f.op {
+                FilterOp::Eq => 1,
+                FilterOp::Ne => 0,
+                _ => {
+                    return Err(LibError::BadRequest(
+                        "usage_right filter wants op eq or ne".into(),
+                    ))
+                }
+            };
+            where_sql.push_str(&format!(" AND {col} = {granted}"));
         }
         // Tag/attr facets live in side tables. Express them as correlated subqueries on `asset.id`
         // rather than relying on the JOINs `query_assets` adds — the COUNT(*) query filters bare

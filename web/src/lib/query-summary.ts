@@ -1,4 +1,8 @@
 import type { Filter, FilterOp, FilterValue, QueryRequest, SourceInfo } from "@/api/types";
+// Relative *and* extensioned, not `@/lib/license`: this module is exercised by the node
+// `--experimental-strip-types` unit runner, which erases type-only `@` imports but can neither
+// resolve a *value* one nor guess an extension the way the bundler does.
+import { usageRightPhrase } from "./license.ts";
 
 const FIELD_LABELS = {
   media_type: "Media type",
@@ -50,6 +54,13 @@ const FIELD_LABELS = {
   author: "Author",
   document_class: "Document type",
 } as const;
+
+const LICENSE_STATUS_LABELS: Record<string, string> = {
+  permissive: "Permissive (commercial use allowed, no attribution required)",
+  attribution: "Attribution required",
+  restricted: "Restricted",
+  unknown: "Unknown / unverified",
+};
 
 const OP_LABELS: Record<FilterOp, string> = {
   eq: "is",
@@ -108,6 +119,18 @@ function filterSummary(
   const value = filter && typeof filter === "object" ? valueLabel(filter.value) : null;
   if (!field || !label || !opLabel || value === null) {
     return { warning: `A saved filter (${field ?? "unknown"}) is not supported by this version.` };
+  }
+  // A usage right is a claim about a permission, not a category, and its *op* carries the direction
+  // (dam-store `helpers.rs`): `eq` → granted, `ne` → known to be denied. A smart folder saved years
+  // ago is read back through this preview, so both directions have to survive the round trip
+  // legibly — "Usage right is not commercial" would be actively misleading (issue #106).
+  if (field === "usage_right" && "str" in filter.value && op) {
+    const phrase = usageRightPhrase(filter.value.str, op, "summary");
+    if (phrase) return { line: phrase };
+  }
+  if (field === "license" && "str" in filter.value) {
+    const status = LICENSE_STATUS_LABELS[filter.value.str];
+    if (status) return { line: `${label} ${opLabel} ${status}` };
   }
   if (field === "source" && "str" in filter.value) {
     const sourceName = sourceNames.get(filter.value.str);

@@ -91,8 +91,12 @@ pub trait LibraryService: Send + Sync {
         -> Result<(), LibError>;
 
     // ── license / rights (first-class field, PRODUCT_SPEC §5) ─────────────
+    // Bulk, and shaped exactly like edit_tags: correcting an extractor's licence guess is an act
+    // over a folder ("everything under kenney/ is CC0"), so it takes the same three selectors, the
+    // same bounded partial-failure warnings, and the same dry_run preview. Write-scoped, plus a
+    // write share per target. Emits AssetChanged { kind: LicenseSet } per changed asset (issue #106).
     async fn set_license(&self, ctx: &AuthContext, req: SetLicenseRequest)
-        -> Result<(), LibError>;
+        -> Result<LicenseEditResult, LibError>;
 
     // ── collections & smart folders ──────────────────────────────────────
     async fn list_collections(&self, ctx: &AuthContext)
@@ -235,7 +239,33 @@ pub struct TagListRequest  { pub prefix: Option<String>, pub kind: TagKind, pub 
 pub enum TagKind { All, Confirmed, Suggested }
 pub struct TagEditRequest  { pub assets: Vec<AssetId>, pub add: Vec<String>, pub remove: Vec<String> }
 pub struct SuggestionDecision { pub asset: AssetId, pub tag: String, pub accept: bool }
-pub struct SetLicenseRequest { pub assets: Vec<AssetId>, pub license: LicenseInput }
+// One selector only — explicit ids win, then collection, then query (matching export selection);
+// explicit ids are capped at LICENSE_EDIT_EXPLICIT_MAX = 1_000.
+pub struct SetLicenseRequest {
+  pub assets: Vec<AssetId>, pub collection: Option<CollectionId>, pub query: Option<QueryRequest>,
+  pub license: LicenseInput,
+  pub dry_run: bool,                    // same authorized selection, no write, no events
+}
+// A three-state patch per column: absent leaves it alone, null clears it, a value sets it.
+// `Patch<T> = Option<Option<T>>`. There is deliberately **no `status`** field — license_status is
+// derived at write time from the patched id + rights (02 §5, ADR 0009 §1), so a client can never
+// assert "permissive" without naming a licence.
+pub struct LicenseInput {
+  pub id: Patch<String>,                                        // SPDX id, or Proprietary/Custom
+  pub commercial: Patch<bool>, pub modify: Patch<bool>,
+  pub redistribute: Patch<bool>, pub attribution: Patch<bool>,  // true = attribution *required*
+  pub holder: Patch<String>, pub credit: Patch<String>, pub url: Patch<String>,
+}
+// Summary-shaped like TagEditResult: counts + bounded warnings, never one row per target.
+// `matched` is the authorized (writable) selection size; `changed` the rows that actually differed
+// — a dry run reports the selection size as its upper bound and leaves `status` empty, because the
+// per-row diff only exists inside the write. Warning codes: target_unavailable / target_read_only
+// (explicit ids), targets_excluded (server-resolved selection), warnings_truncated.
+pub struct LicenseEditResult {
+  pub matched: u64, pub changed: u64,
+  pub status: Vec<LicenseStatusCount>,  // post-write mix over the changed rows
+  pub warnings: Vec<ItemWarning>,
+}
 
 pub struct CreateCollection { pub name: String, pub kind: CollectionKind }
 pub enum   CollectionKind { Manual, Smart(QueryRequest) }   // smart folder = saved query
@@ -508,7 +538,7 @@ body, response, status).
 | GET | `/api/v1/tags` | *(query params)* | `Page<TagInfo>` | `list_tags` |
 | POST | `/api/v1/tags/edit` | `TagEditRequest` | `TagEditResult` | `edit_tags` |
 | POST | `/api/v1/tags/resolve` | `SuggestionDecision` | `204` | `resolve_suggestion` |
-| POST | `/api/v1/assets/license` | `SetLicenseRequest` | `204` | `set_license` |
+| POST | `/api/v1/assets/license` | `SetLicenseRequest` | `LicenseEditResult` | `set_license` |
 | GET | `/api/v1/collections` | — | `Vec<CollectionInfo>` | `list_collections` |
 | GET | `/api/v1/collections/{id}` | — | `Collection` | `get_collection` |
 | POST | `/api/v1/collections` | `CreateCollection` | `{ id }` `201` | `create_collection` |
@@ -608,8 +638,9 @@ Markers only — mechanics are deferred, per the borders.
 - **Event delivery guarantees.** At-least-once with a resume cursor (§7) vs stronger ordering; how much history the
   server buffers for a reconnecting `subscribe`; backpressure when a slow client falls behind a fast scan — overlaps
   [09](09-server-and-web-client.md) and [14](14-concurrency-performance-reliability.md).
-- **Bulk-write result shape.** `edit_tags`/`set_license` over thousands of assets: return a summary count +
-  warnings (current §4) vs a streamed per-asset result. Ties to the incremental principle.
+- **Bulk-write result shape.** `edit_tags`/`set_license` over thousands of assets currently return a summary count +
+  bounded warnings (§4); whether a streamed per-asset result is ever worth it is still open. Ties to the
+  incremental principle.
 - **Preview cache validators for federated assets.** Whether a peer's `ETag` can be trusted end-to-end through the
   proxy, or the local cache must mint its own — [07](07-sources-and-federation.md) / [02](02-data-model-and-storage.md).
 ```

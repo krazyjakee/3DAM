@@ -332,6 +332,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/api/v1/suggestions/review", post(review_suggestion))
         .route("/api/v1/tags/edit", post(edit_tags))
         .route("/api/v1/tags/list", post(list_tags))
+        .route("/api/v1/assets/license", post(set_license))
         .route("/api/v1/assets/favorite", post(set_favorite))
         .route("/api/v1/jobs/analyze", post(submit_analyze))
         .route("/api/v1/thumbnails/regenerate", post(regenerate_thumbnails))
@@ -1722,6 +1723,17 @@ async fn list_tags(
     Json(req): Json<TagListRequest>,
 ) -> Result<Json<Vec<TagInfo>>, ApiError> {
     Ok(Json(st.lib.list_tags(&ctx, req).await?))
+}
+
+/// Bulk rights edit (issue #106). `Writer` because a licence is a claim about how the asset may be
+/// used — the same write gate as any other metadata mutation (scope + network-writes flag + CSRF).
+/// Summary-shaped: the result carries counts and bounded warnings, never one row per target.
+async fn set_license(
+    Writer(ctx): Writer,
+    State(st): State<AppState>,
+    Json(req): Json<SetLicenseRequest>,
+) -> Result<Json<LicenseEditResult>, ApiError> {
+    Ok(Json(st.lib.set_license(&ctx, req).await?))
 }
 
 async fn set_favorite(

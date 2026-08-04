@@ -1157,6 +1157,14 @@ impl LibraryService for ApiClient {
         self.post("/api/v1/tags/list", &req).await
     }
 
+    async fn set_license(
+        &self,
+        _ctx: &AuthContext,
+        req: SetLicenseRequest,
+    ) -> Result<LicenseEditResult, LibError> {
+        self.post("/api/v1/assets/license", &req).await
+    }
+
     async fn set_favorite(&self, _ctx: &AuthContext, req: FavoriteRequest) -> Result<(), LibError> {
         let resp = self
             .http

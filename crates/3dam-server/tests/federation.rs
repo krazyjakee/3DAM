@@ -853,3 +853,80 @@ async fn similar_merges_matched_space_peers_and_gates_mismatched_spaces() {
         gated.partial.warnings
     );
 }
+
+/// Rights edits stop at the library boundary (issue #106; PRODUCT_SPEC §5 and tech-spec 02 §4:
+/// federated assets are read-only and origin-attributed).
+///
+/// The guard is **structural**, not a check the write path performs: federation *proxies* reads
+/// rather than mirroring rows, so a peer-owned id is never in the borrowing library's `asset` table
+/// and no local write can resolve it. `set_license` therefore resolves it to nothing and reports
+/// `target_unavailable` — not `target_read_only`, because from the local catalog's point of view
+/// the row genuinely is not there. This test pins that: the peer's own rights must be untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peer_asset_cannot_be_relicensed_from_the_borrowing_library() {
+    let ctx = AuthContext::embedded();
+    let peer_lib = library_with(&unique_tmp(), &[("remote.png", b"\x89PNG\r\n")]).await;
+    let (endpoint, _addr, _srv) = serve_peer(peer_lib.clone()).await;
+
+    let local = library_with(&unique_tmp(), &[("local.png", b"\x89PNG\r\n")]).await;
+    add_peer(&local, &endpoint, "studio-server").await;
+
+    let page = local.query(&ctx, query_all(50)).await.unwrap();
+    let remote = page
+        .items
+        .iter()
+        .find(|a| a.name == "remote.png")
+        .expect("the peer's asset is visible in the merged page");
+    assert!(matches!(remote.origin, Origin::Peer(ref p) if p == "studio-server"));
+
+    let result = local
+        .set_license(
+            &ctx,
+            SetLicenseRequest {
+                assets: vec![remote.id],
+                license: LicenseInput {
+                    id: Some(Some("CC0-1.0".into())),
+                    commercial: Some(Some(true)),
+                    modify: Some(Some(true)),
+                    redistribute: Some(Some(true)),
+                    attribution: Some(Some(false)),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.matched, 0, "a peer asset is not a writable target");
+    assert_eq!(result.changed, 0);
+    assert_eq!(
+        result
+            .warnings
+            .iter()
+            .map(|w| w.code.as_str())
+            .collect::<Vec<_>>(),
+        ["target_unavailable"],
+        "the refusal is reported, not silent: {:?}",
+        result.warnings
+    );
+
+    // The owning library is the only place that licence could have been written, and it wasn't.
+    assert_eq!(
+        peer_lib
+            .get_asset(&ctx, &remote.id)
+            .await
+            .unwrap()
+            .license
+            .status,
+        LicenseStatus::Unknown,
+        "a borrowing library must never rewrite a peer's rights"
+    );
+    // And the borrowed view still reads through to the peer's own (unchanged) block.
+    let proxied = local
+        .get_asset_from(&ctx, &remote.id, remote.source_id)
+        .await
+        .unwrap();
+    assert_eq!(proxied.license.id, None);
+    assert!(matches!(proxied.summary.origin, Origin::Peer(_)));
+}

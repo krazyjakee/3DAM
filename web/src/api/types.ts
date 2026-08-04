@@ -32,6 +32,63 @@ export interface License {
   provenance: string;
 }
 
+/** A three-state patch field, mirroring `dam-api`'s `Patch<T> = Option<Option<T>>` (dto.rs:270).
+ *
+ *  - **property omitted** (or `undefined`, which `JSON.stringify` drops) → leave the column alone
+ *  - **`null`** → clear the column back to unknown
+ *  - **a value** → set it
+ *
+ *  Do not collapse this to `T | null`: bulk editing depends on being able to say "don't touch this
+ *  field" for a mixed selection, which is a different statement from "make this field unknown". */
+export type Patch<T> = T | null;
+
+/** A patch over one asset's rights block (issue #106). Mirrors `dam-api` `LicenseInput`.
+ *
+ *  There is deliberately **no `status` field**. `license_status` is derived server-side from the id
+ *  plus the four rights at write time (tech-spec 02 §5, ADR 0009 §1) so "permissive" can never be
+ *  asserted without a named licence and four known rights. Clients show the *resulting* badge. */
+export interface LicenseInput {
+  /** SPDX id, or the `Proprietary` / `Custom` sentinels (ADR 0009 §1). */
+  id?: Patch<string>;
+  commercial?: Patch<boolean>;
+  modify?: Patch<boolean>;
+  redistribute?: Patch<boolean>;
+  /** `true` means attribution is *required*. */
+  attribution?: Patch<boolean>;
+  holder?: Patch<string>;
+  credit?: Patch<string>;
+  url?: Patch<string>;
+}
+
+/** Apply a rights patch over one explicit or server-resolved selection (issue #106). Explicit ids
+ *  take precedence, then `collection`, then `query` — matching {@link TagEditRequest}.
+ *  Backend route: POST /api/v1/assets/license (write scope). */
+export interface SetLicenseRequest {
+  assets?: AssetId[];
+  collection?: CollectionId;
+  query?: QueryRequest;
+  license: LicenseInput;
+  /** Calculate the same authorized effect without changing the catalog. */
+  dry_run?: boolean;
+}
+
+export interface LicenseStatusCount {
+  status: LicenseStatus;
+  count: number;
+}
+
+/** Summary-shaped bulk result: bounded warnings rather than one row per target. */
+export interface LicenseEditResult {
+  matched: number;
+  changed: number;
+  /** Post-edit status mix over the changed assets ("42 now permissive, 3 still unknown"). */
+  status: LicenseStatusCount[];
+  warnings: ItemWarning[];
+}
+
+/** Explicit-id cap for one license edit; mirrors `dam-api::LICENSE_EDIT_EXPLICIT_MAX`. */
+export const LICENSE_EDIT_EXPLICIT_MAX = 1000;
+
 export interface AssetSummary {
   id: AssetId;
   name: string;

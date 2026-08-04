@@ -30,6 +30,7 @@ import type {
   JobListRequest,
   JobStatus,
   LibraryStats,
+  LicenseEditResult,
   NewCollection,
   Page,
   PageParams,
@@ -44,6 +45,7 @@ import type {
   RemoveAsset,
   RemoveSource,
   ScanRequest,
+  SetLicenseRequest,
   SimilarHit,
   SimilarRequest,
   TagEditRequest,
@@ -191,6 +193,13 @@ export const api = {
   reviewSuggestion: (req: SuggestionReview) =>
     send<void>("POST", `${API}/suggestions/review`, req),
   editTags: (req: TagEditRequest) => send<TagEditResult>("POST", `${API}/tags/edit`, req),
+
+  /** Patch the rights block over a selection (issue #106). `license` is a three-state patch — an
+   *  omitted key leaves the column alone, `null` clears it. `dry_run` previews the same authorized
+   *  effect without writing. The resulting `license_status` is derived server-side. */
+  setLicense: (req: SetLicenseRequest) =>
+    send<LicenseEditResult>("POST", `${API}/assets/license`, req),
+
   listTags: (prefix?: string) =>
     send<TagInfo[]>("POST", `${API}/tags/list`, { prefix: prefix || null, limit: 20 }),
 

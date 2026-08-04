@@ -17,6 +17,7 @@ test("saved-query summaries retain and explain every discovery scope", () => {
       { field: "folder", op: "eq", value: { str: "Drums/Kicks/" } },
       { field: "license", op: "eq", value: { str: "permissive" } },
       { field: "usage_right", op: "eq", value: { str: "commercial" } },
+      { field: "usage_right", op: "ne", value: { str: "attribution" } },
       { field: "tag", op: "eq", value: { str: "punchy" } },
       { field: "bpm", op: "range", value: { range: [100, 130] } },
     ],
@@ -37,8 +38,18 @@ test("saved-query summaries retain and explain every discovery scope", () => {
   assert.ok(summary.lines.includes("Keywords + similar: “kick”"));
   assert.ok(summary.lines.includes("Source is Studio peer"));
   assert.ok(summary.lines.includes("Folder is Drums/Kicks/"));
-  assert.ok(summary.lines.includes("License is permissive"));
-  assert.ok(summary.lines.includes("Usage right is commercial"));
+  // Licence and usage rights are spelled out rather than echoed (issue #106): "Usage right is
+  // commercial" reads like a taxonomy, when the filter actually asserts a granted permission.
+  assert.ok(
+    summary.lines.includes(
+      "License is Permissive (commercial use allowed, no attribution required)",
+    ),
+  );
+  // The op is the direction, so both readings must survive the round trip distinctly — a saved
+  // smart folder is read back through this preview long after anyone remembers what it asserted.
+  assert.ok(summary.lines.includes("Commercial use is allowed"));
+  assert.ok(summary.lines.includes("No attribution required"));
+  assert.ok(!summary.lines.includes("Usage right is not attribution"));
   assert.ok(summary.lines.includes("Tag is punchy"));
   assert.ok(summary.lines.includes("Tempo is between 100 and 130"));
 });

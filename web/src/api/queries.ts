@@ -37,6 +37,7 @@ import type {
   QueryRequest,
   RemoveAsset,
   ScanRequest,
+  SetLicenseRequest,
   SourceId,
   SuggestionReview,
   TagEditRequest,
@@ -367,6 +368,28 @@ export function useEditTags() {
       qc.invalidateQueries({ queryKey: qk.assets });
       qc.invalidateQueries({ queryKey: ["asset"] });
       qc.invalidateQueries({ queryKey: qk.stats });
+    },
+  });
+}
+
+/** Patch the rights block over a selection (issue #106).
+ *
+ *  A dry run must never disturb the cache — it is a preview the user has not committed to. A real
+ *  edit changes `license_status`, which is a *filterable* column and a facet, so the browse pages,
+ *  the open asset detail, and the aggregate counts all have to be refetched: a "Restricted" smart
+ *  folder that still lists an asset you just cleared is exactly the silent-permissive failure the
+ *  rights model exists to prevent. */
+export function useSetLicense() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (req: SetLicenseRequest) => api.setLicense(req),
+    meta: { errorPrefix: "Couldn’t update licence" },
+    onSuccess: (_result, req) => {
+      if (req.dry_run) return;
+      qc.invalidateQueries({ queryKey: qk.assets });
+      qc.invalidateQueries({ queryKey: ["asset"] });
+      qc.invalidateQueries({ queryKey: qk.stats });
+      qc.invalidateQueries({ queryKey: qk.collections });
     },
   });
 }

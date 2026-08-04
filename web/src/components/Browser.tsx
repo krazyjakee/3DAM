@@ -13,6 +13,7 @@ import {
   Keyboard,
   Menu,
   Rows3,
+  ScrollText,
   Search,
   Sparkles,
   Star,
@@ -54,6 +55,7 @@ import { ContextMenu, useLongPress, type MenuState } from "./ContextMenu";
 import { ExportDialog, type ExportScope } from "./ExportDialog";
 import { ConvertDialog } from "./ConvertDialog";
 import { RetagDialog, type RetagScope } from "./RetagDialog";
+import { LicenseDialog, type LicenseScope } from "./LicenseDialog";
 import { AdvancedSearch } from "./AdvancedSearch";
 import { ActiveFilters } from "./ActiveFilters";
 import { Centered } from "@/lib/ui";
@@ -559,6 +561,7 @@ function SelectionBar({
   const [showExport, setShowExport] = useState(false);
   const [showConvert, setShowConvert] = useState(false);
   const [showRetag, setShowRetag] = useState(false);
+  const [showLicense, setShowLicense] = useState(false);
   // Federated selections are read-only references (tech-spec 07 §7.4): batch actions run against
   // the local subset, and disable when nothing selected is ours.
   const resultWide = selection.selected.kind === "results";
@@ -584,6 +587,8 @@ function SelectionBar({
       ? { collection: selection.selected.selector.collection }
       : { query: selection.selected.selector.query }
     : { assets: localIds };
+  // Same target resolution as retag — licence edits are the other bulk catalog write (issue #106).
+  const licenseScope: LicenseScope = retagScope;
 
   return (
     <div className="browser-selection-bar border-b border-border bg-surface px-3 py-1.5 text-xs">
@@ -630,6 +635,13 @@ function SelectionBar({
         >
           <Tags size={12} /> Retag
         </button>
+        <button
+          className="btn disabled:cursor-not-allowed disabled:opacity-40"
+          onClick={() => setShowLicense(true)}
+          {...gate({ disabled: !resultWide && peerOnly, title: peerOnly && !resultWide ? PEER_READONLY_SET : undefined })}
+        >
+          <ScrollText size={12} /> Licence
+        </button>
         {showConvert && (
           <ConvertDialog assets={locals} onClose={() => setShowConvert(false)} />
         )}
@@ -641,6 +653,13 @@ function SelectionBar({
             scope={retagScope}
             excludedPeers={peerCount}
             onClose={() => setShowRetag(false)}
+          />
+        )}
+        {showLicense && (
+          <LicenseDialog
+            scope={licenseScope}
+            excludedPeers={peerCount}
+            onClose={() => setShowLicense(false)}
           />
         )}
         <select

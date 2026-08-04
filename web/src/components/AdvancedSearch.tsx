@@ -6,8 +6,10 @@
 // sidebar facets and text search. Mirrors the Rust `FacetField` variants one-for-one — keep in sync.
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { SlidersHorizontal, X } from "lucide-react";
-import type { FacetField, Filter, MediaType } from "@/api/types";
+import { ShieldCheck, SlidersHorizontal, X } from "lucide-react";
+import type { FacetField, Filter, LicenseStatus, MediaType } from "@/api/types";
+import { licenseLabel } from "@/lib/format";
+import { USAGE_RIGHTS, type UsageRightOp } from "@/lib/license";
 import { useViewState } from "@/lib/view-state";
 
 /** One structured control. `enum`/`bool` emit a single equality filter; `range` emits a
@@ -324,6 +326,124 @@ function Labeled({ label, children }: { label: string; children: React.ReactNode
   );
 }
 
+const LICENSE_STATUSES: LicenseStatus[] = ["permissive", "attribution", "restricted", "unknown"];
+
+/** Licence + usage-right filters (issue #106). Media-independent, so they sit outside the per-media
+ *  catalog alongside the tag filter.
+ *
+ *  Two encodings meet here, and the asymmetry is deliberate rather than an oversight:
+ *
+ *  - **Licence status** is a column on the asset row and already has a first-class URL param (and a
+ *    sidebar facet). This control drives that param rather than pushing a second `license` filter
+ *    into `adv` — two `license` equalities would AND to nothing and show two chips for one idea.
+ *  - **Usage rights** are one filter per right, the right's name as the value and the *op* carrying
+ *    the direction (dam-store `helpers.rs`): `eq` → `rights_<name> = 1`, `ne` → `rights_<name> = 0`.
+ *    So they are independent three-state controls, not checkboxes and not a multi-select. A
+ *    two-state checkbox could only ever say "granted", which would conflate "known to be denied"
+ *    with "nobody has established it" — the same unknown-vs-no conflation the Inspector's rights
+ *    editor avoids, on the same columns. An unknown right matches neither direction, by design. */
+function RightsFilters({
+  license,
+  adv,
+  onPatch,
+}: {
+  license: string | null;
+  adv: Filter[];
+  /** One patch per interaction. The safe-to-ship shortcut moves both the licence param *and* `adv`,
+   *  and two sequential `patch` calls in one render would each build from the same stale
+   *  `URLSearchParams` — the second silently discarding the first. */
+  onPatch: (next: { license?: string | null; adv?: Filter[] }) => void;
+}) {
+  const rightValue = (f: Filter) =>
+    f.field === "usage_right" && "str" in f.value ? f.value.str : null;
+  /** The op currently asserted for each right, if any. */
+  const settled = new Map(
+    adv.flatMap((f) => {
+      const right = rightValue(f);
+      return right ? ([[right, f.op]] as [string, string][]) : [];
+    }),
+  );
+  const without = (list: Filter[], ...rights: string[]) =>
+    list.filter((f) => {
+      const right = rightValue(f);
+      return right === null || !rights.includes(right);
+    });
+  const rightFilter = (right: string, op: UsageRightOp): Filter => ({
+    field: "usage_right",
+    op,
+    value: { str: right },
+  });
+  const onLicense = (value: string | null) => onPatch({ license: value });
+  const setRight = (right: string, op: string) =>
+    onPatch({
+      adv: op
+        ? [...without(adv, right), rightFilter(right, op as UsageRightOp)]
+        : without(adv, right),
+    });
+  // The canonical safe-to-ship query (PRODUCT_SPEC §5), now stated literally rather than proxied
+  // through the derived `permissive` status. `permissive` was strictly stronger: it also demanded a
+  // named licence plus modify and redistribute, so an asset that genuinely allows commercial use
+  // with no attribution but forbids modification was being excluded from a query it satisfies.
+  // Any existing licence-status filter is cleared for that same reason — a leftover `permissive`
+  // would silently re-impose the constraint this shortcut exists to drop.
+  const safeToShip = () =>
+    onPatch({
+      license: null,
+      adv: [
+        ...without(adv, "commercial", "attribution"),
+        rightFilter("commercial", "eq"),
+        rightFilter("attribution", "ne"),
+      ],
+    });
+
+  return (
+    <div className="flex flex-col gap-1.5">
+      <span className="text-[11px] font-semibold text-fg">Licence &amp; rights</span>
+      <Labeled label="Licence">
+        <select
+          className="field w-full"
+          aria-label="Licence status"
+          value={license ?? ""}
+          onChange={(e) => onLicense(e.target.value || null)}
+        >
+          <option value="">Any</option>
+          {LICENSE_STATUSES.map((status) => (
+            <option key={status} value={status}>
+              {licenseLabel[status]}
+            </option>
+          ))}
+        </select>
+      </Labeled>
+      {USAGE_RIGHTS.map((right) => (
+        <Labeled key={right.key} label={right.label}>
+          <select
+            className="field w-full"
+            aria-label={right.label}
+            value={settled.get(right.key) ?? ""}
+            onChange={(e) => setRight(right.key, e.target.value)}
+          >
+            <option value="">Any</option>
+            <option value="eq">{right.granted}</option>
+            <option value="ne">{right.denied}</option>
+          </select>
+        </Labeled>
+      ))}
+      <button
+        type="button"
+        className="btn justify-center coarse:min-h-11"
+        title="Commercial use allowed and attribution known not to be required — replaces any licence-status filter"
+        onClick={safeToShip}
+      >
+        <ShieldCheck size={12} /> Safe to ship
+      </button>
+      <p className="text-[10px] text-fg-dim">
+        Each right has to be <em>settled</em> to match: an asset whose terms nobody has established
+        is excluded from both directions rather than assumed either way.
+      </p>
+    </div>
+  );
+}
+
 /** Free tag filter (multi): each accepted tag AND-s a `tag` equality onto the query. Tags power
  *  search now that they've left the sidebar; this is where you pin one as a hard filter. */
 function TagFilter({ adv, onChange }: { adv: Filter[]; onChange: (next: Filter[]) => void }) {
@@ -407,7 +527,10 @@ export function AdvancedSearch() {
   }, [close, open]);
 
   const controls = state.media ? CATALOG[state.media] : null;
-  const activeCount = adv.length;
+  // The licence status lives in its own URL param, not in `adv`, but it is edited from this panel —
+  // so it counts towards the badge and is cleared by "Clear advanced".
+  const activeCount = adv.length + (state.license ? 1 : 0);
+  const clearAll = () => patch({ adv: [], license: null, collection: null });
 
   return (
     <div
@@ -460,7 +583,7 @@ export function AdvancedSearch() {
               {activeCount > 0 && (
                 <button
                   className="text-[11px] text-fg-dim hover:text-accent"
-                  onClick={() => setAdv([])}
+                  onClick={clearAll}
                 >
                   Clear advanced
                 </button>
@@ -488,6 +611,13 @@ export function AdvancedSearch() {
               dimensions, triangle count, and more.
             </p>
           )}
+
+          <div className="my-2 border-t border-border" />
+          <RightsFilters
+            license={state.license}
+            adv={adv}
+            onPatch={(next) => patch({ ...next, collection: null })}
+          />
 
           <div className="my-2 border-t border-border" />
           <TagFilter adv={adv} onChange={setAdv} />

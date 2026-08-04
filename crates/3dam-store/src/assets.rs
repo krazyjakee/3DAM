@@ -201,6 +201,96 @@ impl Store {
         Ok(())
     }
 
+    // ── license / rights (issue #106) ──────────────────────────────────────
+
+    /// Apply a rights patch to each id, returning the post-write status of every row that actually
+    /// changed. Ids that do not exist are skipped rather than erroring — the caller has already
+    /// resolved visibility and a concurrent delete must not fail the batch.
+    ///
+    /// One immediate transaction for the whole batch: a bulk "stamp this holder over 500 assets"
+    /// either lands or does not, and a reader must never see half a selection re-licensed.
+    ///
+    /// Two columns are the store's to decide, never the caller's. `license_provenance` becomes
+    /// `'user'` on every row this touches (ADR 0009 §1 — a human edited it, which is exactly what
+    /// overrides an earlier `'declared'`/`'inherited'` value), and `license_status` is *derived*
+    /// from the post-patch id and rights by [`derive_license_status`] rather than supplied
+    /// (tech-spec 02 §5).
+    ///
+    /// Only genuinely changed rows come back. The caller turns each entry into a
+    /// `ChangeKind::LicenseSet` event and a `changed` count, so a patch that re-writes the values a
+    /// row already has must stay silent. "Changed" includes the provenance flip: an asset whose
+    /// terms were `'declared'` and are now user-asserted *is* a different record, and any client
+    /// showing the provenance needs the event.
+    pub fn set_license(
+        &self,
+        ids: &[AssetId],
+        patch: &LicenseInput,
+    ) -> Result<Vec<(AssetId, LicenseStatus)>, LibError> {
+        // Nothing to do, and nothing to lock: an empty selection or an all-absent patch must not
+        // take the write lock away from a scan just to discover it has no work.
+        if ids.is_empty() || patch.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut conn = self.write();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(internal)?;
+        let now = now_ms();
+        let mut changed = Vec::new();
+        {
+            let mut select = tx
+                .prepare(
+                    "SELECT license_id, rights_commercial, rights_modify, rights_redistribute,
+                            rights_attribution, attribution_holder, attribution_credit,
+                            license_url, license_status, license_provenance
+                     FROM asset WHERE id = ?1",
+                )
+                .map_err(internal)?;
+            let mut update = tx
+                .prepare(
+                    "UPDATE asset SET license_id = ?2, rights_commercial = ?3, rights_modify = ?4,
+                            rights_redistribute = ?5, rights_attribution = ?6,
+                            attribution_holder = ?7, attribution_credit = ?8, license_url = ?9,
+                            license_status = ?10, license_provenance = ?11, updated_at = ?12
+                     WHERE id = ?1",
+                )
+                .map_err(internal)?;
+            for id in ids {
+                let key = id.as_bytes().to_vec();
+                let before: Option<RightsRow> = select
+                    .query_row(params![key], RightsRow::from_row)
+                    .optional()
+                    .map_err(internal)?;
+                // Skipped, not an error: the selection was resolved before this transaction opened
+                // and another writer may legitimately have deleted the row in between.
+                let Some(before) = before else { continue };
+                let after = before.patched(patch);
+                if after == before {
+                    continue;
+                }
+                update
+                    .execute(params![
+                        key,
+                        after.id,
+                        after.commercial,
+                        after.modify,
+                        after.redistribute,
+                        after.attribution,
+                        after.holder,
+                        after.credit,
+                        after.url,
+                        after.status.as_str(),
+                        after.provenance,
+                        now,
+                    ])
+                    .map_err(internal)?;
+                changed.push((*id, after.status));
+            }
+        }
+        tx.commit().map_err(internal)?;
+        Ok(changed)
+    }
+
     // ── notes (issue #81) ──────────────────────────────────────────────────
 
     /// The asset's free-text note, or `None` if it has never had one (or it was cleared).
@@ -837,6 +927,135 @@ impl Store {
     }
 }
 
+/// The provenance stamped on any rights block a human edited (ADR 0009 §1's enum). Deliberately
+/// unconditional in [`Store::set_license`]: a manual correction is precisely what must beat a
+/// `'declared'` or `'inherited'` value the catalog derived on its own.
+const USER_PROVENANCE: &str = "user";
+
+/// One asset's rights block exactly as the `asset` columns hold it — the unit
+/// [`Store::set_license`] diffs, so "did this patch change anything?" is one `==` over the whole
+/// record rather than eight hand-written comparisons that a new column could silently fall out of.
+#[derive(Clone, PartialEq, Eq)]
+struct RightsRow {
+    id: Option<String>,
+    commercial: Option<bool>,
+    modify: Option<bool>,
+    redistribute: Option<bool>,
+    attribution: Option<bool>,
+    holder: Option<String>,
+    credit: Option<String>,
+    url: Option<String>,
+    status: LicenseStatus,
+    provenance: String,
+}
+
+impl RightsRow {
+    fn from_row(r: &rusqlite::Row) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: r.get(0)?,
+            commercial: r.get(1)?,
+            modify: r.get(2)?,
+            redistribute: r.get(3)?,
+            attribution: r.get(4)?,
+            holder: r.get(5)?,
+            credit: r.get(6)?,
+            url: r.get(7)?,
+            status: LicenseStatus::parse(&r.get::<_, String>(8)?),
+            provenance: r.get(9)?,
+        })
+    }
+
+    /// This row with the patch applied: the post-write values, including the two the store owns
+    /// ([`USER_PROVENANCE`] and the derived status).
+    fn patched(&self, p: &LicenseInput) -> Self {
+        let id = patch_text(&self.id, &p.id);
+        let commercial = patch_flag(self.commercial, &p.commercial);
+        let modify = patch_flag(self.modify, &p.modify);
+        let redistribute = patch_flag(self.redistribute, &p.redistribute);
+        let attribution = patch_flag(self.attribution, &p.attribution);
+        Self {
+            status: derive_license_status(
+                id.as_deref(),
+                commercial,
+                modify,
+                redistribute,
+                attribution,
+            ),
+            id,
+            commercial,
+            modify,
+            redistribute,
+            attribution,
+            holder: patch_text(&self.holder, &p.holder),
+            credit: patch_text(&self.credit, &p.credit),
+            url: patch_text(&self.url, &p.url),
+            provenance: USER_PROVENANCE.to_string(),
+        }
+    }
+}
+
+/// Apply one three-state text patch. A whitespace-only value is a **clear**, not a licence holder
+/// literally named `" "` — same rule [`Store::set_note`] uses for a blank note body, and it keeps
+/// `"" `/`null` from being two different flavours of "no holder" in the same column.
+fn patch_text(current: &Option<String>, p: &Patch<String>) -> Option<String> {
+    match p {
+        None => current.clone(),
+        Some(None) => None,
+        Some(Some(v)) => {
+            let t = v.trim();
+            (!t.is_empty()).then(|| t.to_string())
+        }
+    }
+}
+
+/// Apply one three-state tri-state-flag patch: absent keeps, `null` returns the right to "unknown".
+fn patch_flag(current: Option<bool>, p: &Patch<bool>) -> Option<bool> {
+    match p {
+        None => current,
+        Some(v) => *v,
+    }
+}
+
+/// The single definition of `license_status`, derived from the **post-patch** id and rights
+/// (tech-spec 02 §5: derived at write time; ADR 0009 §1: set only when a licence is actually known).
+///
+/// The order of the arms is the point. `permissive` is unreachable unless a licence is *named* and
+/// all four rights are *explicitly* known, so PRODUCT_SPEC §5 / DESIGN_GUIDELINES §3.1's "unknown is
+/// never silently permissive" holds structurally rather than by everyone remembering it:
+///
+/// - no `license_id` → `unknown`. Rights with nothing to attribute them to are an opinion.
+/// - any right still NULL → `unknown`. We know the licence's *name*, not its *terms*; a green badge
+///   here would tell an artist the asset is cleared when nobody has established that it is.
+/// - any of commercial/modify/redistribute denied → `restricted`.
+/// - attribution required → `attribution`.
+/// - otherwise → `permissive`.
+///
+/// Note `rights_attribution` alone never makes a licence `restricted`: crediting the author is a
+/// condition of use, not a withheld permission, which is why it has its own badge.
+fn derive_license_status(
+    id: Option<&str>,
+    commercial: Option<bool>,
+    modify: Option<bool>,
+    redistribute: Option<bool>,
+    attribution: Option<bool>,
+) -> LicenseStatus {
+    if id.is_none() {
+        return LicenseStatus::Unknown;
+    }
+    let (Some(commercial), Some(modify), Some(redistribute), Some(attribution)) =
+        (commercial, modify, redistribute, attribution)
+    else {
+        return LicenseStatus::Unknown;
+    };
+    if !commercial || !modify || !redistribute {
+        LicenseStatus::Restricted
+    } else if attribution {
+        LicenseStatus::Attribution
+    } else {
+        LicenseStatus::Permissive
+    }
+}
+
 /// Row → [`Comment`] for the shared column order the queries above use. `display` is always `None`
 /// here: resolving an account id to a name means reading `server.db`, which this crate cannot see.
 fn row_to_comment(r: &rusqlite::Row) -> rusqlite::Result<Comment> {
@@ -862,6 +1081,7 @@ fn row_to_comment(r: &rusqlite::Row) -> rusqlite::Result<Comment> {
 mod tests {
     use super::*;
     use dam_sources::SourceConnection;
+    use LicenseStatus::{Attribution, Permissive, Restricted, Unknown};
 
     fn scanned(src: SourceId, path: &str, media: MediaType, hash: u8) -> NewAsset {
         NewAsset {
@@ -926,6 +1146,379 @@ mod tests {
             .upsert_asset(&scanned(src, "docs/spec.md", MediaType::Document, 2))
             .unwrap();
         assert_eq!(due(), 1, "an edited file must be re-analysed");
+    }
+
+    // ── license editing (issue #106) ───────────────────────────────────────
+
+    fn text(v: &str) -> Patch<String> {
+        Some(Some(v.to_string()))
+    }
+
+    fn flag(v: bool) -> Patch<bool> {
+        Some(Some(v))
+    }
+
+    /// A patch that names a licence and grants every right unconditionally — the shape that must
+    /// come out `permissive`, and the one that must *not* when the id is missing.
+    fn fully_permissive() -> LicenseInput {
+        LicenseInput {
+            id: text("MIT"),
+            commercial: flag(true),
+            modify: flag(true),
+            redistribute: flag(true),
+            attribution: flag(false),
+            ..Default::default()
+        }
+    }
+
+    fn licensed_asset() -> (Store, AssetId) {
+        let (store, src) = store_and_source();
+        let (id, _) = store
+            .upsert_asset(&scanned(src, "kit/brick.png", MediaType::Image, 1))
+            .unwrap();
+        (store, id)
+    }
+
+    /// The derivation table itself (tech-spec 02 §5). Kept as a direct test of the function because
+    /// every arm below is a badge an artist will make a licensing decision on.
+    #[test]
+    fn license_status_follows_the_id_and_the_four_rights() {
+        let d = derive_license_status;
+        let all = (Some(true), Some(true), Some(true));
+        // No id: the rights are an unattributed opinion, whatever they say.
+        assert_eq!(d(None, all.0, all.1, all.2, Some(false)), Unknown);
+        // Named licence, all rights granted, no credit required.
+        assert_eq!(d(Some("MIT"), all.0, all.1, all.2, Some(false)), Permissive);
+        // Same, but the licence wants a credit line.
+        assert_eq!(
+            d(Some("CC-BY-4.0"), all.0, all.1, all.2, Some(true)),
+            Attribution
+        );
+        // Any withheld permission wins over attribution.
+        for denied in 0..3 {
+            let mut rights = [Some(true), Some(true), Some(true)];
+            rights[denied] = Some(false);
+            assert_eq!(
+                d(
+                    Some("CC-BY-NC"),
+                    rights[0],
+                    rights[1],
+                    rights[2],
+                    Some(true)
+                ),
+                Restricted,
+                "right {denied} denied must read restricted"
+            );
+        }
+        // A named licence whose terms nobody has established is still unknown — one NULL is enough.
+        for missing in 0..4 {
+            let mut rights = [Some(true), Some(true), Some(true), Some(false)];
+            rights[missing] = None;
+            assert_eq!(
+                d(Some("Custom"), rights[0], rights[1], rights[2], rights[3]),
+                Unknown,
+                "right {missing} unknown must read unknown"
+            );
+        }
+    }
+
+    /// PRODUCT_SPEC §5 / DESIGN_GUIDELINES §3.1: "unknown is never silently permissive". Asserted
+    /// end-to-end rather than only on the pure function, because the property is only worth
+    /// anything if the *write path* can't be talked into a green badge either.
+    #[test]
+    fn rights_without_a_named_license_can_never_read_permissive() {
+        let (store, id) = licensed_asset();
+        let mut patch = fully_permissive();
+        patch.id = None; // "grant everything, name nothing"
+        let changed = store.set_license(&[id], &patch).unwrap();
+        assert_eq!(changed, vec![(id, Unknown)]);
+        assert_eq!(store.get_asset(&id).unwrap().license.status, Unknown);
+
+        // Naming the licence — and changing nothing else — is what earns the badge.
+        let changed = store
+            .set_license(
+                &[id],
+                &LicenseInput {
+                    id: text("MIT"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(changed, vec![(id, Permissive)]);
+
+        // And clearing the id takes it straight back, rights untouched.
+        let changed = store
+            .set_license(
+                &[id],
+                &LicenseInput {
+                    id: Some(None),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(changed, vec![(id, Unknown)]);
+        let after = store.get_asset(&id).unwrap().license;
+        assert_eq!(after.id, None);
+        assert_eq!(
+            after.commercial,
+            Some(true),
+            "clearing the id keeps the rights"
+        );
+    }
+
+    /// The three states of every field: absent leaves the column alone, `null` clears it, a value
+    /// sets it. Absence has to be genuinely inert — a bulk "stamp this holder" must not wipe the
+    /// licence ids of the assets it touches.
+    #[test]
+    fn a_patch_keeps_clears_and_sets_field_by_field() {
+        let (store, id) = licensed_asset();
+        store
+            .set_license(
+                &[id],
+                &LicenseInput {
+                    holder: text("  Studio Nine  "),
+                    credit: text("Art by Studio Nine"),
+                    url: text("https://example.invalid/eula"),
+                    ..fully_permissive()
+                },
+            )
+            .unwrap();
+        let before = store.get_asset(&id).unwrap().license;
+        assert_eq!(
+            before.holder.as_deref(),
+            Some("Studio Nine"),
+            "text is trimmed"
+        );
+        assert_eq!(before.status, Permissive);
+
+        // Absent everywhere except one field: nothing else may move.
+        let changed = store
+            .set_license(
+                &[id],
+                &LicenseInput {
+                    credit: text("Art by S9"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(changed, vec![(id, Permissive)]);
+        let after = store.get_asset(&id).unwrap().license;
+        assert_eq!(after.credit.as_deref(), Some("Art by S9"));
+        assert_eq!(after.id.as_deref(), Some("MIT"));
+        assert_eq!(after.holder.as_deref(), Some("Studio Nine"));
+        assert_eq!(after.commercial, Some(true));
+
+        // `null` clears; a whitespace-only string is the same clear, not a blank holder.
+        let changed = store
+            .set_license(
+                &[id],
+                &LicenseInput {
+                    holder: text("   "),
+                    url: Some(None),
+                    attribution: Some(None),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            changed,
+            vec![(id, Unknown)],
+            "an unknown right drops a named licence back to unknown"
+        );
+        let after = store.get_asset(&id).unwrap().license;
+        assert_eq!(after.holder, None);
+        assert_eq!(after.url, None);
+        assert_eq!(after.attribution, None);
+        assert_eq!(
+            after.id.as_deref(),
+            Some("MIT"),
+            "untouched columns survive a clear"
+        );
+    }
+
+    /// ADR 0009 §1: `'user'` means a human edited this, and a manual correction is exactly what has
+    /// to beat a value the catalog inherited or the source declared.
+    #[test]
+    fn a_manual_edit_overrides_inherited_provenance() {
+        let (store, id) = licensed_asset();
+        // Stand in for the pack-level inheritance the scan will eventually write.
+        store
+            .write()
+            .execute(
+                "UPDATE asset SET license_id = 'CC-BY-4.0', license_provenance = 'inherited'
+                 WHERE id = ?1",
+                params![id.as_bytes().to_vec()],
+            )
+            .unwrap();
+        assert_eq!(
+            store.get_asset(&id).unwrap().license.provenance,
+            "inherited"
+        );
+
+        store
+            .set_license(
+                &[id],
+                &LicenseInput {
+                    id: text("MIT"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let after = store.get_asset(&id).unwrap().license;
+        assert_eq!(after.id.as_deref(), Some("MIT"));
+        assert_eq!(after.provenance, "user");
+    }
+
+    /// The returned rows become `LicenseSet` events and a `changed` count, so re-writing values a
+    /// row already has must stay silent. An empty selection or an all-absent patch is a no-op that
+    /// never even opens a transaction.
+    #[test]
+    fn only_rows_that_actually_changed_are_reported() {
+        let (store, id) = licensed_asset();
+        let patch = fully_permissive();
+        assert_eq!(
+            store.set_license(&[id], &patch).unwrap(),
+            vec![(id, Permissive)]
+        );
+        // Byte-identical second application: same values, and the provenance is already `'user'`.
+        assert!(store.set_license(&[id], &patch).unwrap().is_empty());
+        assert!(store.set_license(&[], &patch).unwrap().is_empty());
+        assert!(store
+            .set_license(&[id], &LicenseInput::default())
+            .unwrap()
+            .is_empty());
+
+        // A missing id is skipped, not an error — the selection was resolved before the write and a
+        // concurrent delete must not sink the rest of the batch.
+        let ghost = AssetId::new();
+        let changed = store
+            .set_license(
+                &[ghost, id, ghost],
+                &LicenseInput {
+                    holder: text("Studio Nine"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(changed, vec![(id, Permissive)]);
+    }
+
+    /// A rights edit has to land where the reader looks. `FacetField::UsageRight` filters on
+    /// `rights_commercial = 1` on the asset row, so this is the end-to-end proof the write path
+    /// reaches the browse path.
+    #[test]
+    fn a_granted_right_becomes_findable_through_the_usage_right_filter() {
+        let (store, src) = store_and_source();
+        let (cleared, _) = store
+            .upsert_asset(&scanned(src, "kit/ok.png", MediaType::Image, 1))
+            .unwrap();
+        let (_unknown, _) = store
+            .upsert_asset(&scanned(src, "kit/dunno.png", MediaType::Image, 2))
+            .unwrap();
+        let req = QueryRequest {
+            filters: vec![Filter {
+                field: FacetField::UsageRight,
+                op: FilterOp::Eq,
+                value: FilterValue::Str("commercial".into()),
+            }],
+            ..Default::default()
+        };
+        let hits = |store: &Store| {
+            store
+                .query_assets_semantic(&req, None, &Visibility::Full)
+                .unwrap()
+                .items
+        };
+        assert!(
+            hits(&store).is_empty(),
+            "nothing is commercially cleared yet"
+        );
+
+        store
+            .set_license(
+                &[cleared],
+                &LicenseInput {
+                    commercial: flag(true),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let found = hits(&store);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, cleared);
+
+        // Withdrawing the grant removes it again — `0` is not `1`, and NULL is not `1` either.
+        store
+            .set_license(
+                &[cleared],
+                &LicenseInput {
+                    commercial: flag(false),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(hits(&store).is_empty());
+    }
+
+    /// The "commercial use allowed and no attribution required" query (PRODUCT_SPEC §5) needs a
+    /// right asserted *false*, which `FilterOp::Eq` cannot express. `Ne` compiles to `= 0` rather
+    /// than `<> 1`, so an asset whose attribution terms nobody has established stays out of a
+    /// result set the user reads as cleared to ship.
+    #[test]
+    fn a_denied_right_is_expressible_and_never_matched_by_an_unknown_one() {
+        let (store, src) = store_and_source();
+        let (free, _) = store
+            .upsert_asset(&scanned(src, "kit/free.png", MediaType::Image, 1))
+            .unwrap();
+        let (credit, _) = store
+            .upsert_asset(&scanned(src, "kit/credit.png", MediaType::Image, 2))
+            .unwrap();
+        // Never patched: its attribution term stays NULL, i.e. nobody has established it.
+        let (_silent, _) = store
+            .upsert_asset(&scanned(src, "kit/silent.png", MediaType::Image, 3))
+            .unwrap();
+        store
+            .set_license(
+                &[free],
+                &LicenseInput {
+                    attribution: flag(false),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store
+            .set_license(
+                &[credit],
+                &LicenseInput {
+                    attribution: flag(true),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let matching = |op: FilterOp| {
+            let req = QueryRequest {
+                filters: vec![Filter {
+                    field: FacetField::UsageRight,
+                    op,
+                    value: FilterValue::Str("attribution".into()),
+                }],
+                ..Default::default()
+            };
+            store
+                .query_assets_semantic(&req, None, &Visibility::Full)
+                .unwrap()
+                .items
+                .into_iter()
+                .map(|a| a.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(matching(FilterOp::Eq), vec![credit], "attribution required");
+        assert_eq!(
+            matching(FilterOp::Ne),
+            vec![free],
+            "attribution known not to be required — `silent` is unknown, not free"
+        );
     }
 
     /// A media-type flip (the content probe finding an audio-only `.mp4`, or ffprobe appearing

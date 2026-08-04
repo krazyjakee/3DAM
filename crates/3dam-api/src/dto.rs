@@ -261,6 +261,136 @@ pub struct License {
     pub provenance: String,
 }
 
+/// Three-state field for a license patch: absent leaves the column alone, `null` clears it back to
+/// unknown, and a value sets it.
+///
+/// Two states are not enough. A bulk edit like "stamp this holder across 500 assets without
+/// touching their license ids" is inexpressible if absence means clear, and "I was wrong, this
+/// isn't actually CC-BY" is inexpressible if absence means keep.
+pub type Patch<T> = Option<Option<T>>;
+
+/// Deserialize a present-but-possibly-null field into `Some(_)`; `#[serde(default)]` supplies the
+/// `None` that means "key absent".
+fn patch<'de, D, T>(de: D) -> Result<Patch<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(de).map(Some)
+}
+
+/// A patch over one asset's rights block (issue #106).
+///
+/// `status` is deliberately not a field. Tech-spec 02 §5 derives `license_status` from the id and
+/// rights at write time, and ADR 0009 §1 sets it **only** when a license is actually known. If a
+/// client could send it, "permissive" would be assertable without naming a license — precisely the
+/// silent-permissive failure the rights model exists to prevent.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct LicenseInput {
+    /// SPDX id, or the `Proprietary` / `Custom` sentinels (ADR 0009 §1).
+    #[serde(
+        default,
+        deserialize_with = "patch",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub id: Patch<String>,
+    #[serde(
+        default,
+        deserialize_with = "patch",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub commercial: Patch<bool>,
+    #[serde(
+        default,
+        deserialize_with = "patch",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub modify: Patch<bool>,
+    #[serde(
+        default,
+        deserialize_with = "patch",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub redistribute: Patch<bool>,
+    /// `true` means attribution is *required*.
+    #[serde(
+        default,
+        deserialize_with = "patch",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub attribution: Patch<bool>,
+    #[serde(
+        default,
+        deserialize_with = "patch",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub holder: Patch<String>,
+    #[serde(
+        default,
+        deserialize_with = "patch",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub credit: Patch<String>,
+    #[serde(
+        default,
+        deserialize_with = "patch",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub url: Patch<String>,
+}
+
+impl LicenseInput {
+    /// Whether the patch would touch any column at all — an all-absent patch is a no-op that
+    /// should still report its selection rather than being rejected.
+    pub fn is_empty(&self) -> bool {
+        self.id.is_none()
+            && self.commercial.is_none()
+            && self.modify.is_none()
+            && self.redistribute.is_none()
+            && self.attribution.is_none()
+            && self.holder.is_none()
+            && self.credit.is_none()
+            && self.url.is_none()
+    }
+}
+
+/// Apply a rights patch over one explicit or server-resolved selection (issue #106).
+/// Explicit ids take precedence, followed by collection, then query — matching `TagEditRequest`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SetLicenseRequest {
+    #[serde(default)]
+    pub assets: Vec<AssetId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collection: Option<CollectionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<QueryRequest>,
+    pub license: LicenseInput,
+    /// Calculate the same authorized effect without changing the catalog.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// Summary-shaped bulk result: bounded warnings rather than one response row per target.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct LicenseEditResult {
+    pub matched: u64,
+    pub changed: u64,
+    /// Post-edit status mix over the changed assets, so a caller can show "42 now permissive,
+    /// 3 still unknown" without a follow-up query.
+    #[serde(default)]
+    pub status: Vec<LicenseStatusCount>,
+    #[serde(default)]
+    pub warnings: Vec<crate::ItemWarning>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LicenseStatusCount {
+    pub status: LicenseStatus,
+    pub count: u64,
+}
+
+pub const LICENSE_EDIT_EXPLICIT_MAX: usize = 1_000;
+
 // ── asset shapes ───────────────────────────────────────────────────────────
 
 /// Grid/table row — cheap, no heavy blobs (tech-spec 03 §4).
