@@ -310,9 +310,14 @@ async fn managed_convert_dry_run_is_labelled_as_a_plan_and_has_no_download() {
         encoded["result"]["report"]["output_dir"],
         "No output (dry run)"
     );
-    assert!(!encoded["result_artifacts"]
+    // `result_artifacts` is `skip_serializing_if = "Vec::is_empty"`, so a dry run omits the key
+    // entirely rather than encoding `[]`. Absence is exactly the property under test — treat it as
+    // the empty list instead of unwrapping a field the encoder is entitled not to write.
+    let artifacts = encoded["result_artifacts"]
         .as_array()
-        .unwrap()
+        .cloned()
+        .unwrap_or_default();
+    assert!(!artifacts
         .iter()
         .any(|artifact| artifact["route"] == format!("/api/v1/jobs/{id}/artifact")));
     let (status, _, _) = request(
