@@ -115,7 +115,11 @@ Server tests exercise the axum router in-process via `ServiceExt::oneshot` (no s
 ### `xtask` (dev automation)
 
 ```bash
-cargo xtask ci          # web + dependency/format + full feature matrix + tests (canonical pre-push gate)
+cargo xtask ci          # web + dependency/format + full feature matrix + tests (canonical pre-push gate).
+                        # The feature matrix is Clippy-only, so `ci` also *runs* dam-store's `ann`
+                        # tests — it swaps HNSW in for the cosine scan behind an unchanged API,
+                        # which linting cannot vouch for. Other off-by-default features are left
+                        # lint-only on purpose: their tests would need Assimp or a live SFTP/SMB host.
 cargo xtask web         # build React → web/dist/; skips if pnpm is absent, otherwise requires wasm-pack
 cargo xtask wasm        # wasm-pack build dam-viewer → web/src/wasm/; missing wasm-pack is an error
 cargo xtask packaging   # render shell completions + man pages → packaging/ by *running* the

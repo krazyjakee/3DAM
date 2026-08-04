@@ -18,6 +18,7 @@ fn main() -> ExitCode {
                 && run("cargo", &["fmt", "--all", "--check"])
                 && feature_matrix(None)
                 && run("cargo", &["test", "--workspace"])
+                && feature_tests()
         }
         // Strict Clippy coverage for every supported Cargo/target profile. Passing one of the
         // documented profile names runs only that group; no name runs the complete matrix.
@@ -52,6 +53,23 @@ fn main() -> ExitCode {
 struct FeatureProfile {
     name: &'static str,
     commands: &'static [&'static [&'static str]],
+}
+
+/// Non-default features whose behaviour is *executed*, not merely linted.
+///
+/// `feature_matrix` is Clippy-only and `cargo test --workspace` builds default features, so between
+/// them nothing ever ran an off-by-default feature's tests. `dam-store`'s `ann` feature swaps the
+/// exhaustive cosine scan for an HNSW index in `similar` / `nearest_in_space` (`analysis.rs:1081`,
+/// `:1220`, `:1257`, `:1285`) — a different algorithm behind the same API, which is exactly the kind
+/// of substitution a type check cannot vouch for. Its own tests in `src/ann.rs` were dead code here.
+///
+/// Deliberately only `ann`: it pulls one pure-Rust crate (`instant-distance`). The other
+/// off-by-default features need external toolchains (Assimp for `render`/`model-convert`, live
+/// servers for `sftp`/`smb`), so running their tests would make this gate depend on the host.
+const FEATURE_TESTS: &[&[&str]] = &[&["test", "-p", "dam-store", "--features", "ann", "--locked"]];
+
+fn feature_tests() -> bool {
+    FEATURE_TESTS.iter().all(|args| run("cargo", args))
 }
 
 /// The supported compile profiles, kept here so hosted CI and the local pre-push gate execute the
