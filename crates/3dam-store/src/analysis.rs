@@ -181,7 +181,7 @@ impl Store {
         force: bool,
         ids: &[AssetId],
     ) -> Result<AnalysisPlanSummary, LibError> {
-        let conn = self.write();
+        let conn = self.read()?;
         let (where_sql, binds) = plan_where(
             PlanKind::Analysis {
                 current_version,
@@ -298,7 +298,7 @@ impl Store {
         limit: usize,
     ) -> Result<AnalysisPlanBatch, LibError> {
         let limit = limit.clamp(1, ANALYSIS_PLAN_BATCH_MAX);
-        let conn = self.write();
+        let conn = self.read()?;
         let (mut where_sql, mut binds) = plan_where(kind, ids);
         if let Some(cursor) = after {
             push_plan_cursor(&mut where_sql, &mut binds, kind, cursor, false);
@@ -725,7 +725,7 @@ impl Store {
         if ids.is_empty() {
             return Ok(std::collections::HashSet::new());
         }
-        let conn = self.write();
+        let conn = self.read()?;
         let mut where_sql = String::from(" WHERE 1=1");
         let mut binds = Vec::new();
         push_visibility(vis, "asset", &mut where_sql, &mut binds);
@@ -750,7 +750,7 @@ impl Store {
         limit: u32,
         vis: &Visibility,
     ) -> Result<Vec<TagInfo>, LibError> {
-        let conn = self.write();
+        let conn = self.read()?;
         // Whole-source grants can be answered exactly by the maintained source×tag rows. Manual
         // collection grants remain on the visibility-join path below because a collection may
         // overlap a source grant and the union must count an asset once.
@@ -937,7 +937,7 @@ impl Store {
         filters: &[Filter],
         vis: &Visibility,
     ) -> Result<(String, Vec<(AssetSummary, f32)>), LibError> {
-        let conn = self.write();
+        let conn = self.read()?;
         // Query vector + its space.
         let query: Option<(String, Vec<u8>)> = conn
             .query_row(
@@ -956,7 +956,9 @@ impl Store {
 
         // Nearest neighbours in the space, descending cosine. The `ann` feature (M6) serves this from
         // a cached HNSW index; the default build does the exact brute-force scan (correct and the
-        // ground truth the ANN parity test checks against).
+        // ground truth the ANN parity test checks against). Both currently run under the read guard:
+        // a cold `ann_for_space` builds the whole HNSW while a WAL snapshot is pinned, which is the
+        // CPU hand-off issue #137 leaves for a later step (it at least no longer blocks the writer).
         #[cfg(feature = "ann")]
         let scored: Vec<(AssetId, f32)> =
             self.ann_scored(&conn, &space_id, &qvec, id, overfetch)?;
@@ -1004,7 +1006,7 @@ impl Store {
     /// The stored embedding for one asset — `(space_id, vector)`, or `None` when not yet analysed.
     /// The federated fan-out ships this vector to matched-space peers (phase 6, issue #40).
     pub fn embedding_for(&self, id: &AssetId) -> Result<Option<(String, Vec<f32>)>, LibError> {
-        let conn = self.write();
+        let conn = self.read()?;
         let row: Option<(String, Vec<u8>)> = conn
             .query_row(
                 "SELECT space_id, vec FROM embedding WHERE asset_id = ?1",
@@ -1029,7 +1031,7 @@ impl Store {
         filters: &[Filter],
         vis: &Visibility,
     ) -> Result<Vec<(AssetSummary, f32)>, LibError> {
-        let conn = self.write();
+        let conn = self.read()?;
         let dim: Option<i64> = conn
             .query_row(
                 "SELECT LENGTH(vec) / 4 FROM embedding WHERE space_id = ?1 LIMIT 1",
@@ -1174,7 +1176,6 @@ impl Store {
         req: &DupRequest,
         vis: &Visibility,
     ) -> Result<Page<DupGroup>, LibError> {
-        let conn = self.write();
         let mut groups: Vec<DupGroup> = Vec::new();
         let limit = req.limit.clamp(1, DUP_GROUP_PAGE_MAX) as usize;
         let has_more;
@@ -1183,6 +1184,7 @@ impl Store {
 
         match req.kind {
             DupKind::Exact => {
+                let conn = self.read()?;
                 let after = decode_exact_dup_cursor(req.after.as_ref())?;
                 let mut where_sql = String::from(" WHERE content_hash IS NOT NULL");
                 let mut binds: Vec<Value> = Vec::new();
@@ -1315,26 +1317,33 @@ impl Store {
                 sql.push_str(&where_sql);
                 sql.push_str(" ORDER BY e.media_type, e.space_id, e.asset_id LIMIT ?");
                 binds.push(Value::Integer((NEAR_DUP_CANDIDATE_MAX + 1) as i64));
-                let mut stmt = conn.prepare(&sql).map_err(internal)?;
-                let rows = stmt
-                    .query_map(rusqlite::params_from_iter(binds.iter()), |r| {
-                        Ok((
-                            r.get::<_, Vec<u8>>(0)?,
-                            r.get::<_, String>(1)?,
-                            r.get::<_, String>(2)?,
-                            r.get::<_, Vec<u8>>(3)?,
-                        ))
-                    })
-                    .map_err(internal)?;
+                // Scoped: the pairwise union-find below is CPU work over up to
+                // `NEAR_DUP_CANDIDATE_MAX` vectors, and a read guard pins a WAL snapshot for as long
+                // as it lives. The candidates are owned by then, so the connection goes back to the
+                // pool first and a second guard hydrates the surviving members.
                 let mut candidates = Vec::new();
-                for r in rows {
-                    let (id_blob, space, media, vbytes) = r.map_err(internal)?;
-                    candidates.push((
-                        blob_to_asset_id(&id_blob),
-                        space,
-                        media,
-                        bytes_to_f32(&vbytes),
-                    ));
+                {
+                    let conn = self.read()?;
+                    let mut stmt = conn.prepare(&sql).map_err(internal)?;
+                    let rows = stmt
+                        .query_map(rusqlite::params_from_iter(binds.iter()), |r| {
+                            Ok((
+                                r.get::<_, Vec<u8>>(0)?,
+                                r.get::<_, String>(1)?,
+                                r.get::<_, String>(2)?,
+                                r.get::<_, Vec<u8>>(3)?,
+                            ))
+                        })
+                        .map_err(internal)?;
+                    for r in rows {
+                        let (id_blob, space, media, vbytes) = r.map_err(internal)?;
+                        candidates.push((
+                            blob_to_asset_id(&id_blob),
+                            space,
+                            media,
+                            bytes_to_f32(&vbytes),
+                        ));
+                    }
                 }
                 if candidates.len() > NEAR_DUP_CANDIDATE_MAX {
                     candidates.truncate(NEAR_DUP_CANDIDATE_MAX);
@@ -1354,6 +1363,7 @@ impl Store {
                     .iter()
                     .flat_map(|(_, _, ids)| ids.iter().take(DUP_GROUP_MEMBER_MAX).copied())
                     .collect();
+                let conn = self.read()?;
                 let member_details = Self::duplicate_members_for_ids(&conn, &all_ids, vis)?;
                 let mut consumed = 0usize;
                 for (_media, space, ids) in remaining {
@@ -1522,7 +1532,7 @@ impl Store {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let conn = self.write();
+        let conn = self.read()?;
         let requested_ph = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let mut requested_where =
             format!(" WHERE asset.content_hash IS NOT NULL AND asset.id IN ({requested_ph})");
@@ -1570,7 +1580,7 @@ impl Store {
             return Ok(None);
         };
         let hash = decode_hash_hex(&membership.group)?;
-        let conn = self.write();
+        let conn = self.read()?;
         let mut where_sql = String::from(" WHERE asset.content_hash = ?");
         let mut binds = vec![Value::Blob(hash)];
         push_visibility(vis, "asset", &mut where_sql, &mut binds);
@@ -1627,7 +1637,7 @@ impl Store {
         let hash = decode_hash_hex(&req.group)?;
         let after = decode_dup_member_cursor(req.after.as_ref())?;
         let limit = req.limit.clamp(1, DUP_GROUP_PAGE_MAX) as usize;
-        let conn = self.write();
+        let conn = self.read()?;
         let mut where_sql = String::from(" WHERE asset.content_hash = ?");
         let mut binds = vec![Value::Blob(hash)];
         push_visibility(vis, "asset", &mut where_sql, &mut binds);
@@ -2168,7 +2178,7 @@ mod tests {
     }
 
     fn first_asset(store: &Store) -> AssetId {
-        let conn = store.write();
+        let conn = store.read().unwrap();
         conn.query_row("SELECT id FROM asset LIMIT 1", [], |row| {
             Ok(blob_to_asset_id(&row.get::<_, Vec<u8>>(0)?))
         })
@@ -2225,7 +2235,7 @@ mod tests {
             (1, 1, 0)
         );
         let tags = {
-            let conn = store.write();
+            let conn = store.read().unwrap();
             Store::load_tags(&conn, id.as_bytes())
         };
         assert_eq!(
@@ -2252,7 +2262,7 @@ mod tests {
             .result;
         assert_eq!((removed.changed, removed.removals), (1, 1));
         let tags = {
-            let conn = store.write();
+            let conn = store.read().unwrap();
             Store::load_tags(&conn, id.as_bytes())
         };
         assert_eq!(tags.len(), 1);
@@ -2281,7 +2291,7 @@ mod tests {
             .edit_manual_tags(&[id], &["convert-me".into()], &[], false)
             .unwrap();
         let tags = {
-            let conn = store.write();
+            let conn = store.read().unwrap();
             Store::load_tags(&conn, id.as_bytes())
         };
         assert_eq!(tags[0].source, "user");
@@ -2311,7 +2321,7 @@ mod tests {
             .suggest_tag(&id, "texture", 0.95, "image@2", "v2 visual classifier")
             .unwrap();
         let decided = {
-            let conn = store.write();
+            let conn = store.read().unwrap();
             Store::load_tags(&conn, id.as_bytes()).remove(0)
         };
         assert_eq!(decided.state, SuggestionState::Confirmed);
@@ -2325,7 +2335,7 @@ mod tests {
             .suggest_tag(&id, "texture", 0.95, "image@2", "v2 visual classifier")
             .unwrap();
         let reopened = {
-            let conn = store.write();
+            let conn = store.read().unwrap();
             Store::load_tags(&conn, id.as_bytes()).remove(0)
         };
         assert_eq!(reopened.state, SuggestionState::Pending);
@@ -2707,7 +2717,7 @@ mod tests {
     fn duplicate_group_hydration_has_a_hard_member_cap() {
         let store = duplicate_store(1, DUP_GROUP_MEMBER_MAX + 7);
         let id = {
-            let conn = store.write();
+            let conn = store.read().unwrap();
             conn.query_row("SELECT id FROM asset LIMIT 1", [], |row| {
                 Ok(blob_to_asset_id(&row.get::<_, Vec<u8>>(0)?))
             })
@@ -2740,7 +2750,7 @@ mod tests {
             cursor = page.cursor;
         }
         let expected: Vec<AssetId> = {
-            let conn = store.write();
+            let conn = store.read().unwrap();
             let mut stmt = conn
                 .prepare(
                     "SELECT id FROM asset
@@ -2870,7 +2880,7 @@ mod tests {
         );
 
         let query_plans = {
-            let conn = store.write();
+            let conn = store.read().unwrap();
             [
                 "EXPLAIN QUERY PLAN SELECT a.id FROM asset a INDEXED BY idx_asset_derivative_pending JOIN source s ON s.id=a.source_id
                  WHERE s.kind <> 'federated' AND a.derivative_version < 1

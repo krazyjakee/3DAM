@@ -60,7 +60,7 @@ impl Store {
             SortField::Scanned => (format!("scanned_at {dir}, asset.id {dir}"), ", scanned_at"),
         };
 
-        let conn = self.write();
+        let conn = self.read()?;
 
         // The first page establishes an exact selection count. Infinite-scroll continuations omit
         // it unless explicitly requested, avoiding the old full filtered recount on every page.
@@ -235,7 +235,7 @@ impl Store {
         const SEM_SEEDS: usize = 24; // top lexical hits that seed the embedding expansion
         const SEM_CAP: usize = 400; // neighbours kept from the expansion
 
-        let conn = self.write();
+        let conn = self.read()?;
 
         // 1. Lexical candidates, best-first by bm25 (the M1 ranking), bounded.
         let text = req
@@ -459,7 +459,7 @@ impl Store {
         vis: &Visibility,
     ) -> Result<Vec<AssetId>, LibError> {
         let (where_sql, binds) = build_where(req, &self.synonyms, vis)?;
-        let conn = self.write();
+        let conn = self.read()?;
         let sql =
             format!("SELECT asset.id FROM asset {ATTR_JOINS} {where_sql} ORDER BY filename ASC, asset.id ASC");
         let mut stmt = conn.prepare(&sql).map_err(internal)?;
@@ -473,7 +473,7 @@ impl Store {
 
     /// All member ids of a collection (unbounded), newest-added first.
     pub fn collection_member_ids(&self, id: &CollectionId) -> Result<Vec<AssetId>, LibError> {
-        let conn = self.write();
+        let conn = self.read()?;
         let mut stmt = conn
             .prepare(
                 "SELECT asset_id FROM collection_member WHERE collection_id = ?1 ORDER BY added_at DESC",
@@ -499,7 +499,7 @@ impl Store {
         source: Option<&SourceId>,
         vis: &Visibility,
     ) -> Result<LibraryStats, LibError> {
-        let conn = self.write();
+        let conn = self.read()?;
 
         // Source grants compose as a union of whole sources, which the source×facet aggregates can
         // sum exactly. A collection grant is an arbitrary asset subset and may overlap a granted
@@ -1317,7 +1317,8 @@ mod tests {
 
         store.remove_source(&source, false).unwrap();
         let hierarchy_rows: i64 = store
-            .write()
+            .read()
+            .unwrap()
             .query_row(
                 "SELECT count(*) FROM folder WHERE source_id = ?1",
                 params![source.as_bytes().to_vec()],
@@ -1331,7 +1332,7 @@ mod tests {
     fn folder_expansion_plan_uses_the_parent_index_without_reading_assets() {
         let store = store_with("Tree/Branch/leaf.png");
         let source = store.list_sources().unwrap()[0].id;
-        let conn = store.write();
+        let conn = store.read().unwrap();
         let mut statement = conn
             .prepare(
                 "EXPLAIN QUERY PLAN
@@ -1626,7 +1627,7 @@ mod tests {
              JOIN asset ON asset.rowid = text_matches.rowid {where_sql}",
             ranked.cte
         );
-        let conn = store.write();
+        let conn = store.read().unwrap();
         let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
         let details = statement
             .query_map(rusqlite::params_from_iter(binds.iter()), |row| row.get(3))
@@ -2436,7 +2437,7 @@ mod tests {
     #[test]
     fn browse_sort_plans_use_composite_indexes_without_temp_ordering() {
         let store = browse_fixture(&[("a.png", Some(1), 1)]);
-        let conn = store.write();
+        let conn = store.read().unwrap();
         for (order, index) in [
             ("filename ASC, id ASC", "idx_asset_browse_name"),
             ("filename DESC, id DESC", "idx_asset_browse_name"),
@@ -2469,7 +2470,8 @@ mod tests {
         }
         let target_name = format!("catalog_asset_{target_index:07}.png");
         let (id, filename): (Vec<u8>, String) = store
-            .write()
+            .read()
+            .unwrap()
             .query_row(
                 "SELECT id, filename FROM asset WHERE filename = ?1",
                 [target_name],

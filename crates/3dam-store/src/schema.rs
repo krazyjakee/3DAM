@@ -1636,6 +1636,6 @@ mod tests {
         }
         store.repair_aggregates().unwrap();
         store.repair_aggregates().unwrap();
-        assert_aggregate_integrity(&store.write());
+        assert_aggregate_integrity(&store.read().unwrap());
     }
 }

@@ -39,7 +39,6 @@ use std::sync::{Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWrite
 const READER_LIMITS: (usize, usize) = (2, 4);
 
 /// What a connection is allowed to do, which decides its PRAGMA set.
-#[allow(dead_code)] // `Reader` is constructed by the read path; call sites land in step 2 of #137.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Role {
     /// The single read-write connection (and the in-memory store's only connection).
@@ -149,7 +148,6 @@ impl Db {
     /// Check out a read-only connection wrapped in a deferred read transaction, so the whole guard
     /// observes one WAL snapshot. On a memory store this is the shared connection, untransacted —
     /// there is nothing to isolate it from.
-    #[allow(dead_code)] // Call sites move over in step 2 of issue #137.
     pub(crate) fn read(&self) -> Result<ReadGuard<'_>, LibError> {
         let depth = GuardDepth::enter();
         match self {
@@ -227,9 +225,11 @@ impl Db {
 /// A bounded pool of read-only connections, hand-rolled rather than r2d2 (rusqlite is pinned to
 /// 0.39 for MSRV reasons, and r2d2_sqlite tracks newer releases).
 ///
-/// Connections are created **lazily**: a freshly opened store has none, which is what lets the
-/// credential-migration `wal_checkpoint(TRUNCATE)` still see `busy == 0` on the first open.
-#[allow(dead_code)] // Read-path only; call sites land in step 2 of issue #137.
+/// Connections are created **lazily**: a freshly opened store has none until something actually
+/// reads. The credential migration does read first (`source_credentials_migrated`), so its
+/// `wal_checkpoint(TRUNCATE)` runs with pooled connections already open; it still sees `busy == 0`
+/// because [`Db::exclusive`] drains every *active* reader through `maint`, and an idle pooled
+/// connection sits outside a read transaction and therefore holds no WAL read mark.
 pub(crate) struct ReadPool {
     path: PathBuf,
     state: Mutex<PoolState>,
@@ -238,14 +238,12 @@ pub(crate) struct ReadPool {
     available: Condvar,
 }
 
-#[allow(dead_code)] // Read-path only; call sites land in step 2 of issue #137.
 struct PoolState {
     idle: Vec<Connection>,
     /// Connections in existence (idle **or** checked out), so the ceiling counts both.
     open: usize,
 }
 
-#[allow(dead_code)] // Read-path only; call sites land in step 2 of issue #137.
 impl ReadPool {
     fn new(path: PathBuf, max: usize) -> ReadPool {
         ReadPool {
@@ -336,13 +334,11 @@ fn cantopen(err: &rusqlite::Error) -> bool {
 
 /// A checked-out read connection inside a deferred transaction. Rolled back and returned to the
 /// pool on drop.
-#[allow(dead_code)] // Read-path only; call sites land in step 2 of issue #137.
 pub(crate) struct ReadGuard<'a> {
     inner: ReadInner<'a>,
     _depth: GuardDepth,
 }
 
-#[allow(dead_code)] // Read-path only; call sites land in step 2 of issue #137.
 enum ReadInner<'a> {
     Pooled {
         pool: &'a ReadPool,

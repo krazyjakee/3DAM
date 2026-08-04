@@ -56,7 +56,7 @@ impl Store {
 
     /// Every blocked content hash, newest first — the "removed + blocked" management surface.
     pub fn list_blocklist(&self) -> Result<Vec<BlockEntry>, LibError> {
-        let conn = self.write();
+        let conn = self.read()?;
         let mut stmt = conn
             .prepare(
                 "SELECT content_hash, label, blocked_at FROM blocklist ORDER BY blocked_at DESC",
@@ -102,7 +102,7 @@ impl Store {
     /// Whether a content hash is on the blocklist — the scan-time gate (hot path; single indexed
     /// primary-key lookup).
     pub fn is_blocked(&self, hash: &ContentHash) -> Result<bool, LibError> {
-        let conn = self.write();
+        let conn = self.read()?;
         let found: Option<i64> = conn
             .query_row(
                 "SELECT 1 FROM blocklist WHERE content_hash = ?1",

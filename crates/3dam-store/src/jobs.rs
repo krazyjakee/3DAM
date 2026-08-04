@@ -203,7 +203,7 @@ impl Store {
     }
 
     pub fn get_job(&self, id: &JobId) -> Result<JobStatus, LibError> {
-        let conn = self.write();
+        let conn = self.read()?;
         conn.query_row(
             "SELECT id, kind, state, done, total, current, error, sources, created_at, updated_at,
                     summary, warnings, initiator, result_artifacts, result, collections
@@ -219,7 +219,7 @@ impl Store {
     /// Lightweight event/list shape. The full structured result is intentionally fetched only by
     /// `get_job` when a caller opens one history detail.
     pub fn get_job_summary(&self, id: &JobId) -> Result<JobStatus, LibError> {
-        let conn = self.write();
+        let conn = self.read()?;
         conn.query_row(
             "SELECT id, kind, state, done, total, current, error, sources, created_at, updated_at,
                     summary, warnings, initiator, result_artifacts, NULL AS result, collections
@@ -241,7 +241,7 @@ impl Store {
     ) -> Result<Page<JobStatus>, LibError> {
         let limit = req.page.clamped(QUERY_MAX_LIMIT);
         let offset = decode_offset(req.page.after.as_ref())?;
-        let conn = self.write();
+        let conn = self.read()?;
         let mut stmt = conn
             .prepare(
                 "SELECT id, kind, state, done, total, current, error, sources, created_at, updated_at,

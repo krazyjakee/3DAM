@@ -158,7 +158,7 @@ impl Store {
 
     /// The asset's free-text note, or `None` if it has never had one (or it was cleared).
     pub fn get_note(&self, id: &AssetId) -> Result<Option<Note>, LibError> {
-        let conn = self.write();
+        let conn = self.read()?;
         Self::read_note(&conn, id.as_bytes())
     }
 
@@ -252,7 +252,7 @@ impl Store {
     /// Every message on an asset, oldest first. Tombstones are included with an empty body — the
     /// thread has to stay coherent for anyone who replied to a since-deleted message.
     pub fn list_comments(&self, asset: &AssetId) -> Result<Vec<Comment>, LibError> {
-        let conn = self.write();
+        let conn = self.read()?;
         // UUIDv7 ids sort chronologically, so the primary key is the timeline.
         let mut stmt = conn
             .prepare(
@@ -270,7 +270,7 @@ impl Store {
     /// One message, or `NotFound`. Used by the edit/delete guards, which need the author and the
     /// owning asset before they can decide anything.
     pub fn get_comment(&self, id: &CommentId) -> Result<Comment, LibError> {
-        let conn = self.write();
+        let conn = self.read()?;
         conn.query_row(
             "SELECT comment_id, asset_id, author, body, created_at, edited_at, deleted_at, reply_to
              FROM asset_comment WHERE comment_id = ?1",
@@ -642,7 +642,7 @@ impl Store {
     /// a whole [`Self::get_asset`], and so a *removal* can capture the source **before** the row
     /// disappears (issue #42). `None` for an unknown id.
     pub fn asset_source(&self, id: &AssetId) -> Result<Option<SourceId>, LibError> {
-        let conn = self.write();
+        let conn = self.read()?;
         conn.query_row(
             "SELECT source_id FROM asset WHERE id = ?1",
             params![id.as_bytes().to_vec()],
@@ -653,7 +653,7 @@ impl Store {
     }
 
     pub fn get_asset(&self, id: &AssetId) -> Result<Asset, LibError> {
-        let conn = self.write();
+        let conn = self.read()?;
         let asset = conn
             .query_row(
                 "SELECT id, content_hash, source_id, path, filename, size_bytes,
@@ -830,7 +830,11 @@ mod tests {
     }
 
     fn count(store: &Store, sql: &str) -> i64 {
-        store.write().query_row(sql, [], |r| r.get(0)).unwrap()
+        store
+            .read()
+            .unwrap()
+            .query_row(sql, [], |r| r.get(0))
+            .unwrap()
     }
 
     /// The analyse gate is `analysis_version < PIPELINE_VERSION`, and a re-scan of an edited file

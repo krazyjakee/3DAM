@@ -190,7 +190,6 @@ impl Store {
     }
 
     /// Borrow a read-only connection for the duration of one query (see [`db::Db::read`]).
-    #[allow(dead_code)] // Call sites move over in step 2 of issue #137.
     pub(crate) fn read(&self) -> Result<db::ReadGuard<'_>, LibError> {
         self.db.read()
     }

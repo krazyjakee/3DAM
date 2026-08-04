@@ -62,7 +62,7 @@ impl Store {
     /// The secret-free connection plus its opaque credential reference. The engine resolves that
     /// reference immediately before opening a backend; clients only see `SourceInfo.uri`.
     pub fn get_source_connection(&self, id: &SourceId) -> Result<SourceConnection, LibError> {
-        let conn = self.write();
+        let conn = self.read()?;
         let (blob, auth_ref): (String, Option<String>) = conn
             .query_row(
                 "SELECT connection, auth_ref FROM source WHERE id = ?1",
@@ -82,7 +82,7 @@ impl Store {
     pub fn source_connections(
         &self,
     ) -> Result<Vec<(SourceId, SourceConnection, Option<String>)>, LibError> {
-        let conn = self.write();
+        let conn = self.read()?;
         let mut stmt = conn
             .prepare("SELECT id, connection, auth_ref FROM source ORDER BY created_at")
             .map_err(internal)?;
@@ -101,7 +101,7 @@ impl Store {
     }
 
     pub fn source_credentials_migrated(&self) -> Result<bool, LibError> {
-        let conn = self.write();
+        let conn = self.read()?;
         conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM host_migration WHERE key = 'source_credentials_v1')",
             [],
@@ -197,7 +197,7 @@ impl Store {
     }
 
     pub fn pending_source_credential_cleanup(&self) -> Result<Vec<String>, LibError> {
-        let conn = self.write();
+        let conn = self.read()?;
         let mut stmt = conn
             .prepare("SELECT auth_ref FROM host_secret_cleanup ORDER BY auth_ref")
             .map_err(internal)?;
@@ -218,7 +218,7 @@ impl Store {
     }
 
     pub fn list_sources(&self) -> Result<Vec<SourceInfo>, LibError> {
-        let conn = self.write();
+        let conn = self.read()?;
         let mut stmt = conn
             .prepare(
                 "SELECT s.id, s.name, s.kind, s.connection, s.online, s.last_scanned_at,
@@ -240,7 +240,7 @@ impl Store {
         source: &SourceId,
         prefix: &str,
     ) -> Result<Vec<FolderEntry>, LibError> {
-        let conn = self.write();
+        let conn = self.read()?;
         let mut stmt = conn
             .prepare(
                 "SELECT name, descendant_asset_count FROM folder
@@ -260,7 +260,7 @@ impl Store {
     }
 
     pub fn get_source(&self, id: &SourceId) -> Result<Option<SourceInfo>, LibError> {
-        let conn = self.write();
+        let conn = self.read()?;
         conn.query_row(
             "SELECT s.id, s.name, s.kind, s.connection, s.online, s.last_scanned_at,
                     s.last_error, s.watch, COALESCE(ss.asset_count, 0)
@@ -537,7 +537,8 @@ mod tests {
 
     fn missing(store: &Store, source: SourceId, path: &str) -> bool {
         store
-            .write()
+            .read()
+            .unwrap()
             .query_row(
                 "SELECT (flags & 1) <> 0 FROM asset WHERE source_id = ?1 AND path = ?2",
                 params![source.as_bytes().to_vec(), path],
@@ -589,7 +590,8 @@ mod tests {
             None
         );
         let b_seen: i64 = store
-            .write()
+            .read()
+            .unwrap()
             .query_row(
                 "SELECT seen_generation FROM asset WHERE source_id = ?1 AND path = 'b.png'",
                 params![source.as_bytes().to_vec()],
@@ -602,7 +604,8 @@ mod tests {
             None
         );
         let last_scanned: Option<i64> = store
-            .write()
+            .read()
+            .unwrap()
             .query_row(
                 "SELECT last_scanned_at FROM source WHERE id = ?1",
                 params![source.as_bytes().to_vec()],
@@ -656,7 +659,8 @@ mod tests {
         let generation = store.begin_source_scan(&source).unwrap();
         store.upsert_asset(&scanned(source, "new.png")).unwrap();
         let seen: i64 = store
-            .write()
+            .read()
+            .unwrap()
             .query_row(
                 "SELECT seen_generation FROM asset WHERE source_id = ?1 AND path = 'new.png'",
                 params![source.as_bytes().to_vec()],
