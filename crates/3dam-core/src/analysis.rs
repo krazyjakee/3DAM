@@ -10,17 +10,21 @@
 //! Every stage is fail-soft (DESIGN_GUIDELINES §2): a bad decode degrades that one asset to "no
 //! embedding" and the pass moves on — never an aborted job.
 
+use crate::writer::BatchAccumulator;
 use crate::{emit_progress, reliability};
 use dam_api::dto::*;
 use dam_api::event::{ChangeKind, LibraryEvent};
-use dam_api::id::{AssetId, JobId};
+use dam_api::id::{AssetId, JobId, SourceId};
 use dam_api::LibError;
-use dam_store::{AnalysisPlanSource, AnalysisPlanTarget, ImageAnalysis, Store};
+use dam_store::{
+    AnalysisBatchContext, AnalysisPlanSource, AnalysisPlanTarget, AnalysisWrite, AudioFeatureWrite,
+    EmbeddingWrite, ImageAnalysis, Store, TagSuggestion,
+};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::sync::broadcast;
 
 /// The current analysis pipeline version. Bump when any extractor's algorithm/output changes so the
@@ -57,6 +61,10 @@ pub(crate) fn model_free_space(media: MediaType) -> &'static str {
     }
 }
 
+/// Progress heartbeat for a pass that persists *nothing*. Progress normally rides along inside the
+/// batch transaction that carries the rows it counts, so it costs no transaction of its own; a pass
+/// whose every asset fails (an offline source, say) never fills a batch, and this is how often it
+/// commits the counter anyway.
 const PROGRESS_EVERY: u64 = 8;
 pub(crate) const PLAN_BATCH_SIZE: usize = 256;
 pub(crate) const PLAN_PREFETCH_BATCHES: usize = 2;
@@ -103,15 +111,241 @@ fn produce_analysis_batches(
     }
 }
 
+/// One analysed asset waiting to be committed, with the little bit of context the post-commit
+/// bookkeeping needs: `source_id` for its `AssetChanged` event, `path` for a warning or the job's
+/// "currently working on" line. Neither is part of the write itself.
+struct PendingAnalysis {
+    write: AnalysisWrite,
+    source_id: SourceId,
+    path: String,
+}
+
+/// Roughly how much memory one pending write pins, for the accumulator's payload bound.
+///
+/// Deliberately an over-estimate of the *stored* form rather than a measurement of the Rust one:
+/// what the bound protects is the transaction the batch turns into, and text and peaks are the only
+/// two fields that can differ from their neighbours by three orders of magnitude.
+fn payload_cost(write: &AnalysisWrite) -> usize {
+    /// Attributes, image analysis and class are a few fixed-size columns; charge a flat row cost
+    /// rather than walking them, so an ordinary image or model batch closes on the row bound.
+    const ROW_COST: usize = 512;
+    let mut cost = ROW_COST;
+    cost += write.document_text.as_ref().map_or(0, String::len);
+    // Peaks reach the catalog as a JSON array of floats, several bytes per sample rather than four.
+    cost += write
+        .audio_peaks
+        .as_ref()
+        .map_or(0, |peaks| peaks.len() * 8);
+    for embedding in &write.embeddings {
+        cost += embedding.vector.len() * std::mem::size_of::<f32>()
+            + embedding.space_id.len()
+            + embedding.extractor.len();
+    }
+    for tag in &write.tags {
+        cost += ROW_COST + tag.name.len() + tag.extractor.len() + tag.explanation.len();
+    }
+    cost
+}
+
+/// A `Mutex` guard that survives a poisoned lock. A worker that panicked mid-analysis must not
+/// wedge the whole pass: the accumulator and the warning list are both plain collections, so the
+/// worst a poisoned one can hold is a partially-pushed batch, which the next flush picks up.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The bounded write stage for one analysis job (issue #138).
+///
+/// Every rayon worker submits into the same accumulator; the worker whose push crosses a bound
+/// takes the pending vector under the lock, releases it, and performs the flush itself. There is no
+/// writer thread — a second worker that fills the fresh vector before the first flush returns simply
+/// blocks on the store's writer guard, and that is the backpressure.
+///
+/// Events are emitted from [`AnalysisSink::flush`] *after* `apply_analysis_batch` returns, never
+/// from the compute path, so an `AssetChanged { Reanalyzed }` on the wire always describes a
+/// committed row.
+struct AnalysisSink<'a> {
+    store: &'a Store,
+    events: &'a broadcast::Sender<LibraryEvent>,
+    /// The job's cancel flag, also *written* here: `outcome.job.state` is the only place a
+    /// cancellation that landed while a batch was being filled becomes visible to this thread.
+    cancel: &'a AtomicBool,
+    job: JobId,
+    total: u64,
+    /// Targets whose outcome is final — committed or failed. Deliberately not "targets computed":
+    /// progress is written inside the batch transaction, so counting work that has not been
+    /// committed would let a crash leave the job claiming more than the catalog holds.
+    done: AtomicU64,
+    warnings: AtomicU64,
+    warning_details: Mutex<Vec<String>>,
+    pending: Mutex<BatchAccumulator<PendingAnalysis>>,
+}
+
+impl<'a> AnalysisSink<'a> {
+    fn new(
+        store: &'a Store,
+        events: &'a broadcast::Sender<LibraryEvent>,
+        cancel: &'a AtomicBool,
+        job: JobId,
+        total: u64,
+    ) -> AnalysisSink<'a> {
+        AnalysisSink {
+            store,
+            events,
+            cancel,
+            job,
+            total,
+            done: AtomicU64::new(0),
+            warnings: AtomicU64::new(0),
+            warning_details: Mutex::new(Vec::new()),
+            pending: Mutex::new(BatchAccumulator::new()),
+        }
+    }
+
+    /// Enqueue one analysed asset, flushing on this thread if that push closed the batch.
+    fn submit(&self, item: PendingAnalysis) {
+        let cost = payload_cost(&item.write);
+        let batch = {
+            let mut pending = lock(&self.pending);
+            // `push` reports the size bounds; the age bound is checked on the same guard so a
+            // trickle of small assets still commits promptly.
+            (pending.push(item, cost) || pending.due_by_age()).then(|| pending.take())
+        };
+        if let Some(batch) = batch {
+            self.flush(batch);
+        }
+    }
+
+    /// A compute failure: the asset produced no write at all, so there is nothing to commit and it
+    /// stays legitimately due for the next pass (§1.3 fail-soft, DESIGN_GUIDELINES §2).
+    fn fail(&self, target: &AnalysisPlanTarget, error: &str) {
+        let done = self.done.fetch_add(1, Ordering::Relaxed) + 1;
+        self.warn(&target.path, error);
+        tracing::warn!(asset = %target.id, path = %target.path, error = %error, "analysis skipped asset");
+        // A pass where *everything* fails (an offline source) enqueues nothing, so no flush would
+        // ever carry its progress. Commit the counter on its own in that case, and take the chance
+        // to drain anything the age bound has made due.
+        if done.is_multiple_of(PROGRESS_EVERY) {
+            let batch = {
+                let mut pending = lock(&self.pending);
+                (pending.is_empty() || pending.due_by_age()).then(|| pending.take())
+            };
+            if let Some(batch) = batch {
+                self.flush(batch);
+            }
+        }
+    }
+
+    /// Record a per-asset warning against the job. The detail list is capped; the count is not.
+    fn warn(&self, path: &str, error: &str) {
+        let prior = self.warnings.fetch_add(1, Ordering::Relaxed);
+        if prior < MAX_JOB_WARNING_DETAILS {
+            lock(&self.warning_details).push(format!(
+                "“{path}” could not be analysed; inspect its source status and retry"
+            ));
+        }
+        tracing::debug!(%path, %error, "analysis warning");
+    }
+
+    /// Commit one batch — derived rows, vectors, suggestions and the version stamp for every asset
+    /// in it — in a single transaction, then emit what it made true. An empty batch is legal and
+    /// commits only the progress counters.
+    fn flush(&self, batch: Vec<PendingAnalysis>) {
+        let count = batch.len() as u64;
+        let done = self.done.fetch_add(count, Ordering::Relaxed) + count;
+        let current = batch.last().map(|item| item.path.clone());
+        let mut writes = Vec::with_capacity(batch.len());
+        let mut origins = Vec::with_capacity(batch.len());
+        for item in batch {
+            writes.push(item.write);
+            origins.push((item.source_id, item.path));
+        }
+        let ctx = AnalysisBatchContext {
+            job: self.job,
+            state: JobState::Running,
+            done,
+            total: Some(self.total),
+            current,
+        };
+        match self.store.apply_analysis_batch(&ctx, &writes) {
+            Ok(outcome) => {
+                for (result, (source_id, path)) in outcome.items.iter().zip(origins.iter()) {
+                    match result {
+                        // The version stamp is the last statement of an item, so `analysed` is the
+                        // one honest signal that this asset's whole derivation is durable.
+                        Ok(item) if item.analysed => {
+                            reliability::publish_event(
+                                self.events,
+                                LibraryEvent::AssetChanged {
+                                    id: item.id,
+                                    source_id: Some(*source_id),
+                                    kind: ChangeKind::Reanalyzed,
+                                },
+                                "publish analysed asset",
+                            );
+                        }
+                        // Nothing was stamped, so the asset stays due — silently, by design.
+                        Ok(_) => {}
+                        Err(error) => {
+                            self.warn(path, error);
+                            tracing::warn!(%path, %error, "analysis write rolled back");
+                        }
+                    }
+                }
+                // A cancellation that landed while this batch was being filled is visible only in
+                // the state the transaction just read back.
+                if outcome.job.state == JobState::Cancelled {
+                    self.cancel.store(true, Ordering::Relaxed);
+                }
+                reliability::publish_event(
+                    self.events,
+                    LibraryEvent::JobProgress(outcome.job),
+                    "publish analysis batch progress",
+                );
+            }
+            Err(error) => {
+                // Transaction-level failure: nothing in this batch landed, so every asset in it is
+                // a warning and is re-planned by the next pass.
+                let detail = error.to_string();
+                for (_, path) in &origins {
+                    self.warn(path, &detail);
+                }
+                reliability::retryable_store_write(
+                    Err(error),
+                    "persist analysis batch",
+                    Some(&self.job),
+                    None,
+                );
+            }
+        }
+    }
+
+    /// Commit whatever is left. Called once the fan-out is finished — including on cancellation,
+    /// where flushing before the terminal state is what keeps completed-but-unwritten work from
+    /// being thrown away (an asset that never flushes simply never advances its analysis version
+    /// and is re-planned).
+    fn flush_remaining(&self) {
+        let batch = lock(&self.pending).take();
+        if !batch.is_empty() {
+            self.flush(batch);
+        }
+    }
+}
+
 /// The background analysis job (mirrors `scan::run_scan`): the caller supplies only a stable plan
 /// boundary and total; a bounded producer keyset-streams due targets while this consumer runs
-/// Extract→Derive→Classify→Index and emits a `Reanalyzed` event per completion (§1.3 incremental).
+/// Extract→Derive→Classify→Index and emits a `Reanalyzed` event per commit (§1.3 incremental).
 ///
 /// Per-asset work is CPU-bound (decode → derive → classify → embed), so it fans out across the rayon
 /// pool (ADR 0007, issue #67) — a whole-library pass now scales with cores instead of pinning one. The
-/// async caller already handed off via `spawn_blocking`, so this stays a one-shot async→CPU hop. The
-/// store's writes still serialise on its single connection mutex (no `SQLITE_BUSY` — one guarded
-/// connection), but the expensive compute overlaps, which is where the time goes.
+/// async caller already handed off via `spawn_blocking`, so this stays a one-shot async→CPU hop.
+///
+/// Persistence is a bounded batch stage (issue #138): a worker produces an [`AnalysisWrite`] and
+/// hands it to [`AnalysisSink`] rather than writing anything itself, so one analysed image costs a
+/// share of one transaction instead of the ~28 it used to (image analysis + embedding + a
+/// `suggest_tag` round trip per tag + the version stamp).
 #[allow(clippy::too_many_arguments)] // the job runner's full context; a struct would just rename it
 pub(crate) fn run_analyze(
     store: Arc<Store>,
@@ -127,10 +361,10 @@ pub(crate) fn run_analyze(
 ) -> Result<(), LibError> {
     let total = plan.total;
     store.update_job_progress(&job, JobState::Running, 0, Some(total), None)?;
-    // Shared across the rayon workers: a monotonic completion counter and a skip counter.
-    let done = AtomicU64::new(0);
-    let warnings = AtomicU64::new(0);
-    let warning_details = Mutex::new(Vec::new());
+    // Shared across the rayon workers: the bounded write stage, and with it the completion and
+    // warning counters (progress is committed with the rows it describes, so the counter belongs
+    // to whatever writes them).
+    let sink = AnalysisSink::new(&store, &events, &cancel, job, total);
 
     let mut backends = SourceBackends::new();
     let mut planner_error = None;
@@ -171,50 +405,19 @@ pub(crate) fn run_analyze(
                         return;
                     }
                     let outcome = match backends.get(&target.source_id) {
-                        Some(Ok(source)) => {
-                            analyze_one(&store, target, model.as_deref(), source.as_ref())
-                        }
+                        Some(Ok(source)) => analyze_one(target, model.as_deref(), source.as_ref()),
                         Some(Err(error)) => Err(error.clone()),
                         None => Err("source backend missing".to_string()),
                     };
                     match outcome {
-                        Ok(()) => {
-                            reliability::publish_event(
-                                &events,
-                                LibraryEvent::AssetChanged {
-                                    id: target.id,
-                                    source_id: Some(target.source_id),
-                                    kind: ChangeKind::Reanalyzed,
-                                },
-                                "publish analysed asset",
-                            );
-                        }
-                        Err(error) => {
-                            let prior = warnings.fetch_add(1, Ordering::Relaxed);
-                            if prior < MAX_JOB_WARNING_DETAILS {
-                                warning_details.lock().unwrap().push(format!(
-                                    "“{}” could not be analysed; inspect its source status and retry",
-                                    target.path
-                                ));
-                            }
-                            tracing::warn!(asset = %target.id, path = %target.path, error = %error, "analysis skipped asset");
-                        }
-                    }
-                    let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-                    if n.is_multiple_of(PROGRESS_EVERY) {
-                        reliability::retryable_store_write(
-                            store.update_job_progress(
-                                &job,
-                                JobState::Running,
-                                n,
-                                Some(total),
-                                Some(&target.path),
-                            ),
-                            "persist analysis progress",
-                            Some(&job),
-                            Some(&target.source_id),
-                        );
-                        emit_progress(&store, &events, &job);
+                        // Nothing is written or announced here: the asset joins the pending batch
+                        // and its event follows the commit that makes it true.
+                        Ok(write) => sink.submit(PendingAnalysis {
+                            write,
+                            source_id: target.source_id,
+                            path: target.path.clone(),
+                        }),
+                        Err(error) => sink.fail(target, &error),
                     }
                 });
             });
@@ -222,6 +425,15 @@ pub(crate) fn run_analyze(
         drop(receiver);
     });
 
+    // Flush before the terminal state, cancelled or not: work that is already computed is cheap to
+    // keep and expensive to redo, and an asset that never reaches a commit is simply still due.
+    sink.flush_remaining();
+    let AnalysisSink {
+        done,
+        warnings,
+        warning_details,
+        ..
+    } = sink;
     let done = done.load(Ordering::Relaxed);
     let warnings = warnings.load(Ordering::Relaxed);
     let mut warning_details = warning_details
@@ -292,8 +504,16 @@ fn open_batch_backends(
     }
 }
 
-/// Analyse one asset end-to-end: extract features, derive signals, classify → suggest, index the
-/// embedding, and mark it analysed at the current version. Fail-soft per stage.
+/// Analyse one asset end-to-end: extract features, derive signals, classify → suggest, and collect
+/// the whole lot into one [`AnalysisWrite`]. Fail-soft per stage.
+///
+/// This function no longer touches the store. Everything it derives — including the version stamp —
+/// is accumulated and handed back, so the asset lands as a single all-or-nothing item inside a
+/// batch savepoint (issue #138). That closes a real hole as well as saving transactions: a failure
+/// between the old `set_image_analysis` and `mark_analysed` used to leave derived signals written
+/// with the version gate unmoved, i.e. a half-derivation that the next pass would overwrite rather
+/// than notice. A *compute* failure still returns `Err` from here, before any write exists at all,
+/// and takes the caller's per-asset warning path unchanged.
 ///
 /// Bytes arrive through `fs.fetch` (issue #48): in place for a local source — the same path the old
 /// root-join produced, minus the chance of disagreeing with the scan about it — and a temp file for
@@ -301,65 +521,64 @@ fn open_batch_backends(
 /// usage across a remote pass is bounded by the background pool's width times the largest asset,
 /// not by the size of the batch.
 fn analyze_one(
-    store: &Store,
     t: &AnalysisPlanTarget,
     model: Option<&dyn crate::semantic::SemanticModel>,
     fs: &dyn dam_sources::FileSource,
-) -> Result<(), String> {
+) -> Result<AnalysisWrite, String> {
     let fetched = fs.fetch(&t.path).map_err(|e| e.to_string())?;
     let abs = fetched.path().to_path_buf();
     let det = dam_media::Detected {
         media: t.media,
         format: t.format.clone(),
     };
+    let mut write = AnalysisWrite::new(t.id);
     match t.media {
-        MediaType::Image => analyze_image(store, t, &abs)?,
-        MediaType::Audio => analyze_audio(store, t, &abs, &det)?,
-        MediaType::Model => analyze_model(store, t, &abs, &det)?,
-        MediaType::Video => analyze_video(store, t, &abs, &det)?,
-        MediaType::Document => analyze_document(store, t, &abs, &det)?,
+        MediaType::Image => analyze_image(&mut write, &abs)?,
+        MediaType::Audio => analyze_audio(&mut write, t, &abs, &det)?,
+        MediaType::Model => analyze_model(&mut write, &abs, &det)?,
+        MediaType::Video => analyze_video(&mut write, t, &abs, &det)?,
+        MediaType::Document => analyze_document(&mut write, t, &abs, &det)?,
     }
     // Model-backed semantic embedding (semantic-search M4): when a model ships, also index the
     // shared text/media space so text queries can rank against it (M5 semantic mode). Additive to
     // the model-free space above — different `space_id`, never cross-ranked. `None` on the default
     // build, so this is a no-op there.
     if let Some(m) = model {
-        if let Some(vec) = m.encode_asset(t.media, &abs) {
-            let space = m.space_id(t.media);
-            if let Err(e) = store.set_embedding(&t.id, &space, t.media, &vec, "semantic@1") {
-                tracing::warn!(asset = %t.id, error = %e, "semantic embedding failed");
-            }
+        if let Some(vector) = m.encode_asset(t.media, &abs) {
+            write.embeddings.push(EmbeddingWrite {
+                space_id: m.space_id(t.media),
+                media: t.media,
+                vector,
+                extractor: "semantic@1".into(),
+            });
         }
         // Zero-shot content labels — the semantic tier CLAP/SigLIP add on top of the model-free DSP
         // class (music/speech/sfx by timbre, genre, mood, instrument): tags pure DSP can't derive.
         // Suggested (not confirmed) so they share the accept/reject lifecycle. No-op when the model
         // has no taxonomy for this media (default trait impl returns empty).
-        for (tag, conf) in m.zero_shot_labels(t.media, &abs) {
-            if let Err(e) = store.suggest_tag(
-                &t.id,
-                &tag,
-                conf,
-                "semantic@1",
-                "The semantic model matched this content label.",
-            ) {
-                tracing::warn!(asset = %t.id, tag = %tag, error = %e, "semantic label suggest_tag failed");
-            }
+        for (name, confidence) in m.zero_shot_labels(t.media, &abs) {
+            write.tags.push(TagSuggestion {
+                name,
+                confidence,
+                extractor: "semantic@1".into(),
+                explanation: "The semantic model matched this content label.".into(),
+            });
         }
     }
     // Filename-derived tag suggestions (semantic-search M2): the words in a name ("ak47", "lowpoly")
     // are a real, if weak, content signal. Suggested (not confirmed) so they flow through the same
     // accept/reject lifecycle as the media-derived tags — a reject is remembered.
-    suggest_filename_tags(store, t);
-    store
-        .mark_analysed(&t.id, PIPELINE_VERSION)
-        .map_err(|e| e.to_string())?;
-    Ok(())
+    suggest_filename_tags(&mut write, t);
+    // Written last by the store, after everything above (see `apply_analysis_batch`), so this asset
+    // can never claim to be analysed at a version it only half reached.
+    write.analysed_version = Some(PIPELINE_VERSION);
+    Ok(write)
 }
 
 /// Suggest a tag for each meaningful whole word in the filename: alphanumeric runs of ≥3 chars that
 /// aren't purely numeric and aren't the format/extension. Low confidence — a name is a weaker signal
-/// than a decoded attribute. Fail-soft per tag.
-fn suggest_filename_tags(store: &Store, t: &AnalysisPlanTarget) {
+/// than a decoded attribute.
+fn suggest_filename_tags(w: &mut AnalysisWrite, t: &AnalysisPlanTarget) {
     let filename = Path::new(&t.path)
         .file_name()
         .and_then(|s| s.to_str())
@@ -370,44 +589,33 @@ fn suggest_filename_tags(store: &Store, t: &AnalysisPlanTarget) {
         if tok.len() < 3 || tok == fmt || tok.chars().all(|c| c.is_ascii_digit()) {
             continue;
         }
-        if let Err(e) = store.suggest_tag(
-            &t.id,
-            &tok,
-            0.4,
-            "filename@1",
-            "This term appears in the source filename.",
-        ) {
-            tracing::warn!(asset = %t.id, tag = %tok, error = %e, "filename suggest_tag failed");
-        }
+        w.tags.push(TagSuggestion {
+            name: tok,
+            confidence: 0.4,
+            extractor: "filename@1".into(),
+            explanation: "This term appears in the source filename.".into(),
+        });
     }
 }
 
-fn analyze_image(store: &Store, t: &AnalysisPlanTarget, abs: &Path) -> Result<(), String> {
+fn analyze_image(w: &mut AnalysisWrite, abs: &Path) -> Result<(), String> {
     let f = dam_media::extract_image_features(abs).map_err(|e| e.to_string())?;
-    // Derive: persist perceptual/tileability/colour signals (§5, §6).
-    store
-        .set_image_analysis(
-            &t.id,
-            &ImageAnalysis {
-                phash: f.phash,
-                tileability: f.tileability,
-                repeat_period: f.repeat_period.map(|p| p as i64),
-                tile_class: f.tile_class.to_string(),
-                dominant_colors: f.dominant_colors.clone(),
-                class: f.class.to_string(),
-            },
-        )
-        .map_err(|e| e.to_string())?;
+    // Derive: perceptual/tileability/colour signals (§5, §6).
+    w.image = Some(ImageAnalysis {
+        phash: f.phash,
+        tileability: f.tileability,
+        repeat_period: f.repeat_period.map(|p| p as i64),
+        tile_class: f.tile_class.to_string(),
+        dominant_colors: f.dominant_colors,
+        class: f.class.to_string(),
+    });
     // Index: the visual embedding (§3.1).
-    store
-        .set_embedding(
-            &t.id,
-            model_free_space(MediaType::Image),
-            MediaType::Image,
-            &f.embedding,
-            "image-stats@1",
-        )
-        .map_err(|e| e.to_string())?;
+    w.embeddings.push(EmbeddingWrite {
+        space_id: model_free_space(MediaType::Image).to_string(),
+        media: MediaType::Image,
+        vector: f.embedding,
+        extractor: "image-stats@1".into(),
+    });
     // Classify → suggest (§1.4): tileability + content class drive auto-tags with a confidence.
     let mut suggestions: Vec<(&str, f32)> = vec![(f.class, 0.7)];
     match f.tile_class {
@@ -416,8 +624,7 @@ fn analyze_image(store: &Store, t: &AnalysisPlanTarget, abs: &Path) -> Result<()
         _ => {}
     }
     suggest_all(
-        store,
-        &t.id,
+        w,
         &suggestions,
         "Image analysis inferred this from visual and tiling signals.",
     );
@@ -425,7 +632,7 @@ fn analyze_image(store: &Store, t: &AnalysisPlanTarget, abs: &Path) -> Result<()
 }
 
 fn analyze_audio(
-    store: &Store,
+    w: &mut AnalysisWrite,
     t: &AnalysisPlanTarget,
     abs: &Path,
     det: &dam_media::Detected,
@@ -435,21 +642,17 @@ fn analyze_audio(
     };
     // Model-free stats embedding: a normalised cheap-attribute vector (§2.3). Duration dominates.
     let dur = a.duration_ms.unwrap_or(0) as f32;
-    let vec = normalise(vec![
-        (1.0 + dur).log10(),
-        a.sample_rate.unwrap_or(0) as f32 / 48_000.0,
-        a.channels.unwrap_or(0) as f32 / 2.0,
-        a.bit_depth.unwrap_or(0) as f32 / 24.0,
-    ]);
-    store
-        .set_embedding(
-            &t.id,
-            model_free_space(MediaType::Audio),
-            MediaType::Audio,
-            &vec,
-            "audio-stats@1",
-        )
-        .map_err(|e| e.to_string())?;
+    w.embeddings.push(EmbeddingWrite {
+        space_id: model_free_space(MediaType::Audio).to_string(),
+        media: MediaType::Audio,
+        vector: normalise(vec![
+            (1.0 + dur).log10(),
+            a.sample_rate.unwrap_or(0) as f32 / 48_000.0,
+            a.channels.unwrap_or(0) as f32 / 2.0,
+            a.bit_depth.unwrap_or(0) as f32 / 24.0,
+        ]),
+        extractor: "audio-stats@1".into(),
+    });
     // Classify from *measured* DSP signals, not duration (§4.2). A full decode yields loopability
     // (authored `smpl` loop points, else a seamless wrap boundary), tonality + key, tempo, and
     // envelope shape — the orthogonal "does it loop" and "what is it" axes a length threshold
@@ -479,13 +682,13 @@ fn analyze_audio(
             } else {
                 ("transient", 0.5)
             });
-            suggest_audio_extras(store, &t.id, f);
-            // Persist the continuous acoustic features for the inspector bars (issue #61).
-            if let Err(e) =
-                store.set_audio_features(&t.id, f.loudness_lufs, f.brightness, f.harmonicity)
-            {
-                tracing::warn!(asset = %t.id, error = %e, "set_audio_features failed");
-            }
+            suggest_audio_extras(w, f);
+            // The continuous acoustic features behind the inspector bars (issue #61).
+            w.audio_features = Some(AudioFeatureWrite {
+                loudness_lufs: f.loudness_lufs,
+                brightness: f.brightness,
+                harmonicity: f.harmonicity,
+            });
             let conf = if f.loop_source == dam_media::LoopSource::Metadata {
                 0.95
             } else {
@@ -502,32 +705,24 @@ fn analyze_audio(
             (c, cf, Vec::new())
         }
     };
-    store
-        .set_media_class(&t.id, MediaType::Audio, class)
-        .map_err(|e| e.to_string())?;
+    w.class = Some((MediaType::Audio, class.to_string()));
     extra.insert(0, (class, conf));
     suggest_all(
-        store,
-        &t.id,
+        w,
         &extra,
         "Audio analysis inferred this from measured rhythm, timbre, and envelope signals.",
     );
     // Waveform peaks for the inspector (issue #73): derived during the same decode as features, so
     // no client or second server pass re-downloads + re-decodes the audio to draw the bars.
     match analysis {
-        Ok(analysis) => {
-            if let Err(e) = store.set_audio_peaks(&t.id, &analysis.waveform_peaks) {
-                tracing::warn!(asset = %t.id, error = %e, "set_audio_peaks failed");
-            }
-        }
+        Ok(analysis) => w.audio_peaks = Some(analysis.waveform_peaks),
         Err(e) => tracing::warn!(asset = %t.id, error = %e, "waveform peak computation failed"),
     }
     Ok(())
 }
 
 fn analyze_model(
-    store: &Store,
-    t: &AnalysisPlanTarget,
+    w: &mut AnalysisWrite,
     abs: &Path,
     det: &dam_media::Detected,
 ) -> Result<(), String> {
@@ -545,36 +740,30 @@ fn analyze_model(
     // embedding is computed so the stored row and the vector agree.
     let m = match dam_media::extract_model_metadata_deep(abs, &det.format) {
         Ok(exact) => {
-            if let Err(e) = store.set_media_attrs(&t.id, &MediaAttributes::Model(exact.clone())) {
-                tracing::warn!(asset = %t.id, error = %e, "storing exact model counts failed");
-            }
+            w.attrs = Some(MediaAttributes::Model(exact.clone()));
             exact
         }
         Err(e) => {
-            tracing::debug!(asset = %t.id, error = %e, "exact model counts unavailable");
+            tracing::debug!(asset = %w.id, error = %e, "exact model counts unavailable");
             m
         }
     };
     // Model-free stats embedding from geometry counts + rig/anim/uv flags (§2.3, §4.2 corroboration).
-    let vec = normalise(vec![
-        (1.0 + m.vertex_count.unwrap_or(0) as f32).log10(),
-        (1.0 + m.triangle_count.unwrap_or(0) as f32).log10(),
-        (1.0 + m.mesh_count.unwrap_or(0) as f32).log10(),
-        m.material_count.unwrap_or(0) as f32 / 8.0,
-        m.texture_count.unwrap_or(0) as f32 / 8.0,
-        m.has_rig.unwrap_or(false) as u8 as f32,
-        m.has_animation.unwrap_or(false) as u8 as f32,
-        m.has_uvs.unwrap_or(false) as u8 as f32,
-    ]);
-    store
-        .set_embedding(
-            &t.id,
-            model_free_space(MediaType::Model),
-            MediaType::Model,
-            &vec,
-            "model-stats@1",
-        )
-        .map_err(|e| e.to_string())?;
+    w.embeddings.push(EmbeddingWrite {
+        space_id: model_free_space(MediaType::Model).to_string(),
+        media: MediaType::Model,
+        vector: normalise(vec![
+            (1.0 + m.vertex_count.unwrap_or(0) as f32).log10(),
+            (1.0 + m.triangle_count.unwrap_or(0) as f32).log10(),
+            (1.0 + m.mesh_count.unwrap_or(0) as f32).log10(),
+            m.material_count.unwrap_or(0) as f32 / 8.0,
+            m.texture_count.unwrap_or(0) as f32 / 8.0,
+            m.has_rig.unwrap_or(false) as u8 as f32,
+            m.has_animation.unwrap_or(false) as u8 as f32,
+            m.has_uvs.unwrap_or(false) as u8 as f32,
+        ]),
+        extractor: "model-stats@1".into(),
+    });
     // Category guess from triangle budget (§5): a coarse low/mid/high-poly bucket.
     let class = match m.triangle_count {
         Some(tris) if tris < 2_000 => "prop_lowpoly",
@@ -582,9 +771,7 @@ fn analyze_model(
         Some(_) => "prop_highpoly",
         None => "prop",
     };
-    store
-        .set_media_class(&t.id, MediaType::Model, class)
-        .map_err(|e| e.to_string())?;
+    w.class = Some((MediaType::Model, class.to_string()));
     // Structural facts make good high-confidence suggestions (§1.4).
     let mut suggestions: Vec<(&str, f32)> = vec![(class, 0.6)];
     if m.has_rig.unwrap_or(false) {
@@ -597,8 +784,7 @@ fn analyze_model(
         suggestions.push(("uv_mapped", 0.9));
     }
     suggest_all(
-        store,
-        &t.id,
+        w,
         &suggestions,
         "Model analysis inferred this from measured geometry and structure.",
     );
@@ -619,7 +805,7 @@ fn analyze_model(
 /// vectors and half having shape vectors, depending on whether ffmpeg happened to be installed at
 /// scan time, is exactly what the `space_id` seam exists to prevent.
 fn analyze_video(
-    store: &Store,
+    w: &mut AnalysisWrite,
     t: &AnalysisPlanTarget,
     abs: &Path,
     det: &dam_media::Detected,
@@ -636,23 +822,19 @@ fn analyze_video(
     }
 
     let secs = v.duration_ms.unwrap_or(0) as f32 / 1000.0;
-    let vec = normalise(vec![
-        (1.0 + secs).log10(),
-        (1.0 + v.width.unwrap_or(0) as f32).log10(),
-        (1.0 + v.height.unwrap_or(0) as f32).log10(),
-        v.fps.unwrap_or(0.0) / 60.0,
-        (1.0 + v.bitrate.unwrap_or(0) as f32).log10() / 8.0,
-        v.has_audio.unwrap_or(false) as u8 as f32,
-    ]);
-    store
-        .set_embedding(
-            &t.id,
-            model_free_space(MediaType::Video),
-            MediaType::Video,
-            &vec,
-            "video-stats@1",
-        )
-        .map_err(|e| e.to_string())?;
+    w.embeddings.push(EmbeddingWrite {
+        space_id: model_free_space(MediaType::Video).to_string(),
+        media: MediaType::Video,
+        vector: normalise(vec![
+            (1.0 + secs).log10(),
+            (1.0 + v.width.unwrap_or(0) as f32).log10(),
+            (1.0 + v.height.unwrap_or(0) as f32).log10(),
+            v.fps.unwrap_or(0.0) / 60.0,
+            (1.0 + v.bitrate.unwrap_or(0) as f32).log10() / 8.0,
+            v.has_audio.unwrap_or(false) as u8 as f32,
+        ]),
+        extractor: "video-stats@1".into(),
+    });
 
     // Duration is the one axis that reliably separates the kinds of video a game project holds.
     let class = match v.duration_ms {
@@ -661,9 +843,7 @@ fn analyze_video(
         Some(_) => "cutscene",
         None => "clip",
     };
-    store
-        .set_media_class(&t.id, MediaType::Video, class)
-        .map_err(|e| e.to_string())?;
+    w.class = Some((MediaType::Video, class.to_string()));
 
     let mut suggestions: Vec<(&str, f32)> = vec![(class, 0.6)];
     // A video with no audio track is very often a UI/VFX element or a video texture rather than a
@@ -679,8 +859,7 @@ fn analyze_video(
         }
     }
     suggest_all(
-        store,
-        &t.id,
+        w,
         &suggestions,
         "Video analysis inferred this from measured duration, dimensions, and track metadata.",
     );
@@ -690,10 +869,11 @@ fn analyze_video(
 /// Analyse a document: extract its full text, index it for search, and embed it.
 ///
 /// This is the only analyse path that writes to the FTS index rather than (or as well as) the
-/// catalog, because for a document the *text is the content*. The order matters: text first, so a
-/// document is findable even if the embedding step later fails.
+/// catalog, because for a document the *text is the content*. It is also the reason the batch
+/// accumulator has a payload bound at all: the body text is capped at `MAX_TEXT_BYTES` (1 MiB) per
+/// asset, so a batch of documents is three orders of magnitude heavier than a batch of images.
 fn analyze_document(
-    store: &Store,
+    w: &mut AnalysisWrite,
     t: &AnalysisPlanTarget,
     abs: &Path,
     det: &dam_media::Detected,
@@ -703,9 +883,7 @@ fn analyze_document(
     };
     // Re-persist the cheap tier: word/page counts and the excerpt for a document scanned before
     // this pipeline version existed would otherwise stay empty until a rescan.
-    store
-        .set_media_attrs(&t.id, &MediaAttributes::Document(d.clone()))
-        .map_err(|e| e.to_string())?;
+    w.attrs = Some(MediaAttributes::Document(d.clone()));
 
     // A scanned-image PDF with no text layer legitimately yields nothing. That is not an error —
     // it is a document we can describe but not read, and it stays findable by filename and tags.
@@ -717,25 +895,18 @@ fn analyze_document(
         tracing::debug!(asset = %t.id, "no extractable text; indexing by name only");
     }
 
-    store
-        .set_document_text(&t.id, &text)
-        .map_err(|e| e.to_string())?;
-
     // `text_descriptor` returns `None` for text with no usable tokens, so an unreadable document
     // never gets a vector — but a *stale* one from a previous version must not survive either.
     match dam_media::text_descriptor(&text) {
-        Some(vec) => store
-            .set_embedding(
-                &t.id,
-                model_free_space(MediaType::Document),
-                MediaType::Document,
-                &vec,
-                "text-hash@1",
-            )
-            .map_err(|e| e.to_string())?,
-        None => store
-            .clear_embedding(&t.id, model_free_space(MediaType::Document))
-            .map_err(|e| e.to_string())?,
+        Some(vector) => w.embeddings.push(EmbeddingWrite {
+            space_id: model_free_space(MediaType::Document).to_string(),
+            media: MediaType::Document,
+            vector,
+            extractor: "text-hash@1".into(),
+        }),
+        None => w
+            .cleared_spaces
+            .push(model_free_space(MediaType::Document).to_string()),
     }
 
     // Classify by what the document *is* to a project. Filename is the strongest signal here —
@@ -762,65 +933,56 @@ fn analyze_document(
     } else {
         "document"
     };
-    store
-        .set_media_class(&t.id, MediaType::Document, class)
-        .map_err(|e| e.to_string())?;
+    w.class = Some((MediaType::Document, class.to_string()));
 
     let mut suggestions: Vec<(&str, f32)> = vec![(class, 0.6)];
     if d.page_count.is_some_and(|p| p > 20) {
         suggestions.push(("long_form", 0.8));
     }
     suggest_all(
-        store,
-        &t.id,
+        w,
         &suggestions,
         "Document analysis inferred this from the filename and extracted text.",
     );
+    w.document_text = Some(text);
     Ok(())
 }
 
 /// Suggest the audio tags that need an owned string (tempo bucket, musical key) — kept out of the
 /// `&'static str` batch below. Tempo is bucketed to the nearest 5 BPM so near-identical estimates
-/// collapse to one filterable tag. Fail-soft per tag.
-fn suggest_audio_extras(store: &Store, id: &dam_api::id::AssetId, f: &dam_media::AudioFeatures) {
+/// collapse to one filterable tag.
+fn suggest_audio_extras(w: &mut AnalysisWrite, f: &dam_media::AudioFeatures) {
     if let Some(bpm) = f.bpm {
         let bucket = ((bpm / 5.0).round() * 5.0) as i64;
-        let tag = format!("{bucket}bpm");
-        if let Err(e) = store.suggest_tag(
-            id,
-            &tag,
-            0.5,
-            "analyze@1",
-            "Measured tempo falls in this BPM bucket.",
-        ) {
-            tracing::warn!(asset = %id, tag = %tag, error = %e, "bpm suggest_tag failed");
-        }
+        w.tags.push(TagSuggestion {
+            name: format!("{bucket}bpm"),
+            confidence: 0.5,
+            extractor: "analyze@1".into(),
+            explanation: "Measured tempo falls in this BPM bucket.".into(),
+        });
     }
     if let Some(key) = f.key {
-        let tag = format!("key-{key}");
-        if let Err(e) = store.suggest_tag(
-            id,
-            &tag,
-            0.5,
-            "analyze@1",
-            "Pitch analysis detected this musical key.",
-        ) {
-            tracing::warn!(asset = %id, tag = %tag, error = %e, "key suggest_tag failed");
-        }
+        w.tags.push(TagSuggestion {
+            name: format!("key-{key}"),
+            confidence: 0.5,
+            extractor: "analyze@1".into(),
+            explanation: "Pitch analysis detected this musical key.".into(),
+        });
     }
 }
 
-/// Write a batch of suggested tags fail-soft (a single insert failure never sinks the asset).
-fn suggest_all(
-    store: &Store,
-    id: &dam_api::id::AssetId,
-    suggestions: &[(&str, f32)],
-    explanation: &str,
-) {
-    for (name, conf) in suggestions {
-        if let Err(e) = store.suggest_tag(id, name, *conf, "analyze@1", explanation) {
-            tracing::warn!(asset = %id, tag = name, error = %e, "suggest_tag failed");
-        }
+/// Collect a batch of suggested tags onto the pending write. Each one used to be its own
+/// transaction — interning the name, inserting the row, and rewriting the whole `asset_fts.tags`
+/// column — which is where most of an analysed image's ~28 transactions went; the batch interns
+/// each distinct name once and reindexes each asset once.
+fn suggest_all(w: &mut AnalysisWrite, suggestions: &[(&str, f32)], explanation: &str) {
+    for (name, confidence) in suggestions {
+        w.tags.push(TagSuggestion {
+            name: (*name).to_string(),
+            confidence: *confidence,
+            extractor: "analyze@1".into(),
+            explanation: explanation.to_string(),
+        });
     }
 }
 

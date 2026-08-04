@@ -16,6 +16,7 @@ mod scan;
 pub mod semantic;
 mod upload;
 mod watch;
+mod writer;
 
 pub use background::PipelinePolicy;
 pub use cache::CacheOptions;
