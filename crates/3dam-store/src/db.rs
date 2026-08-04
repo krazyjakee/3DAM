@@ -38,6 +38,9 @@
 //! no such thing. The cost is nil either way, so the convention is unconditional: **if it writes,
 //! it begins immediate.** Deferred `BEGIN` is reserved for [`Db::read`], which never writes.
 //!
+//! `SQLITE_BUSY_SNAPSHOT` is not the only place the busy handler goes missing: `PRAGMA
+//! journal_mode` is the other, and [`enter_wal`] hand-rolls the wait it should have had.
+//!
 //! ## In-memory stores are the sharp edge
 //!
 //! [`Db::Memory`] cannot be pooled: a second `:memory:` handle is a *different database*, and the
@@ -79,8 +82,7 @@ pub(crate) enum Role {
 pub(crate) fn configure(conn: &Connection, role: Role) -> Result<(), LibError> {
     conn.busy_timeout(BUSY_TIMEOUT).map_err(internal)?;
     if role == Role::Writer {
-        conn.pragma_update(None, "journal_mode", "WAL")
-            .map_err(internal)?;
+        enter_wal(conn)?;
         conn.pragma_update(None, "synchronous", "NORMAL")
             .map_err(internal)?;
     }
@@ -91,6 +93,43 @@ pub(crate) fn configure(conn: &Connection, role: Role) -> Result<(), LibError> {
             .map_err(internal)?;
     }
     Ok(())
+}
+
+/// Switch the database file into WAL, retrying while another connection holds it.
+///
+/// `journal_mode` is the one PRAGMA `busy_timeout` cannot cover. Changing it rewrites the database
+/// *header*, so it needs a brief exclusive lock — and SQLite answers `SQLITE_BUSY` for that case
+/// **without invoking the busy handler**, exactly as it does for `SQLITE_BUSY_SNAPSHOT`. Two
+/// processes opening the same data dir at the same instant (the desktop shell booting its
+/// in-process server while a CLI run starts — the scenario this module's `BEGIN IMMEDIATE`
+/// convention exists for) therefore raced here, and the loser failed its whole `Store::open` with a
+/// bare "database is locked". So the wait is hand-rolled, bounded by the same [`BUSY_TIMEOUT`] the
+/// handler would have used.
+///
+/// The window is only ever open on the *first* open of a fresh (or legacy rollback-journal) file:
+/// once the file is in WAL, this pragma is a no-op that takes no lock at all.
+fn enter_wal(conn: &Connection) -> Result<(), LibError> {
+    /// Short enough that the common uncontended path costs one sleep at worst, long enough not to
+    /// spin on a migration that holds the write lock for a while.
+    const RETRY_EVERY: std::time::Duration = std::time::Duration::from_millis(20);
+    let deadline = std::time::Instant::now() + BUSY_TIMEOUT;
+    loop {
+        match conn.pragma_update(None, "journal_mode", "WAL") {
+            Ok(()) => return Ok(()),
+            Err(err) if busy(&err) && std::time::Instant::now() < deadline => {
+                std::thread::sleep(RETRY_EVERY);
+            }
+            Err(err) => return Err(internal(err)),
+        }
+    }
+}
+
+fn busy(err: &rusqlite::Error) -> bool {
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(e, _)
+            if e.code == ErrorCode::DatabaseBusy || e.code == ErrorCode::DatabaseLocked
+    )
 }
 
 /// How many pooled readers to allow. `3DAM_DB_READERS` overrides (mirroring the `3DAM_BG_THREADS`
@@ -618,6 +657,35 @@ mod tests {
         let db = Db::in_memory(Connection::open_in_memory().unwrap()).unwrap();
         let _first = db.write();
         let _second = db.write();
+    }
+
+    /// Two writers opening the *same fresh file* both come up in WAL. The second one's `PRAGMA
+    /// journal_mode = WAL` lands while the first holds the file's write lock, and SQLite refuses
+    /// that with `SQLITE_BUSY` without ever calling the busy handler — so [`enter_wal`] has to wait
+    /// by hand or `Store::open` fails outright (see `tests/concurrency.rs`, which reproduces the
+    /// two-process form).
+    #[test]
+    fn a_second_writer_waits_out_the_journal_mode_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("library.db");
+
+        // Connection A converts the file and parks inside a write transaction, holding the lock.
+        let first = Connection::open(&path).unwrap();
+        configure(&first, Role::Writer).unwrap();
+        first
+            .execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        first.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        // B's `journal_mode` is a no-op on an already-WAL file, so it must not even need the wait.
+        let second = Connection::open(&path).unwrap();
+        configure(&second, Role::Writer).expect("configuring a second writer must not fail");
+        first.execute_batch("ROLLBACK").unwrap();
+
+        let mode: String = second
+            .pragma_query_value(None, "journal_mode", |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode.to_lowercase(), "wal");
     }
 
     /// `3DAM_DB_READERS` overrides the CPU-derived ceiling verbatim (never to zero); without it the

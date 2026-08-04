@@ -67,6 +67,8 @@ Each *file-source* asset carries a **content hash** over the raw file bytes:
 
 SQLite in **WAL** journal mode (concurrent readers during a write scan), `foreign_keys = ON`, `synchronous = NORMAL`. DDL below is indicative, not frozen.
 
+**Connection handling** (shipped, issue #137; the full contract is [14](14-concurrency-performance-reliability.md) §4.3 and the module doc on `dam-store/src/db.rs`). WAL's concurrent readers only exist if there is more than one connection, so `Store` owns **one read-write connection** behind a mutex plus a **bounded pool of read-only connections** (CPU count clamped to 2–4, overridable with **`3DAM_DB_READERS`**), gated by a `maint` `RwLock` that `VACUUM` / `wal_checkpoint(TRUNCATE)` / migrations take exclusively to drain everyone. Reads run inside `BEGIN DEFERRED` so one call observes one snapshot; writes are always one `BEGIN IMMEDIATE` transaction, so a concurrent reader can never catch a half-applied edit and a second process on the same data dir waits on the busy handler instead of failing with `SQLITE_BUSY_SNAPSHOT`. Only the writer connection sets `journal_mode`/`synchronous` (they are persisted header properties); pooled readers add `query_only = ON`. An in-memory store (tests) is single-connection by construction and cannot be pooled.
+
 ### 3.1 `asset` — shared fields
 
 The spine. One row per catalogued asset (local or federated), media-agnostic where possible.

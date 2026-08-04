@@ -235,6 +235,21 @@ impl Store {
         const SEM_SEEDS: usize = 24; // top lexical hits that seed the embedding expansion
         const SEM_CAP: usize = 400; // neighbours kept from the expansion
 
+        // 0. Model-backed text→asset list (M4): assets nearest to the encoded *query text* in the
+        //    model's shared space — the ones a pure name search would miss entirely. Empty unless a
+        //    semantic model produced `text_vec`.
+        //
+        //    Runs *before* the read guard on purpose (issue #137 step 5): `nearest_in_space` scores a
+        //    whole embedding space (or builds its HNSW) and checks out its own connection so that CPU
+        //    work never pins this query's WAL snapshot. Calling it under the guard below would trip
+        //    the debug nested-guard check. The cost is that these hits come from a slightly earlier
+        //    snapshot than the lexical list they are fused with, which only matters for an asset
+        //    embedded and then deleted mid-query — it is filtered out by `summaries_for_ids` anyway.
+        let text_hits: Vec<(AssetId, f32)> = match &text_vec {
+            Some((space, qv)) => self.nearest_in_space(space, qv, SEM_CAP)?,
+            None => Vec::new(),
+        };
+
         let conn = self.read()?;
 
         // 1. Lexical candidates, best-first by bm25 (the M1 ranking), bounded.
@@ -267,14 +282,6 @@ impl Store {
         // 2. Expand: embedding neighbours of the top lexical seeds (best cosine per neighbour).
         let seeds: Vec<AssetId> = lex_ids.iter().take(SEM_SEEDS).copied().collect();
         let neighbours = Self::semantic_neighbours(&conn, &seeds, SEM_CAP)?;
-
-        // 2b. Model-backed text→asset list (M4): assets nearest to the encoded *query text* in the
-        //     model's shared space — the ones a pure name search would miss entirely. Empty unless a
-        //     semantic model produced `text_vec`.
-        let text_hits: Vec<(AssetId, f32)> = match &text_vec {
-            Some((space, qv)) => self.nearest_in_space(&conn, space, qv, SEM_CAP)?,
-            None => Vec::new(),
-        };
 
         // 3. Reciprocal-rank fuse the ranked lists. `w_text` leads in Semantic mode when the model is
         //    present; the model-free seed-neighbours (`w_sem`) still contribute.

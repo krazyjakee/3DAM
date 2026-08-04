@@ -211,9 +211,27 @@ fn query_stream(req) -> PageStream<AssetSummary> {
 
 The same pattern backs `watch_job` and `subscribe` ([03](03-library-service-and-api.md) §7): progress and change events are pushed into bounded per-subscriber channels. If a subscriber lags past its buffer, the server drops it to the resume cursor rather than growing memory unboundedly — the **coalesce-and-resume** policy: progress events are coalesced (only the latest `Progress` matters), and the client catches up via the `since` cursor ([03](03-library-service-and-api.md) §7). Wire specifics are [09](09-server-and-web-client.md).
 
-### 4.3 The single DB writer
+### 4.3 The single DB writer — **shipped** (issue #137)
 
-SQLite in WAL mode has one writer. Rather than contend a mutex per asset, the store stage owns a **single writer task** fed by a bounded channel; it **batches** upserts into transactions (size- and time-bounded — e.g. flush every N rows or every M ms, whichever first) so a scan of a million files is thousands of transactions, not a million. Reads use a separate pooled connection set and are never blocked by the writer (WAL readers proceed during a write). This keeps stage 3 fast without turning the DB into the bottleneck.
+SQLite in WAL mode has one writer. `dam-store` owns that shape directly in `src/db.rs`: **one read-write connection** behind a mutex, a **bounded pool of read-only connections**, and a `maint` `RwLock` that lets whole-file maintenance drain both. Three accessors, three contracts:
+
+| accessor | holds | for |
+|---|---|---|
+| `Store::read` | `maint.read()` + one pooled read-only connection inside `BEGIN DEFERRED` | every query |
+| `Store::write` | `maint.read()` + the writer mutex | anything that mutates rows |
+| `Store::exclusive` | `maint.write()` + the writer mutex | `VACUUM`, `wal_checkpoint(TRUNCATE)`, migrations |
+
+Lock order is always `maint` → connection, so `write` and `exclusive` cannot deadlock against each other. Readers are never blocked by the writer — that is the WAL guarantee the old single-`Mutex<Connection>` store threw away, and `tests/concurrency.rs` asserts it as *progress* (readers complete many queries during a sustained write burst), never as a latency threshold.
+
+Four properties are load-bearing:
+
+- **Reads pin one snapshot.** `BEGIN DEFERRED` takes no lock until the first statement, so it never blocks the writer, but it fixes the WAL snapshot for the guard's whole lifetime. A multi-statement read — `stats()` reads `library_stat`, `media_stat`, and `source_stat` in three statements — is therefore internally consistent instead of stitched from three moments.
+- **Writes are transactional and `Immediate`.** Because readers now run concurrently, every multi-statement write must be one transaction or a reader will observe a half-applied edit (an asset whose `media_type` no longer matches its `*_attr` row). And every such transaction takes `BEGIN IMMEDIATE`, never rusqlite's default deferred `BEGIN`: a deferred transaction that reads before it writes fails its lock upgrade with `SQLITE_BUSY_SNAPSHOT`, for which SQLite does **not** invoke the busy handler, so `busy_timeout` cannot rescue it. In-process the writer mutex already serialises us; a second process on the same data dir (the desktop shell plus a CLI run) has nothing but this.
+- **`PRAGMA journal_mode` is the other place `busy_timeout` does not reach.** Entering WAL rewrites the database header and needs a brief exclusive lock, and SQLite refuses it with a bare `SQLITE_BUSY` without calling the busy handler. Two processes opening the *same fresh* data dir at the same instant therefore raced, and the loser's `Store::open` failed outright with "database is locked". `db::enter_wal` hand-rolls the wait the handler would have done, bounded by the same `BUSY_TIMEOUT`. Only the first open of a fresh (or legacy rollback-journal) file can contend: on an already-WAL file the pragma is a lock-free no-op.
+- **CPU work never runs on a connection.** A pinned snapshot means an ever-growing WAL, so anything expensive against copied data — near-duplicate union-find, brute-force cosine scans, HNSW index construction — fetches its rows under a guard, drops it, and computes with none held. Those methods therefore observe more than one snapshot; they were always a best-effort view of a moving catalog, and the affected doc comments say so.
+- **Pool size.** CPU count clamped to 2–4, overridable verbatim with **`3DAM_DB_READERS`** (mirroring `3DAM_BG_THREADS` in `dam-core`'s resource governor). Connections open lazily, so a freshly opened store has none until something reads. An in-memory store cannot be pooled at all — a second `:memory:` handle is a different database — so it aliases `read` and `write` onto one connection, and a debug-only per-thread guard-depth counter turns the resulting nested-guard hang into an immediate panic.
+
+Not shipped: the bounded writer *channel* and the size/time-bounded **upsert batching** originally sketched here. Today each `upsert_asset` is its own immediate transaction, called from the scan's blocking worker. Batching remains the obvious next lever if a million-file scan proves commit-bound; it is a change inside `Store::write`'s callers, not to the ownership model above.
 
 ---
 
