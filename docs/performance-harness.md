@@ -35,15 +35,34 @@ The fixture contains local filesystem, SFTP, SMB, and federated sources; all fiv
 
 The harness measures median first-page, late-page, lexical-search, faceted-query, library-stats,
 and confirmed-tag-facet latency; analysis-planning and exact-duplicate latency; scan/upsert and
-bounded export throughput; process peak RSS; and the serialized initial browse payload. The stats
+bounded export throughput; browse latency sampled during that write workload; process peak RSS; and
+the serialized initial browse payload. The stats
 and tag-facet budgets are intentionally identical for smoke, 100k, and 1M profiles: growth in asset
 rows cannot buy a looser threshold, so a return to catalog scans fails the scale profile.
 
-Write evidence has two complementary measures. `scan_upsert_assets_per_second` exercises the real
+Write evidence has three complementary measures. `scan_upsert_assets_per_second` exercises the real
 production upsert path with aggregate triggers enabled. `aggregate_write_overhead_ratio` compares
 an aggregate-relevant no-op asset update with an otherwise identical indexed no-op update against
 the production schema, in rolled-back transactions over deterministic fixture ids; this isolates
 the maintained-count trigger cost without changing the measured catalog.
+
+`browse_under_write_ms` is the reader half of that same workload, and the regression guard for
+[issue #137](https://github.com/krazyjakee/3DAM/issues/137)'s one-writer/pooled-readers connection
+ownership. A sampler thread browses the catalog once per millisecond for as long as the upsert loop
+above runs — the same writes, not a second workload — issuing the default first page with
+`include_total: false`, so the sample is a keyset page fetch whose cost is a function of page size
+rather than of catalog size. Two consequences follow. The measurement is charged honestly: the
+sampler's contention is included in `scan_upsert_assets_per_second`, because a scan rate that only
+holds when nobody is browsing is not a rate worth recording. And the threshold is the **p95, not the
+median** — when reads serialise behind the writer the latency distribution goes bimodal rather than
+shifting, since most browses still slip into the gap between two writes while the unlucky ones wait
+out a whole write (or several, `std::sync::Mutex` being unfair). Forcing `Db::read` back onto the
+writer mutex on the smoke profile moved the median only 0.6 ms → 1.5 ms but moved the p95
+1.2 ms → 289 ms, and cut completed browses from 1,231 to 40 in the same wall clock. All three
+profiles share one 20 ms reference at a 2.0 ratio, because a browse under write must not scale with
+catalog size when keyset pagination and the read pool are both working — measured, the pooled p95 is
+1.18 ms on smoke and 1.10 ms on 100k. That leaves roughly 30x of headroom in the 40 ms ceiling for a
+loaded CI runner, while the serialised regression overshoots it by between 1.4x and 8x.
 
 The Node browser profile traverses every logical page while retaining only the production browse
 window and reports long-scroll p99 work time and post-midpoint heap growth.

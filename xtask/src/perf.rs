@@ -25,6 +25,7 @@ const STORE_METRICS: &[&str] = &[
     "stats_ms",
     "tag_facets_ms",
     "scan_upsert_assets_per_second",
+    "browse_under_write_ms",
     "aggregate_write_overhead_ratio",
     "analysis_plan_ms",
     "duplicate_detection_ms",
@@ -840,7 +841,70 @@ fn benchmark_store(
         vec![export_rate],
     )?;
 
+    // One workload, two metrics (issue #137). The upsert loop is the only write workload in the
+    // harness; a sampler thread browses the catalog *while* it runs, so the reads contend with a
+    // real sustained writer rather than with a synthetic lock. With one writer connection and a
+    // pooled read-only connection per checkout the two never serialise, so the browse samples
+    // should land within noise of `first_page_ms`. Put reads back behind the writer mutex and a
+    // browse has to wait out whichever upsert is in flight — see [`insert_tail_timing`] for why
+    // that shows up in the tail rather than the median, and for the measured numbers. The sampler's
+    // own cost is charged to `scan_upsert_assets_per_second` too, deliberately: a scan that only
+    // goes fast when nobody is looking is not the property we want to record.
+    let browse_request = QueryRequest {
+        // Deliberately no exact total: that count is a whole-catalog aggregate (already gated by
+        // `first_page_ms` and `stats_ms`) and would make this threshold grow with row count instead
+        // of with contention. The rest is the default first page a client asks for.
+        include_total: Some(false),
+        ..QueryRequest::default()
+    };
+    let writing = std::sync::atomic::AtomicBool::new(true);
     let upsert_started = Instant::now();
+    let browse_samples = std::thread::scope(|scope| {
+        let sampler =
+            scope.spawn(|| browse_while_writing(store, &browse_request, &visibility, &writing));
+        let written = run_upsert_workload(store, profile);
+        // Release the sampler before propagating a write failure, or the scope blocks forever.
+        writing.store(false, std::sync::atomic::Ordering::Release);
+        let sampled = sampler
+            .join()
+            .unwrap_or_else(|_| Err("browse sampler panicked".into()));
+        written.and(sampled)
+    })?;
+    let upsert_rate = profile.upsert_sample as f64 / upsert_started.elapsed().as_secs_f64();
+    insert_metric(
+        &mut metrics,
+        "scan_upsert_assets_per_second",
+        upsert_rate,
+        "assets_per_second",
+        Direction::HigherIsBetter,
+        vec![upsert_rate],
+    )?;
+    insert_tail_timing(&mut metrics, "browse_under_write_ms", browse_samples)?;
+    let overhead = aggregate_write_overhead(database_path, profile.upsert_sample.min(5_000))?;
+    insert_metric(
+        &mut metrics,
+        "aggregate_write_overhead_ratio",
+        overhead,
+        "ratio",
+        Direction::LowerIsBetter,
+        vec![overhead],
+    )?;
+    let rss = peak_rss_bytes().ok_or("peak RSS is unavailable on this platform")? as f64;
+    insert_metric(
+        &mut metrics,
+        "peak_rss_bytes",
+        rss,
+        "bytes",
+        Direction::LowerIsBetter,
+        vec![rss],
+    )?;
+    Ok(metrics)
+}
+
+/// The harness's only write workload: `upsert_sample` assets through the production upsert path,
+/// aggregate and folder triggers live. Times `scan_upsert_assets_per_second` at the call site and
+/// supplies the sustained writer that `browse_under_write_ms` measures against.
+fn run_upsert_workload(store: &Store, profile: &Profile) -> Result<(), String> {
     for index in 0..profile.upsert_sample {
         let source = index % profile.source_count;
         let (media, extension) = media(index);
@@ -868,34 +932,43 @@ fn benchmark_store(
             })
             .map_err(|e| e.to_string())?;
     }
-    let upsert_rate = profile.upsert_sample as f64 / upsert_started.elapsed().as_secs_f64();
-    insert_metric(
-        &mut metrics,
-        "scan_upsert_assets_per_second",
-        upsert_rate,
-        "assets_per_second",
-        Direction::HigherIsBetter,
-        vec![upsert_rate],
-    )?;
-    let overhead = aggregate_write_overhead(database_path, profile.upsert_sample.min(5_000))?;
-    insert_metric(
-        &mut metrics,
-        "aggregate_write_overhead_ratio",
-        overhead,
-        "ratio",
-        Direction::LowerIsBetter,
-        vec![overhead],
-    )?;
-    let rss = peak_rss_bytes().ok_or("peak RSS is unavailable on this platform")? as f64;
-    insert_metric(
-        &mut metrics,
-        "peak_rss_bytes",
-        rss,
-        "bytes",
-        Direction::LowerIsBetter,
-        vec![rss],
-    )?;
-    Ok(metrics)
+    Ok(())
+}
+
+/// Sample a browse page repeatedly until `writing` clears, returning per-sample milliseconds.
+///
+/// Paced rather than spun: a browse is a user action arriving at an arbitrary point in the write
+/// stream, and a hot loop would both take a core off the writer and stop being representative. The
+/// loop is do-while, so however short the workload the metric always has at least one sample.
+fn browse_while_writing(
+    store: &Store,
+    request: &QueryRequest,
+    visibility: &Visibility,
+    writing: &std::sync::atomic::AtomicBool,
+) -> Result<Vec<f64>, String> {
+    /// Gap between browses. Short enough that even the one-second smoke workload yields hundreds of
+    /// samples, long enough that the sampler stays a reader rather than becoming a load generator
+    /// that competes with the writer for a CI runner's two cores.
+    const PACE: std::time::Duration = std::time::Duration::from_millis(1);
+    /// Reading continues for the whole workload — that is the point — but the report keeps every
+    /// raw sample, and the 1M profile writes for tens of seconds. Past this many the distribution
+    /// has long settled, so stop growing the JSON rather than stop contending.
+    const RECORD_LIMIT: usize = 4_096;
+    let mut samples = Vec::new();
+    loop {
+        let started = Instant::now();
+        store
+            .query_assets_semantic(request, None, visibility)
+            .map_err(|error| error.to_string())?;
+        let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
+        if samples.len() < RECORD_LIMIT {
+            samples.push(elapsed);
+        }
+        if !writing.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(samples);
+        }
+        std::thread::sleep(PACE);
+    }
 }
 
 /// Measure the incremental V26 trigger cost against the same indexed no-op asset update without an
@@ -1037,6 +1110,32 @@ fn insert_timing(
     )
 }
 
+/// Like [`insert_timing`], but the *gated* value is the p95, not the median.
+///
+/// The median is the right summary for an uncontended query and the wrong one for a contention
+/// probe. When reads serialise behind the writer the distribution goes bimodal rather than shifting:
+/// most browses still slip into the gap between two writes and stay fast, while the unlucky ones
+/// wait out a whole write — or, because `std::sync::Mutex` is not fair, several in a row. Measured
+/// on the smoke profile with `Db::read` forced back onto the writer mutex, the median moved
+/// 0.6 ms → 1.5 ms (which no honest threshold can separate from machine noise) while the p95 moved
+/// 1.2 ms → 289 ms. The tail is both what a user actually feels and the only statistic that catches
+/// the regression, so it is what the baseline compares. `Metric::p95` reports the same number.
+fn insert_tail_timing(
+    metrics: &mut BTreeMap<String, Metric>,
+    name: &str,
+    samples: Vec<f64>,
+) -> Result<(), String> {
+    let tail = p95(&samples);
+    insert_metric(metrics, name, tail, "ms", Direction::LowerIsBetter, samples)
+}
+
+fn p95(samples: &[f64]) -> f64 {
+    let mut ordered = samples.to_vec();
+    ordered.sort_by(f64::total_cmp);
+    let index = (ordered.len() * 95).div_ceil(100).saturating_sub(1);
+    ordered[index]
+}
+
 fn insert_metric(
     metrics: &mut BTreeMap<String, Metric>,
     name: &str,
@@ -1052,12 +1151,7 @@ fn insert_metric(
         name.into(),
         Metric {
             value,
-            p95: {
-                let mut ordered = samples.clone();
-                ordered.sort_by(f64::total_cmp);
-                let index = (ordered.len() * 95).div_ceil(100).saturating_sub(1);
-                ordered[index]
-            },
+            p95: p95(&samples),
             unit,
             direction,
             samples,
