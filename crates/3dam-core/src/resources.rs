@@ -181,6 +181,28 @@ pub fn io_stall_pct() -> Option<f64> {
     }
 }
 
+/// One reading of everything the governor decides on. Bundling the probes behind a value (and
+/// [`sample_host`] behind a callable) is what lets the governor's own logic — caching, transition
+/// logging, the pause loop — be tested against a fixed host instead of whatever `/proc` happens to
+/// say on a busy CI runner.
+#[derive(Clone, Copy)]
+struct Sample {
+    available: Option<u64>,
+    load1: Option<f64>,
+    io_stall: Option<f64>,
+    cpus: usize,
+}
+
+/// Read the live host probes. The only place the governor touches the filesystem.
+fn sample_host() -> Sample {
+    Sample {
+        available: available_memory(),
+        load1: loadavg_1(),
+        io_stall: io_stall_pct(),
+        cpus: effective_cpus(),
+    }
+}
+
 /// Size the bounded background pool: `effective_cpus − 2` (the inspector-priority headroom,
 /// tech-spec 14), hard-capped at [`DEFAULT_BG_THREAD_CAP`] unless the operator overrides — and an
 /// override is still clamped to the effective CPU budget, never past it.
@@ -254,16 +276,32 @@ impl Governor {
     /// Is the host under pressure right now? Samples at most every [`SAMPLE_EVERY`]; logs each
     /// transition (info level) so an operator can see the engine yielding.
     pub fn pressured(&self) -> bool {
+        self.pressured_at(Instant::now(), sample_host)
+    }
+
+    /// [`Governor::pressured`] against an injected clock and host reading — the seam that lets the
+    /// caching and transition logic be tested against a fixed host and a fixed `now`, instead of
+    /// whatever `/proc` and the wall clock happen to say on a loaded CI runner.
+    ///
+    /// `sample` stays a closure rather than a value so the [`SAMPLE_EVERY`] cache still
+    /// short-circuits *before* any probing — paying for the file reads per item (thousands of
+    /// assets) is exactly what the cache exists to avoid.
+    fn pressured_at(&self, now: Instant, sample: impl Fn() -> Sample) -> bool {
         let mut st = self.state.lock().unwrap();
-        if st.sampled_at.is_some_and(|at| at.elapsed() < SAMPLE_EVERY) {
+        if st
+            .sampled_at
+            .is_some_and(|at| now.duration_since(at) < SAMPLE_EVERY)
+        {
             return st.pressured;
         }
-        let available = available_memory();
-        let load = loadavg_1();
-        let io_stall = io_stall_pct();
-        let cpus = effective_cpus();
+        let Sample {
+            available,
+            load1: load,
+            io_stall,
+            cpus,
+        } = sample();
         st.pressured = self.decide(available, load, io_stall, cpus);
-        st.sampled_at = Some(Instant::now());
+        st.sampled_at = Some(now);
         if st.pressured != st.was_pressured {
             st.was_pressured = st.pressured;
             if st.pressured {
@@ -287,6 +325,21 @@ impl Governor {
     pub fn pace(&self, cancel: &AtomicBool) {
         while self.pressured() && !cancel.load(Ordering::Relaxed) {
             std::thread::sleep(PAUSE_TICK);
+        }
+    }
+
+    /// [`Governor::pace`] against an injectable host reading and sleeper, so a test can assert
+    /// *how many times the loop slept* rather than how long it took — the wall clock on a loaded
+    /// box says nothing about whether the cancel flag was honoured.
+    #[cfg(test)]
+    fn pace_with(
+        &self,
+        cancel: &AtomicBool,
+        sample: impl Fn() -> Sample,
+        mut sleep: impl FnMut(Duration),
+    ) {
+        while self.pressured_at(Instant::now(), &sample) && !cancel.load(Ordering::Relaxed) {
+            sleep(PAUSE_TICK);
         }
     }
 }
@@ -429,31 +482,99 @@ mod tests {
         assert!(background_thread_count(Some(10_000)) <= cpus);
     }
 
+    /// A host that trips the memory floor of every governor built below (1 GiB / impossible), with
+    /// load and disk deliberately healthy so only the memory gate is under test.
+    fn starved_host() -> Sample {
+        Sample {
+            available: Some(0),
+            load1: Some(0.1),
+            io_stall: Some(0.0),
+            cpus: 4,
+        }
+    }
+
     #[test]
-    fn pace_returns_immediately_when_cancelled() {
-        let g = Governor::new(Some(u64::MAX / (1024 * 1024)), None); // impossible floor → always pressured
+    fn pace_does_not_sleep_when_cancelled() {
+        let g = Governor::new(Some(1024), None);
+        // Vacuity guard: without this the loop would exit on `pressured()` alone and the test
+        // would pass no matter what `pace` did with the cancel flag.
+        assert!(
+            Governor::new(Some(1024), None).pressured_at(Instant::now(), starved_host),
+            "the injected host must be pressured for the cancel check to mean anything"
+        );
+
         let cancel = AtomicBool::new(true);
-        let start = Instant::now();
-        g.pace(&cancel); // must not sleep
-        assert!(start.elapsed() < Duration::from_millis(400));
+        let mut naps = 0usize;
+        g.pace_with(&cancel, starved_host, |_| naps += 1);
+        assert_eq!(naps, 0, "pace must not sleep once cancel is set");
+    }
+
+    #[test]
+    fn pace_sleeps_while_pressured_and_stops_when_cancel_flips() {
+        let g = Governor::new(Some(1024), None);
+        let cancel = AtomicBool::new(false);
+        let mut naps = 0usize;
+        g.pace_with(&cancel, starved_host, |tick| {
+            assert_eq!(tick, PAUSE_TICK);
+            naps += 1;
+            if naps == 3 {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        });
+        assert_eq!(naps, 3, "pace parks while pressured, then honours cancel");
+    }
+
+    /// The [`SAMPLE_EVERY`] cache must short-circuit *before* probing — the probes are file reads
+    /// and background loops call this per item. Driven off an injected `now` so it asserts on the
+    /// window itself, not on how fast the test machine gets through two statements.
+    #[test]
+    fn pressure_is_probed_at_most_once_per_window() {
+        let g = Governor::new(Some(1024), None);
+        let calls = std::cell::Cell::new(0usize);
+        let sample = || {
+            calls.set(calls.get() + 1);
+            starved_host()
+        };
+        let t0 = Instant::now();
+        assert!(g.pressured_at(t0, sample));
+        assert_eq!(calls.get(), 1);
+        // Still inside the window: cached verdict, no probing.
+        assert!(g.pressured_at(t0 + SAMPLE_EVERY / 2, sample));
+        assert_eq!(calls.get(), 1, "the cache short-circuits probing");
+        // Past it: re-probes.
+        assert!(g.pressured_at(t0 + SAMPLE_EVERY, sample));
+        assert_eq!(calls.get(), 2, "the window expires");
     }
 }
 
 #[cfg(test)]
 mod live_probe {
     use super::*;
+
+    /// The live probes are wired into the decision: on a host where `/proc` answers, an impossible
+    /// memory floor pauses background work.
+    ///
+    /// Takes **one** reading of the host and decides from that snapshot. The previous shape
+    /// probed once to decide whether to skip, then let `pressured()` probe again to assert — two
+    /// independent reads of live state, so a transient failure of the second (fd exhaustion under
+    /// a heavy parallel build, a cgroup file churning) flipped the verdict with nothing wrong in
+    /// the code. The pure floor→pressured arithmetic is covered hermetically by
+    /// `tests::governor_decides_on_memory_load_and_io`; this test only adds "the real probes feed
+    /// it", which one snapshot proves just as well.
     #[test]
-    fn pressured_is_true_under_impossible_floor_on_linux() {
-        if available_memory().is_none() {
-            return; // non-Linux: governor is inert by design
+    fn live_sample_drives_the_decision_on_linux() {
+        let host = sample_host();
+        if host.available.is_none() {
+            return; // non-Linux, or no /proc: governor is inert by design
         }
         let g = Governor::new(Some(9_999_999), None); // ~9.5 TiB floor
         assert!(
-            g.pressured(),
-            "available={:?} load={:?} cpus={}",
-            available_memory(),
-            loadavg_1(),
-            effective_cpus()
+            g.pressured_at(Instant::now(), || host),
+            "available={:?} load={:?} io_stall={:?} cpus={}",
+            host.available,
+            host.load1,
+            host.io_stall,
+            host.cpus
         );
     }
 }
