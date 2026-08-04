@@ -751,6 +751,67 @@ impl Store {
         vis: &Visibility,
     ) -> Result<Vec<TagInfo>, LibError> {
         let conn = self.conn.lock().unwrap();
+        // Whole-source grants can be answered exactly by the maintained source×tag rows. Manual
+        // collection grants remain on the visibility-join path below because a collection may
+        // overlap a source grant and the union must count an asset once.
+        if vis
+            .restricted()
+            .is_none_or(|scope| scope.collections.is_empty())
+        {
+            let mut binds = Vec::new();
+            let (from, count, manual) = if let Some(scope) = vis.restricted() {
+                if scope.sources.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let placeholders = scope
+                    .sources
+                    .iter()
+                    .map(|_| "?")
+                    .collect::<Vec<_>>()
+                    .join(",");
+                binds.extend(
+                    scope
+                        .sources
+                        .iter()
+                        .map(|id| Value::Blob(id.as_bytes().to_vec())),
+                );
+                (
+                    format!(
+                        "source_tag_stat ats JOIN tag t ON t.id = ats.tag_id \
+                         WHERE ats.source_id IN ({placeholders})"
+                    ),
+                    "SUM(ats.asset_count)",
+                    "SUM(ats.manual_count)",
+                )
+            } else {
+                (
+                    "tag_stat ats JOIN tag t ON t.id = ats.tag_id WHERE 1=1".into(),
+                    "ats.asset_count",
+                    "ats.manual_count",
+                )
+            };
+            let mut prefix_sql = String::new();
+            if let Some(prefix) = prefix.filter(|prefix| !prefix.is_empty()) {
+                prefix_sql.push_str(" AND t.name LIKE ? ESCAPE '\\'");
+                binds.push(Value::Text(format!("{}%", escape_like(prefix))));
+            }
+            binds.push(Value::Integer(limit.clamp(1, 50) as i64));
+            let sql = format!(
+                "SELECT t.name, {count} n, {manual} manual FROM {from}{prefix_sql}
+                 GROUP BY t.id HAVING n > 0 ORDER BY n DESC, t.name ASC LIMIT ?"
+            );
+            let mut stmt = conn.prepare(&sql).map_err(internal)?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(binds.iter()), |row| {
+                    Ok(TagInfo {
+                        name: row.get(0)?,
+                        count: row.get::<_, i64>(1)?.max(0) as u64,
+                        manual: row.get::<_, i64>(2)? > 0,
+                    })
+                })
+                .map_err(internal)?;
+            return rows.collect::<rusqlite::Result<Vec<_>>>().map_err(internal);
+        }
         let mut where_sql = String::from(" WHERE at.state = 'confirmed'");
         let mut binds = Vec::new();
         if let Some(prefix) = prefix.filter(|prefix| !prefix.is_empty()) {

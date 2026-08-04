@@ -137,6 +137,54 @@ impl Store {
         })
     }
 
+    /// Rebuild every maintained library/facet count from its authoritative catalog rows.
+    ///
+    /// Normal writes cannot drift because the V26 triggers update both sides transactionally. This
+    /// explicit repair seam exists for integrity tooling and recovery from an externally modified
+    /// database. The delete + backfill is one immediate transaction, so readers observe either the
+    /// old complete snapshot or the repaired complete snapshot, never an empty intermediate state.
+    pub fn repair_aggregates(&self) -> Result<(), LibError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(internal)?;
+        tx.execute("DELETE FROM source_tag_stat", [])
+            .map_err(internal)?;
+        tx.execute("DELETE FROM tag_stat", []).map_err(internal)?;
+        tx.execute("DELETE FROM source_media_stat", [])
+            .map_err(internal)?;
+        tx.execute("DELETE FROM source_stat", [])
+            .map_err(internal)?;
+        tx.execute("DELETE FROM media_stat", []).map_err(internal)?;
+        tx.execute("DELETE FROM library_stat", [])
+            .map_err(internal)?;
+        tx.execute_batch(
+            "INSERT INTO library_stat(singleton, asset_count, unanalyzed_count, source_count)
+             SELECT 1, (SELECT COUNT(*) FROM asset),
+                       (SELECT COUNT(*) FROM asset WHERE analysed_at IS NULL),
+                       (SELECT COUNT(*) FROM source);
+             INSERT INTO media_stat(media_type, asset_count)
+             SELECT media_type, COUNT(*) FROM asset GROUP BY media_type;
+             INSERT INTO source_stat(source_id, asset_count, unanalyzed_count)
+             SELECT s.id, COUNT(a.id), COUNT(a.id) FILTER (WHERE a.analysed_at IS NULL)
+               FROM source s LEFT JOIN asset a ON a.source_id = s.id GROUP BY s.id;
+             INSERT INTO source_media_stat(source_id, media_type, asset_count)
+             SELECT source_id, media_type, COUNT(*) FROM asset GROUP BY source_id, media_type;
+             INSERT INTO tag_stat(tag_id, asset_count, manual_count)
+             SELECT t.id, COUNT(at.asset_id) FILTER (WHERE at.state = 'confirmed'),
+                    COUNT(at.asset_id) FILTER (
+                        WHERE at.state = 'confirmed' AND at.source = 'user')
+               FROM tag t LEFT JOIN asset_tag at ON at.tag_id = t.id GROUP BY t.id;
+             INSERT INTO source_tag_stat(source_id, tag_id, asset_count, manual_count)
+             SELECT a.source_id, at.tag_id, COUNT(*),
+                    COUNT(*) FILTER (WHERE at.source = 'user')
+               FROM asset_tag at JOIN asset a ON a.id = at.asset_id
+              WHERE at.state = 'confirmed' GROUP BY a.source_id, at.tag_id;",
+        )
+        .map_err(internal)?;
+        tx.commit().map_err(internal)
+    }
+
     // ── vacuum (Settings §Storage → Compact database) ────────────────────────
 
     /// Compact `library.db` in place (`VACUUM`), reclaiming pages freed by deletes. Sizing the file

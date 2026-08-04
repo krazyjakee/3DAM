@@ -23,7 +23,9 @@ const STORE_METRICS: &[&str] = &[
     "search_ms",
     "faceted_query_ms",
     "stats_ms",
+    "tag_facets_ms",
     "scan_upsert_assets_per_second",
+    "aggregate_write_overhead_ratio",
     "analysis_plan_ms",
     "duplicate_detection_ms",
     "export_assets_per_second",
@@ -220,7 +222,7 @@ fn execute(options: Result<Options, String>) -> Result<(), String> {
         .len();
 
     let store = Store::open(&options.work_dir).map_err(|e| format!("open fixture: {e}"))?;
-    let mut metrics = benchmark_store(&store, &profile)?;
+    let mut metrics = benchmark_store(&store, &profile, &database_path)?;
     let browser = if options.skip_browser {
         BrowserStatus::Skipped {
             reason: "requested with --skip-browser".into(),
@@ -485,6 +487,16 @@ fn generate_catalog(data_dir: &Path, profile: &Profile) -> Result<(), String> {
             "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;",
         )
         .map_err(|e| e.to_string())?;
+    // Maintaining every ancestor folder row per asset is correct for production's streamed scan,
+    // but turns deterministic fixture construction into millions of recursive trigger walks. The
+    // fixture recipe is already a bulk loader, so suspend only that derived read model, rebuild it
+    // set-wise after the asset load, and restore the exact migrated trigger SQL before measuring.
+    // Aggregate triggers deliberately remain live: generation and the write-overhead metric both
+    // exercise the production V26 maintenance path.
+    let folder_triggers = suspend_triggers(&connection, "folder_")?;
+    if folder_triggers.is_empty() {
+        return Err("migrated fixture schema had no folder triggers to suspend".into());
+    }
     let now = 1_700_000_000_000_i64;
     let source_connections = [
         r#"{"kind":"local_fs","root":"/fixture/local"}"#,
@@ -585,10 +597,94 @@ fn generate_catalog(data_dir: &Path, profile: &Profile) -> Result<(), String> {
             eprintln!("generated {batch_end}/{} assets", profile.asset_count);
         }
     }
+    rebuild_folders(&mut connection)?;
+    restore_triggers(&connection, &folder_triggers)?;
+    let root_assets: i64 = connection
+        .query_row(
+            "SELECT COALESCE(SUM(descendant_asset_count), 0) FROM folder WHERE path = ''",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if root_assets != profile.asset_count as i64 {
+        return Err(format!(
+            "folder rebuild counted {root_assets} assets, expected {}",
+            profile.asset_count
+        ));
+    }
     connection
         .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); ANALYZE;")
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+fn suspend_triggers(conn: &Connection, prefix: &str) -> Result<Vec<String>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT name, sql FROM sqlite_schema
+              WHERE type='trigger' AND substr(name, 1, length(?1)) = ?1 ORDER BY name",
+        )
+        .map_err(|error| error.to_string())?;
+    let triggers = stmt
+        .query_map([prefix], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| error.to_string())?;
+    drop(stmt);
+    for (name, _) in &triggers {
+        if !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            return Err(format!(
+                "refusing to suspend unexpected trigger name {name:?}"
+            ));
+        }
+        conn.execute_batch(&format!("DROP TRIGGER {name};"))
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(triggers.into_iter().map(|(_, sql)| sql).collect())
+}
+
+fn restore_triggers(conn: &Connection, triggers: &[String]) -> Result<(), String> {
+    for sql in triggers {
+        conn.execute_batch(sql).map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn rebuild_folders(conn: &mut Connection) -> Result<(), String> {
+    let tx = conn.transaction().map_err(|error| error.to_string())?;
+    tx.execute("DELETE FROM folder", [])
+        .map_err(|error| error.to_string())?;
+    tx.execute_batch(
+        "INSERT INTO folder(source_id, path, parent_path, name)
+             SELECT id, '', '', '' FROM source;
+         WITH RECURSIVE hierarchy(source_id, path, parent_path, name, rest) AS (
+             SELECT source_id, '', '', '', path FROM asset
+             UNION ALL
+             SELECT source_id,
+                    path || substr(rest, 1, instr(rest, '/')),
+                    path,
+                    substr(rest, 1, instr(rest, '/') - 1),
+                    substr(rest, instr(rest, '/') + 1)
+               FROM hierarchy WHERE instr(rest, '/') > 0
+         )
+         INSERT INTO folder(source_id, path, parent_path, name,
+                            direct_asset_count, descendant_asset_count)
+             SELECT source_id, path, min(parent_path), min(name),
+                    sum(CASE WHEN instr(rest, '/') = 0 THEN 1 ELSE 0 END), count(*)
+               FROM hierarchy GROUP BY source_id, path
+             ON CONFLICT(source_id, path) DO UPDATE SET
+                 parent_path = excluded.parent_path,
+                 name = excluded.name,
+                 direct_asset_count = excluded.direct_asset_count,
+                 descendant_asset_count = excluded.descendant_asset_count;",
+    )
+    .map_err(|error| error.to_string())?;
+    tx.commit().map_err(|error| error.to_string())
 }
 
 fn deterministic_id(namespace: u8, index: u64) -> [u8; 16] {
@@ -619,7 +715,11 @@ fn deterministic_embedding(index: usize, dimension: usize) -> Vec<u8> {
         .collect()
 }
 
-fn benchmark_store(store: &Store, profile: &Profile) -> Result<BTreeMap<String, Metric>, String> {
+fn benchmark_store(
+    store: &Store,
+    profile: &Profile,
+    database_path: &Path,
+) -> Result<BTreeMap<String, Metric>, String> {
     let visibility = Visibility::Full;
     let mut metrics = BTreeMap::new();
     let first_request = QueryRequest::default();
@@ -699,6 +799,13 @@ fn benchmark_store(store: &Store, profile: &Profile) -> Result<BTreeMap<String, 
     )?;
     insert_timing(
         &mut metrics,
+        "tag_facets_ms",
+        sample(profile.samples, || {
+            store.list_tags(None, 50, &visibility).map(|_| ())
+        })?,
+    )?;
+    insert_timing(
+        &mut metrics,
         "analysis_plan_ms",
         sample(profile.samples, || {
             store.list_analysis_targets(1, false, &[]).map(|_| ())
@@ -770,6 +877,15 @@ fn benchmark_store(store: &Store, profile: &Profile) -> Result<BTreeMap<String, 
         Direction::HigherIsBetter,
         vec![upsert_rate],
     )?;
+    let overhead = aggregate_write_overhead(database_path, profile.upsert_sample.min(5_000))?;
+    insert_metric(
+        &mut metrics,
+        "aggregate_write_overhead_ratio",
+        overhead,
+        "ratio",
+        Direction::LowerIsBetter,
+        vec![overhead],
+    )?;
     let rss = peak_rss_bytes().ok_or("peak RSS is unavailable on this platform")? as f64;
     insert_metric(
         &mut metrics,
@@ -780,6 +896,57 @@ fn benchmark_store(store: &Store, profile: &Profile) -> Result<BTreeMap<String, 
         vec![rss],
     )?;
     Ok(metrics)
+}
+
+/// Measure the incremental V26 trigger cost against the same indexed no-op asset update without an
+/// aggregate-relevant column. Both loops run inside rolled-back transactions against production
+/// schema and identical deterministic rows; the ratio therefore records aggregate write overhead
+/// without changing the fixture used by later diagnostics.
+fn aggregate_write_overhead(database_path: &Path, samples: usize) -> Result<f64, String> {
+    let mut conn = Connection::open(database_path).map_err(|error| error.to_string())?;
+    conn.busy_timeout(std::time::Duration::from_secs(15))
+        .map_err(|error| error.to_string())?;
+    let samples = samples.max(100);
+    let timed = |conn: &mut Connection, sql: &str| -> Result<f64, String> {
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let started = Instant::now();
+        {
+            let mut update = tx.prepare_cached(sql).map_err(|error| error.to_string())?;
+            for index in 0..samples {
+                update
+                    .execute([deterministic_id(3, index as u64).to_vec()])
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        let seconds = started.elapsed().as_secs_f64();
+        tx.rollback().map_err(|error| error.to_string())?;
+        Ok(seconds)
+    };
+    const BASELINE: &str = "UPDATE asset SET scanned_at=scanned_at WHERE id=?1";
+    const MAINTAINED: &str = "UPDATE asset SET analysed_at=analysed_at WHERE id=?1";
+    // Warm both statement/page paths before collecting paired rounds; otherwise whichever loop runs
+    // first pays SQLite's cold-cache cost and can make the incremental trigger ratio misleading.
+    let _ = timed(&mut conn, BASELINE)?;
+    let _ = timed(&mut conn, MAINTAINED)?;
+    let mut baseline_samples = Vec::with_capacity(5);
+    let mut maintained_samples = Vec::with_capacity(5);
+    for round in 0..5 {
+        if round % 2 == 0 {
+            maintained_samples.push(timed(&mut conn, MAINTAINED)?);
+            baseline_samples.push(timed(&mut conn, BASELINE)?);
+        } else {
+            baseline_samples.push(timed(&mut conn, BASELINE)?);
+            maintained_samples.push(timed(&mut conn, MAINTAINED)?);
+        }
+    }
+    baseline_samples.sort_by(f64::total_cmp);
+    maintained_samples.sort_by(f64::total_cmp);
+    let baseline = baseline_samples[baseline_samples.len() / 2];
+    let maintained = maintained_samples[maintained_samples.len() / 2];
+    if baseline <= f64::EPSILON {
+        return Err("aggregate write-overhead baseline timer had zero duration".into());
+    }
+    Ok(maintained / baseline)
 }
 
 fn cursor_near_end(

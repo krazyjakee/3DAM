@@ -889,6 +889,207 @@ pub const MIGRATIONS: &[&str] = &[
         WHERE a.rowid = asset_fts.rowid AND at.state = 'confirmed'
     ), '');
     "#,
+    // ── V26: transactionally maintained library/facet aggregates (issue #135) ──────────────
+    // Stats are invalidated by live catalog events, so deriving them with repeated catalog scans
+    // makes an otherwise cheap UI refresh linear in library size. These compact tables are the
+    // read model for whole-library and source-ceiling stats. Triggers keep the read model in the
+    // same transaction as every base-row transition; the INSERT ... SELECT backfill is both the
+    // migration rebuild and the canonical repair recipe exercised below.
+    r#"
+    CREATE TABLE library_stat (
+        singleton       INTEGER PRIMARY KEY CHECK(singleton = 1),
+        asset_count     INTEGER NOT NULL,
+        unanalyzed_count INTEGER NOT NULL,
+        source_count    INTEGER NOT NULL
+    ) STRICT;
+    INSERT INTO library_stat(singleton, asset_count, unanalyzed_count, source_count)
+    SELECT 1,
+           (SELECT COUNT(*) FROM asset),
+           (SELECT COUNT(*) FROM asset WHERE analysed_at IS NULL),
+           (SELECT COUNT(*) FROM source);
+
+    CREATE TABLE media_stat (
+        media_type TEXT PRIMARY KEY,
+        asset_count INTEGER NOT NULL
+    ) STRICT;
+    INSERT INTO media_stat(media_type, asset_count)
+    SELECT media_type, COUNT(*) FROM asset GROUP BY media_type;
+
+    CREATE TABLE source_stat (
+        source_id BLOB PRIMARY KEY REFERENCES source(id) ON DELETE CASCADE,
+        asset_count INTEGER NOT NULL,
+        unanalyzed_count INTEGER NOT NULL
+    ) STRICT;
+    INSERT INTO source_stat(source_id, asset_count, unanalyzed_count)
+    SELECT s.id, COUNT(a.id), COUNT(a.id) FILTER (WHERE a.analysed_at IS NULL)
+      FROM source s LEFT JOIN asset a ON a.source_id = s.id GROUP BY s.id;
+
+    CREATE TABLE source_media_stat (
+        source_id BLOB NOT NULL REFERENCES source(id) ON DELETE CASCADE,
+        media_type TEXT NOT NULL,
+        asset_count INTEGER NOT NULL,
+        PRIMARY KEY(source_id, media_type)
+    ) STRICT;
+    INSERT INTO source_media_stat(source_id, media_type, asset_count)
+    SELECT source_id, media_type, COUNT(*) FROM asset GROUP BY source_id, media_type;
+
+    CREATE TABLE tag_stat (
+        tag_id BLOB PRIMARY KEY REFERENCES tag(id) ON DELETE CASCADE,
+        asset_count INTEGER NOT NULL,
+        manual_count INTEGER NOT NULL
+    ) STRICT;
+    INSERT INTO tag_stat(tag_id, asset_count, manual_count)
+    SELECT t.id,
+           COUNT(at.asset_id) FILTER (WHERE at.state = 'confirmed'),
+           COUNT(at.asset_id) FILTER (WHERE at.state = 'confirmed' AND at.source = 'user')
+      FROM tag t LEFT JOIN asset_tag at ON at.tag_id = t.id GROUP BY t.id;
+
+    CREATE TABLE source_tag_stat (
+        source_id BLOB NOT NULL REFERENCES source(id) ON DELETE CASCADE,
+        tag_id BLOB NOT NULL REFERENCES tag(id) ON DELETE CASCADE,
+        asset_count INTEGER NOT NULL,
+        manual_count INTEGER NOT NULL,
+        PRIMARY KEY(source_id, tag_id)
+    ) STRICT;
+    INSERT INTO source_tag_stat(source_id, tag_id, asset_count, manual_count)
+    SELECT a.source_id, at.tag_id, COUNT(*),
+           COUNT(*) FILTER (WHERE at.source = 'user')
+      FROM asset_tag at JOIN asset a ON a.id = at.asset_id
+     WHERE at.state = 'confirmed' GROUP BY a.source_id, at.tag_id;
+
+    CREATE TRIGGER aggregate_source_ai AFTER INSERT ON source BEGIN
+        UPDATE library_stat SET source_count = source_count + 1 WHERE singleton = 1;
+        INSERT INTO source_stat(source_id, asset_count, unanalyzed_count)
+        VALUES(new.id, 0, 0);
+    END;
+    CREATE TRIGGER aggregate_source_ad AFTER DELETE ON source BEGIN
+        UPDATE library_stat SET source_count = source_count - 1 WHERE singleton = 1;
+    END;
+
+    CREATE TRIGGER aggregate_asset_ai AFTER INSERT ON asset BEGIN
+        UPDATE library_stat SET asset_count = asset_count + 1,
+            unanalyzed_count = unanalyzed_count + (new.analysed_at IS NULL)
+         WHERE singleton = 1;
+        INSERT INTO media_stat(media_type, asset_count) VALUES(new.media_type, 1)
+            ON CONFLICT(media_type) DO UPDATE SET asset_count = asset_count + 1;
+        UPDATE source_stat SET asset_count = asset_count + 1,
+            unanalyzed_count = unanalyzed_count + (new.analysed_at IS NULL)
+         WHERE source_id = new.source_id;
+        INSERT INTO source_media_stat(source_id, media_type, asset_count)
+            VALUES(new.source_id, new.media_type, 1)
+            ON CONFLICT(source_id, media_type) DO UPDATE SET asset_count = asset_count + 1;
+    END;
+    CREATE TRIGGER aggregate_asset_ad BEFORE DELETE ON asset BEGIN
+        UPDATE library_stat SET asset_count = asset_count - 1,
+            unanalyzed_count = unanalyzed_count - (old.analysed_at IS NULL)
+         WHERE singleton = 1;
+        UPDATE media_stat SET asset_count = asset_count - 1 WHERE media_type = old.media_type;
+        DELETE FROM media_stat WHERE media_type = old.media_type AND asset_count = 0;
+        UPDATE source_stat SET asset_count = asset_count - 1,
+            unanalyzed_count = unanalyzed_count - (old.analysed_at IS NULL)
+         WHERE source_id = old.source_id;
+        UPDATE source_media_stat SET asset_count = asset_count - 1
+         WHERE source_id = old.source_id AND media_type = old.media_type;
+        DELETE FROM source_media_stat
+         WHERE source_id = old.source_id AND media_type = old.media_type AND asset_count = 0;
+        UPDATE source_tag_stat SET asset_count = asset_count - 1,
+            manual_count = manual_count - EXISTS(
+                SELECT 1 FROM asset_tag at WHERE at.asset_id = old.id
+                 AND at.tag_id = source_tag_stat.tag_id AND at.state = 'confirmed'
+                 AND at.source = 'user')
+         WHERE source_id = old.source_id AND tag_id IN (
+             SELECT tag_id FROM asset_tag WHERE asset_id = old.id AND state = 'confirmed');
+        DELETE FROM source_tag_stat WHERE source_id = old.source_id AND asset_count = 0;
+    END;
+    CREATE TRIGGER aggregate_asset_au
+    AFTER UPDATE OF source_id, media_type, analysed_at ON asset BEGIN
+        UPDATE library_stat SET
+            unanalyzed_count = unanalyzed_count - (old.analysed_at IS NULL)
+                               + (new.analysed_at IS NULL)
+         WHERE singleton = 1;
+        UPDATE media_stat SET asset_count = asset_count - 1
+         WHERE media_type = old.media_type AND old.media_type <> new.media_type;
+        DELETE FROM media_stat WHERE media_type = old.media_type AND asset_count = 0;
+        INSERT INTO media_stat(media_type, asset_count)
+        SELECT new.media_type, 1 WHERE old.media_type <> new.media_type
+            ON CONFLICT(media_type) DO UPDATE SET asset_count = asset_count + 1;
+        UPDATE source_stat SET asset_count = asset_count - 1,
+            unanalyzed_count = unanalyzed_count - (old.analysed_at IS NULL)
+         WHERE source_id = old.source_id AND old.source_id <> new.source_id;
+        UPDATE source_stat SET asset_count = asset_count + 1,
+            unanalyzed_count = unanalyzed_count + (new.analysed_at IS NULL)
+         WHERE source_id = new.source_id AND old.source_id <> new.source_id;
+        UPDATE source_stat SET unanalyzed_count = unanalyzed_count
+            - (old.analysed_at IS NULL) + (new.analysed_at IS NULL)
+         WHERE source_id = new.source_id AND old.source_id = new.source_id;
+        UPDATE source_media_stat SET asset_count = asset_count - 1
+         WHERE source_id = old.source_id AND media_type = old.media_type
+           AND (old.source_id <> new.source_id OR old.media_type <> new.media_type);
+        DELETE FROM source_media_stat WHERE asset_count = 0;
+        INSERT INTO source_media_stat(source_id, media_type, asset_count)
+        SELECT new.source_id, new.media_type, 1
+         WHERE old.source_id <> new.source_id OR old.media_type <> new.media_type
+            ON CONFLICT(source_id, media_type) DO UPDATE SET asset_count = asset_count + 1;
+        UPDATE source_tag_stat SET asset_count = asset_count - 1,
+            manual_count = manual_count - EXISTS(
+                SELECT 1 FROM asset_tag at WHERE at.asset_id = old.id
+                 AND at.tag_id = source_tag_stat.tag_id AND at.state = 'confirmed'
+                 AND at.source = 'user')
+         WHERE source_id = old.source_id AND old.source_id <> new.source_id
+           AND tag_id IN (SELECT tag_id FROM asset_tag WHERE asset_id = old.id AND state = 'confirmed');
+        DELETE FROM source_tag_stat WHERE source_id = old.source_id AND asset_count = 0;
+        INSERT INTO source_tag_stat(source_id, tag_id, asset_count, manual_count)
+        SELECT new.source_id, at.tag_id, 1, (at.source = 'user')
+          FROM asset_tag at WHERE at.asset_id = new.id AND at.state = 'confirmed'
+           AND old.source_id <> new.source_id
+        ON CONFLICT(source_id, tag_id) DO UPDATE SET
+            asset_count = asset_count + 1, manual_count = manual_count + excluded.manual_count;
+    END;
+
+    CREATE TRIGGER aggregate_tag_ai AFTER INSERT ON tag BEGIN
+        INSERT INTO tag_stat(tag_id, asset_count, manual_count) VALUES(new.id, 0, 0);
+    END;
+    CREATE TRIGGER aggregate_asset_tag_ai AFTER INSERT ON asset_tag
+    WHEN new.state = 'confirmed' BEGIN
+        UPDATE tag_stat SET asset_count = asset_count + 1,
+            manual_count = manual_count + (new.source = 'user') WHERE tag_id = new.tag_id;
+        INSERT INTO source_tag_stat(source_id, tag_id, asset_count, manual_count)
+        SELECT source_id, new.tag_id, 1, (new.source = 'user') FROM asset WHERE id = new.asset_id
+        ON CONFLICT(source_id, tag_id) DO UPDATE SET asset_count = asset_count + 1,
+            manual_count = manual_count + excluded.manual_count;
+    END;
+    CREATE TRIGGER aggregate_asset_tag_ad AFTER DELETE ON asset_tag
+    WHEN old.state = 'confirmed' BEGIN
+        UPDATE tag_stat SET asset_count = asset_count - 1,
+            manual_count = manual_count - (old.source = 'user') WHERE tag_id = old.tag_id;
+        UPDATE source_tag_stat SET asset_count = asset_count - 1,
+            manual_count = manual_count - (old.source = 'user')
+         WHERE tag_id = old.tag_id AND source_id =
+             (SELECT source_id FROM asset WHERE id = old.asset_id);
+        DELETE FROM source_tag_stat WHERE tag_id = old.tag_id AND asset_count = 0;
+    END;
+    CREATE TRIGGER aggregate_asset_tag_au
+    AFTER UPDATE OF asset_id, tag_id, state, source ON asset_tag BEGIN
+        UPDATE tag_stat SET asset_count = asset_count - (old.state = 'confirmed'),
+            manual_count = manual_count - (old.state = 'confirmed' AND old.source = 'user')
+         WHERE tag_id = old.tag_id;
+        UPDATE source_tag_stat SET asset_count = asset_count - (old.state = 'confirmed'),
+            manual_count = manual_count - (old.state = 'confirmed' AND old.source = 'user')
+         WHERE tag_id = old.tag_id AND source_id =
+             (SELECT source_id FROM asset WHERE id = old.asset_id);
+        DELETE FROM source_tag_stat WHERE tag_id = old.tag_id AND asset_count = 0;
+        UPDATE tag_stat SET asset_count = asset_count + (new.state = 'confirmed'),
+            manual_count = manual_count + (new.state = 'confirmed' AND new.source = 'user')
+         WHERE tag_id = new.tag_id;
+        INSERT INTO source_tag_stat(source_id, tag_id, asset_count, manual_count)
+        SELECT source_id, new.tag_id, (new.state = 'confirmed'),
+               (new.state = 'confirmed' AND new.source = 'user')
+          FROM asset WHERE id = new.asset_id AND new.state = 'confirmed'
+        ON CONFLICT(source_id, tag_id) DO UPDATE SET
+            asset_count = asset_count + excluded.asset_count,
+            manual_count = manual_count + excluded.manual_count;
+    END;
+    "#,
 ];
 
 #[cfg(test)]
@@ -903,6 +1104,110 @@ mod tests {
             conn.execute_batch(step).unwrap();
         }
         conn
+    }
+
+    fn rows2(conn: &Connection, sql: &str) -> Vec<(Vec<u8>, String, i64, i64)> {
+        conn.prepare(sql)
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    /// Compare every aggregate dimension to authoritative base-table counts. Keeping this as one
+    /// reusable assertion makes each lifecycle transition below prove all dimensions, rather than
+    /// only the counter most likely to have changed.
+    fn assert_aggregate_integrity(conn: &Connection) {
+        let actual: (i64, i64, i64) = conn
+            .query_row(
+                "SELECT asset_count, unanalyzed_count, source_count FROM library_stat",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let expected: (i64, i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM asset),
+                        (SELECT COUNT(*) FROM asset WHERE analysed_at IS NULL),
+                        (SELECT COUNT(*) FROM source)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(actual, expected, "library aggregate drifted");
+
+        let pairs = |sql: &str| -> Vec<(String, i64)> {
+            conn.prepare(sql)
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(
+            pairs("SELECT media_type, asset_count FROM media_stat ORDER BY media_type"),
+            pairs("SELECT media_type, COUNT(*) FROM asset GROUP BY media_type ORDER BY media_type"),
+            "media aggregate drifted"
+        );
+        assert_eq!(
+            rows2(
+                conn,
+                "SELECT source_id, '', asset_count, unanalyzed_count FROM source_stat ORDER BY source_id"
+            ),
+            rows2(
+                conn,
+                "SELECT s.id, '', COUNT(a.id), COUNT(a.id) FILTER (WHERE a.analysed_at IS NULL)
+                   FROM source s LEFT JOIN asset a ON a.source_id=s.id GROUP BY s.id ORDER BY s.id"
+            ),
+            "source aggregate drifted"
+        );
+        assert_eq!(
+            rows2(
+                conn,
+                "SELECT source_id, media_type, asset_count, 0 FROM source_media_stat
+                  ORDER BY source_id, media_type"
+            ),
+            rows2(
+                conn,
+                "SELECT source_id, media_type, COUNT(*), 0 FROM asset
+                  GROUP BY source_id, media_type ORDER BY source_id, media_type"
+            ),
+            "source/media aggregate drifted"
+        );
+        assert_eq!(
+            rows2(
+                conn,
+                "SELECT tag_id, '', asset_count, manual_count FROM tag_stat ORDER BY tag_id"
+            ),
+            rows2(
+                conn,
+                "SELECT t.id, '', COUNT(at.asset_id) FILTER (WHERE at.state='confirmed'),
+                        COUNT(at.asset_id) FILTER (
+                            WHERE at.state='confirmed' AND at.source='user')
+                   FROM tag t LEFT JOIN asset_tag at ON at.tag_id=t.id
+                  GROUP BY t.id ORDER BY t.id"
+            ),
+            "tag aggregate drifted"
+        );
+        assert_eq!(
+            rows2(
+                conn,
+                "SELECT source_id, hex(tag_id), asset_count, manual_count FROM source_tag_stat
+                  ORDER BY source_id, tag_id"
+            ),
+            rows2(
+                conn,
+                "SELECT a.source_id, hex(at.tag_id), COUNT(*),
+                        COUNT(*) FILTER (WHERE at.source='user')
+                   FROM asset_tag at JOIN asset a ON a.id=at.asset_id
+                  WHERE at.state='confirmed' GROUP BY a.source_id, at.tag_id
+                  ORDER BY a.source_id, at.tag_id"
+            ),
+            "source/tag aggregate drifted"
+        );
     }
 
     /// An FTS5 rebuild has to carry the index-only columns across, and the only way to know it does
@@ -1234,5 +1539,103 @@ mod tests {
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
         assert_eq!(indexes.len(), 3);
+    }
+
+    #[test]
+    fn aggregate_migration_repairs_and_tracks_every_write_transition() {
+        let conn = db_at(25);
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        conn.execute_batch(
+            "INSERT INTO source (id,name,kind,connection,created_at,updated_at) VALUES
+                (x'01','one','local_fs','{}',0,0), (x'02','two','local_fs','{}',0,0);
+             INSERT INTO tag(id,name) VALUES (x'11','red'), (x'12','blue'), (x'13','green');
+             INSERT INTO asset(id,source_id,path,filename,scanned_at,analysed_at,media_type,format,
+                               created_at,updated_at) VALUES
+                (x'21',x'01','a.png','a.png',0,NULL,'image','png',0,0),
+                (x'22',x'01','b.wav','b.wav',0,10,'audio','wav',0,0),
+                (x'23',x'02','c.glb','c.glb',0,NULL,'model','glb',0,0);
+             INSERT INTO asset_tag(asset_id,tag_id,state,source,created_at) VALUES
+                (x'21',x'11','confirmed','user',0),
+                (x'22',x'11','rejected','auto',0),
+                (x'22',x'12','confirmed','auto',0),
+                (x'23',x'11','confirmed','auto',0);",
+        )
+        .unwrap();
+
+        // Populated migration is the initial repair/backfill path.
+        conn.execute_batch(MIGRATIONS[25]).unwrap();
+        assert_aggregate_integrity(&conn);
+
+        // One statement exercises analysed, media, and source transitions together.
+        conn.execute(
+            "UPDATE asset SET analysed_at=20, media_type='video', source_id=x'02' WHERE id=x'21'",
+            [],
+        )
+        .unwrap();
+        assert_aggregate_integrity(&conn);
+
+        // Confirm/reject, user/auto, and tag-id changes each affect a different pair of counters.
+        conn.execute(
+            "UPDATE asset_tag SET state='confirmed' WHERE asset_id=x'22' AND tag_id=x'11'",
+            [],
+        )
+        .unwrap();
+        assert_aggregate_integrity(&conn);
+        conn.execute(
+            "UPDATE asset_tag SET source='user' WHERE asset_id=x'22' AND tag_id=x'11'",
+            [],
+        )
+        .unwrap();
+        assert_aggregate_integrity(&conn);
+        conn.execute(
+            "UPDATE asset_tag SET tag_id=x'13' WHERE asset_id=x'22' AND tag_id=x'11'",
+            [],
+        )
+        .unwrap();
+        assert_aggregate_integrity(&conn);
+        conn.execute(
+            "UPDATE asset_tag SET state='rejected' WHERE asset_id=x'22' AND tag_id=x'13'",
+            [],
+        )
+        .unwrap();
+        assert_aggregate_integrity(&conn);
+        conn.execute(
+            "UPDATE asset_tag SET state='confirmed', source='auto'
+              WHERE asset_id=x'22' AND tag_id=x'13'",
+            [],
+        )
+        .unwrap();
+        assert_aggregate_integrity(&conn);
+        conn.execute(
+            "UPDATE asset_tag SET source='user' WHERE asset_id=x'22' AND tag_id=x'13'",
+            [],
+        )
+        .unwrap();
+        assert_aggregate_integrity(&conn);
+
+        // Explicit asset deletion cascades its confirmed tag; global and source-tag rows must each
+        // decrement once even though the parent and child triggers both participate.
+        conn.execute("DELETE FROM asset WHERE id=x'23'", [])
+            .unwrap();
+        assert_aggregate_integrity(&conn);
+
+        // Source deletion adds a second cascade layer (source → asset → asset_tag).
+        conn.execute("DELETE FROM source WHERE id=x'01'", [])
+            .unwrap();
+        assert_aggregate_integrity(&conn);
+
+        // The callable repair is idempotent and restores deliberately corrupted aggregate rows.
+        conn.pragma_update(None, "user_version", MIGRATIONS.len() as i64)
+            .unwrap();
+        let store = crate::Store::from_conn(conn, crate::search::SynonymMap::builtin()).unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute("UPDATE library_stat SET asset_count=999", [])
+                .unwrap();
+            conn.execute("DELETE FROM source_tag_stat", []).unwrap();
+        }
+        store.repair_aggregates().unwrap();
+        store.repair_aggregates().unwrap();
+        assert_aggregate_integrity(&store.conn.lock().unwrap());
     }
 }

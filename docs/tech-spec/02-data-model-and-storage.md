@@ -313,6 +313,21 @@ Rules:
 - The **facet** "commercial use, no attribution required" is `rights_commercial = 1 AND rights_attribution = 0` — indexed by `idx_asset_license` — and drives the *safe-to-ship* smart folder.
 - Auto-detection (from pack manifests, sidecars, `LICENSE`/readme files) writes `license_provenance` accordingly; how far to auto-detect vs require the user is an open question (§11, carried from PRODUCT_SPEC §10).
 
+### 5.1 Maintained library and facet counts
+
+`library_stats`, the source sidebar, and the confirmed-tag vocabulary read compact maintained
+tables rather than counting `asset`/`asset_tag` at refresh time. `library_stat` owns total,
+unanalyzed, and source counts; `media_stat` owns the global media mix; `source_stat` and
+`source_media_stat` own source-scoped totals; `tag_stat` and `source_tag_stat` own confirmed and
+manual tag counts. Asset/source/tag triggers update those rows in the same transaction as scan,
+removal, analysis, retag, reclassification, and cascade deletion.
+
+A visibility ceiling made only of whole-source grants is an exact sum of source aggregates. A
+manual-collection grant is an arbitrary asset subset and may overlap a source grant, so that case
+continues through the visibility join to preserve union-without-double-counting semantics. V26
+backfills every aggregate while migrating an existing catalog; `Store::repair_aggregates` exposes
+the same rebuild as one atomic, idempotent integrity-repair operation.
+
 ---
 
 ## 6. Migrations

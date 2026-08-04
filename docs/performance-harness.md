@@ -23,11 +23,30 @@ Reports default to `perf-results/<profile>.json`; catalogs default to `target/pe
 
 [`perf/profiles.json`](../perf/profiles.json) is a strict, versioned profile schema. Every profile uses the fixed seed and fixture recipe version recorded in its report. The generator first opens the directory through `Store::open`, applying the supported forward migrations, then populates the public schema in 10,000-row transactions using the versioned recipe. That boundary keeps million-row setup practical while making schema drift fail visibly.
 
+The loader temporarily suspends only the migrated `folder_` triggers while inserting deterministic
+assets, rebuilds the folder read model once with V20's canonical recursive CTE, and restores the
+exact trigger definitions before any measurement. Production scans still exercise per-asset folder
+maintenance; bulk fixture construction avoids millions of redundant ancestor walks. V26 aggregate
+triggers remain enabled throughout generation so their production write cost is represented.
+
 The fixture contains local filesystem, SFTP, SMB, and federated sources; all five media types; paths up to the configured depth; confirmed tags; normalized embeddings; and repeatable exact-duplicate groups. Names include a stable search term. The generated database and WAL never enter git.
 
 ## Measurements and reports
 
-The harness measures median first-page, late-page, lexical-search, faceted-query, stats, analysis-planning, and exact-duplicate latency; scan/upsert and bounded export throughput; process peak RSS; and the serialized initial browse payload. The Node browser profile traverses every logical page while retaining only the production browse window and reports long-scroll p99 work time and post-midpoint heap growth.
+The harness measures median first-page, late-page, lexical-search, faceted-query, library-stats,
+and confirmed-tag-facet latency; analysis-planning and exact-duplicate latency; scan/upsert and
+bounded export throughput; process peak RSS; and the serialized initial browse payload. The stats
+and tag-facet budgets are intentionally identical for smoke, 100k, and 1M profiles: growth in asset
+rows cannot buy a looser threshold, so a return to catalog scans fails the scale profile.
+
+Write evidence has two complementary measures. `scan_upsert_assets_per_second` exercises the real
+production upsert path with aggregate triggers enabled. `aggregate_write_overhead_ratio` compares
+an aggregate-relevant no-op asset update with an otherwise identical indexed no-op update against
+the production schema, in rolled-back transactions over deterministic fixture ids; this isolates
+the maintained-count trigger cost without changing the measured catalog.
+
+The Node browser profile traverses every logical page while retaining only the production browse
+window and reports long-scroll p99 work time and post-midpoint heap growth.
 
 Reports include every raw timing sample, median and p95, units, lower/higher-is-better direction, fixture seed/version/profile, database size, OS/architecture/CPU/memory, Rust version, git revision, browser status, comparisons, and the overall result. Missing/non-finite metrics, unknown baseline keys, direction mismatches, and browser failures are errors rather than silent passes.
 

@@ -217,13 +217,13 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT id, name, kind, connection, online, last_scanned_at, last_error, watch
-                 FROM source ORDER BY created_at",
+                "SELECT s.id, s.name, s.kind, s.connection, s.online, s.last_scanned_at,
+                        s.last_error, s.watch, COALESCE(ss.asset_count, 0)
+                   FROM source s LEFT JOIN source_stat ss ON ss.source_id = s.id
+                  ORDER BY s.created_at",
             )
             .map_err(internal)?;
-        let rows = stmt
-            .query_map([], |r| Self::row_to_source(r, &conn))
-            .map_err(internal)?;
+        let rows = stmt.query_map([], Self::row_to_source).map_err(internal)?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(internal)
     }
 
@@ -258,16 +258,17 @@ impl Store {
     pub fn get_source(&self, id: &SourceId) -> Result<Option<SourceInfo>, LibError> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT id, name, kind, connection, online, last_scanned_at, last_error, watch
-             FROM source WHERE id = ?1",
+            "SELECT s.id, s.name, s.kind, s.connection, s.online, s.last_scanned_at,
+                    s.last_error, s.watch, COALESCE(ss.asset_count, 0)
+               FROM source s LEFT JOIN source_stat ss ON ss.source_id = s.id WHERE s.id = ?1",
             params![id.as_bytes().to_vec()],
-            |r| Self::row_to_source(r, &conn),
+            Self::row_to_source,
         )
         .optional()
         .map_err(internal)
     }
 
-    fn row_to_source(r: &rusqlite::Row, conn: &Connection) -> rusqlite::Result<SourceInfo> {
+    fn row_to_source(r: &rusqlite::Row) -> rusqlite::Result<SourceInfo> {
         let id_blob: Vec<u8> = r.get(0)?;
         let id = blob_to_source_id(&id_blob);
         let name: String = r.get(1)?;
@@ -277,6 +278,7 @@ impl Store {
         let last_scanned_at: Option<i64> = r.get(5)?;
         let last_error: Option<String> = r.get(6)?;
         let watch: i64 = r.get(7)?;
+        let asset_count = r.get::<_, i64>(8)?.max(0) as u64;
         // Prefer the typed connection's secret-free display URI; fall back to the legacy `{"uri":…}`
         // shape (pre-phase-4 local sources) so old dev libraries still list cleanly.
         let uri = parse_connection(&connection)
@@ -289,13 +291,6 @@ impl Store {
                     .unwrap_or_default()
             });
         let kind = SourceKind::parse(&kind_s).unwrap_or(SourceKind::LocalFs);
-        let asset_count: u64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM asset WHERE source_id = ?1",
-                params![id_blob],
-                |c| c.get::<_, i64>(0),
-            )
-            .unwrap_or(0) as u64;
         let state = if let Some(err) = last_error.clone() {
             SourceState::Error(err)
         } else if online != 0 {

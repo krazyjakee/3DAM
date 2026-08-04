@@ -501,6 +501,17 @@ impl Store {
     ) -> Result<LibraryStats, LibError> {
         let conn = self.conn.lock().unwrap();
 
+        // Source grants compose as a union of whole sources, which the source×facet aggregates can
+        // sum exactly. A collection grant is an arbitrary asset subset and may overlap a granted
+        // source, so it deliberately stays on the predicate path below: summing both would double
+        // count the intersection and using only source rows would hide collection-only members.
+        if vis
+            .restricted()
+            .is_none_or(|scope| scope.collections.is_empty())
+        {
+            return Self::stats_from_aggregates(&conn, source, vis);
+        }
+
         // The shared per-asset predicate: optional source scope + the visibility ceiling. Built once
         // per alias (the aggregates below reference the asset table as `asset` or `a`).
         let asset_pred = |alias: &str| -> (String, Vec<Value>) {
@@ -627,6 +638,171 @@ impl Store {
             sources: sources as u64,
         })
     }
+
+    fn stats_from_aggregates(
+        conn: &Connection,
+        source: Option<&SourceId>,
+        vis: &Visibility,
+    ) -> Result<LibraryStats, LibError> {
+        let selected_sources: Option<Vec<Vec<u8>>> = match (source, vis.restricted()) {
+            (Some(id), None) => Some(vec![id.as_bytes().to_vec()]),
+            (Some(id), Some(scope)) if scope.sources.contains(id) => {
+                Some(vec![id.as_bytes().to_vec()])
+            }
+            (Some(_), Some(_)) => Some(Vec::new()),
+            (None, None) => None,
+            (None, Some(scope)) => Some(
+                scope
+                    .sources
+                    .iter()
+                    .map(|id| id.as_bytes().to_vec())
+                    .collect(),
+            ),
+        };
+        let filter = |column: &str| -> (String, Vec<Value>) {
+            match &selected_sources {
+                None => (String::new(), Vec::new()),
+                Some(ids) if ids.is_empty() => (" AND 0=1".into(), Vec::new()),
+                Some(ids) => (
+                    format!(
+                        " AND {column} IN ({})",
+                        ids.iter().map(|_| "?").collect::<Vec<_>>().join(",")
+                    ),
+                    ids.iter().cloned().map(Value::Blob).collect(),
+                ),
+            }
+        };
+
+        let (total, unanalyzed) = if selected_sources.is_none() {
+            conn.query_row(
+                "SELECT asset_count, unanalyzed_count FROM library_stat WHERE singleton = 1",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .map_err(internal)?
+        } else {
+            let (pred, binds) = filter("source_id");
+            conn.query_row(
+                &format!(
+                    "SELECT COALESCE(SUM(asset_count), 0), COALESCE(SUM(unanalyzed_count), 0)
+                       FROM source_stat WHERE 1=1{pred}"
+                ),
+                rusqlite::params_from_iter(binds.iter()),
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .map_err(internal)?
+        };
+        let sources = match (source, vis.restricted()) {
+            (Some(_), _) => 1,
+            (None, None) => conn
+                .query_row(
+                    "SELECT source_count FROM library_stat WHERE singleton = 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(internal)?,
+            (None, Some(scope)) => scope.sources.len() as i64,
+        };
+
+        let mut by_media = CountMap::new();
+        if selected_sources.is_none() {
+            let mut stmt = conn
+                .prepare("SELECT media_type, asset_count FROM media_stat")
+                .map_err(internal)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .map_err(internal)?;
+            for row in rows {
+                let (name, count) = row.map_err(internal)?;
+                by_media.insert(name, count.max(0) as u64);
+            }
+        } else {
+            let (pred, binds) = filter("source_id");
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT media_type, SUM(asset_count) FROM source_media_stat
+                      WHERE 1=1{pred} GROUP BY media_type"
+                ))
+                .map_err(internal)?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(binds.iter()), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .map_err(internal)?;
+            for row in rows {
+                let (name, count) = row.map_err(internal)?;
+                by_media.insert(name, count.max(0) as u64);
+            }
+        }
+
+        let mut by_source = CountMap::new();
+        {
+            let (pred, binds) = filter("s.id");
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT s.name, ss.asset_count FROM source s
+                       JOIN source_stat ss ON ss.source_id = s.id WHERE 1=1{pred}"
+                ))
+                .map_err(internal)?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(binds.iter()), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .map_err(internal)?;
+            for row in rows {
+                let (name, count) = row.map_err(internal)?;
+                by_source.insert(name, count.max(0) as u64);
+            }
+        }
+
+        let mut tags = CountMap::new();
+        if selected_sources.is_none() {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT t.name, ts.asset_count FROM tag_stat ts JOIN tag t ON t.id = ts.tag_id
+                      WHERE ts.asset_count > 0 ORDER BY ts.asset_count DESC, t.name ASC LIMIT 30",
+                )
+                .map_err(internal)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .map_err(internal)?;
+            for row in rows {
+                let (name, count) = row.map_err(internal)?;
+                tags.insert(name, count.max(0) as u64);
+            }
+        } else {
+            let (pred, binds) = filter("sts.source_id");
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT t.name, SUM(sts.asset_count) AS n FROM source_tag_stat sts
+                       JOIN tag t ON t.id = sts.tag_id WHERE 1=1{pred}
+                       GROUP BY sts.tag_id HAVING n > 0 ORDER BY n DESC, t.name ASC LIMIT 30"
+                ))
+                .map_err(internal)?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(binds.iter()), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .map_err(internal)?;
+            for row in rows {
+                let (name, count) = row.map_err(internal)?;
+                tags.insert(name, count.max(0) as u64);
+            }
+        }
+
+        Ok(LibraryStats {
+            total: total.max(0) as u64,
+            by_media,
+            by_source,
+            tags,
+            unanalyzed: unanalyzed.max(0) as u64,
+            sources: sources.max(0) as u64,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -667,6 +843,101 @@ mod tests {
             })
             .unwrap();
         store
+    }
+
+    #[test]
+    fn maintained_stats_preserve_source_and_collection_visibility_unions() {
+        use dam_api::service::VisibilityScope;
+
+        let store = Store::open_in_memory().unwrap();
+        let source_one = store
+            .add_source(
+                &SourceConnection::LocalFs {
+                    root: "/one".into(),
+                },
+                "one",
+                false,
+            )
+            .unwrap();
+        let source_two = store
+            .add_source(
+                &SourceConnection::LocalFs {
+                    root: "/two".into(),
+                },
+                "two",
+                false,
+            )
+            .unwrap();
+        let insert = |source_id, name: &str, media_type| {
+            store
+                .upsert_asset(&NewAsset {
+                    source_id,
+                    path: name.into(),
+                    filename: name.into(),
+                    content_hash: None,
+                    size_bytes: None,
+                    source_modified_at: None,
+                    scanned_at: 0,
+                    media_type,
+                    format: name.rsplit_once('.').unwrap().1.into(),
+                })
+                .unwrap()
+                .0
+        };
+        let one_image = insert(source_one, "one.png", MediaType::Image);
+        let one_audio = insert(source_one, "one.wav", MediaType::Audio);
+        let two_model = insert(source_two, "two.glb", MediaType::Model);
+        store.mark_analysed(&one_audio, 1).unwrap();
+        store
+            .edit_manual_tags(&[one_image, two_model], &["shared".into()], &[], false)
+            .unwrap();
+
+        let collection = store
+            .create_collection("mixed", CollectionKind::Manual, None)
+            .unwrap();
+        // The collection overlaps the granted source at one_image and adds two_model. The fallback
+        // visibility join must count that union as 3, not sum it as 2 + 2.
+        store
+            .modify_collection_members(&collection, &[one_image, two_model], &[])
+            .unwrap();
+
+        let source_only = Visibility::Restricted(VisibilityScope {
+            sources: [source_one].into_iter().collect(),
+            ..VisibilityScope::default()
+        });
+        let stats = store.stats(None, &source_only).unwrap();
+        assert_eq!(stats.total, 2);
+        assert_eq!(stats.unanalyzed, 1);
+        assert_eq!(stats.by_media.get("image"), Some(&1));
+        assert_eq!(stats.by_media.get("audio"), Some(&1));
+        assert_eq!(stats.by_media.get("model"), None);
+        assert_eq!(stats.by_source.keys().collect::<Vec<_>>(), vec!["one"]);
+        assert_eq!(stats.tags.get("shared"), Some(&1));
+
+        let union = Visibility::Restricted(VisibilityScope {
+            sources: [source_one].into_iter().collect(),
+            collections: [collection].into_iter().collect(),
+            ..VisibilityScope::default()
+        });
+        let union_stats = store.stats(None, &union).unwrap();
+        assert_eq!(
+            union_stats.total, 3,
+            "overlapping visibility union double-counted"
+        );
+        assert_eq!(union_stats.tags.get("shared"), Some(&2));
+        assert_eq!(
+            union_stats.by_source.keys().collect::<Vec<_>>(),
+            vec!["one"]
+        );
+
+        let scoped = store.stats(Some(&source_two), &Visibility::Full).unwrap();
+        assert_eq!(scoped.total, 1);
+        assert_eq!(scoped.by_media.get("model"), Some(&1));
+        assert_eq!(scoped.tags.get("shared"), Some(&1));
+
+        let listed = store.list_sources().unwrap();
+        assert_eq!(listed[0].stats.asset_count, 2);
+        assert_eq!(listed[1].stats.asset_count, 1);
     }
 
     /// The ranking risk the video/document epic (#79) called out: document body text joins the same
