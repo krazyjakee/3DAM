@@ -15,9 +15,15 @@ impl Store {
     /// group) and records that hash on the blocklist — capturing the filename as a display label — so
     /// future scans skip it. Returns `NotFound` if the id is unknown.
     pub fn remove_asset(&self, id: &AssetId, block: bool) -> Result<(), LibError> {
-        let conn = self.write();
+        let mut conn = self.write();
+        // One immediate transaction: the "purge the duplicate group, then record the hash" path
+        // writes twice, and readers now run concurrently (#137). Without it a reader could observe
+        // the copies gone while the blocklist entry that explains their absence does not yet exist.
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(internal)?;
         // Read the hash + filename before the row is gone — needed for a meaningful blocklist entry.
-        let row: Option<(Option<Vec<u8>>, String)> = conn
+        let row: Option<(Option<Vec<u8>>, String)> = tx
             .query_row(
                 "SELECT content_hash, filename FROM asset WHERE id = ?1",
                 params![id.as_bytes().to_vec()],
@@ -34,23 +40,25 @@ impl Store {
         // collection_member, embedding — all keyed ON DELETE CASCADE to asset.id.
         if block {
             if let Some(hash) = hash_blob {
-                conn.execute("DELETE FROM asset WHERE content_hash = ?1", params![hash])
+                tx.execute("DELETE FROM asset WHERE content_hash = ?1", params![hash])
                     .map_err(internal)?;
-                conn.execute(
+                tx.execute(
                     "INSERT INTO blocklist (content_hash, label, blocked_at) VALUES (?1, ?2, ?3)
                      ON CONFLICT(content_hash) DO UPDATE SET label = excluded.label",
                     params![hash, filename, now_ms()],
                 )
                 .map_err(internal)?;
+                tx.commit().map_err(internal)?;
                 return Ok(());
             }
         }
 
-        conn.execute(
+        tx.execute(
             "DELETE FROM asset WHERE id = ?1",
             params![id.as_bytes().to_vec()],
         )
         .map_err(internal)?;
+        tx.commit().map_err(internal)?;
         Ok(())
     }
 

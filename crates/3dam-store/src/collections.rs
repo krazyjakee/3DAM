@@ -236,7 +236,9 @@ impl Store {
         remove: &[AssetId],
     ) -> Result<(), LibError> {
         let mut conn = self.write();
-        let tx = conn.transaction().map_err(internal)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(internal)?;
         // The collection must exist and be manual (a smart folder's set is query-driven).
         let kind: Option<String> = tx
             .query_row(

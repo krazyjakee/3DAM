@@ -8,10 +8,17 @@ impl Store {
     /// Insert a new asset or reconcile an existing `(source_id, path)` row (delta re-scan).
     /// Returns the id and whether it was newly inserted.
     pub fn upsert_asset(&self, a: &NewAsset) -> Result<(AssetId, bool), LibError> {
-        let conn = self.write();
+        let mut conn = self.write();
+        // One immediate transaction for the whole upsert. A media-type change deletes the old
+        // attr rows between statements, and readers now run concurrently (#137) — without this a
+        // browse query could catch an asset whose `media_type` no longer matches any surviving
+        // attr row, breaking `GRID_SELECT`'s "exactly one non-NULL join" invariant.
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(internal)?;
         // The previous hash and media type come back with the id: both decide whether the derived
         // layer this row already carries is still about the same file (see below).
-        let existing: Option<(Vec<u8>, Option<Vec<u8>>, String)> = conn
+        let existing: Option<(Vec<u8>, Option<Vec<u8>>, String)> = tx
             .query_row(
                 "SELECT id, content_hash, media_type FROM asset WHERE source_id = ?1 AND path = ?2",
                 params![a.source_id.as_bytes().to_vec(), a.path],
@@ -21,6 +28,9 @@ impl Store {
             .map_err(internal)?;
         let hash_blob = a.content_hash.map(|h| h.as_bytes().to_vec());
         let now = now_ms();
+        // Set when this upsert deletes the row's embeddings, so the ANN cache generation can be
+        // bumped once the transaction has actually committed.
+        let mut dropped_embeddings = false;
         let (id, is_new) = if let Some((id_blob, prev_hash, prev_media)) = existing {
             // Same path, different bytes: everything the analyse pass derived (embedding, class,
             // indexed document text) describes the *old* file. Only a Some→Some change counts —
@@ -34,7 +44,7 @@ impl Store {
             // becoming available between scans) is the same problem plus one: the derived rows are
             // in the wrong tables entirely.
             let media_changed = prev_media != a.media_type.as_str();
-            conn.execute(
+            tx.execute(
                 "UPDATE asset SET content_hash = ?2, filename = ?3, size_bytes = ?4,
                     source_modified_at = ?5, scanned_at = ?6, media_type = ?7, format = ?8,
                     updated_at = ?9, flags = flags & -2 WHERE id = ?1",
@@ -58,20 +68,21 @@ impl Store {
                 // which are all in the old media's space and can never be re-ranked against the new
                 // one anyway. The FTS body text goes with them for the same reason.
                 for media in MediaType::ALL.iter().filter(|m| **m != a.media_type) {
-                    conn.execute(
+                    tx.execute(
                         &format!("DELETE FROM {} WHERE asset_id = ?1", attr_table(*media)),
                         params![id_blob],
                     )
                     .map_err(internal)?;
                 }
-                conn.execute(
+                tx.execute(
                     "DELETE FROM embedding WHERE asset_id = ?1",
                     params![id_blob],
                 )
                 .map_err(internal)?;
-                self.embed_gen
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                conn.execute(
+                // The ANN cache generation is bumped after the commit, not here: a bump for a
+                // write that then rolls back would discard a still-valid cached index for nothing.
+                dropped_embeddings = true;
+                tx.execute(
                     "UPDATE asset_fts SET text = '' WHERE rowid = (SELECT rowid FROM asset WHERE id = ?1)",
                     params![id_blob],
                 )
@@ -81,14 +92,14 @@ impl Store {
                 // Re-open the analyse gate (`analysis_version < PIPELINE_VERSION`, §7.2). The scan
                 // has already refreshed the cheap tier; without this the expensive tier would keep
                 // the stale derivation forever, because the version alone still looks current.
-                conn.execute(
+                tx.execute(
                     "UPDATE asset SET analysis_version = 0, analysed_at = NULL WHERE id = ?1",
                     params![id_blob],
                 )
                 .map_err(internal)?;
             }
             if derivative_key_changed || media_changed {
-                conn.execute(
+                tx.execute(
                     "UPDATE asset SET derivative_version = 0 WHERE id = ?1",
                     params![id_blob],
                 )
@@ -97,7 +108,7 @@ impl Store {
             (blob_to_asset_id(&id_blob), false)
         } else {
             let id = AssetId::new();
-            conn.execute(
+            tx.execute(
                 "INSERT INTO asset (id, content_hash, source_id, path, filename, size_bytes,
                     source_modified_at, scanned_at, media_type, format, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
@@ -128,11 +139,16 @@ impl Store {
         // the ingest.
         let tokens = crate::search::tokenize_name(&a.filename).join(" ");
         let folder = crate::search::folder_terms(&a.path);
-        let _ = conn.execute(
+        let _ = tx.execute(
             "UPDATE asset_fts SET tokens = ?2, folder = ?3
              WHERE rowid = (SELECT rowid FROM asset WHERE id = ?1)",
             params![id.as_bytes().to_vec(), tokens, folder],
         );
+        tx.commit().map_err(internal)?;
+        if dropped_embeddings {
+            self.embed_gen
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         Ok((id, is_new))
     }
 
@@ -193,7 +209,9 @@ impl Store {
         }
         let body = body.trim();
         let now = now_ms();
-        let tx = conn.transaction().map_err(internal)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(internal)?;
         if body.is_empty() {
             tx.execute("DELETE FROM asset_note WHERE asset_id = ?1", params![key])
                 .map_err(internal)?;

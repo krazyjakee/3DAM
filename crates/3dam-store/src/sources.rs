@@ -157,7 +157,9 @@ impl Store {
         // removes older copies from the WAL and rebuilds the main file without free-page remnants.
         conn.pragma_update(None, "secure_delete", "ON")
             .map_err(internal)?;
-        let tx = conn.transaction().map_err(internal)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(internal)?;
         for (id, blob, auth_ref) in encoded {
             tx.execute(
                 "UPDATE source SET connection = ?2, auth_ref = ?3, updated_at = ?4 WHERE id = ?1",
@@ -335,7 +337,9 @@ impl Store {
             // Queue the opaque ref in the same transaction that removes the source. Host-secret
             // deletion is acknowledged separately, so a locked provider cannot create an orphan.
             let mut conn = conn;
-            let tx = conn.transaction().map_err(internal)?;
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(internal)?;
             tx.execute(
                 "INSERT OR IGNORE INTO host_secret_cleanup(auth_ref)
                  SELECT auth_ref FROM source WHERE id = ?1 AND auth_ref IS NOT NULL",
@@ -439,7 +443,9 @@ impl Store {
         scanned_at: i64,
     ) -> Result<Option<u64>, LibError> {
         let mut conn = self.write();
-        let tx = conn.transaction().map_err(internal)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(internal)?;
         let current = tx
             .query_row(
                 "SELECT scan_generation FROM source WHERE id = ?1",
@@ -483,7 +489,9 @@ impl Store {
             return Ok(0);
         }
         let mut conn = self.write();
-        let tx = conn.transaction().map_err(internal)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(internal)?;
         let now = now_ms();
         let mut n = 0u64;
         for p in paths {
@@ -690,7 +698,9 @@ mod tests {
             .unwrap();
         {
             let mut connection = store.write();
-            let transaction = connection.transaction().unwrap();
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
             let mut insert = transaction
                 .prepare_cached(
                     "INSERT INTO asset(

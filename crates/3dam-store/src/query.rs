@@ -1373,7 +1373,9 @@ mod tests {
             .unwrap();
         {
             let mut connection = store.write();
-            let transaction = connection.transaction().unwrap();
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
             let mut insert = transaction
                 .prepare_cached(
                     "INSERT INTO asset(
@@ -1910,7 +1912,9 @@ mod tests {
             .unwrap();
         {
             let mut connection = store.write();
-            let transaction = connection.transaction().unwrap();
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
             {
                 let mut insert = transaction
                     .prepare_cached(

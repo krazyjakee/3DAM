@@ -35,7 +35,9 @@ impl Store {
             tags_removed: count(&conn, "tag")?,
         };
 
-        let tx = conn.transaction().map_err(internal)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(internal)?;
         // Preserve opaque refs in the retry queue before `source` is emptied. Credential deletion
         // happens in the host backend after this transaction; failures remain recoverable on the
         // next open/reset instead of silently orphaning secrets.
@@ -94,7 +96,9 @@ impl Store {
         )?;
         let embeddings_removed = count(&conn, "SELECT COUNT(*) FROM embedding")?;
 
-        let tx = conn.transaction().map_err(internal)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(internal)?;
         // Suggestions + a remembered "rejected" reset so re-analysis starts clean; user-confirmed
         // tags survive (they are `state = 'confirmed'`).
         tx.execute(

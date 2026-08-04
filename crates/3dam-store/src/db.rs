@@ -18,6 +18,26 @@
 //! each other, and a reader parked waiting for a free pooled connection still holds only
 //! `maint.read()`.
 //!
+//! ## Writer transactions are always `Immediate`
+//!
+//! Two rules follow from readers no longer being excluded by the writer lock.
+//!
+//! **Every multi-statement write is a transaction.** The writer mutex only serialises *writers*; a
+//! pooled reader can land between two of its statements and observe a half-applied change (an
+//! asset whose `media_type` no longer matches its `*_attr` row, deleted rows whose blocklist entry
+//! is not there yet). One transaction makes the whole edit a single visible step.
+//!
+//! **Every one of those transactions takes `TransactionBehavior::Immediate`**, never rusqlite's
+//! default `BEGIN DEFERRED`. A deferred transaction that reads before it writes pins a WAL snapshot
+//! at its first read and only asks for the write lock later; if anything else committed in between,
+//! that upgrade fails with `SQLITE_BUSY_SNAPSHOT` — and SQLite does **not** invoke the busy handler
+//! for that case, so `busy_timeout` cannot rescue it and the caller sees a bare "database is
+//! locked". `BEGIN IMMEDIATE` takes the write lock up front, where the busy handler *does* apply,
+//! so contention costs a wait instead of an error. In-process the single writer mutex already
+//! serialises us, but a second process on the same data dir (the desktop shell plus a CLI run) has
+//! no such thing. The cost is nil either way, so the convention is unconditional: **if it writes,
+//! it begins immediate.** Deferred `BEGIN` is reserved for [`Db::read`], which never writes.
+//!
 //! ## In-memory stores are the sharp edge
 //!
 //! [`Db::Memory`] cannot be pooled: a second `:memory:` handle is a *different database*, and the

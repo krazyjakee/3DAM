@@ -850,7 +850,9 @@ impl Store {
         dry_run: bool,
     ) -> Result<ManualTagEditOutcome, LibError> {
         let mut conn = self.write();
-        let tx = conn.transaction().map_err(internal)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(internal)?;
         let mut result = TagEditResult {
             matched: ids.len() as u64,
             ..TagEditResult::default()
@@ -2793,7 +2795,9 @@ mod tests {
             })
             .collect();
         let mut conn = store.write();
-        let transaction = conn.transaction().unwrap();
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
         {
             let mut insert = transaction
                 .prepare_cached(
