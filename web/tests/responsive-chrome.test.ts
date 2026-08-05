@@ -24,19 +24,21 @@ test("Browser chrome responds to centre-pane width instead of viewport width", a
 });
 
 test("table columns intentionally reduce at narrow pane widths", async () => {
-  const [browser, css] = await Promise.all([
-    component("Browser.tsx"),
+  // The table renderer (header, rows, and its skeleton) moved to `browser/TableList.tsx` behind the
+  // `ListProps` contract (issue #165); the column contract itself is unchanged.
+  const [table, css] = await Promise.all([
+    component("browser/TableList.tsx"),
     readFile(new URL("../src/index.css", import.meta.url), "utf8"),
   ]);
   assert.ok(
-    browser.match(/asset-table-columns/g)?.length === 4,
+    table.match(/asset-table-columns/g)?.length === 4,
     "skeleton, header, and virtual rows must share one responsive column contract",
   );
   assert.match(css, /@container browser \(max-width: 42rem\)/);
   assert.match(css, /@container browser \(max-width: 28rem\)/);
   assert.match(css, /\.asset-table-detail\s*\{\s*display: none/);
   assert.match(css, /\.asset-table-license\s*\{\s*display: none/);
-  assert.doesNotMatch(browser, /grid-cols-\[1fr_64px_104px_112px_84px\]/);
+  assert.doesNotMatch(table, /grid-cols-\[1fr_64px_104px_112px_84px\]/);
 });
 
 test("phone status chrome keeps jobs, cancellation, connection, and sign-in reachable", async () => {

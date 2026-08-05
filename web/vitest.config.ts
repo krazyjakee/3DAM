@@ -26,15 +26,34 @@ export default defineConfig({
         "src/components/browser/Breadcrumb.tsx",
         "src/components/browser/SelectionBar.tsx",
         "src/components/browser/Toolbar.tsx",
+        // The grid/table renderers behind the `ListProps` contract (issue #165) — same rule.
+        "src/components/browser/DupBadge.tsx",
+        "src/components/browser/FavoriteStar.tsx",
+        "src/components/browser/GridList.tsx",
+        "src/components/browser/TableList.tsx",
+        "src/components/browser/item.ts",
+        "src/components/browser/types.ts",
+        "src/components/browser/useBrowseWindowLoading.ts",
+        "src/components/browser/useRovingFocus.ts",
         "src/components/Inspector.tsx",
-        // Extracted out of Inspector.tsx (issue #167). `thresholds.perFile` is true and this list is
-        // an allowlist, so code that leaves Inspector.tsx has to be named here or it leaves coverage
-        // entirely and the threshold passes vacuously.
+        // Extracted out of Inspector.tsx (issues #167, #166). `thresholds.perFile` is true and this
+        // list is an allowlist, so code that leaves Inspector.tsx has to be named here or it leaves
+        // coverage entirely and the threshold passes vacuously.
+        "src/components/inspector/Collections.tsx",
+        "src/components/inspector/Duplicates.tsx",
+        "src/components/inspector/License.tsx",
+        "src/components/inspector/MediaFacts.tsx",
+        "src/components/inspector/NoteEditor.tsx",
         "src/components/inspector/preview/index.tsx",
-        // Extracted out of Settings.tsx (issue #161) — same allowlist rule again.
+        "src/components/inspector/primitives.tsx",
+        "src/components/inspector/Similar.tsx",
+        "src/components/inspector/Tags.tsx",
+        // Extracted out of Settings.tsx (issues #161, #162) — same allowlist rule again.
         "src/components/settings/AccountsSection.tsx",
         "src/components/settings/GroupsSection.tsx",
+        "src/components/settings/OidcSection.tsx",
         "src/components/settings/StorageSection.tsx",
+        "src/components/settings/TokensSection.tsx",
         "src/lib/dialogs.tsx",
         "src/lib/use-focus-trap.ts",
       ],
