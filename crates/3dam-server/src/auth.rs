@@ -206,7 +206,7 @@ pub struct Reader(pub AuthContext);
 impl FromRequestParts<AppState> for Reader {
     type Rejection = ApiError;
     async fn from_request_parts(parts: &mut Parts, st: &AppState) -> Result<Self, ApiError> {
-        if let Some(ticket) = crate::resolve_media_ticket(st, parts).await {
+        if let Some(ticket) = crate::tickets::resolve_media_ticket(st, parts).await {
             return Ok(Reader(ticket?));
         }
         // Browser media is fetched with this same header and converted to a local blob URL; raw
