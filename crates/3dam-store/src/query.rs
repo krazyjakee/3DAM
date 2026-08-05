@@ -418,7 +418,7 @@ impl Store {
                 seed_vecs
                     .entry(space)
                     .or_default()
-                    .push(crate::analysis::bytes_to_f32(&vb));
+                    .push(crate::similarity::bytes_to_f32(&vb));
             }
         }
         if seed_vecs.is_empty() {
@@ -441,10 +441,10 @@ impl Store {
                 if seed_set.contains(&id) {
                     continue;
                 }
-                let v = crate::analysis::bytes_to_f32(&vb);
+                let v = crate::similarity::bytes_to_f32(&vb);
                 let score = svecs
                     .iter()
-                    .map(|sv| crate::analysis::cosine(sv, &v))
+                    .map(|sv| crate::similarity::cosine(sv, &v))
                     .fold(f32::MIN, f32::max);
                 let e = best.entry(id).or_insert(f32::MIN);
                 if score > *e {

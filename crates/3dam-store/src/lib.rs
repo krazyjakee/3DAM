@@ -255,18 +255,22 @@ impl Store {
 
 // The `impl Store` surface is split across these modules by concern; each adds methods to the same
 // `Store` type. Shared free helpers (SQL filter building, blob↔id conversions) live in `helpers`.
-mod analysis;
+mod analysis_plan;
+mod analysis_write;
 mod assets;
 mod batch;
 mod blocklist;
 mod collections;
+mod duplicates;
 mod export;
 mod helpers;
 mod jobs;
 mod maintenance;
 mod query;
 pub mod search;
+mod similarity;
 mod sources;
+mod tags;
 
 pub use batch::{
     AnalysisBatchContext, AnalysisBatchOutcome, AnalysisItemOutcome, AnalysisWrite,

@@ -1,6 +1,6 @@
 //! HNSW approximate-nearest-neighbour index over an embedding space (semantic-search M6).
 //!
-//! The brute-force cosine scan in [`crate::analysis`] is exact and correct, but O(n·d) per query —
+//! The brute-force cosine scan in [`crate::similarity`] is exact and correct, but O(n·d) per query —
 //! fine at v1 scale, linear at 100k+ embeddings. This wraps `instant-distance`'s HNSW so similarity
 //! and hybrid search stay sub-linear once a space grows. `instant-distance` is the decided backend
 //! per `docs/adr/0016-vector-index-backend.md` — one pure-Rust crate, no build script and no C++

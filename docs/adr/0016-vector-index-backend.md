@@ -19,7 +19,7 @@ for small libraries / exact re-rank."*
 
 **The shipped engine does neither.** `crates/3dam-store/src/ann.rs` wraps `instant-distance`'s
 HNSW behind the off-by-default `ann` Cargo feature; the default similarity path is the exact
-rayon cosine scan in `analysis.rs`, which is also the ground truth the ANN parity test checks
+rayon cosine scan in `similarity.rs`, which is also the ground truth the ANN parity test checks
 against. Issue #141, which scopes index persistence and incremental maintenance, keeps that
 backend. So the spec has named one crate and the tree has shipped another for a full phase, and
 every downstream issue inherits the ambiguity. That divergence — not a performance problem — is
@@ -86,7 +86,7 @@ It is worth being precise about what the spike settled and what it did not.
   the low-powered serve host, not the workstation, and it is the most likely trigger below.
 - **This ADR fixes the backend, not the lifecycle.** Today the index is an in-memory per-space
   cache built lazily and invalidated by a global embedding generation
-  (`analysis.rs::ann_for_space`). Persistence, incremental per-space maintenance, atomic swap,
+  (`similarity.rs::ann_for_space`). Persistence, incremental per-space maintenance, atomic swap,
   corruption recovery, and the 100k/1M recall+latency benchmarks are #141's scope, and they now
   have a named backend to build against.
 - **The spike's numbers survive as the acceptance bar even though its crate did not.** They are the
