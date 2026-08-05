@@ -1885,37 +1885,35 @@ impl LibraryService for EmbeddedLibrary {
         let vis = ctx.visibility.clone();
         let Some(sid) = source else {
             let mut stats = self.db(move |s| s.stats(None, &vis)).await?;
-            // Preserve the established owner view (unscoped stats describe the local index), but
-            // make a restricted peer-only account's aggregate agree with its federated search and
-            // MCP view. Only shared peers are contacted; unavailable peers fail soft because this
-            // DTO predates per-peer partial warnings.
-            if !ctx.visibility.is_full() {
-                for peer in self
-                    .fed_peers()
-                    .await
-                    .iter()
-                    .filter(|peer| ctx.visibility.allows_source(&peer.source_id))
-                {
-                    let peer_stats = tokio::time::timeout(
-                        federation::QUERY_DEADLINE,
-                        peer.client.library_stats(&AuthContext::embedded(), None),
-                    )
-                    .await;
-                    let Ok(Ok(peer_stats)) = peer_stats else {
-                        continue;
-                    };
-                    stats.total += peer_stats.total;
-                    stats.unanalyzed += peer_stats.unanalyzed;
-                    for (media, count) in peer_stats.by_media {
-                        *stats.by_media.entry(media).or_default() += count;
-                    }
-                    for (tag, count) in peer_stats.tags {
-                        *stats.tags.entry(tag).or_default() += count;
-                    }
-                    // The peer is one source in this library's namespace. Do not leak or collide
-                    // its internal source names in the outer sidebar aggregate.
-                    stats.by_source.insert(peer.name.clone(), peer_stats.total);
+            // Unscoped stats describe *the library the caller can reach*, not just the local
+            // index: a federated source is one row in this sidebar, so leaving its assets out of
+            // the aggregate reads as an empty library whenever the catalog is peer-only. The
+            // owner's totals therefore fan out exactly like the browse grid already does; a
+            // restricted account is additionally narrowed to the peers it may reach, so its
+            // aggregate keeps agreeing with its federated search and MCP view. Unavailable peers
+            // fail soft because this DTO predates per-peer partial warnings.
+            for peer in self.fed_peers().await.iter().filter(|peer| {
+                ctx.visibility.is_full() || ctx.visibility.allows_source(&peer.source_id)
+            }) {
+                let peer_stats = tokio::time::timeout(
+                    federation::QUERY_DEADLINE,
+                    peer.client.library_stats(&AuthContext::embedded(), None),
+                )
+                .await;
+                let Ok(Ok(peer_stats)) = peer_stats else {
+                    continue;
+                };
+                stats.total += peer_stats.total;
+                stats.unanalyzed += peer_stats.unanalyzed;
+                for (media, count) in peer_stats.by_media {
+                    *stats.by_media.entry(media).or_default() += count;
                 }
+                for (tag, count) in peer_stats.tags {
+                    *stats.tags.entry(tag).or_default() += count;
+                }
+                // The peer is one source in this library's namespace. Do not leak or collide
+                // its internal source names in the outer sidebar aggregate.
+                stats.by_source.insert(peer.name.clone(), peer_stats.total);
             }
             return Ok(stats);
         };

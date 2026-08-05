@@ -384,9 +384,17 @@ async fn source_filter_routes_to_the_peer_alone() {
         .id;
     let local_stats = local.library_stats(&ctx, Some(local_sid)).await.unwrap();
     assert_eq!(local_stats.total, 1);
-    // Unscoped stays the local library (peers merge into queries, not local aggregates).
+    // Unscoped is every source the caller can reach — local *plus* peer — so the sidebar's
+    // "all media types" agrees with the unfiltered grid instead of counting the local index
+    // alone (which reads as an empty library when the catalog is peer-only).
     let all = local.library_stats(&ctx, None).await.unwrap();
-    assert_eq!(all.total, 1);
+    assert_eq!(all.total, 2, "local row + the peer's row");
+    assert_eq!(all.by_media.get("audio"), Some(&2));
+    assert_eq!(
+        all.by_source.get("peer"),
+        Some(&1),
+        "the peer contributes under its local source name, not its own internal names"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

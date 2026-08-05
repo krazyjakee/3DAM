@@ -236,3 +236,21 @@ fn backwards_compatible_defaults_and_optional_null_are_explicit() {
     .unwrap();
     assert_eq!(omitted.expected_version, explicit.expected_version);
 }
+
+/// A federated peer is a separately deployed 3dam, so the reader must accept the spelling the
+/// previous release wrote. `suggested` was the pre-#112 wire value for what is now `pending`;
+/// rejecting it fails the *whole* `Asset` decode, so one tagged asset on a peer that is one
+/// release behind turns every detail read into a `404`.
+#[test]
+fn a_peer_on_the_previous_release_still_decodes() {
+    let legacy = serde_json::json!({
+        "name": "texture", "state": "suggested", "source": "auto", "confidence": 0.7
+    });
+    let tag: TagRef = serde_json::from_value(legacy).unwrap();
+    assert_eq!(tag.state, SuggestionState::Pending);
+    // The alias is read-only: the committed vocabulary is still what goes out on the wire.
+    assert_eq!(
+        serde_json::to_value(tag.state).unwrap(),
+        Value::String("pending".into())
+    );
+}

@@ -6,11 +6,16 @@ const source = (name: string) =>
   readFile(new URL(`../src/components/${name}`, import.meta.url), "utf8");
 
 test("source and collection actions reveal while their row owns keyboard focus", async () => {
-  const navigation = await source("Navigation.tsx");
-  assert.ok(
-    navigation.match(/group-focus-within:flex/g)?.length === 2,
-    "both source and collection action groups must reveal on focus-within",
-  );
+  // One assertion per row module: the two hover-reveal action groups moved out of Navigation.tsx
+  // when the sidebar rows became their own files, and a count over the parent would now pass on
+  // zero of them.
+  for (const row of ["navigation/SourceRow.tsx", "navigation/Collections.tsx"]) {
+    assert.match(
+      await source(row),
+      /group-focus-within:flex/,
+      `${row}'s action group must reveal on focus-within`,
+    );
+  }
 });
 
 test("asset menus retain root and submenu WAI-ARIA contracts", async () => {

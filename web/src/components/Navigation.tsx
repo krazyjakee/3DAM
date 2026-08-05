@@ -201,8 +201,12 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
   const sources = useSources();
   // Sidebar counts follow the browsed source (phase 6): a scoped local source counts its own
   // assets; a federated source reports the peer's live numbers (polled — no WS across peers).
+  // Unscoped counts every reachable source, peers included, so they need the same polling
+  // whenever any federated source is registered — a peer's catalog changes silently here too.
   const isPeer =
-    sources.data?.some((s) => s.id === state.source && s.kind === "federated") ?? false;
+    sources.data?.some((s) =>
+      s.kind === "federated" && (state.source === null || s.id === state.source),
+    ) ?? false;
   const stats = useStats(state.source, { isPeer });
   const scan = useScan();
   const analyze = useAnalyze();

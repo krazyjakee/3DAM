@@ -242,6 +242,12 @@ pub struct TagRef {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SuggestionState {
+    /// Also accepts the pre-#112 wire spelling `suggested` on the way in. A federated peer is an
+    /// independently deployed 3dam, so a fleet is routinely mid-upgrade: without the alias a peer
+    /// one release behind makes every *tagged* asset's detail read fail to decode, which surfaces
+    /// as a `404` and a client that cannot open any peer asset. Only the reader is lenient — this
+    /// still serialises as `pending`, so the committed vocabulary is unchanged.
+    #[serde(alias = "suggested")]
     Pending,
     Confirmed,
     Rejected,
