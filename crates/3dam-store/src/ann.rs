@@ -2,9 +2,12 @@
 //!
 //! The brute-force cosine scan in [`crate::analysis`] is exact and correct, but O(n·d) per query —
 //! fine at v1 scale, linear at 100k+ embeddings. This wraps `instant-distance`'s HNSW so similarity
-//! and hybrid search stay sub-linear once a space grows. It is built behind the `ann` Cargo feature
-//! and the store keeps it in a per-space cache invalidated whenever an embedding is written; the
-//! brute-force path remains the fallback (and the ground truth the parity test checks against).
+//! and hybrid search stay sub-linear once a space grows. `instant-distance` is the decided backend
+//! per `docs/adr/0016-vector-index-backend.md` — one pure-Rust crate, no build script and no C++
+//! toolchain; the spike's faster `usearch` was not taken and `sqlite-vec` was dropped outright.
+//! It is built behind the `ann` Cargo feature and the store keeps it in a per-space cache
+//! invalidated whenever an embedding is written; the brute-force path remains the fallback (and the
+//! ground truth the parity test checks against).
 
 use dam_api::id::AssetId;
 use instant_distance::{Builder, HnswMap, Point, Search};

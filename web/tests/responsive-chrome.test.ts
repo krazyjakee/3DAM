@@ -6,14 +6,18 @@ const component = (name: string) =>
   readFile(new URL(`../src/components/${name}`, import.meta.url), "utf8");
 
 test("Browser chrome responds to centre-pane width instead of viewport width", async () => {
-  const [browser, css] = await Promise.all([
+  // The toolbar and selection bar were extracted into `components/browser/` (issue #164); the
+  // container-query contract they share with the shell is unchanged.
+  const [browser, toolbar, selectionBar, css] = await Promise.all([
     component("Browser.tsx"),
+    component("browser/Toolbar.tsx"),
+    component("browser/SelectionBar.tsx"),
     readFile(new URL("../src/index.css", import.meta.url), "utf8"),
   ]);
   assert.match(browser, /className="browser-shell /);
-  assert.match(browser, /browser-toolbar-primary/);
-  assert.match(browser, /browser-toolbar-secondary/);
-  assert.match(browser, /browser-selection-actions/);
+  assert.match(toolbar, /browser-toolbar-primary/);
+  assert.match(toolbar, /browser-toolbar-secondary/);
+  assert.match(selectionBar, /browser-selection-actions/);
   assert.match(css, /container-name: browser/);
   assert.match(css, /@container browser \(max-width: 48rem\)/);
   assert.match(css, /@container browser \(max-width: 40rem\)/);

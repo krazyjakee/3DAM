@@ -101,6 +101,16 @@ capability you have not deliberately switched on.
   workflow. Audio, image, and 3D remain the media types 3DAM is *for*.
 - Not a **real-time collaborative** editor — the server enables shared *access* to a
   library; concurrent multi-user editing and sync are out of scope for v1.
+- Not a **biometric or people-recognition** system, and this one is a standing position rather
+  than a v1 line. 3DAM does not detect, embed, cluster, store, or search **faces as identities**,
+  and there is no People view. A face template used to identify someone is GDPR Art. 9
+  special-category data, a BIPA-covered biometric identifier, and an EU AI Act high-risk category
+  whose FOSS exemption our MIT licence does not reach — and an off-by-default flag would relocate
+  that exposure onto the small studios and solo developers 3DAM is for, not remove it. The
+  automatic-clustering increment over what already ships (image similarity, tags with the
+  suggest/confirm/reject lifecycle, collections, smart folders) does not pay for it. Declined with
+  full reasoning and explicit reopening conditions in
+  [ADR 0017](adr/0017-facial-recognition-declined.md).
 
 ## 3. Primary users & use cases
 
@@ -617,8 +627,9 @@ Choices to be validated by spikes; listed to establish direction, not to lock in
   ([ADR 0005](adr/0005-gui-toolkit-egui.md)) — with **wgpu** for the embedded 3D viewer and
   custom thumbnail/waveform rendering.
 - **Database:** embedded **SQLite** (via `rusqlite`/`sqlx`) for metadata; the vector index for
-  similarity is a **sidecar HNSW (`usearch`)** ([spike](../spikes/vector-index/README.md)), with
-  `sqlite-vec` retained for small libraries / exact re-rank. Local, single-file, portable.
+  similarity is a **sidecar HNSW** ([spike](../spikes/vector-index/README.md)) built on the
+  pure-Rust **`instant-distance`** crate, with an exact in-process cosine scan as the default and
+  fallback ([ADR 0016](adr/0016-vector-index-backend.md)). Local, single-file, portable.
 - **Audio:** `symphonia` (decode) + FFT/DSP crates (`rustfft`/`realfft`) for feature
   extraction; playback via `cpal`/`rodio`.
 - **Image:** `image` + `imageproc`; perceptual hashing (`img_hash`); optional GPU decode.
@@ -748,8 +759,11 @@ Choices to be validated by spikes; listed to establish direction, not to lock in
   audio forces the `ort` fallback. A follow-up code spike validates on-domain quality + latency
   before dims freeze.
 - ~~Vector index: embedded extension vs standalone crate; on-disk vs in-memory at scale.~~
-  **Decided:** sidecar HNSW (`usearch`) as the primary index, `sqlite-vec` for small libraries /
-  exact re-rank ([spike](../spikes/vector-index/README.md)).
+  **Decided:** a **sidecar HNSW** is the primary index, never an exact scan inside SQLite
+  ([spike](../spikes/vector-index/README.md)); the backend crate is **`instant-distance`**
+  (pure Rust, no C++ toolchain) and **`sqlite-vec` is dropped entirely** — the in-process exact
+  cosine scan already beats it ~10× at 1M and covers both the small-library and exact-re-rank
+  roles ([ADR 0016](adr/0016-vector-index-backend.md)).
 - ~~Extent of write-back to sources (rename/relocate) vs strictly-read-only default.~~
   **Decided:** strictly **read-only default** in v1; write-back (rename/relocate) is opt-in and
   **post-v1**.
@@ -791,6 +805,12 @@ Choices to be validated by spikes; listed to establish direction, not to lock in
   Proprietary | Custom | NULL) + tri-state rights flags; licences recorded only from explicit
   declarations; per-asset overrides via an `'inherited'` provenance. 3DAM records and surfaces
   licence — it is not legal advice.
+- ~~**Facial recognition and a People view** — does person-level browsing belong in a game-asset
+  manager, and can an off-by-default flag carry the biometric exposure?~~ **Decided: no, declined**
+  ([ADR 0017](adr/0017-facial-recognition-declined.md)). No faces, no `person`/`face` tables, no
+  `FaceRecognition` flag, no phase in §9 — recorded as a standing non-goal in §2. The ADR names the
+  concrete conditions that would reopen it; a detection-only "contains identifiable people" signal
+  for the usage-rights surface is *not* authorised by it and would need its own gate.
 
 ---
 

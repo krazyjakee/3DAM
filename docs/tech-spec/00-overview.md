@@ -160,10 +160,12 @@ questions (PRODUCT_SPEC §10) and its build phasing (PRODUCT_SPEC §9).
   quality + real latency before dims freeze. [05](05-analysis-similarity-dedup.md).
 - Vector-index storage: embedded extension (`sqlite-vec`) vs sidecar HNSW; on-disk vs in-memory
   at 1M+. [02](02-data-model-and-storage.md)/[05](05-analysis-similarity-dedup.md).
-  **✅ Decided 2026-07-06** by [`spikes/vector-index/`](../../spikes/vector-index/README.md):
-  **sidecar HNSW (usearch) is the primary index** (sub-ms/query at 1M, recall tunable to ~100%);
-  `sqlite-vec` is exact-but-O(N) (726 ms/query at 1M) → kept for small libraries / exact re-rank.
-  Remaining: quantization (f16/i8) for memory, and validation on real embeddings.
+  **✅ Decided 2026-07-06** by [`spikes/vector-index/`](../../spikes/vector-index/README.md), backend
+  settled **2026-08-05** by [ADR 0016](../adr/0016-vector-index-backend.md): a **sidecar HNSW is the
+  primary index** (sub-ms/query at 1M, recall tunable to ~100%) on the pure-Rust **`instant-distance`**
+  crate; `sqlite-vec` is exact-but-O(N) (726 ms/query at 1M, ~10× slower than our own exact scan)
+  → **dropped entirely**. Remaining: index persistence, plus quantization for memory and validation
+  on real embeddings (issue [#141](https://github.com/krazyjakee/3DAM/issues/141)).
 
 **Data & licence:** — all **decided in [ADR 0009 §1](../adr/0009-v1-scope-decisions.md)**.
 - ~~Licence taxonomy & detection~~ — **No defaults; unknown-is-unknown** (never inferred). Hybrid

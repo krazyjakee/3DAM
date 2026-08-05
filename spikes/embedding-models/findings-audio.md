@@ -83,7 +83,9 @@ embed → **mean-pool then L2-renormalise** (the same pooling pattern §2.4 alre
 multi-view).
 
 **Index-scale implication (dim).** Per the [vector-index spike](../vector-index/README.md),
-the usearch HNSW index is ~**f32 · dim · N bytes** resident. At **1M assets**:
+an HNSW index is ~**f32 · dim · N bytes** resident (raw vector bytes dominate, so this holds for
+the shipped `instant-distance` backend too — [ADR 0016](../../docs/adr/0016-vector-index-backend.md)).
+At **1M assets**:
 
 - **512-d (CLAP):** ~**2.0 GB** — matches the measured 512-d image/vector-index baseline.
 - **2048-d (PANNs CNN14):** ~**8 GB** — 4× the RAM/disk for the audio index alone.
@@ -146,7 +148,8 @@ but **AGPL-3.0**, so not shippable in a permissively-licensed product).
    near-dup separability (feeds the §4.2 audio near-dup thresholds), plus a text→sound spot
    check. Public ESC-50/MAEB numbers are a proxy, not game-audio.
 4. **Dim/quantization at scale** — confirm the 512-d f32 → ~2 GB/1M estimate on the real
-   usearch index and test f16/i8 scalar quantization (the vector-index spike's open follow-up)
+   index and test f16/i8 scalar quantization (the vector-index spike's open follow-up; note the
+   shipped `instant-distance` backend has none — [ADR 0016](../../docs/adr/0016-vector-index-backend.md))
    for the audio space specifically.
 5. **space_id honesty** — record the CLAP artefact `{model_id, model_version, sha256, dim=512,
    metric=cosine}` so the cross-peer gate ([cross-peer spike](../cross-peer-similarity/README.md))

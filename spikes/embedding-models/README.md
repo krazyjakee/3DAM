@@ -53,7 +53,9 @@ weights: pooled multi-view 3D vectors must never cross-rank against single-image
 
 ## Vector-index memory implication
 
-usearch was measured at **~2 GB / 1M vectors at 512-d** ([vector-index spike](../vector-index/README.md)).
+An HNSW index was measured at **~2 GB / 1M vectors at 512-d** (usearch, in the
+[vector-index spike](../vector-index/README.md); the shipped backend is `instant-distance` —
+[ADR 0016](../../docs/adr/0016-vector-index-backend.md) — and the raw-vector bytes dominate either way).
 Scaling by dim, per **separate per-media index**: image 768-d ≈ 3 GB/1M, shape 768-d ≈ 3 GB/1M,
 audio 512-d ≈ 2 GB/1M, optional DINOv2 384-d ≈ 1.5 GB/1M. This is what makes the deferred
 **f16/i8 quantization** follow-up (vector-index spike) matter at multi-million scale.

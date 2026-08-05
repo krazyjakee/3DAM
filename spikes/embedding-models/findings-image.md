@@ -10,8 +10,8 @@ Sibling spikes: [vector-index](../vector-index/README.md), [cross-peer-similarit
 
 Which concrete **image embedding model** should 3DAM ship for v1? The pipeline
 ([05 §2.1](../../docs/tech-spec/05-analysis-similarity-dedup.md)) is written against the
-`Embedder` contract — one L2-normalised, fixed-dim vector per image, feeding the usearch HNSW
-index and near-dup detection. Choosing the model *fixes the dim* (and therefore index memory at
+`Embedder` contract — one L2-normalised, fixed-dim vector per image, feeding the HNSW similarity
+index ([ADR 0016](../../docs/adr/0016-vector-index-backend.md)) and near-dup detection. Choosing the model *fixes the dim* (and therefore index memory at
 1M+, per the [vector-index spike](../vector-index/README.md)), and fixes the `EmbeddingSpace`
 `space_id` that the [cross-peer spike](../cross-peer-similarity/README.md) gates on.
 

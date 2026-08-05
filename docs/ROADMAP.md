@@ -256,6 +256,7 @@ Most were resolved on 2026-07-06 in [ADR 0008](adr/0008-web-client-stack.md) (we
 - ~~Distribution channels.~~ **GitHub Releases only for v1** ([ADR 0009 §10](adr/0009-v1-scope-decisions.md)).
 - ~~View-logic sharing web ↔ desktop.~~ **Each frontend owns its presentation over the shared API in v1;** no shared view crate ([ADR 0009 §9](adr/0009-v1-scope-decisions.md)).
 - ~~Desktop GUI embeds a webview.~~ Originally **no** (fully native egui, [ADR 0009 §9](adr/0009-v1-scope-decisions.md)); **reversed 2026-07-16** — the desktop app is now a Tauri webview over the embedded web client ([ADR 0013](adr/0013-desktop-shell-tauri.md)).
+- ~~Facial recognition + a People view (#83).~~ **Declined 2026-08-05** ([ADR 0017](adr/0017-facial-recognition-declined.md)): faces are biometric data whose exposure an off-by-default flag relocates onto our users rather than removing, and MIT + local-first does not reach the EU AI Act's FOSS carve-out for high-risk biometric identification. **No phase in §9 covers it and none is reserved** — the ADR carries the reopening conditions.
 
 ---
 

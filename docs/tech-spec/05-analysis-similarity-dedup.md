@@ -222,9 +222,10 @@ view is rendered*.
 ### 3.1 Index
 
 - Similarity uses an **approximate nearest-neighbour (ANN)** index over the normalised
-  embeddings — an **HNSW graph** is the working choice (candidates per PRODUCT_SPEC §7:
-  `usearch`, an HNSW crate, or `sqlite-vec`). Cosine metric (dot product on normalised
-  vectors).
+  embeddings — an **HNSW graph** on the pure-Rust **`instant-distance`** crate
+  ([ADR 0016](../adr/0016-vector-index-backend.md)). Cosine metric (dot product on normalised
+  vectors). It sits behind dam-store's off-by-default `ann` feature; the **exact rayon cosine
+  scan is the default path, the fallback, and the parity ground truth**.
 - **One logical index per embedding-space id** (§2.1): image, audio, and 3D vectors are never
   mixed in one graph — they're different spaces and different dims. Queries are always
   scoped to a media type's space.
@@ -502,8 +503,12 @@ Carried from PRODUCT_SPEC §10 and rolled up in [00-overview.md](00-overview.md)
   before dims freeze. Still gated on the `Embedder` contract (§2.1), so any swap is a `model_version`
   bump (§7).
 - ~~**Inference runtime pick**~~ — **Decided: `candle`** ([ADR 0006](../adr/0006-inference-runtime-candle.md), 2026-07-06), `ort` as a feature-gated fallback. Only the *concrete models* (above) remain open.
-- **Vector index choice** (§3.1) — embedded extension (`sqlite-vec`) vs standalone crate
-  (`usearch`/HNSW), in-memory vs on-disk at 1M+ scale. Storage layout is 02's; the
+- ~~**Vector index choice** (§3.1)~~ — **Decided 2026-08-05** ([ADR 0016](../adr/0016-vector-index-backend.md)):
+  a sidecar **HNSW on `instant-distance`** (pure Rust, no C++ toolchain), **`sqlite-vec` dropped**
+  entirely — the in-process exact cosine scan already beats its 726 ms/query at 1M by ~10×, so it
+  loses even the exact-re-rank role. **Remaining:** persistence and incremental maintenance, plus
+  the 100k/1M recall+latency numbers that would trigger a revisit (issue
+  [#141](https://github.com/krazyjakee/3DAM/issues/141)). Storage layout is 02's; the
   perf/out-of-core call is shared with [14](14-concurrency-performance-reliability.md).
 - ~~**Cross-peer similarity** (§3.4)~~ — **Decided 2026-07-06** ([`spikes/cross-peer-similarity/`](../../spikes/cross-peer-similarity/README.md)):
   **advertise the `EmbeddingSpace` `space_id` and gate cross-peer ranking on exact match**; fall

@@ -163,8 +163,9 @@ pub const MIGRATIONS: &[&str] = &[
     // so V3 only adds the vector index. One row per (asset, embedding-space): the normalised f32
     // embedding is stored as little-endian bytes, tagged with the space id + extractor version so a
     // model bump can invalidate just its slice (§2.1, §3.1, §7.2). Similarity is a brute-force cosine
-    // scan over this table in v1 — correct and exact; an HNSW/`usearch` sidecar is the scale
-    // follow-up (§3.1, open question). Storage layout owned here per tech-spec 02.
+    // scan over this table by default — correct and exact; the scale path is an `instant-distance`
+    // HNSW sidecar over these same rows, behind the `ann` feature (see `crate::ann`, ADR 0016).
+    // Storage layout owned here per tech-spec 02.
     r#"
     CREATE TABLE embedding (
         asset_id   BLOB NOT NULL REFERENCES asset(id) ON DELETE CASCADE,

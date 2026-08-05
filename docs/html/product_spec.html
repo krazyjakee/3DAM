@@ -281,6 +281,16 @@ capability you have not deliberately switched on.</p>
 <li>Not a <strong>general-purpose DAM</strong> for documents/video — game audio, images, and 3D only in v1.</li>
 <li>Not a <strong>real-time collaborative</strong> editor — the server enables shared <em>access</em> to a
   library; concurrent multi-user editing and sync are out of scope for v1.</li>
+<li>Not a <strong>biometric or people-recognition</strong> system, and this one is a standing position rather
+  than a v1 line. 3DAM does not detect, embed, cluster, store, or search <strong>faces as identities</strong>,
+  and there is no People view. A face template used to identify someone is GDPR Art. 9
+  special-category data, a BIPA-covered biometric identifier, and an EU AI Act high-risk category
+  whose FOSS exemption our MIT licence does not reach — and an off-by-default flag would relocate
+  that exposure onto the small studios and solo developers 3DAM is for, not remove it. The
+  automatic-clustering increment over what already ships (image similarity, tags with the
+  suggest/confirm/reject lifecycle, collections, smart folders) does not pay for it. Declined with
+  full reasoning and explicit reopening conditions in
+  <a href="adr/0017-facial-recognition-declined.md">ADR 0017</a>.</li>
 </ul>
 <h2 id="3-primary-users-use-cases">3. Primary users &amp; use cases</h2>
 <ul>
@@ -790,8 +800,9 @@ can read and set it too — so nothing is browser-only and a headless operator i
   (<a href="adr/0005-gui-toolkit-egui.md">ADR 0005</a>) — with <strong>wgpu</strong> for the embedded 3D viewer and
   custom thumbnail/waveform rendering.</li>
 <li><strong>Database:</strong> embedded <strong>SQLite</strong> (via <code>rusqlite</code>/<code>sqlx</code>) for metadata; the vector index for
-  similarity is a <strong>sidecar HNSW (<code>usearch</code>)</strong> (<a href="../spikes/vector-index/README.md">spike</a>), with
-  <code>sqlite-vec</code> retained for small libraries / exact re-rank. Local, single-file, portable.</li>
+  similarity is a <strong>sidecar HNSW</strong> (<a href="../spikes/vector-index/README.md">spike</a>) built on the
+  pure-Rust <strong><code>instant-distance</code></strong> crate, with an exact in-process cosine scan as the default and
+  fallback (<a href="adr/0016-vector-index-backend.md">ADR 0016</a>). Local, single-file, portable.</li>
 <li><strong>Audio:</strong> <code>symphonia</code> (decode) + FFT/DSP crates (<code>rustfft</code>/<code>realfft</code>) for feature
   extraction; playback via <code>cpal</code>/<code>rodio</code>.</li>
 <li><strong>Image:</strong> <code>image</code> + <code>imageproc</code>; perceptual hashing (<code>img_hash</code>); optional GPU decode.</li>
@@ -888,8 +899,11 @@ build phasing; where a step mentions a GUI or web client, that web-first orderin
   audio forces the <code>ort</code> fallback. A follow-up code spike validates on-domain quality + latency
   before dims freeze.</li>
 <li>~~Vector index: embedded extension vs standalone crate; on-disk vs in-memory at scale.~~
-  <strong>Decided:</strong> sidecar HNSW (<code>usearch</code>) as the primary index, <code>sqlite-vec</code> for small libraries /
-  exact re-rank (<a href="../spikes/vector-index/README.md">spike</a>).</li>
+  <strong>Decided:</strong> a <strong>sidecar HNSW</strong> is the primary index, never an exact scan inside SQLite
+  (<a href="../spikes/vector-index/README.md">spike</a>); the backend crate is <strong><code>instant-distance</code></strong>
+  (pure Rust, no C++ toolchain) and <strong><code>sqlite-vec</code> is dropped entirely</strong> — the in-process exact
+  cosine scan already beats it ~10× at 1M and covers both the small-library and exact-re-rank
+  roles (<a href="adr/0016-vector-index-backend.md">ADR 0016</a>).</li>
 <li>~~Extent of write-back to sources (rename/relocate) vs strictly-read-only default.~~
   <strong>Decided:</strong> strictly <strong>read-only default</strong> in v1; write-back (rename/relocate) is opt-in and
   <strong>post-v1</strong>.</li>
@@ -931,6 +945,12 @@ build phasing; where a step mentions a GUI or web client, that web-first orderin
   Proprietary | Custom | NULL) + tri-state rights flags; licences recorded only from explicit
   declarations; per-asset overrides via an <code>'inherited'</code> provenance. 3DAM records and surfaces
   licence — it is not legal advice.</li>
+<li>~~<strong>Facial recognition and a People view</strong> — does person-level browsing belong in a game-asset
+  manager, and can an off-by-default flag carry the biometric exposure?~~ <strong>Decided: no, declined</strong>
+  (<a href="adr/0017-facial-recognition-declined.md">ADR 0017</a>). No faces, no <code>person</code>/<code>face</code> tables, no
+  <code>FaceRecognition</code> flag, no phase in §9 — recorded as a standing non-goal in §2. The ADR names the
+  concrete conditions that would reopen it; a detection-only "contains identifiable people" signal
+  for the usage-rights surface is <em>not</em> authorised by it and would need its own gate.</li>
 </ul>
 <hr />
 <p>See also: <a href="mission.html">MISSION.md</a> · <a href="design_guidelines.html">DESIGN_GUIDELINES.md</a></p>
