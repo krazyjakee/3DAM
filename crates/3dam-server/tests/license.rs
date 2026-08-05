@@ -3,7 +3,7 @@
 //! only `Read` must be refused before the engine ever sees the request.
 //!
 //! Driven through the real axum router with `ServiceExt::oneshot` (no socket bind), per the house
-//! convention in `phase5.rs`.
+//! convention in `auth_tokens.rs`.
 
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};

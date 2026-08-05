@@ -167,6 +167,68 @@ pub async fn call(
     (st, v)
 }
 
+/// Post one upload body as a signed-in browser. Upload deliberately uses a raw streaming body, not
+/// JSON, so the ordinary [`call`] helper cannot exercise its auth/share boundary.
+pub async fn upload_call(
+    app: &axum::Router,
+    session: &Session,
+    source: &str,
+    name: &str,
+    bytes: Vec<u8>,
+) -> (StatusCode, Value) {
+    upload_body_call(app, session, source, name, Body::from(bytes)).await
+}
+
+/// As [`upload_call`], but the caller supplies the body — a `Body` that stalls or over-runs its
+/// declared length is how the streaming guards get exercised.
+pub async fn upload_body_call(
+    app: &axum::Router,
+    session: &Session,
+    source: &str,
+    name: &str,
+    body: Body,
+) -> (StatusCode, Value) {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri(format!("/api/v1/upload?source={source}&name={name}"))
+        .header("content-type", "application/octet-stream");
+    for (name, value) in session.headers() {
+        request = request.header(name, value);
+    }
+    let response = app
+        .clone()
+        .oneshot(request.body(body).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let value = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    };
+    (status, value)
+}
+
+/// One JSON-RPC call against the mounted `/mcp` endpoint, as a token bearer or as nobody.
+pub async fn rpc(
+    app: &axum::Router,
+    token: Option<&str>,
+    method: &str,
+    params: Value,
+) -> (StatusCode, Value) {
+    call_token(
+        app,
+        "POST",
+        "/mcp",
+        token,
+        Some(json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params})),
+    )
+    .await
+}
+
 /// Fire one request bearing a token (an API token or an OIDC access token), or none.
 pub async fn call_token(
     app: &axum::Router,
@@ -369,6 +431,82 @@ pub async fn seed_two_sources(lib: &EmbeddedLibrary) -> (dam_api::SourceId, dam_
         .unwrap();
     wait_job(lib, &ctx, &job).await;
     (shared_sid, secret_sid)
+}
+
+/// The world every accounts leak-audit scenario starts from: [`seed_two_sources`], accounts on, an
+/// admin (`owner`) holding the instance, and viewer `vera` given a **read** share on `shared-src`
+/// only — `secret-src` is shared with nobody, so anything of its that reaches `vera` is a leak.
+///
+/// Returns `(app, store, lib, admin, vera, shared_source_id, secret_source_id, vera_account_id)`.
+#[allow(clippy::type_complexity)]
+pub async fn leak_world() -> (
+    axum::Router,
+    Arc<ServerStore>,
+    Arc<EmbeddedLibrary>,
+    Session, // admin
+    Session, // vera (viewer, shared-src read)
+    String,  // shared source id
+    String,  // secret source id
+    String,  // vera account id
+) {
+    let (app, store, lib) = harness(true).await;
+    let (shared_sid, secret_sid) = seed_two_sources(&lib).await;
+    enable_accounts(&app).await;
+    let admin = claim(&app, "owner").await;
+    let vera_id = create_account(&app, &admin, "vera", "viewer").await;
+    share(
+        &app,
+        &admin,
+        "source",
+        &shared_sid.to_string(),
+        ("account_id", &vera_id),
+        "read",
+    )
+    .await;
+    let vera = login(&app, "vera", "password123").await;
+    (
+        app,
+        store,
+        lib,
+        admin,
+        vera,
+        shared_sid.to_string(),
+        secret_sid.to_string(),
+        vera_id,
+    )
+}
+
+// ── the server store, reached behind the router ──────────────────────────────
+
+/// Mint a token with the given scopes directly on the store — the setup a test needs *before* it
+/// raises the auth mode, since minting over the admin API would then need a credential it lacks.
+pub fn mint(store: &ServerStore, label: &str, scopes: dam_api::service::Scopes) -> String {
+    store
+        .create_token(
+            dam_api::admin::NewToken {
+                label: label.into(),
+                scopes,
+                expires: None,
+            },
+            "test",
+        )
+        .unwrap()
+        .secret
+}
+
+/// Set the authentication mode on the store, bypassing the admin API's own gates.
+pub fn set_auth(store: &ServerStore, mode: dam_api::admin::AuthMode) {
+    store
+        .set_flag(
+            dam_api::admin::FlagKey::Authentication,
+            dam_api::admin::SetFlag {
+                value: dam_api::admin::FlagValue::Auth(mode),
+                expected_version: None,
+                confirm: false,
+            },
+            "test",
+        )
+        .unwrap();
 }
 
 /// Block until an engine-side job reaches a terminal state.
