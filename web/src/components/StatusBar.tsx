@@ -5,6 +5,7 @@ import { useCancelJob, useJobs, useScopes, useStats, useVersion, useWhoami } fro
 import { authApi } from "@/api/auth";
 import { useConnection, type ConnState } from "@/api/connection";
 import type { JobStatus, MediaType } from "@/api/types";
+import { useEta } from "@/lib/eta";
 import { clearToken, getServer, isRemote, serverLabel } from "@/lib/server";
 import { toast } from "@/lib/toast";
 import { useEscape, useFocusTrap } from "@/lib/use-focus-trap";
@@ -565,51 +566,4 @@ function ProgressBar({
       />
     </div>
   );
-}
-
-/** Live ETA from throughput: tracks `done` over wall-clock time (per `key`), smooths the rate with
- *  an EMA, and returns a formatted "time left" string — or null when it can't estimate (unknown
- *  total, no progress yet, or done). */
-function useEta(key: string, done: number, total: number | null): string | null {
-  const [eta, setEta] = useState<string | null>(null);
-  const sample = useRef<{ t: number; done: number } | null>(null);
-  const rate = useRef(0); // items per ms (EMA)
-
-  useEffect(() => {
-    // Reset the estimator when the tracked job/aggregate identity changes.
-    sample.current = null;
-    rate.current = 0;
-    setEta(null);
-  }, [key]);
-
-  useEffect(() => {
-    if (total == null || total <= 0) {
-      setEta(null);
-      return;
-    }
-    const now = Date.now();
-    const prev = sample.current;
-    if (prev && now > prev.t && done > prev.done) {
-      const inst = (done - prev.done) / (now - prev.t);
-      rate.current = rate.current === 0 ? inst : rate.current * 0.6 + inst * 0.4;
-    }
-    sample.current = { t: now, done };
-    const remaining = Math.max(0, total - done);
-    setEta(remaining > 0 && rate.current > 0 ? fmtDuration(remaining / rate.current) : null);
-  }, [done, total]);
-
-  return eta;
-}
-
-/** ms → a compact "1m 20s" / "45s" / "1h 3m" duration. */
-function fmtDuration(ms: number): string {
-  const s = Math.round(ms / 1000);
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  if (m < 60) {
-    const rem = s % 60;
-    return rem ? `${m}m ${rem}s` : `${m}m`;
-  }
-  const h = Math.floor(m / 60);
-  return `${h}h ${m % 60}m`;
 }
