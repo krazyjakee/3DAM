@@ -1733,7 +1733,7 @@ checksum = "6f55d7153ba3b507595872a3874803f07a8a81d1e888abed8e5db7da0597d6e2"
 
 [[package]]
 name = "dam"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "dam-cli",
  "dam-desktop",
@@ -1743,7 +1743,7 @@ dependencies = [
 
 [[package]]
 name = "dam-api"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "futures",
@@ -1755,7 +1755,7 @@ dependencies = [
 
 [[package]]
 name = "dam-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -1775,7 +1775,7 @@ dependencies = [
 
 [[package]]
 name = "dam-client"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "dam-api",
@@ -1791,7 +1791,7 @@ dependencies = [
 
 [[package]]
 name = "dam-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1828,7 +1828,7 @@ dependencies = [
 
 [[package]]
 name = "dam-desktop"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "dam-frontend",
@@ -1846,7 +1846,7 @@ dependencies = [
 
 [[package]]
 name = "dam-frontend"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "dam-api",
  "dam-client",
@@ -1856,7 +1856,7 @@ dependencies = [
 
 [[package]]
 name = "dam-media"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64 0.22.1",
  "dam-api",
@@ -1880,7 +1880,7 @@ dependencies = [
 
 [[package]]
 name = "dam-render"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "bytemuck",
  "glam 0.30.10",
@@ -1894,7 +1894,7 @@ dependencies = [
 
 [[package]]
 name = "dam-server"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1931,7 +1931,7 @@ dependencies = [
 
 [[package]]
 name = "dam-sources"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "cap-primitives",
  "cap-std",
@@ -1953,7 +1953,7 @@ dependencies = [
 
 [[package]]
 name = "dam-store"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -1970,7 +1970,7 @@ dependencies = [
 
 [[package]]
 name = "dam-viewer"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "bytemuck",
  "console_error_panic_hook",
@@ -11139,7 +11139,7 @@ checksum = "3ae8337f8a065cfc972643663ea4279e04e7256de865aa66fe25cec5fb912d3f"
 
 [[package]]
 name = "xtask"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "dam-api",
  "dam-store",

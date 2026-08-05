@@ -18,7 +18,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/krazyjakee/3DAM"
@@ -33,20 +33,20 @@ rust-version = "1.91"
 # internal crates. Package names use the `dam-` prefix (cargo forbids a leading digit),
 # so libs import as `dam_api`, `dam_core`, … exactly as the tech-spec pseudocode writes them.
 # Directories keep the branded `3dam-` names; the shipped binary target is `3dam`.
-dam-api = { path = "crates/3dam-api", version = "=0.1.1" }
-dam-store = { path = "crates/3dam-store", version = "=0.1.1" }
-dam-media = { path = "crates/3dam-media", version = "=0.1.1" }
+dam-api = { path = "crates/3dam-api", version = "=0.1.2" }
+dam-store = { path = "crates/3dam-store", version = "=0.1.2" }
+dam-media = { path = "crates/3dam-media", version = "=0.1.2" }
 # default-features off here so light consumers (the store) skip the SFTP/SMB network stack; the
 # engine (dam-core) opts the backends back in via `features = ["sftp", "smb"]`.
-dam-sources = { path = "crates/3dam-sources", version = "=0.1.1", default-features = false }
-dam-render = { path = "crates/3dam-render", version = "=0.1.1" }
-dam-viewer = { path = "crates/3dam-viewer", version = "=0.1.1" }
-dam-core = { path = "crates/3dam-core", version = "=0.1.1" }
-dam-client = { path = "crates/3dam-client", version = "=0.1.1" }
-dam-server = { path = "crates/3dam-server", version = "=0.1.1" }
-dam-frontend = { path = "crates/3dam-frontend", version = "=0.1.1" }
-dam-desktop = { path = "crates/3dam-desktop", version = "=0.1.1" }
-dam-cli = { path = "crates/3dam-cli", version = "=0.1.1" }
+dam-sources = { path = "crates/3dam-sources", version = "=0.1.2", default-features = false }
+dam-render = { path = "crates/3dam-render", version = "=0.1.2" }
+dam-viewer = { path = "crates/3dam-viewer", version = "=0.1.2" }
+dam-core = { path = "crates/3dam-core", version = "=0.1.2" }
+dam-client = { path = "crates/3dam-client", version = "=0.1.2" }
+dam-server = { path = "crates/3dam-server", version = "=0.1.2" }
+dam-frontend = { path = "crates/3dam-frontend", version = "=0.1.2" }
+dam-desktop = { path = "crates/3dam-desktop", version = "=0.1.2" }
+dam-cli = { path = "crates/3dam-cli", version = "=0.1.2" }
 
 # async / runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs", "signal", "time", "io-std", "io-util"] }
