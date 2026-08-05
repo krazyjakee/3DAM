@@ -7,6 +7,8 @@
 //! genuinely gone — a limit that would otherwise reject nearly every real asset and make the whole
 //! feature look broken rather than misconfigured.
 
+mod support;
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use dam_api::admin::{AuthMode, FlagKey, FlagValue, NewToken, SetFlag};
@@ -15,25 +17,8 @@ use dam_core::EmbeddedLibrary;
 use dam_server::{router, ServerStore};
 use serde_json::Value;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use support::unique_tmp;
 use tower::ServiceExt;
-
-fn unique_tmp() -> std::path::PathBuf {
-    // Per-process counter as well as a timestamp: these tests run in parallel in one process and
-    // `as_nanos()` can coincide for two that start in the same tick, silently sharing a data dir.
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    std::env::temp_dir().join(format!(
-        "3dam-srv-upload-{}-{}-{}",
-        std::process::id(),
-        nanos,
-        n
-    ))
-}
 
 /// A router over a library with one registered, writable local source, **uploads enabled**.
 ///
@@ -60,7 +45,7 @@ async fn harness_flag_off() -> (
     std::path::PathBuf,
     String,
 ) {
-    let tmp = unique_tmp();
+    let tmp = unique_tmp("srv-upload");
     let src = tmp.join("src");
     std::fs::create_dir_all(&src).unwrap();
     let lib = Arc::new(

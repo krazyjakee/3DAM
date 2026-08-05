@@ -2,55 +2,18 @@
 
 mod support;
 
-use axum::body::Body;
-use axum::extract::ConnectInfo;
-use axum::http::{Request, StatusCode};
+use axum::http::StatusCode;
 use dam_api::accounts::{NewAccount, Role};
 use dam_api::admin::{FlagKey, FlagValue, OidcConfig, OidcProvisioning, SetFlag, SetOidcConfig};
-use dam_core::EmbeddedLibrary;
-use dam_server::{router, ServerStore};
+use dam_server::ServerStore;
 use futures::future::join_all;
-use serde_json::{json, Value};
-use std::net::SocketAddr;
+use serde_json::json;
 use std::sync::Arc;
+use support::call_token;
 use support::oidc_issuer::TestIssuer;
-use tower::ServiceExt;
 
 const CLIENT_ID: &str = "3dam-test-client";
 const REDIRECT_URL: &str = "http://127.0.0.1:7878/api/v1/auth/oidc/callback";
-
-fn unique_tmp() -> std::path::PathBuf {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    std::env::temp_dir().join(format!("3dam-oidc-bearer-{}-{n}", std::process::id()))
-}
-
-async fn send(
-    app: &axum::Router,
-    method: &str,
-    uri: &str,
-    bearer: Option<&str>,
-    body: Option<Value>,
-) -> (StatusCode, Value) {
-    let mut request = Request::builder().method(method).uri(uri);
-    if let Some(token) = bearer {
-        request = request.header("authorization", format!("Bearer {token}"));
-    }
-    let request = match body {
-        Some(body) => request
-            .header("content-type", "application/json")
-            .body(Body::from(body.to_string()))
-            .unwrap(),
-        None => request.body(Body::empty()).unwrap(),
-    };
-    let response = app.clone().oneshot(request).await.unwrap();
-    let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-    (status, body)
-}
 
 struct Harness {
     app: axum::Router,
@@ -58,12 +21,7 @@ struct Harness {
 }
 
 async fn harness(issuer: &TestIssuer, oidc_enabled: bool) -> Harness {
-    let lib = Arc::new(
-        EmbeddedLibrary::open_with(&unique_tmp(), dam_core::ResourceOptions::ungoverned())
-            .await
-            .unwrap(),
-    );
-    let store = Arc::new(ServerStore::open_in_memory().unwrap());
+    let (app, store, _lib) = support::harness(true).await;
     if oidc_enabled {
         store
             .set_flag(
@@ -104,10 +62,7 @@ async fn harness(issuer: &TestIssuer, oidc_enabled: bool) -> Harness {
         )
         .unwrap();
 
-    let peer: SocketAddr = "127.0.0.1:54321".parse().unwrap();
-    let app = router(lib, store.clone(), "127.0.0.1:7878", true)
-        .layer(axum::Extension(ConnectInfo(peer)));
-    let (status, owner) = send(
+    let (status, owner) = call_token(
         &app,
         "POST",
         "/api/v1/auth/claim",
@@ -142,7 +97,7 @@ async fn a_linked_bearer_uses_the_accounts_scope_and_visibility_seam() {
     let issuer = TestIssuer::start().await;
     let h = harness(&issuer, true).await;
     let token = issuer.bearer_token("agent-sub", CLIENT_ID);
-    let (status, body) = send(&h.app, "GET", "/api/v1/whoami", Some(&token), None).await;
+    let (status, body) = call_token(&h.app, "GET", "/api/v1/whoami", Some(&token), None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["account"]["username"], "agent");
     assert_eq!(body["restricted"], true);
@@ -151,7 +106,7 @@ async fn a_linked_bearer_uses_the_accounts_scope_and_visibility_seam() {
     assert!(!scopes.iter().any(|scope| scope == "write"));
 
     let admin = issuer.bearer_token("owner-sub", CLIENT_ID);
-    let (status, body) = send(
+    let (status, body) = call_token(
         &h.app,
         "PUT",
         "/admin/api/flags/auto_thumbnail",
@@ -174,12 +129,12 @@ async fn unknown_issuer_and_subject_are_rejected() {
     let h = harness(&issuer, true).await;
     let wrong_issuer =
         issuer.bearer_token_with_issuer("agent-sub", CLIENT_ID, "https://issuer.example.invalid");
-    let (status, _) = send(&h.app, "GET", "/api/v1/whoami", Some(&wrong_issuer), None).await;
+    let (status, _) = call_token(&h.app, "GET", "/api/v1/whoami", Some(&wrong_issuer), None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(issuer.jwks_requests(), 0, "unknown issuer must not fetch");
 
     let unknown_subject = issuer.bearer_token("stranger", CLIENT_ID);
-    let (status, _) = send(
+    let (status, _) = call_token(
         &h.app,
         "GET",
         "/api/v1/whoami",
@@ -201,7 +156,7 @@ async fn audience_expiry_and_signature_are_verified() {
         issuer.bad_signature_bearer_token("agent-sub", CLIENT_ID),
     ];
     for token in tokens {
-        let (status, _) = send(&h.app, "GET", "/api/v1/whoami", Some(&token), None).await;
+        let (status, _) = call_token(&h.app, "GET", "/api/v1/whoami", Some(&token), None).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 }
@@ -212,7 +167,7 @@ async fn an_unknown_kid_refresh_is_singleflight_and_accepts_rotation() {
     let h = harness(&issuer, true).await;
     let warm = issuer.bearer_token("agent-sub", CLIENT_ID);
     assert_eq!(
-        send(&h.app, "GET", "/api/v1/whoami", Some(&warm), None)
+        call_token(&h.app, "GET", "/api/v1/whoami", Some(&warm), None)
             .await
             .0,
         StatusCode::OK
@@ -221,7 +176,7 @@ async fn an_unknown_kid_refresh_is_singleflight_and_accepts_rotation() {
 
     issuer.publish_rotated_key();
     let rotated = issuer.rotated_bearer_token("agent-sub", CLIENT_ID);
-    let calls = (0..12).map(|_| send(&h.app, "GET", "/api/v1/whoami", Some(&rotated), None));
+    let calls = (0..12).map(|_| call_token(&h.app, "GET", "/api/v1/whoami", Some(&rotated), None));
     for (status, body) in join_all(calls).await {
         assert_eq!(status, StatusCode::OK, "{body}");
     }
@@ -238,7 +193,7 @@ async fn failed_unknown_kid_refreshes_are_rate_bounded() {
     let h = harness(&issuer, true).await;
     let warm = issuer.bearer_token("agent-sub", CLIENT_ID);
     assert_eq!(
-        send(&h.app, "GET", "/api/v1/whoami", Some(&warm), None)
+        call_token(&h.app, "GET", "/api/v1/whoami", Some(&warm), None)
             .await
             .0,
         StatusCode::OK
@@ -247,7 +202,7 @@ async fn failed_unknown_kid_refreshes_are_rate_bounded() {
     let unknown = issuer.unknown_key_bearer_token("agent-sub", CLIENT_ID);
     for _ in 0..8 {
         assert_eq!(
-            send(&h.app, "GET", "/api/v1/whoami", Some(&unknown), None)
+            call_token(&h.app, "GET", "/api/v1/whoami", Some(&unknown), None)
                 .await
                 .0,
             StatusCode::UNAUTHORIZED
@@ -267,7 +222,7 @@ async fn an_initial_jwks_outage_is_rate_bounded() {
     let h = harness(&issuer, true).await;
     let token = issuer.bearer_token("agent-sub", CLIENT_ID);
 
-    let calls = (0..12).map(|_| send(&h.app, "GET", "/api/v1/whoami", Some(&token), None));
+    let calls = (0..12).map(|_| call_token(&h.app, "GET", "/api/v1/whoami", Some(&token), None));
     for (status, _) in join_all(calls).await {
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     }
@@ -283,12 +238,12 @@ async fn oidc_flag_off_and_native_token_precedence_never_fetch_jwks() {
     let issuer = TestIssuer::start().await;
     let h = harness(&issuer, false).await;
     let token = issuer.bearer_token("agent-sub", CLIENT_ID);
-    let (status, _) = send(&h.app, "GET", "/api/v1/whoami", Some(&token), None).await;
+    let (status, _) = call_token(&h.app, "GET", "/api/v1/whoami", Some(&token), None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(issuer.jwks_requests(), 0);
 
     let h = harness(&issuer, true).await;
-    let (status, _) = send(
+    let (status, _) = call_token(
         &h.app,
         "GET",
         "/api/v1/whoami",

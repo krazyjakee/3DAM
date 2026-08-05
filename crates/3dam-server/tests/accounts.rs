@@ -9,122 +9,24 @@
 //! `harness(false)` a public one. The claim gate reads that peer and nothing else about the bind
 //! (ADR 0014 — a loopback *bind* is not evidence of a local caller behind a same-host proxy).
 
+mod support;
+
 use axum::body::Body;
-use axum::extract::ConnectInfo;
-use axum::http::{HeaderMap, Request, StatusCode};
+use axum::http::{Request, StatusCode};
 use dam_api::dto::*;
 use dam_api::event::LibraryEvent;
 use dam_api::service::{AuthContext, LibraryService};
 use dam_core::EmbeddedLibrary;
 use dam_server::{router, ServerStore};
 use serde_json::{json, Value};
-use std::net::SocketAddr;
-use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use support::{
+    asset_id_by_name, call, claim, create_account, enable_accounts, harness, login, next_event,
+    query_names, seed_two_sources, send, session_from_reply, share, unique_tmp, wait_job,
+    write_png, Session,
+};
 use tower::ServiceExt;
-
-fn unique_tmp() -> std::path::PathBuf {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    std::env::temp_dir().join(format!(
-        "3dam-accounts-{}-{}-{}",
-        std::process::id(),
-        nanos,
-        n
-    ))
-}
-
-/// Build the in-process router with a synthetic peer address. `local_peer` chooses between a
-/// loopback client (the desktop / `curl localhost` case) and an off-box one.
-async fn harness(local_peer: bool) -> (axum::Router, Arc<ServerStore>, Arc<EmbeddedLibrary>) {
-    let lib = Arc::new(
-        EmbeddedLibrary::open_with(&unique_tmp(), dam_core::ResourceOptions::ungoverned())
-            .await
-            .unwrap(),
-    );
-    let store = Arc::new(ServerStore::open_in_memory().unwrap());
-    let peer: SocketAddr = if local_peer {
-        "127.0.0.1:54321".parse().unwrap()
-    } else {
-        // TEST-NET-3 (RFC 5737) — unambiguously not loopback.
-        "203.0.113.9:54321".parse().unwrap()
-    };
-    // `Extension` as a layer inserts into request extensions, which is exactly where
-    // `into_make_service_with_connect_info` puts `ConnectInfo` on the real serve path.
-    let app = router(lib.clone(), store.clone(), "127.0.0.1:7878", local_peer)
-        .layer(axum::Extension(ConnectInfo(peer)));
-    (app, store, lib)
-}
-
-/// A signed-in browser: the session cookie + the CSRF token the login reply carried.
-#[derive(Clone)]
-struct Session {
-    cookie: String,
-    csrf: String,
-}
-
-impl Session {
-    fn headers(&self) -> Vec<(String, String)> {
-        vec![
-            ("cookie".into(), format!("dam_session={}", self.cookie)),
-            ("x-dam-csrf".into(), self.csrf.clone()),
-        ]
-    }
-    /// Cookie only — for asserting the CSRF gate itself.
-    fn cookie_only(&self) -> Vec<(String, String)> {
-        vec![("cookie".into(), format!("dam_session={}", self.cookie))]
-    }
-}
-
-/// Fire one request; returns `(status, response headers, json-or-null)`.
-async fn send(
-    app: &axum::Router,
-    method: &str,
-    uri: &str,
-    headers: &[(String, String)],
-    body: Option<Value>,
-) -> (StatusCode, HeaderMap, Value) {
-    let mut b = Request::builder().method(method).uri(uri);
-    for (k, v) in headers {
-        b = b.header(k, v);
-    }
-    let req = match body {
-        Some(v) => b
-            .header("content-type", "application/json")
-            .body(Body::from(v.to_string()))
-            .unwrap(),
-        None => b.body(Body::empty()).unwrap(),
-    };
-    let resp = app.clone().oneshot(req).await.unwrap();
-    let status = resp.status();
-    let hdrs = resp.headers().clone();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let val = if bytes.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
-    };
-    (status, hdrs, val)
-}
-
-async fn call(
-    app: &axum::Router,
-    method: &str,
-    uri: &str,
-    session: Option<&Session>,
-    body: Option<Value>,
-) -> (StatusCode, Value) {
-    let headers = session.map(|s| s.headers()).unwrap_or_default();
-    let (st, _h, v) = send(app, method, uri, &headers, body).await;
-    (st, v)
-}
 
 /// Post one upload body as a signed-in browser. Upload deliberately uses a raw streaming body, not
 /// JSON, so the ordinary `call` helper cannot exercise its auth/share boundary.
@@ -169,222 +71,7 @@ async fn upload_body_call(
     (status, value)
 }
 
-/// Parse `dam_session` out of the reply's Set-Cookie headers and pair it with the body's csrf.
-fn session_from_reply(headers: &HeaderMap, body: &Value) -> Session {
-    let cookie = headers
-        .get_all(axum::http::header::SET_COOKIE)
-        .iter()
-        .find_map(|h| {
-            let s = h.to_str().ok()?;
-            s.strip_prefix("dam_session=")
-                .and_then(|rest| rest.split(';').next())
-                .map(|v| v.to_string())
-        })
-        .expect("login/claim reply sets the session cookie");
-    Session {
-        cookie,
-        csrf: body["csrf"].as_str().expect("csrf in reply").to_string(),
-    }
-}
-
-/// Flip the `user_accounts` flag on (as the pre-accounts local owner, auth Off) and return the
-/// bootstrap owner token the reply minted (the never-locked-out guarantee).
-async fn enable_accounts(app: &axum::Router) -> Option<String> {
-    let (st, body) = call(
-        app,
-        "PUT",
-        "/admin/api/flags/user_accounts",
-        None,
-        Some(json!({"value": true, "expected_version": null, "confirm": true})),
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK, "flag flip failed: {body}");
-    body["bootstrap_token"]["secret"].as_str().map(String::from)
-}
-
-/// Claim the instance as `username` (loopback harness) and return the admin session.
-async fn claim(app: &axum::Router, username: &str) -> Session {
-    let (st, headers, body) = send(
-        app,
-        "POST",
-        "/api/v1/auth/claim",
-        &[],
-        Some(json!({"username": username, "password": "password123"})),
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK, "claim failed: {body}");
-    assert_eq!(body["account"]["role"], "admin");
-    session_from_reply(&headers, &body)
-}
-
-async fn login(app: &axum::Router, username: &str, password: &str) -> Session {
-    let (st, headers, body) = send(
-        app,
-        "POST",
-        "/api/v1/auth/login",
-        &[],
-        Some(json!({"username": username, "password": password})),
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK, "login failed: {body}");
-    session_from_reply(&headers, &body)
-}
-
-/// Create an account via the admin API; returns its account_id.
-async fn create_account(app: &axum::Router, admin: &Session, username: &str, role: &str) -> String {
-    let (st, body) = call(
-        app,
-        "POST",
-        "/admin/api/accounts",
-        Some(admin),
-        Some(json!({"username": username, "password": "password123", "role": role})),
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK, "create account failed: {body}");
-    body["account_id"].as_str().unwrap().to_string()
-}
-
-/// Share a resource to an account (or group) and return the share id.
-async fn share(
-    app: &axum::Router,
-    admin: &Session,
-    resource: &str,
-    resource_id: &str,
-    target: (&str, &str), // ("account_id" | "group_id", id)
-    access: &str,
-) -> String {
-    let (st, body) = call(
-        app,
-        "POST",
-        "/admin/api/shares",
-        Some(admin),
-        Some({
-            let mut req = json!({
-                "resource": resource, "resource_id": resource_id, "access": access,
-            });
-            req[target.0] = json!(target.1);
-            req
-        }),
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK, "share failed: {body}");
-    body["share_id"].as_str().unwrap().to_string()
-}
-
 // ── fixture seeding (engine-side, before the gate goes up) ───────────────────
-
-/// Write a tiny solid-colour PNG (analysable by the model-free pipeline).
-fn write_png(path: &Path, rgb: [u8; 3]) {
-    let img = image::RgbImage::from_pixel(24, 24, image::Rgb(rgb));
-    img.save(path).unwrap();
-}
-
-/// Two local sources: `shared/` (brick_red, brick_blue) and `secret/` (secret_wall + a byte-perfect
-/// twin of brick_red for the dedup/similar leak tests). Returns (shared_sid, secret_sid).
-async fn seed_two_sources(lib: &EmbeddedLibrary) -> (dam_api::SourceId, dam_api::SourceId) {
-    let ctx = AuthContext::embedded();
-    let base = unique_tmp();
-    let shared = base.join("shared");
-    let secret = base.join("secret");
-    std::fs::create_dir_all(&shared).unwrap();
-    std::fs::create_dir_all(&secret).unwrap();
-    write_png(&shared.join("brick_red.png"), [200, 40, 40]);
-    write_png(&shared.join("brick_blue.png"), [40, 40, 200]);
-    write_png(&secret.join("secret_wall.png"), [10, 200, 10]);
-    // The cross-source exact duplicate: identical bytes to brick_red.png.
-    std::fs::copy(
-        shared.join("brick_red.png"),
-        secret.join("brick_red_copy.png"),
-    )
-    .unwrap();
-
-    let add = |uri: String, name: &str| AddSource {
-        kind: SourceKind::LocalFs,
-        uri,
-        name: Some(name.into()),
-        options: SourceOptions::default(),
-    };
-    let shared_sid = lib
-        .add_source(
-            &ctx,
-            add(shared.to_string_lossy().into_owned(), "shared-src"),
-        )
-        .await
-        .unwrap();
-    let secret_sid = lib
-        .add_source(
-            &ctx,
-            add(secret.to_string_lossy().into_owned(), "secret-src"),
-        )
-        .await
-        .unwrap();
-    let job = lib
-        .submit_scan(
-            &ctx,
-            ScanRequest {
-                sources: vec![],
-                mode: ScanMode::Full,
-            },
-        )
-        .await
-        .unwrap();
-    wait_job(lib, &ctx, &job).await;
-    // Analysis gives every image an embedding (model-free v1 space) → similar/near-dup work.
-    let job = lib
-        .submit_analyze(
-            &ctx,
-            AnalyzeRequest {
-                assets: vec![],
-                force: false,
-            },
-        )
-        .await
-        .unwrap();
-    wait_job(lib, &ctx, &job).await;
-    (shared_sid, secret_sid)
-}
-
-async fn wait_job(lib: &EmbeddedLibrary, ctx: &AuthContext, job: &dam_api::JobId) {
-    loop {
-        let j = lib.get_job(ctx, job).await.unwrap();
-        if matches!(
-            j.state,
-            JobState::Done | JobState::Failed | JobState::Cancelled
-        ) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
-
-/// Asset names a query returns for this session.
-async fn query_names(app: &axum::Router, s: &Session) -> Vec<String> {
-    let (st, body) = call(app, "POST", "/api/v1/query", Some(s), Some(json!({}))).await;
-    assert_eq!(st, StatusCode::OK, "query failed: {body}");
-    let mut names: Vec<String> = body["items"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|i| i["name"].as_str().unwrap().to_string())
-        .collect();
-    names.sort();
-    names
-}
-
-/// Find one asset id by name via an admin session.
-async fn asset_id_by_name(app: &axum::Router, admin: &Session, name: &str) -> String {
-    let (st, body) = call(app, "POST", "/api/v1/query", Some(admin), Some(json!({}))).await;
-    assert_eq!(st, StatusCode::OK);
-    body["items"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|i| i["name"] == name)
-        .unwrap_or_else(|| panic!("asset {name} not found"))["id"]
-        .as_str()
-        .unwrap()
-        .to_string()
-}
 
 // ── the surface is absent while the flag is off ──────────────────────────────
 
@@ -1260,16 +947,6 @@ async fn restricted_subscriber_receives_events_only_for_shared_sources() {
     );
 }
 
-/// Deadline-bounded read of the next event — a filter bug that withholds everything would otherwise
-/// hang the test rather than fail it.
-async fn next_event(stream: &mut dam_api::service::EventStream<LibraryEvent>) -> LibraryEvent {
-    use futures::StreamExt;
-    tokio::time::timeout(Duration::from_secs(10), stream.next())
-        .await
-        .expect("an allowed event should arrive before the timeout")
-        .expect("the stream should still be open")
-}
-
 #[tokio::test]
 async fn leak_audit_mcp_tools_inherit_the_ceiling() {
     // The MCP surface is the same engine over a different transport: it gets the visibility filter
@@ -1472,7 +1149,7 @@ async fn upload_source_picker_and_route_follow_write_grants_immediately() {
         )
         .unwrap();
 
-    let staged = unique_tmp().with_extension("png");
+    let staged = unique_tmp("accounts").with_extension("png");
     write_png(&staged, [90, 120, 180]);
     let bytes = std::fs::read(&staged).unwrap();
 
@@ -1646,7 +1323,7 @@ async fn leak_audit_export_respects_the_ceiling() {
         dam_api::Visibility::Restricted(scope),
     );
 
-    let out = unique_tmp();
+    let out = unique_tmp("accounts");
     std::fs::create_dir_all(&out).unwrap();
     let whole = lib
         .export(
@@ -2213,7 +1890,7 @@ async fn smart_collection_share_grants_the_view_but_never_widens_its_live_query(
         .unwrap();
     let smart_ctx =
         AuthContext::connected(Some(account.username), account.role.scopes(), visibility);
-    let output = unique_tmp().join("smart-only.json");
+    let output = unique_tmp("accounts").join("smart-only.json");
     let report = lib
         .export(
             &smart_ctx,
@@ -2270,9 +1947,12 @@ async fn federated_peer_accepts_read_share_rejects_write_and_revokes_next_reques
     // Needs a *real* peer: the federated `add_source` handshakes over HTTP, so the oneshot seam
     // can't stand in. Bind a second server on an ephemeral port with the federation flag on.
     let peer_lib = Arc::new(
-        EmbeddedLibrary::open_with(&unique_tmp(), dam_core::ResourceOptions::ungoverned())
-            .await
-            .unwrap(),
+        EmbeddedLibrary::open_with(
+            &unique_tmp("accounts"),
+            dam_core::ResourceOptions::ungoverned(),
+        )
+        .await
+        .unwrap(),
     );
     let peer_store = Arc::new(ServerStore::open_in_memory().unwrap());
     peer_store

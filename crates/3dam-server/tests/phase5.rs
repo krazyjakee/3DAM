@@ -5,77 +5,16 @@
 //! (`Arc`) with the test so a flag flip is visible to the next request — the same live-toggle path
 //! the admin UI uses.
 
+mod support;
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use dam_core::EmbeddedLibrary;
-use dam_server::{router, ServerStore, WriteGate};
+use dam_server::{ServerStore, WriteGate};
 use serde_json::{json, Value};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use support::{call_token, harness, unique_tmp};
 use tower::ServiceExt;
-
-fn unique_tmp() -> std::path::PathBuf {
-    // Per-process atomic counter as well as a timestamp, for the reason `dam-core/tests/scan.rs`
-    // documents: these tests run in parallel within one process and `as_nanos()` can coincide for
-    // two that start in the same clock tick, silently sharing a data dir — which surfaces as a
-    // migration failure ("table already exists") from whichever harness loses the race. The
-    // window is only as narrow as `open` is fast, so it widens whenever a migration is added.
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    std::env::temp_dir().join(format!(
-        "3dam-phase5-{}-{}-{}",
-        std::process::id(),
-        nanos,
-        n
-    ))
-}
-
-async fn harness(localhost_only: bool) -> (axum::Router, Arc<ServerStore>, Arc<EmbeddedLibrary>) {
-    let lib = Arc::new(
-        EmbeddedLibrary::open_with(&unique_tmp(), dam_core::ResourceOptions::ungoverned())
-            .await
-            .unwrap(),
-    );
-    let store = Arc::new(ServerStore::open_in_memory().unwrap());
-    let app = router(lib.clone(), store.clone(), "127.0.0.1:7878", localhost_only);
-    (app, store, lib)
-}
-
-/// Fire one request at the router and read back `(status, json-body-or-null)`.
-async fn call(
-    app: &axum::Router,
-    method: &str,
-    uri: &str,
-    token: Option<&str>,
-    body: Option<Value>,
-) -> (StatusCode, Value) {
-    let mut b = Request::builder().method(method).uri(uri);
-    if let Some(t) = token {
-        b = b.header("authorization", format!("Bearer {t}"));
-    }
-    let req = match body {
-        Some(v) => b
-            .header("content-type", "application/json")
-            .body(Body::from(v.to_string()))
-            .unwrap(),
-        None => b.body(Body::empty()).unwrap(),
-    };
-    let resp = app.clone().oneshot(req).await.unwrap();
-    let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let val = if bytes.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
-    };
-    (status, val)
-}
 
 async fn rpc(
     app: &axum::Router,
@@ -83,7 +22,7 @@ async fn rpc(
     method: &str,
     params: Value,
 ) -> (StatusCode, Value) {
-    call(
+    call_token(
         app,
         "POST",
         "/mcp",
@@ -100,7 +39,7 @@ async fn defaults_are_safe_and_admin_reachable_under_off() {
     let (app, _store, _lib) = harness(true).await;
 
     // Off mode: the local owner reaches the admin surface with no credential.
-    let (st, body) = call(&app, "GET", "/admin/api/status", None, None).await;
+    let (st, body) = call_token(&app, "GET", "/admin/api/status", None, None).await;
     assert_eq!(st, StatusCode::OK);
     assert_eq!(body["auth"], "off");
     assert_eq!(body["mcp"], "off");
@@ -113,7 +52,7 @@ async fn defaults_are_safe_and_admin_reachable_under_off() {
     // user accounts (phase 6, issue #42), also off, which keeps the whole accounts/groups/shares
     // surface absent, uploads (issue #80), off, which keeps the one write-into-source route
     // absent, and OIDC login (issue #41), off, which keeps `/api/v1/auth/oidc` absent.
-    let (st, flags) = call(&app, "GET", "/admin/api/flags", None, None).await;
+    let (st, flags) = call_token(&app, "GET", "/admin/api/flags", None, None).await;
     assert_eq!(st, StatusCode::OK);
     let flags = flags.as_array().unwrap();
     assert_eq!(flags.len(), 9);
@@ -133,11 +72,11 @@ async fn defaults_are_safe_and_admin_reachable_under_off() {
     assert_eq!(flag("upload")["exposure_increasing"], true);
 
     // Federation off ⇒ the advertise surface is absent (404, same mechanism as /mcp).
-    let (st, _) = call(&app, "GET", "/api/v1/advertise", None, None).await;
+    let (st, _) = call_token(&app, "GET", "/api/v1/advertise", None, None).await;
     assert_eq!(st, StatusCode::NOT_FOUND);
 
     // Upload off ⇒ so is the one write-into-source route (issue #80, same mechanism again).
-    let (st, _) = call(
+    let (st, _) = call_token(
         &app,
         "POST",
         "/api/v1/upload?source=x&name=y.png",
@@ -148,7 +87,7 @@ async fn defaults_are_safe_and_admin_reachable_under_off() {
     assert_eq!(st, StatusCode::NOT_FOUND);
 
     // Reads work under Off (owner holds Read).
-    let (st, _) = call(&app, "GET", "/api/v1/stats", None, None).await;
+    let (st, _) = call_token(&app, "GET", "/api/v1/stats", None, None).await;
     assert_eq!(st, StatusCode::OK);
 }
 
@@ -192,13 +131,13 @@ async fn health_probes_are_unauthenticated_and_ready() {
         )
         .unwrap();
 
-    let (st, _) = call(&app, "GET", "/healthz", None, None).await;
+    let (st, _) = call_token(&app, "GET", "/healthz", None, None).await;
     assert_eq!(st, StatusCode::OK, "liveness needs no token");
-    let (st, _) = call(&app, "GET", "/readyz", None, None).await;
+    let (st, _) = call_token(&app, "GET", "/readyz", None, None).await;
     assert_eq!(st, StatusCode::OK, "readiness needs no token and is ready");
 
     // A gated API route still refuses the anonymous caller — the probes are the only open surface.
-    let (st, _) = call(&app, "GET", "/api/v1/stats", None, None).await;
+    let (st, _) = call_token(&app, "GET", "/api/v1/stats", None, None).await;
     assert_eq!(st, StatusCode::UNAUTHORIZED);
 }
 
@@ -233,19 +172,19 @@ async fn token_mode_gates_reads_and_scopes_gate_writes() {
         .unwrap();
 
     // No credential → 401.
-    let (st, _) = call(&app, "GET", "/api/v1/stats", None, None).await;
+    let (st, _) = call_token(&app, "GET", "/api/v1/stats", None, None).await;
     assert_eq!(st, StatusCode::UNAUTHORIZED);
 
     // Valid read token → 200 on a read.
-    let (st, _) = call(&app, "GET", "/api/v1/stats", Some(&secret), None).await;
+    let (st, _) = call_token(&app, "GET", "/api/v1/stats", Some(&secret), None).await;
     assert_eq!(st, StatusCode::OK);
 
     // Derived credentials never echo the parent and cannot cross their transport/path boundary.
-    let (st, ws_ticket) = call(&app, "POST", "/api/v1/ws-ticket", Some(&secret), None).await;
+    let (st, ws_ticket) = call_token(&app, "POST", "/api/v1/ws-ticket", Some(&secret), None).await;
     assert_eq!(st, StatusCode::OK);
     let ws_ticket = ws_ticket["ticket"].as_str().unwrap();
     assert!(!ws_ticket.contains(&secret));
-    let (st, _) = call(
+    let (st, _) = call_token(
         &app,
         "GET",
         &format!("/api/v1/stats?ticket={ws_ticket}"),
@@ -261,7 +200,7 @@ async fn token_mode_gates_reads_and_scopes_gate_writes() {
 
     let asset = uuid::Uuid::now_v7();
     let other = uuid::Uuid::now_v7();
-    let (st, media_ticket) = call(
+    let (st, media_ticket) = call_token(
         &app,
         "POST",
         "/api/v1/media-ticket",
@@ -272,7 +211,7 @@ async fn token_mode_gates_reads_and_scopes_gate_writes() {
     assert_eq!(st, StatusCode::OK);
     let media_ticket = media_ticket["ticket"].as_str().unwrap();
     assert!(!media_ticket.contains(&secret));
-    let (st, _) = call(
+    let (st, _) = call_token(
         &app,
         "GET",
         &format!("/api/v1/assets/{other}/content?ticket={media_ticket}"),
@@ -288,7 +227,7 @@ async fn token_mode_gates_reads_and_scopes_gate_writes() {
 
     // Read token on a write route → 403 (missing Write scope). Localhost, so the network ceiling
     // is not the blocker — the identity scope is.
-    let (st, _) = call(
+    let (st, _) = call_token(
         &app,
         "POST",
         "/api/v1/jobs/scan",
@@ -299,12 +238,12 @@ async fn token_mode_gates_reads_and_scopes_gate_writes() {
     assert_eq!(st, StatusCode::FORBIDDEN);
 
     // A bogus token → 401.
-    let (st, _) = call(&app, "GET", "/api/v1/stats", Some("dam_nope"), None).await;
+    let (st, _) = call_token(&app, "GET", "/api/v1/stats", Some("dam_nope"), None).await;
     assert_eq!(st, StatusCode::UNAUTHORIZED);
 
     // Long-lived bearers are never URI credentials (issue #128). Even a valid sentinel in the
     // query is ignored; browser media/WS use narrow derived tickets minted via a header request.
-    let (st, _) = call(
+    let (st, _) = call_token(
         &app,
         "GET",
         &format!("/api/v1/stats?token={secret}"),
@@ -313,7 +252,7 @@ async fn token_mode_gates_reads_and_scopes_gate_writes() {
     )
     .await;
     assert_eq!(st, StatusCode::UNAUTHORIZED);
-    let (st, _) = call(&app, "GET", "/api/v1/stats?token=dam_nope", None, None).await;
+    let (st, _) = call_token(&app, "GET", "/api/v1/stats?token=dam_nope", None, None).await;
     assert_eq!(st, StatusCode::UNAUTHORIZED);
 }
 
@@ -325,7 +264,7 @@ async fn flag_set_confirm_and_optimistic_concurrency() {
     let (app, _store, _lib) = harness(true).await;
 
     // Enabling network writes is exposure-increasing → without `confirm`, 400.
-    let (st, _) = call(
+    let (st, _) = call_token(
         &app,
         "PUT",
         "/admin/api/flags/network_writes",
@@ -336,7 +275,7 @@ async fn flag_set_confirm_and_optimistic_concurrency() {
     assert_eq!(st, StatusCode::BAD_REQUEST);
 
     // With `confirm`, it applies and bumps the version.
-    let (st, info) = call(
+    let (st, info) = call_token(
         &app,
         "PUT",
         "/admin/api/flags/network_writes",
@@ -349,7 +288,7 @@ async fn flag_set_confirm_and_optimistic_concurrency() {
     assert_eq!(info["version"], 1);
 
     // A stale `expected_version` is detected, not silently last-write-wins → 409.
-    let (st, _) = call(
+    let (st, _) = call_token(
         &app,
         "PUT",
         "/admin/api/flags/network_writes",
@@ -421,13 +360,13 @@ async fn maintenance_usage_wipe_gate_and_audit() {
     let (app, store, _lib) = harness(true).await;
 
     // Usage is reachable and well-formed on an empty library.
-    let (st, usage) = call(&app, "GET", "/admin/api/maintenance/usage", None, None).await;
+    let (st, usage) = call_token(&app, "GET", "/admin/api/maintenance/usage", None, None).await;
     assert_eq!(st, StatusCode::OK);
     assert_eq!(usage["asset_count"], 0);
     assert!(usage["thumbnails"]["files"].is_number());
 
     // Clearing caches on a cold cache succeeds (nothing to free).
-    let (st, cache) = call(
+    let (st, cache) = call_token(
         &app,
         "POST",
         "/admin/api/maintenance/clear-cache",
@@ -439,7 +378,7 @@ async fn maintenance_usage_wipe_gate_and_audit() {
     assert_eq!(cache["files_deleted"], 0);
 
     // Wipe without confirm is rejected — the machine form of warn-and-confirm.
-    let (st, _) = call(
+    let (st, _) = call_token(
         &app,
         "POST",
         "/admin/api/maintenance/wipe",
@@ -450,7 +389,7 @@ async fn maintenance_usage_wipe_gate_and_audit() {
     assert_eq!(st, StatusCode::BAD_REQUEST);
 
     // With confirm it runs and reports (empty catalog → zero removed).
-    let (st, wipe) = call(
+    let (st, wipe) = call_token(
         &app,
         "POST",
         "/admin/api/maintenance/wipe",
@@ -485,7 +424,7 @@ async fn factory_reset_requires_confirm_and_erases_tokens() {
     assert_eq!(store.list_tokens().unwrap().len(), 1);
 
     // Without confirm → rejected.
-    let (st, _) = call(
+    let (st, _) = call_token(
         &app,
         "POST",
         "/admin/api/maintenance/factory-reset",
@@ -496,7 +435,7 @@ async fn factory_reset_requires_confirm_and_erases_tokens() {
     assert_eq!(st, StatusCode::BAD_REQUEST);
 
     // With confirm → tokens erased and the audit log holds just the reset entry.
-    let (st, report) = call(
+    let (st, report) = call_token(
         &app,
         "POST",
         "/admin/api/maintenance/factory-reset",
@@ -583,9 +522,12 @@ async fn mcp_off_is_404_then_mounts_and_gates_writes() {
 #[tokio::test]
 async fn mcp_adapter_stdio_is_locally_trusted() {
     let lib = Arc::new(
-        EmbeddedLibrary::open_with(&unique_tmp(), dam_core::ResourceOptions::ungoverned())
-            .await
-            .unwrap(),
+        EmbeddedLibrary::open_with(
+            &unique_tmp("phase5"),
+            dam_core::ResourceOptions::ungoverned(),
+        )
+        .await
+        .unwrap(),
     );
     let library: Arc<dyn dam_api::service::LibraryService> = lib;
     let adapter = dam_server::McpAdapter::new(library, WriteGate::local_stdio());
@@ -691,7 +633,7 @@ async fn verified_write_token_bypasses_network_ceiling() {
     );
     set_auth(&store, dam_api::admin::AuthMode::Token);
 
-    let (st, body) = call(
+    let (st, body) = call_token(
         &app,
         "POST",
         "/api/v1/collections",
@@ -712,7 +654,7 @@ async fn implicit_trust_still_capped_by_network_ceiling() {
     // identity, so the network ceiling still applies until the flag opens it.
     let (app, store, _lib) = harness(false).await;
 
-    let (st, body) = call(
+    let (st, body) = call_token(
         &app,
         "POST",
         "/api/v1/collections",
@@ -737,7 +679,7 @@ async fn implicit_trust_still_capped_by_network_ceiling() {
             "test",
         )
         .unwrap();
-    let (st, _) = call(
+    let (st, _) = call_token(
         &app,
         "POST",
         "/api/v1/collections",
@@ -763,7 +705,7 @@ async fn read_token_never_gains_write_from_ceiling_bypass() {
     );
     set_auth(&store, dam_api::admin::AuthMode::Token);
 
-    let (st, body) = call(
+    let (st, body) = call_token(
         &app,
         "POST",
         "/api/v1/jobs/scan",
@@ -849,12 +791,12 @@ async fn version_reports_auth_mode_publicly() {
     // provoking 401s.
     let (app, store, _lib) = harness(true).await;
 
-    let (st, body) = call(&app, "GET", "/api/version", None, None).await;
+    let (st, body) = call_token(&app, "GET", "/api/version", None, None).await;
     assert_eq!(st, StatusCode::OK);
     assert_eq!(body["auth"], "off");
 
     set_auth(&store, dam_api::admin::AuthMode::Token);
-    let (st, body) = call(&app, "GET", "/api/version", None, None).await;
+    let (st, body) = call_token(&app, "GET", "/api/version", None, None).await;
     assert_eq!(st, StatusCode::OK, "version stays public in token mode");
     assert_eq!(body["auth"], "token");
 }
@@ -866,7 +808,7 @@ async fn enabling_auth_mints_a_bootstrap_owner_token() {
     let (app, store, _lib) = harness(true).await;
 
     // The owner (auth off) enables token mode over the admin API with an empty token store.
-    let (st, body) = call(
+    let (st, body) = call_token(
         &app,
         "PUT",
         "/admin/api/flags/authentication",
@@ -886,12 +828,12 @@ async fn enabling_auth_mints_a_bootstrap_owner_token() {
     assert_eq!(body["bootstrap_token"]["label"], "owner");
 
     // The minted secret is a working admin credential — the flip never locks the operator out.
-    let (st, status) = call(&app, "GET", "/admin/api/status", Some(&secret), None).await;
+    let (st, status) = call_token(&app, "GET", "/admin/api/status", Some(&secret), None).await;
     assert_eq!(st, StatusCode::OK);
     assert_eq!(status["auth"], "token");
 
     // Flipping again mints nothing: an admin credential now exists.
-    let (st, body) = call(
+    let (st, body) = call_token(
         &app,
         "PUT",
         "/admin/api/flags/authentication",
@@ -919,7 +861,7 @@ async fn whoami_reports_the_callers_scopes() {
     let (app, store, _lib) = harness(true).await;
 
     // Under Off, the unauthenticated local owner is a full-trust, non-anonymous identity.
-    let (st, body) = call(&app, "GET", "/api/v1/whoami", None, None).await;
+    let (st, body) = call_token(&app, "GET", "/api/v1/whoami", None, None).await;
     assert_eq!(st, StatusCode::OK);
     assert_eq!(body["anonymous"], false);
     let scopes = body["scopes"].as_array().unwrap();
@@ -951,11 +893,11 @@ async fn whoami_reports_the_callers_scopes() {
         .unwrap();
 
     // No credential under Token mode → 401 (the client's cue to show a login gate).
-    let (st, _) = call(&app, "GET", "/api/v1/whoami", None, None).await;
+    let (st, _) = call_token(&app, "GET", "/api/v1/whoami", None, None).await;
     assert_eq!(st, StatusCode::UNAUTHORIZED);
 
     // The read token sees itself: read but not write, non-anonymous, its label as identity.
-    let (st, body) = call(&app, "GET", "/api/v1/whoami", Some(&secret), None).await;
+    let (st, body) = call_token(&app, "GET", "/api/v1/whoami", Some(&secret), None).await;
     assert_eq!(st, StatusCode::OK);
     assert_eq!(body["anonymous"], false);
     assert_eq!(body["identity"], "reader");

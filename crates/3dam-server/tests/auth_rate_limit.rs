@@ -1,5 +1,7 @@
 //! Wire-level regression for the unauthenticated auth limiter (issue #126).
 
+mod support;
+
 use axum::body::Body;
 use axum::extract::ConnectInfo;
 use axum::http::{header, Request, StatusCode};
@@ -9,28 +11,18 @@ use dam_server::{router, ServerStore};
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use support::unique_tmp;
 use tower::ServiceExt;
-
-fn unique_tmp() -> std::path::PathBuf {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let sequence = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    std::env::temp_dir().join(format!(
-        "3dam-auth-rate-{}-{nanos}-{sequence}",
-        std::process::id()
-    ))
-}
 
 #[tokio::test]
 async fn rotating_usernames_and_forwarded_headers_end_in_429_with_retry_after() {
     let lib = Arc::new(
-        EmbeddedLibrary::open_with(&unique_tmp(), dam_core::ResourceOptions::ungoverned())
-            .await
-            .unwrap(),
+        EmbeddedLibrary::open_with(
+            &unique_tmp("auth-rate"),
+            dam_core::ResourceOptions::ungoverned(),
+        )
+        .await
+        .unwrap(),
     );
     let store = Arc::new(ServerStore::open_in_memory().unwrap());
     store

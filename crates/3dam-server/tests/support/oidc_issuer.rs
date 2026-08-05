@@ -264,12 +264,15 @@ impl TestIssuer {
             .send()
             .await
             .expect("GET the authorization endpoint");
-        assert_eq!(
-            resp.status(),
-            reqwest::StatusCode::OK,
-            "authorization endpoint refused the request: {}",
-            resp.text().await.unwrap_or_default()
-        );
+        // A panic rather than an assertion: this is the fake issuer failing to serve the fixture,
+        // not the server under test misbehaving. Nothing in `support/` asserts.
+        if resp.status() != reqwest::StatusCode::OK {
+            let status = resp.status();
+            panic!(
+                "test setup: the authorization endpoint refused the request with {status}: {}",
+                resp.text().await.unwrap_or_default()
+            );
+        }
         let state = resp.text().await.expect("read authorize body");
         self.inner
             .seen

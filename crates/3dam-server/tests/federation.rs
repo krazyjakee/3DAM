@@ -5,6 +5,8 @@
 //! Unlike the phase-5 tests this suite binds sockets: the engine's peer transport is a real HTTP
 //! client, so `ServiceExt::oneshot` can't stand in for the peer.
 
+mod support;
+
 use dam_api::admin::{FlagKey, FlagValue, SetFlag};
 use dam_api::dto::*;
 use dam_api::event::{LibraryEvent, SubscribeRequest};
@@ -13,33 +15,11 @@ use dam_api::service::{AuthContext, LibraryService};
 use dam_core::EmbeddedLibrary;
 use dam_server::{router, McpAdapter, ServerStore, WriteGate};
 use futures::StreamExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-fn unique_tmp() -> PathBuf {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    std::env::temp_dir().join(format!("3dam-fed-{}-{}-{}", std::process::id(), nanos, n))
-}
-
-async fn wait_job(lib: &EmbeddedLibrary, ctx: &AuthContext, job: &dam_api::id::JobId) {
-    loop {
-        let j = lib.get_job(ctx, job).await.unwrap();
-        if matches!(
-            j.state,
-            JobState::Done | JobState::Failed | JobState::Cancelled
-        ) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
+use std::time::Duration;
+use support::{unique_tmp, wait_job};
 
 /// Open a library over `dir/data`, register `dir/src` as a local source, and scan it.
 async fn library_with(dir: &Path, files: &[(&str, &[u8])]) -> Arc<EmbeddedLibrary> {
@@ -200,7 +180,7 @@ fn query_all(limit: u32) -> QueryRequest {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hinted_reads_contact_one_owner_and_peer_caches_do_not_collide() {
-    let local = library_with(&unique_tmp(), &[("local.wav", b"RIFF....WAVE")]).await;
+    let local = library_with(&unique_tmp("fed"), &[("local.wav", b"RIFF....WAVE")]).await;
     let (a_endpoint, a_requests, _a) = thumbnail_peer(Some(b'A')).await;
     let (b_endpoint, b_requests, _b) = thumbnail_peer(Some(b'B')).await;
     let (offline_endpoint, offline_requests, _offline) = thumbnail_peer(None).await;
@@ -302,14 +282,14 @@ async fn hinted_reads_contact_one_owner_and_peer_caches_do_not_collide() {
 async fn query_merges_local_and_peer_results() {
     let ctx = AuthContext::embedded();
     let peer_lib = library_with(
-        &unique_tmp(),
+        &unique_tmp("fed"),
         &[("b.wav", b"RIFF....WAVE"), ("d.png", b"\x89PNG\r\n")],
     )
     .await;
     let (endpoint, _addr, _srv) = serve_peer(peer_lib).await;
 
     let local = library_with(
-        &unique_tmp(),
+        &unique_tmp("fed"),
         &[("a.wav", b"RIFF....WAVE"), ("c.png", b"\x89PNG\r\n")],
     )
     .await;
@@ -368,9 +348,9 @@ async fn query_merges_local_and_peer_results() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn source_filter_routes_to_the_peer_alone() {
     let ctx = AuthContext::embedded();
-    let peer_lib = library_with(&unique_tmp(), &[("remote.wav", b"RIFF....WAVE")]).await;
+    let peer_lib = library_with(&unique_tmp("fed"), &[("remote.wav", b"RIFF....WAVE")]).await;
     let (endpoint, _addr, _srv) = serve_peer(peer_lib).await;
-    let local = library_with(&unique_tmp(), &[("local.wav", b"RIFF....WAVE")]).await;
+    let local = library_with(&unique_tmp("fed"), &[("local.wav", b"RIFF....WAVE")]).await;
     let fed_sid = add_peer(&local, &endpoint, "peer").await;
 
     let mut req = query_all(50);
@@ -413,7 +393,7 @@ async fn source_filter_routes_to_the_peer_alone() {
 async fn restricted_federated_share_reaches_only_that_peer_and_revokes_cached_reads() {
     let owner = AuthContext::embedded();
 
-    let peer_a_dir = unique_tmp();
+    let peer_a_dir = unique_tmp("fed");
     std::fs::create_dir_all(peer_a_dir.join("src")).unwrap();
     gradient(32, 32)
         .save(peer_a_dir.join("src").join("a-reference.png"))
@@ -426,7 +406,7 @@ async fn restricted_federated_share_reaches_only_that_peer_and_revokes_cached_re
     analyze_all(&peer_a, &owner).await;
     let (endpoint_a, _addr_a, _server_a) = serve_peer(peer_a).await;
 
-    let peer_b_dir = unique_tmp();
+    let peer_b_dir = unique_tmp("fed");
     std::fs::create_dir_all(peer_b_dir.join("src")).unwrap();
     let mut secret = gradient(32, 32);
     secret.put_pixel(3, 7, image::Rgba([1, 250, 1, 255]));
@@ -437,7 +417,7 @@ async fn restricted_federated_share_reaches_only_that_peer_and_revokes_cached_re
     analyze_all(&peer_b, &owner).await;
     let (endpoint_b, _addr_b, _server_b) = serve_peer(peer_b).await;
 
-    let local = library_with(&unique_tmp(), &[("local.wav", b"RIFF....WAVE")]).await;
+    let local = library_with(&unique_tmp("fed"), &[("local.wav", b"RIFF....WAVE")]).await;
     let source_a = add_peer(&local, &endpoint_a, "shared-peer").await;
     let source_b = add_peer(&local, &endpoint_b, "hidden-peer").await;
 
@@ -536,7 +516,7 @@ async fn restricted_federated_share_reaches_only_that_peer_and_revokes_cached_re
     assert!(!text.contains("b-secret.png"));
     assert!(!text.contains("local.wav"));
 
-    let export_path = unique_tmp().join("shared-peer.json");
+    let export_path = unique_tmp("fed").join("shared-peer.json");
     let report = local
         .export(
             &restricted,
@@ -575,7 +555,10 @@ async fn restricted_federated_share_reaches_only_that_peer_and_revokes_cached_re
                 collection: None,
                 query: None,
                 format: ExportFormat::Json,
-                output: unique_tmp().join("job.json").to_string_lossy().into_owned(),
+                output: unique_tmp("fed")
+                    .join("job.json")
+                    .to_string_lossy()
+                    .into_owned(),
                 attribution_only: false,
             },
         )
@@ -659,9 +642,9 @@ async fn restricted_federated_share_reaches_only_that_peer_and_revokes_cached_re
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hung_peer_is_dropped_at_the_deadline_and_flagged_partial() {
     let ctx = AuthContext::embedded();
-    let peer_lib = library_with(&unique_tmp(), &[("remote.wav", b"RIFF....WAVE")]).await;
+    let peer_lib = library_with(&unique_tmp("fed"), &[("remote.wav", b"RIFF....WAVE")]).await;
     let (endpoint, addr, srv) = serve_peer(peer_lib).await;
-    let local = library_with(&unique_tmp(), &[("local.wav", b"RIFF....WAVE")]).await;
+    let local = library_with(&unique_tmp("fed"), &[("local.wav", b"RIFF....WAVE")]).await;
     add_peer(&local, &endpoint, "peer").await;
 
     // Replace the healthy peer with one that accepts connections but never answers: the fan-out
@@ -707,7 +690,7 @@ async fn mismatched_protocol_version_is_rejected_at_add() {
     let (endpoint, _srv) =
         fake_peer(r#"{"protocol_version":"2.0.0","instance":"future","assets":0,"spaces":{}}"#)
             .await;
-    let local = library_with(&unique_tmp(), &[("local.wav", b"RIFF....WAVE")]).await;
+    let local = library_with(&unique_tmp("fed"), &[("local.wav", b"RIFF....WAVE")]).await;
     let err = local
         .add_source(
             &AuthContext::embedded(),
@@ -748,7 +731,7 @@ async fn similar_merges_matched_space_peers_and_gates_mismatched_spaces() {
     let ctx = AuthContext::embedded();
 
     // Peer: a near-copy of the local reference image, analysed so it has an embedding.
-    let peer_dir = unique_tmp();
+    let peer_dir = unique_tmp("fed");
     std::fs::create_dir_all(peer_dir.join("src")).unwrap();
     let mut near = gradient(64, 64);
     for i in 0..3u32 {
@@ -761,7 +744,7 @@ async fn similar_merges_matched_space_peers_and_gates_mismatched_spaces() {
     let (endpoint, _addr, _srv) = serve_peer(peer_lib.clone()).await;
 
     // Local: the reference image, analysed.
-    let local_dir = unique_tmp();
+    let local_dir = unique_tmp("fed");
     std::fs::create_dir_all(local_dir.join("src")).unwrap();
     gradient(64, 64)
         .save(local_dir.join("src").join("reference.png"))
@@ -865,10 +848,10 @@ async fn similar_merges_matched_space_peers_and_gates_mismatched_spaces() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_peer_asset_cannot_be_relicensed_from_the_borrowing_library() {
     let ctx = AuthContext::embedded();
-    let peer_lib = library_with(&unique_tmp(), &[("remote.png", b"\x89PNG\r\n")]).await;
+    let peer_lib = library_with(&unique_tmp("fed"), &[("remote.png", b"\x89PNG\r\n")]).await;
     let (endpoint, _addr, _srv) = serve_peer(peer_lib.clone()).await;
 
-    let local = library_with(&unique_tmp(), &[("local.png", b"\x89PNG\r\n")]).await;
+    let local = library_with(&unique_tmp("fed"), &[("local.png", b"\x89PNG\r\n")]).await;
     add_peer(&local, &endpoint, "studio-server").await;
 
     let page = local.query(&ctx, query_all(50)).await.unwrap();

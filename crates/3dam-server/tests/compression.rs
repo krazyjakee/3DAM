@@ -2,6 +2,8 @@
 //! router, so these assertions cover Axum body conversion, negotiation, the compression predicate,
 //! and the final wire bytes together.
 
+mod support;
+
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use axum::response::Response;
@@ -13,30 +15,13 @@ use dam_core::EmbeddedLibrary;
 use dam_server::{router, ServerStore};
 use std::io::Read;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+use support::unique_tmp;
 use tower::ServiceExt;
 
-fn unique_tmp() -> std::path::PathBuf {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let sequence = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    std::env::temp_dir().join(format!(
-        "3dam-compression-{}-{nanos}-{sequence}",
-        std::process::id()
-    ))
-}
-
+/// The shared router; these tests only ever talk to it as the local owner.
 async fn harness() -> axum::Router {
-    let library = Arc::new(
-        EmbeddedLibrary::open_with(&unique_tmp(), dam_core::ResourceOptions::ungoverned())
-            .await
-            .unwrap(),
-    );
-    let store = Arc::new(ServerStore::open_in_memory().unwrap());
-    router(library, store, "127.0.0.1:7878", true)
+    support::harness(true).await.0
 }
 
 async fn get(app: &axum::Router, path: &str, accept_encoding: Option<&str>) -> Response {
@@ -134,7 +119,7 @@ async fn tiny_probe_is_not_compressed() {
 
 #[tokio::test]
 async fn range_body_is_never_recompressed() {
-    let root = unique_tmp();
+    let root = unique_tmp("compression");
     let source = root.join("source");
     std::fs::create_dir_all(&source).unwrap();
     let original = b"0123456789".repeat(100);

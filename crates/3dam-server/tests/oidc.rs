@@ -31,18 +31,13 @@
 
 mod support;
 
-use axum::body::Body;
-use axum::extract::ConnectInfo;
-use axum::http::{HeaderMap, Request, StatusCode};
+use axum::http::{HeaderMap, StatusCode};
 use dam_api::admin::{OidcConfig, OidcProvisioning, SetOidcConfig};
-use dam_core::EmbeddedLibrary;
-use dam_server::{router, ServerStore};
-use serde_json::{json, Value};
-use std::net::SocketAddr;
+use dam_server::ServerStore;
+use serde_json::json;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use support::oidc_issuer::{SubjectClaims, TestIssuer, FOREIGN_KEY_PEM};
-use tower::ServiceExt;
+use support::{call, claim, cookie, send, Session};
 
 /// The redirect URI registered with the provider. Never actually fetched by a browser here — the
 /// test carries the callback to the in-process router itself — but it is echoed in the token
@@ -50,94 +45,6 @@ use tower::ServiceExt;
 const REDIRECT_URL: &str = "http://127.0.0.1:7878/api/v1/auth/oidc/callback";
 const CLIENT_ID: &str = "3dam-test-client";
 const CLIENT_SECRET: &str = "test-client-secret";
-
-fn unique_tmp() -> std::path::PathBuf {
-    // Per-process atomic counter as well as a timestamp, for the reason `dam-core/tests/scan.rs`
-    // documents: these tests run in parallel within one process and `as_nanos()` can coincide for
-    // two that start in the same clock tick, silently sharing a data dir.
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    std::env::temp_dir().join(format!("3dam-oidc-{}-{}-{}", std::process::id(), nanos, n))
-}
-
-/// A signed-in browser: the session cookie plus the CSRF token from the paired cookie.
-#[derive(Clone, Debug)]
-struct Session {
-    cookie: String,
-    csrf: String,
-}
-
-impl Session {
-    fn headers(&self) -> Vec<(String, String)> {
-        vec![
-            ("cookie".into(), format!("dam_session={}", self.cookie)),
-            ("x-dam-csrf".into(), self.csrf.clone()),
-        ]
-    }
-}
-
-/// Fire one request; returns `(status, response headers, json-or-null)`.
-async fn send(
-    app: &axum::Router,
-    method: &str,
-    uri: &str,
-    headers: &[(String, String)],
-    body: Option<Value>,
-) -> (StatusCode, HeaderMap, Value) {
-    let mut b = Request::builder().method(method).uri(uri);
-    for (k, v) in headers {
-        b = b.header(k, v);
-    }
-    let req = match body {
-        Some(v) => b
-            .header("content-type", "application/json")
-            .body(Body::from(v.to_string()))
-            .unwrap(),
-        None => b.body(Body::empty()).unwrap(),
-    };
-    let resp = app.clone().oneshot(req).await.unwrap();
-    let status = resp.status();
-    let hdrs = resp.headers().clone();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let val = if bytes.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
-    };
-    (status, hdrs, val)
-}
-
-async fn call(
-    app: &axum::Router,
-    method: &str,
-    uri: &str,
-    session: Option<&Session>,
-    body: Option<Value>,
-) -> (StatusCode, Value) {
-    let headers = session.map(|s| s.headers()).unwrap_or_default();
-    let (st, _h, v) = send(app, method, uri, &headers, body).await;
-    (st, v)
-}
-
-/// Read one cookie out of a reply's `Set-Cookie` headers.
-fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
-    let prefix = format!("{name}=");
-    headers
-        .get_all(axum::http::header::SET_COOKIE)
-        .iter()
-        .find_map(|h| {
-            let s = h.to_str().ok()?;
-            s.strip_prefix(&prefix)
-                .and_then(|rest| rest.split(';').next())
-                .map(str::to_string)
-        })
-}
 
 /// The `Location` of a redirect reply.
 fn location(headers: &HeaderMap) -> String {
@@ -160,15 +67,7 @@ async fn harness(
     issuer: &TestIssuer,
     provisioning: OidcProvisioning,
 ) -> (axum::Router, Arc<ServerStore>, Session) {
-    let lib = Arc::new(
-        EmbeddedLibrary::open_with(&unique_tmp(), dam_core::ResourceOptions::ungoverned())
-            .await
-            .unwrap(),
-    );
-    let store = Arc::new(ServerStore::open_in_memory().unwrap());
-    let peer: SocketAddr = "127.0.0.1:54321".parse().unwrap();
-    let app = router(lib.clone(), store.clone(), "127.0.0.1:7878", true)
-        .layer(axum::Extension(ConnectInfo(peer)));
+    let (app, store, _lib) = support::harness(true).await;
 
     for key in ["oidc", "user_accounts"] {
         let (st, body) = call(
@@ -199,19 +98,7 @@ async fn harness(
         .expect("configure the provider");
 
     // The first-run claim: gives the instance an admin, so the accounts surface can be inspected.
-    let (st, headers, body) = send(
-        &app,
-        "POST",
-        "/api/v1/auth/claim",
-        &[],
-        Some(json!({"username": "owner", "password": "password123"})),
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK, "claim failed: {body}");
-    let admin = Session {
-        cookie: cookie(&headers, "dam_session").expect("claim sets the session cookie"),
-        csrf: body["csrf"].as_str().expect("csrf in reply").to_string(),
-    };
+    let admin = claim(&app, "owner").await;
     (app, store, admin)
 }
 
@@ -693,13 +580,7 @@ async fn a_callback_from_another_browser_is_refused() {
 #[tokio::test]
 async fn the_login_surface_is_absent_until_both_flags_are_on() {
     let issuer = TestIssuer::start().await;
-    let lib = Arc::new(
-        EmbeddedLibrary::open_with(&unique_tmp(), dam_core::ResourceOptions::ungoverned())
-            .await
-            .unwrap(),
-    );
-    let store = Arc::new(ServerStore::open_in_memory().unwrap());
-    let app = router(lib.clone(), store.clone(), "127.0.0.1:7878", true);
+    let (app, store, _lib) = support::harness(true).await;
 
     // Even fully configured, the routes do not exist while the flags are off — so an operator who
     // sets up a provider and forgets the switch gets a 404, not a half-working login.
