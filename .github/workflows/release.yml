@@ -332,14 +332,18 @@ jobs:
 
           # 2. The engine opens a fresh catalog — which runs every schema migration — and
           #    emits the JSON contract the CLI promises.
-          "${exe}" --data smoke/data stats --json | grep -q '"total"'
+          # Capture-then-grep, never `| grep -q`: -q exits at the first match, the binary
+          # takes a broken pipe mid-write, and Rust surfaces that as a panic (exit 101).
+          "${exe}" --data smoke/data stats --json > smoke/stats.json
+          grep -q '"total"' smoke/stats.json
 
           # 2b. The archive carries the completions and man pages, and the binary can still
           #     render them (they are generated, not compiled in, so a broken `completions`
           #     subcommand would otherwise only surface at the next release).
           test -f smoke/unpacked/completions/3dam.bash
           test -f smoke/unpacked/man/3dam.1 || test -f smoke/unpacked/man/3dam.1.gz
-          "${exe}" completions bash | grep -q '3dam'
+          "${exe}" completions bash > smoke/completions.bash
+          grep -q '3dam' smoke/completions.bash
 
           # 3. The serve role binds, answers /healthz, and serves the *embedded* client.
           #    Grepping for `assets/` distinguishes the real bundle from dam-server's

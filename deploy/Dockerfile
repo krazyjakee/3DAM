@@ -15,10 +15,11 @@
 # @stable so it never noticed; this pinned image must track a recent stable, not lag behind.
 FROM rust:1.95-bookworm AS builder
 
-# Native deps: egui/eframe (GTK/xcb/wayland — the unified binary links the GUI), audio (ALSA), TLS
+# Native deps: the Tauri desktop shell (GTK3 + webkit2gtk-4.1 — the unified binary links the GUI
+# role even though this container only ever runs `serve`, ADR 0013), audio (ALSA), TLS
 # (openssl/pkg-config), and the Assimp/Draco 3D toolchain (cmake + clang, ADR 0011).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libgtk-3-dev libxkbcommon-dev libwayland-dev \
+        libgtk-3-dev libwebkit2gtk-4.1-dev libxkbcommon-dev libwayland-dev \
         libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb1-dev \
         libasound2-dev libssl-dev pkg-config \
         cmake clang libclang-dev \
@@ -52,7 +53,7 @@ FROM debian:bookworm-slim AS runtime
 # Runtime shared libs the binary links (the -dev headers above are build-only). Mesa's software
 # Vulkan (lavapipe) lets 3D turntable thumbnails render without a GPU; without it they fail soft.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libgtk-3-0 libxkbcommon0 libwayland-client0 \
+        libgtk-3-0 libwebkit2gtk-4.1-0 libxkbcommon0 libwayland-client0 \
         libxcb-render0 libxcb-shape0 libxcb-xfixes0 libxcb1 \
         libasound2 libssl3 ca-certificates curl \
         mesa-vulkan-drivers \
