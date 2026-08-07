@@ -160,12 +160,15 @@ unsafe fn distinct_textures(materials: &[*mut russimp_ng::sys::aiMaterial]) -> i
             continue;
         }
         for ty in TEXTURE_TYPES {
-            let n = russimp_ng::sys::aiGetMaterialTextureCount(mat, ty);
+            // `as _`, not a named type: bindgen gives C enums a signed underlying type under
+            // MSVC and an unsigned one elsewhere, so `aiTextureType` is i32 on Windows and u32
+            // on the other targets.
+            let n = russimp_ng::sys::aiGetMaterialTextureCount(mat, ty as _);
             for i in 0..n {
                 let mut path = std::mem::zeroed::<russimp_ng::sys::aiString>();
                 let ok = russimp_ng::sys::aiGetMaterialTexture(
                     mat,
-                    ty,
+                    ty as _,
                     i,
                     &mut path,
                     std::ptr::null_mut(),
