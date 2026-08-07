@@ -49,14 +49,25 @@ jobs:
 
   tests:
     name: Rust tests / default features
-    runs-on: ubuntu-22.04
+    # Runs on the self-hosted 3dam runner pair (Portainer git-runners stack). Those containers
+    # bake in a shared CARGO_HOME + a local sccache (RUSTC_WRAPPER / CMAKE_*_COMPILER_LAUNCHER),
+    # so the heavy dependency + Assimp compile is cached on-box across runs.
+    runs-on: [self-hosted, Linux, X64, 3dam]
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+      # rustup lives in the persistent $CARGO_HOME cache volume; install it once if the volume is
+      # fresh, then expose it on PATH so dtolnay/rust-toolchain (next step) can manage the toolchain.
+      - name: Ensure rustup is present in the cache volume
+        run: |
+          if [ ! -x "$CARGO_HOME/bin/rustup" ]; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --no-modify-path --profile minimal --default-toolchain none
+          fi
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: stable-tests-default
+      # No Swatinem/rust-cache: the on-box sccache + shared CARGO_HOME already cache this work, and
+      # saving it to the GitHub Actions cache would just re-consume the 10 GB per-repo cache budget.
       - name: Install native dependencies
         run: |
           sudo apt-get update
@@ -67,7 +78,9 @@ jobs:
 
   features:
     name: Rust features / ${{ matrix.profile }}
-    runs-on: ubuntu-22.04
+    # Self-hosted 3dam runners (see the tests job) — 6 matrix legs share the 2-runner pair, so they
+    # queue two at a time; each leg is fast against the warm sccache / CARGO_HOME.
+    runs-on: [self-hosted, Linux, X64, 3dam]
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -87,13 +100,20 @@ jobs:
             native: true
     steps:
       - uses: actions/checkout@v4
+      # See the tests job: bootstrap rustup from the cache volume, then let dtolnay add the
+      # clippy component + wasm target (they persist in the shared RUSTUP_HOME volume).
+      - name: Ensure rustup is present in the cache volume
+        run: |
+          if [ ! -x "$CARGO_HOME/bin/rustup" ]; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --no-modify-path --profile minimal --default-toolchain none
+          fi
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
           targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: feature-${{ matrix.profile }}
+      # No Swatinem/rust-cache: see the tests job.
       - name: Install native dependencies
         if: matrix.native
         run: |
