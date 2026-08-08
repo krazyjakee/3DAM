@@ -27,7 +27,7 @@ import { getServer, setServer } from "@/lib/server";
 import { errorMessage, toast } from "@/lib/toast";
 import { useDialogs } from "@/lib/dialogs";
 import { useEscape, useFocusTrap } from "@/lib/use-focus-trap";
-import { TokenLoginForm } from "./AuthGate";
+import { TokenLoginForm } from "./auth/TokenLoginForm";
 import { AccountsAndGroups } from "./settings/AccountsSection";
 import { AdminField } from "./settings/AdminField";
 import { Choice, Toggle } from "./settings/Controls";

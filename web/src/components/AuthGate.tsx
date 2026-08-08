@@ -8,10 +8,7 @@
 //
 // The three sign-in forms themselves live in `./auth/` (issue #169). What is left here is the
 // *routing*: which of boot splash, claim screen, login screen, or the app itself a given posture
-// gets. The forms are re-exported below because the gate stays the app's one named entry point for
-// signing in — the StatusBar modal, Administration's token swap, and Profile each host a form
-// outside the gate, and importing it from here says "this is the same sign-in" rather than making
-// every surface reach into a directory of forms.
+// gets. Other sign-in surfaces import the standalone forms directly from that feature directory.
 
 import { useState, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
@@ -30,9 +27,6 @@ import { useFocusTrap } from "@/lib/use-focus-trap";
 import { AccountLoginForm } from "./auth/AccountLoginForm";
 import { ClaimScreen } from "./auth/ClaimScreen";
 import { TokenLoginForm } from "./auth/TokenLoginForm";
-
-export { AccountLoginForm } from "./auth/AccountLoginForm";
-export { TokenLoginForm } from "./auth/TokenLoginForm";
 
 /** Does this browser hold (the readable half of) an account session? The session itself is an
  *  HttpOnly cookie we can't see, but its CSRF mirror `dam_csrf` is readable — enough to tell "had a

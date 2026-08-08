@@ -1,7 +1,6 @@
-import { useCallback, useRef, useState } from "react";
+import { useRef, useState } from "react";
 import { Link } from "react-router";
 import {
-  AlertTriangle,
   Ban,
   Check,
   FolderUp,
@@ -10,38 +9,13 @@ import {
   Loader2,
   Trash2,
   Upload as UploadIcon,
-  X,
 } from "lucide-react";
-import { useQueryClient } from "@tanstack/react-query";
-import { api, ApiError } from "@/api/client";
-import { qk, useCan, useSources, useVersion } from "@/api/queries";
-import type { SourceId, SourceInfo, UploadCollision, UploadOutcome } from "@/api/types";
+import { useCan, useSources, useVersion } from "@/api/queries";
+import type { SourceId, SourceInfo, UploadCollision } from "@/api/types";
 import { AUTH_COPY } from "@/lib/auth";
-import { bytes } from "@/lib/format";
-import { toast } from "@/lib/toast";
 import { FolderTree } from "./FolderTree";
-
-/** How many files travel at once.
- *
- *  One request per file is what makes per-file progress and fail-soft work (see the server's
- *  `upload` module), but letting a 200-file drop open 200 sockets would stall the whole browser
- *  connection pool and starve the thumbnails the user is looking at. Three keeps the pipe busy
- *  while leaving room for the rest of the app. */
-const CONCURRENCY = 3;
-
-type ItemState = "queued" | "uploading" | "done" | "skipped" | "error";
-
-interface Item {
-  id: string;
-  file: File;
-  state: ItemState;
-  /** 0–1 while uploading. */
-  progress: number;
-  outcome?: UploadOutcome;
-  error?: string;
-}
-
-let seq = 0;
+import { UploadRow } from "./upload/UploadRow";
+import { useUploadQueue } from "./upload/useUploadQueue";
 
 /** Why this source cannot be an upload destination, or `null` if it can.
  *
@@ -61,71 +35,20 @@ function unwritableReason(s: SourceInfo): string | null {
   return "not writable — check permissions on the folder";
 }
 
-/** One line for the batch that just finished, raised as a toast.
- *
- *  There is deliberately no server-side upload *job* to report: the transport is one request per
- *  file, which is what makes per-file progress and fail-soft free rather than invented (tech-spec 08
- *  §5.1, and `dam-server`'s `upload` module). The batch therefore only exists on this side of the
- *  wire, so its summary is assembled here. The rows keep the per-file detail; this answers "did my
- *  drop land?" without the user reading twenty of them — and it survives navigating away from the
- *  list, since the toast viewport sits above every route. */
-function summarise(results: Item[]): void {
-  if (!results.length) return;
-  const written = results.filter((r) => r.state === "done");
-  const uncatalogued = written.filter((r) => r.outcome?.uncatalogued_reason).length;
-  const skipped = results.filter((r) => r.state === "skipped").length;
-  const failed = results.filter((r) => r.state === "error").length;
-
-  const parts = [`${written.length} uploaded`];
-  if (skipped) parts.push(`${skipped} skipped (name already taken)`);
-  if (failed) parts.push(`${failed} failed`);
-  // Stored-but-not-catalogued is part of the "uploaded" count, not an alternative to it, so it is
-  // appended rather than listed alongside — otherwise the numbers would appear not to add up.
-  const suffix = uncatalogued ? ` — ${uncatalogued} stored but not catalogued` : "";
-  const message = `${parts.join(", ")}${suffix}`;
-
-  // A batch with any failure is an error toast: those linger, and a success toast that auto-dismisses
-  // in 3.5s is exactly the wrong lifetime for "one of your files didn't make it".
-  if (failed) toast.error(message);
-  else toast.success(message);
-}
-
 export function Upload() {
   const sources = useSources();
   const version = useVersion();
   const canWrite = useCan("write");
-  const qc = useQueryClient();
   const [source, setSource] = useState<SourceId | null>(null);
   const [folder, setFolder] = useState("");
   const [collision, setCollision] = useState<UploadCollision>("fail");
-  const [items, setItems] = useState<Item[]>([]);
-  const [running, setRunning] = useState(false);
+  const { items, running, addFiles, addRejected, remove, clear, run } = useUploadQueue();
   const fileInput = useRef<HTMLInputElement>(null);
 
   // Drag state is a *counter*, not a boolean. `dragenter`/`dragleave` fire for every descendant the
   // pointer crosses, so a boolean flickers off the moment the cursor moves over a child of the drop
   // zone. Counting enters minus leaves is stable no matter how deeply nested the zone gets.
   const [dragDepth, setDragDepth] = useState(0);
-
-  /** The work queue, deliberately *not* React state.
-   *
-   *  `items` is what the list renders; this is what the workers consume. Keeping them separate is
-   *  what lets files dropped mid-run join the same pass — a run that snapshotted `items` at click
-   *  time would strand them as rows that say "queued" forever after the batch reports itself
-   *  finished — without any of the read-your-own-state-mid-async-loop guesswork. */
-  const pending = useRef<Item[]>([]);
-
-  const addFiles = useCallback((files: FileList | File[]) => {
-    const next = Array.from(files).map((file) => ({
-      id: `${(seq += 1)}`,
-      file,
-      state: "queued" as ItemState,
-      progress: 0,
-    }));
-    if (!next.length) return;
-    pending.current.push(...next);
-    setItems((prev) => [...prev, ...next]);
-  }, []);
 
   const onDrop = (e: React.DragEvent) => {
     e.preventDefault();
@@ -146,107 +69,12 @@ export function Upload() {
     const files = Array.from(e.dataTransfer.files).filter((f) => !dirNames.includes(f.name));
 
     if (dirNames.length) {
-      setItems((prev) => [
-        ...prev,
-        ...dirNames.map((name) => ({
-          id: `${(seq += 1)}`,
-          file: new File([], name),
-          state: "error" as ItemState,
-          progress: 0,
-          error: "Folders can't be dropped yet — open it and drop the files inside.",
-        })),
-      ]);
+      addRejected(
+        dirNames,
+        "Folders can't be dropped yet — open it and drop the files inside.",
+      );
     }
     if (files.length) addFiles(files);
-  };
-
-  const clearFinished = () =>
-    setItems((prev) => prev.filter((i) => i.state === "queued" || i.state === "uploading"));
-
-  const patchItem = (id: string, patch: Partial<Item>) =>
-    setItems((prev) => prev.map((i) => (i.id === id ? { ...i, ...patch } : i)));
-
-  /** Ids the user removed, so a worker can skip a file that is still waiting.
-   *
-   *  Removing a row has to actually *cancel* it, not merely hide it: without this the worker would
-   *  still reach the entry, write the bytes into the user's source, and audit the write — with no
-   *  row left to report it, so nothing in the UI would ever say it landed. */
-  const removed = useRef(new Set<string>());
-
-  const removeItem = (id: string) => {
-    removed.current.add(id);
-    // By id, not object identity: `patchItem` replaces the object on every progress tick, so a
-    // handler closing over the old one would match nothing and silently do nothing.
-    setItems((prev) => prev.filter((i) => i.id !== id));
-  };
-
-  /** Upload everything queued, `CONCURRENCY` at a time.
-   *
-   *  Fail-soft per item by construction: each file is its own request, so one rejection settles one
-   *  promise and the rest carry on. Nothing here aborts the batch. */
-  const start = async () => {
-    if (!source || running) return;
-    setRunning(true);
-
-    // What the batch summary counts, accumulated by the workers themselves rather than read back
-    // out of `items` when the run ends. `items` is the wrong source for two reasons: a `setItems`
-    // closure captured at click time is stale by the first await, and the list deliberately keeps
-    // rows from *earlier* batches until the user clears them — summarising it would re-report
-    // yesterday's failures every time. Pushing is safe without a lock because JS is single-threaded
-    // and every push happens synchronously after its own await resumes.
-    const results: Item[] = [];
-
-    const worker = async () => {
-      for (;;) {
-        // `shift()` is the whole synchronisation story: JS is single-threaded and there is no
-        // `await` inside it, so two workers can never take the same file, and anything appended
-        // while the run is in flight is picked up by whichever worker frees up next.
-        const item = pending.current.shift();
-        if (!item) return;
-        if (removed.current.has(item.id)) continue;
-        patchItem(item.id, { state: "uploading", progress: 0 });
-        try {
-          let lastPct = -1;
-          const outcome = await api.upload(
-            { source, folder, name: item.file.name, collision },
-            item.file,
-            (fraction) => {
-              // Only on a whole-percent change. `patchItem` rebuilds the array and re-renders every
-              // row, and XHR fires progress every few tens of milliseconds per file — on a 200-file
-              // drop the progress bars would themselves be what makes the page stutter.
-              const pct = Math.floor(fraction * 100);
-              if (pct !== lastPct) {
-                lastPct = pct;
-                patchItem(item.id, { progress: fraction });
-              }
-            },
-          );
-          const patch: Partial<Item> = {
-            state: outcome.skipped ? "skipped" : "done",
-            progress: 1,
-            outcome,
-          };
-          patchItem(item.id, patch);
-          results.push({ ...item, ...patch });
-        } catch (e) {
-          const patch: Partial<Item> = {
-            state: "error",
-            error: e instanceof ApiError ? e.message : String(e),
-          };
-          patchItem(item.id, patch);
-          results.push({ ...item, ...patch });
-        }
-      }
-    };
-    await Promise.all(Array.from({ length: CONCURRENCY }, worker));
-
-    summarise(results);
-    setRunning(false);
-    // The server's `asset_added` events already invalidate these over the WebSocket, but an upload
-    // that was stored-but-not-catalogued emits none — and the folder counts still moved.
-    qc.invalidateQueries({ queryKey: qk.assets });
-    qc.invalidateQueries({ queryKey: qk.stats });
-    qc.invalidateQueries({ queryKey: ["folders"] });
   };
 
   const all = sources.data ?? [];
@@ -451,7 +279,7 @@ export function Upload() {
           {items.length > 0 && (
             <ul className="flex flex-col gap-1 rounded border border-border bg-surface p-1">
               {items.map((i) => (
-                <Row key={i.id} item={i} onRemove={() => removeItem(i.id)} />
+                <UploadRow key={i.id} item={i} onRemove={() => remove(i.id)} />
               ))}
             </ul>
           )}
@@ -459,7 +287,9 @@ export function Upload() {
           <div className="flex items-center gap-2">
             <button
               className="btn btn-accent"
-              onClick={start}
+              onClick={() => {
+                if (source) void run({ source, folder, collision });
+              }}
               disabled={running || queued.length === 0}
             >
               {running ? (
@@ -473,7 +303,7 @@ export function Upload() {
               )}
             </button>
             {items.length > 0 && !running && (
-              <button className="btn" onClick={clearFinished}>
+              <button className="btn" onClick={clear}>
                 <Trash2 size={13} /> Clear finished
               </button>
             )}
@@ -503,114 +333,4 @@ function Unavailable({ children }: { children: React.ReactNode }) {
       <p className="rounded border border-border bg-panel p-3 text-xs text-fg-dim">{children}</p>
     </div>
   );
-}
-
-function Row({ item, onRemove }: { item: Item; onRemove: () => void }) {
-  const pct = Math.round(item.progress * 100);
-  const name = item.outcome?.path ?? item.file.name;
-  const nameId = `upload-name-${item.id}`;
-  const stateId = `upload-state-${item.id}`;
-  const terminalAnnouncement =
-    item.state === "done"
-      ? `${name} uploaded`
-      : item.state === "skipped"
-        ? `${name} skipped because a file of that name already exists`
-        : item.state === "error"
-          ? `${name} upload failed: ${item.error}`
-          : "";
-  return (
-    <li className="flex items-center gap-2 rounded px-2 py-1 text-xs">
-      <StateIcon state={item.state} />
-      {/* The name keeps a floor so a long message can't starve it down to one letter — knowing
-          *which* file failed matters at least as much as why. Both sides truncate; both carry the
-          full text in a title. */}
-      <span
-        id={nameId}
-        className="min-w-[7rem] flex-1 truncate text-fg"
-        title={name}
-      >
-        {name}
-      </span>
-
-      {item.state === "uploading" && (
-        <>
-          <div
-            className="h-1 w-24 shrink-0 overflow-hidden rounded bg-surface-2"
-            role="progressbar"
-            aria-labelledby={`${nameId} ${stateId}`}
-            aria-valuemin={0}
-            aria-valuemax={100}
-            aria-valuenow={pct}
-            aria-valuetext={`${pct}% uploaded`}
-          >
-            <div
-              aria-hidden="true"
-              className="h-full rounded"
-              style={{
-                width: `${pct}%`,
-                background: "var(--color-accent)",
-                transition: "width .2s",
-              }}
-            />
-          </div>
-          <span id={stateId} className="shrink-0 tabular-nums text-fg-dim">
-            {pct}% uploaded
-          </span>
-        </>
-      )}
-
-      {item.state === "queued" && (
-        <span className="shrink-0 tabular-nums text-fg-dim">{bytes(item.file.size)}</span>
-      )}
-
-      {item.state === "skipped" && (
-        <span className="min-w-0 truncate text-fg-dim">
-          skipped — a file of that name is already there
-        </span>
-      )}
-
-      {/* Stored but not catalogued is a *success* the user still has to know about: the file is on
-          disk, and quietly showing a green tick would turn "why isn't it in my library?" into a bug
-          report. */}
-      {item.state === "done" && item.outcome?.uncatalogued_reason && (
-        <span
-          className="flex min-w-0 items-center gap-1 text-warn"
-          title={item.outcome.uncatalogued_reason}
-        >
-          <AlertTriangle size={12} className="shrink-0" />
-          <span className="truncate">{item.outcome.uncatalogued_reason}</span>
-        </span>
-      )}
-
-      {item.state === "error" && (
-        <span className="min-w-0 truncate text-danger" title={item.error}>
-          {item.error}
-        </span>
-      )}
-
-      <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">
-        {terminalAnnouncement}
-      </span>
-
-      {(item.state === "queued" || item.state === "error") && (
-        <button
-          onClick={onRemove}
-          className="shrink-0 text-fg-dim hover:text-danger coarse:min-h-11 coarse:min-w-11"
-          title="Remove"
-          aria-label={`Remove ${item.file.name}`}
-        >
-          <X size={12} />
-        </button>
-      )}
-    </li>
-  );
-}
-
-function StateIcon({ state }: { state: ItemState }) {
-  if (state === "uploading")
-    return <Loader2 size={13} className="shrink-0 animate-spin text-accent" />;
-  if (state === "done") return <Check size={13} className="shrink-0 text-lic-permissive" />;
-  if (state === "skipped") return <Ban size={13} className="shrink-0 text-fg-dim" />;
-  if (state === "error") return <X size={13} className="shrink-0 text-danger" />;
-  return <UploadIcon size={13} className="shrink-0 text-fg-dim" />;
 }

@@ -15,7 +15,8 @@ import {
 import { clearToken, getServer, isRemote } from "@/lib/server";
 import { useDialogs } from "@/lib/dialogs";
 import { errorMessage, toast } from "@/lib/toast";
-import { AccountLoginForm, oidcStartUrl } from "./AuthGate";
+import { oidcStartUrl } from "./AuthGate";
+import { AccountLoginForm } from "./auth/AccountLoginForm";
 
 const ROLE_LABEL: Record<AccountRef["role"], string> = {
   admin: "Administrator",

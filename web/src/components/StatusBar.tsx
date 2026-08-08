@@ -10,7 +10,8 @@ import { clearToken, getServer, isRemote, serverLabel } from "@/lib/server";
 import { toast } from "@/lib/toast";
 import { useEscape, useFocusTrap } from "@/lib/use-focus-trap";
 import { ConnectDialog } from "./ConnectDialog";
-import { AccountLoginForm, TokenLoginForm } from "./AuthGate";
+import { AccountLoginForm } from "./auth/AccountLoginForm";
+import { TokenLoginForm } from "./auth/TokenLoginForm";
 
 /** Bottom status strip: active scan/analysis jobs with live progress, the live-connection state, and
  *  the server build. A single job shows inline; concurrent jobs condense into one aggregate bar with
