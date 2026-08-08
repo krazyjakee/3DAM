@@ -43,7 +43,7 @@ fn content_response(content: AssetContent, cache_control: &'static str) -> Respo
 /// distinguishes, which are *not* two: "I can't parse this" and "this asks for bytes you don't
 /// have" get different answers, and conflating them 416s a client that only sent us a typo.
 #[derive(Debug, PartialEq, Eq)]
-pub(super) enum RangeSpec {
+pub(crate) enum RangeSpec {
     /// A valid single range that overlaps the representation: serve `206` with these bounds.
     Satisfiable(u64, u64),
     /// Syntactically valid but starting past the end of the representation: `416`, the one case
@@ -65,7 +65,7 @@ pub(super) enum RangeSpec {
 ///
 /// Total: every arithmetic path saturates, so a zero-length representation or an absurd offset
 /// returns an answer rather than panicking.
-pub(super) fn parse_range(spec: &str, len: u64) -> RangeSpec {
+pub(crate) fn parse_range(spec: &str, len: u64) -> RangeSpec {
     let Some(spec) = spec.trim().strip_prefix("bytes=") else {
         return RangeSpec::Ignore;
     };

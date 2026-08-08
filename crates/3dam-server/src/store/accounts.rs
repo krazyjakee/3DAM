@@ -10,7 +10,7 @@ use std::sync::atomic::Ordering;
 // Preserve the established crate-visible path used by the authentication transport.
 pub(crate) use super::sessions::NewSession;
 #[cfg(test)]
-use super::sessions::{SESSION_ABS_MS, SESSION_IDLE_MS};
+use super::sessions::SESSION_IDLE_MS;
 
 fn hash_password(pw: &str) -> Result<String, LibError> {
     if pw.len() < 8 {
@@ -339,6 +339,8 @@ impl ServerStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dam_api::id::SourceId;
+    use dam_api::service::Visibility;
 
     fn store() -> ServerStore {
         let s = ServerStore::open_in_memory().unwrap();

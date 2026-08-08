@@ -819,10 +819,8 @@ async fn mcp_http(State(st): State<AppState>, headers: HeaderMap, body: Body) ->
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        managed_path_belongs_to, parse_range, response_compression, safe_archive_name, trace_path,
-        RangeSpec, WORKER_CSP,
-    };
+    use super::http::{managed_path_belongs_to, parse_range, safe_archive_name, RangeSpec};
+    use super::{response_compression, trace_path, WORKER_CSP};
     use axum::body::Body;
     use axum::http::{header, Request};
     use axum::response::IntoResponse;

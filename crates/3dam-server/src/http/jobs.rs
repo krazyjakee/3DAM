@@ -262,7 +262,7 @@ fn decorate_managed_job(root: &std::path::Path, job: &mut JobStatus) {
 /// Containment for result decoration also works before a file exists (for example an empty convert
 /// or a dry run): canonicalize the managed root and the nearest existing parent, then append only a
 /// single final file name. A parent component, absolute replacement, or symlink escape fails shut.
-fn managed_path_belongs_to(root: &std::path::Path, candidate: &std::path::Path) -> bool {
+pub(crate) fn managed_path_belongs_to(root: &std::path::Path, candidate: &std::path::Path) -> bool {
     let Ok(relative) = candidate.strip_prefix(root) else {
         return false;
     };
@@ -449,7 +449,7 @@ async fn package_managed_directory(
     canonical_managed_artifact(root, &destination)
 }
 
-fn safe_archive_name(name: &std::ffi::OsStr) -> Result<String, LibError> {
+pub(crate) fn safe_archive_name(name: &std::ffi::OsStr) -> Result<String, LibError> {
     let Some(name) = name.to_str() else {
         return Err(LibError::NotFound("job artifact".into()));
     };
