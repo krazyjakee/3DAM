@@ -1,7 +1,8 @@
-use dam_api::dto::{DupRequest, QueryRequest};
-use dam_api::id::{ContentHash, SourceId};
+use dam_api::dto::{AnalyzeRequest, DupRequest, JobState, QueryRequest};
+use dam_api::id::{AssetId, ContentHash, SourceId};
 use dam_api::page::{Cursor, PageParams};
-use dam_api::service::Visibility;
+use dam_api::service::{AuthContext, LibraryService, Visibility};
+use dam_core::{EmbeddedLibrary, ResourceOptions};
 use dam_store::{ExportSelection, NewAsset, Store};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
@@ -9,7 +10,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const RECIPE_VERSION: &str = "3dam-scale-v1";
 const FIXED_SEED: u64 = 0x3da1_2026_0132;
@@ -26,6 +28,8 @@ const STORE_METRICS: &[&str] = &[
     "tag_facets_ms",
     "scan_upsert_assets_per_second",
     "browse_under_write_ms",
+    "browse_under_analyze_ms",
+    "analysis_rayon_core_utilization_pct",
     "aggregate_write_overhead_ratio",
     "analysis_plan_ms",
     "duplicate_detection_ms",
@@ -218,6 +222,7 @@ fn execute(options: Result<Options, String>) -> Result<(), String> {
     let generation_started = Instant::now();
     generate_catalog(&options.work_dir, &profile)?;
     let thumbnail_hit = populate_derivative_cache(&options.work_dir, profile.asset_count)?;
+    let analysis_targets = prepare_analysis_fixture(&options.work_dir, &profile)?;
     let fixture_generate_seconds = generation_started.elapsed().as_secs_f64();
     let database_path = options.work_dir.join("library.db");
     let database_bytes = fs::metadata(&database_path)
@@ -231,7 +236,13 @@ fn execute(options: Result<Options, String>) -> Result<(), String> {
             * 1_000.0;
 
     let store = Store::open(&options.work_dir).map_err(|e| format!("open fixture: {e}"))?;
-    let mut metrics = benchmark_store(&store, &profile, &database_path)?;
+    let mut metrics = benchmark_store(
+        &store,
+        &profile,
+        &database_path,
+        &options.work_dir,
+        analysis_targets,
+    )?;
     insert_metric(
         &mut metrics,
         "derivative_cache_first_thumbnail_hit_ms",
@@ -656,6 +667,158 @@ fn populate_derivative_cache(data_dir: &Path, entry_count: usize) -> Result<Path
     Ok(hit)
 }
 
+/// Materialize a bounded subset of the catalog's existing local image rows. All paths hard-link a
+/// deterministic 512px PNG, so profile size controls target count without multiplying fixture
+/// bytes. The analysis still performs the production decode/feature/classify/write path per asset.
+fn prepare_analysis_fixture(data_dir: &Path, profile: &Profile) -> Result<Vec<AssetId>, String> {
+    const ANALYSIS_EDGE: u32 = 512;
+    let root = data_dir.join("analysis-source");
+    fs::create_dir_all(&root)
+        .map_err(|error| format!("create analysis fixture {}: {error}", root.display()))?;
+    let master = root.join("analysis-master.png");
+    fs::write(&master, deterministic_png(ANALYSIS_EDGE))
+        .map_err(|error| format!("write analysis fixture {}: {error}", master.display()))?;
+
+    // Source zero is local in every deterministic profile. Point only that persisted source at the
+    // harness-owned tree; the selected ids below are rows already assigned to it and typed image.
+    let connection = serde_json::json!({
+        "kind": "local_fs",
+        "root": root.to_string_lossy(),
+    })
+    .to_string();
+    let database_path = data_dir.join("library.db");
+    let database = Connection::open(&database_path).map_err(|error| {
+        format!(
+            "open {} for analysis fixture: {error}",
+            database_path.display()
+        )
+    })?;
+    let updated = database
+        .execute(
+            "UPDATE source SET connection=?1 WHERE id=?2",
+            params![connection, deterministic_id(1, 0).to_vec()],
+        )
+        .map_err(|error| format!("point local source at analysis fixture: {error}"))?;
+    if updated != 1 {
+        return Err(format!(
+            "analysis fixture expected one local source update, got {updated}"
+        ));
+    }
+
+    let mut targets = Vec::with_capacity(profile.upsert_sample);
+    for index in 0..profile.asset_count {
+        if !index.is_multiple_of(profile.source_count) || !index.is_multiple_of(5) {
+            continue;
+        }
+        let relative = fixture_asset_path(index, profile.max_depth);
+        let target = root.join(&relative);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                format!("create analysis fixture path {}: {error}", parent.display())
+            })?;
+        }
+        fs::hard_link(&master, &target)
+            .or_else(|_| fs::copy(&master, &target).map(|_| ()))
+            .map_err(|error| {
+                format!("materialize analysis fixture {}: {error}", target.display())
+            })?;
+        targets.push(AssetId::from_bytes(deterministic_id(3, index as u64)));
+        if targets.len() == profile.upsert_sample {
+            break;
+        }
+    }
+    if targets.len() != profile.upsert_sample {
+        return Err(format!(
+            "analysis fixture found {} local image targets, expected {}",
+            targets.len(),
+            profile.upsert_sample
+        ));
+    }
+    Ok(targets)
+}
+
+fn fixture_asset_path(index: usize, max_depth: usize) -> String {
+    let (_, extension) = media(index);
+    let filename = if index.is_multiple_of(10) {
+        format!("hero_texture_{index:09}.{extension}")
+    } else {
+        format!("asset_{index:09}.{extension}")
+    };
+    let depth = 2 + index % (max_depth - 1);
+    let folders = (0..depth)
+        .map(|level| format!("level{level:02}_{}", (index / (level + 1)) % 97))
+        .collect::<Vec<_>>()
+        .join("/");
+    format!("{folders}/{filename}")
+}
+
+/// Minimal RGB PNG encoder using stored DEFLATE blocks. Avoiding an image dependency keeps xtask's
+/// fixture generator small; the production decoder validates these bytes during the smoke run.
+fn deterministic_png(edge: u32) -> Vec<u8> {
+    let mut scanlines = Vec::with_capacity((edge as usize * 3 + 1) * edge as usize);
+    for y in 0..edge {
+        scanlines.push(0); // PNG filter: none
+        for x in 0..edge {
+            scanlines.extend_from_slice(&[
+                x.wrapping_mul(13).wrapping_add(y * 3) as u8,
+                x.wrapping_mul(5).wrapping_add(y * 11) as u8,
+                (x ^ y).wrapping_mul(7) as u8,
+            ]);
+        }
+    }
+    let mut deflate = vec![0x78, 0x01]; // zlib header: no compression/fastest
+    let chunks = scanlines.chunks(u16::MAX as usize);
+    let chunk_count = chunks.len();
+    for (index, chunk) in chunks.enumerate() {
+        deflate.push(u8::from(index + 1 == chunk_count)); // BFINAL + stored BTYPE
+        let length = chunk.len() as u16;
+        deflate.extend_from_slice(&length.to_le_bytes());
+        deflate.extend_from_slice(&(!length).to_le_bytes());
+        deflate.extend_from_slice(chunk);
+    }
+    deflate.extend_from_slice(&adler32(&scanlines).to_be_bytes());
+
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    let mut header = Vec::with_capacity(13);
+    header.extend_from_slice(&edge.to_be_bytes());
+    header.extend_from_slice(&edge.to_be_bytes());
+    header.extend_from_slice(&[8, 2, 0, 0, 0]); // 8-bit RGB, standard compression/filter
+    append_png_chunk(&mut png, b"IHDR", &header);
+    append_png_chunk(&mut png, b"IDAT", &deflate);
+    append_png_chunk(&mut png, b"IEND", &[]);
+    png
+}
+
+fn append_png_chunk(output: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+    output.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    output.extend_from_slice(kind);
+    output.extend_from_slice(data);
+    let mut checksum_input = Vec::with_capacity(kind.len() + data.len());
+    checksum_input.extend_from_slice(kind);
+    checksum_input.extend_from_slice(data);
+    output.extend_from_slice(&crc32(&checksum_input).to_be_bytes());
+}
+
+fn adler32(bytes: &[u8]) -> u32 {
+    let (mut a, mut b) = (1_u32, 0_u32);
+    for byte in bytes {
+        a = (a + u32::from(*byte)) % 65_521;
+        b = (b + a) % 65_521;
+    }
+    (b << 16) | a
+}
+
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = u32::MAX;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xedb8_8320 & 0_u32.wrapping_sub(crc & 1));
+        }
+    }
+    !crc
+}
+
 fn suspend_triggers(conn: &Connection, prefix: &str) -> Result<Vec<String>, String> {
     let mut stmt = conn
         .prepare(
@@ -757,6 +920,8 @@ fn benchmark_store(
     store: &Store,
     profile: &Profile,
     database_path: &Path,
+    data_dir: &Path,
+    analysis_targets: Vec<AssetId>,
 ) -> Result<BTreeMap<String, Metric>, String> {
     let visibility = Visibility::Full;
     let mut metrics = BTreeMap::new();
@@ -926,6 +1091,27 @@ fn benchmark_store(
         Direction::LowerIsBetter,
         vec![overhead],
     )?;
+
+    // One production analysis pass, two views of the same interval (issue #184). The service sends
+    // image feature extraction to its named, bounded Rayon pool. A paced thread queries through the
+    // service for the pass's entire lifetime, so its contention is charged honestly to both the
+    // p95 browse latency and the worker utilization. Reading Linux's per-thread scheduler runtime
+    // isolates `dam-bg-*` CPU from the query sampler, Tokio, SQLite, and the harness itself.
+    let analysis =
+        benchmark_analysis_under_browse(data_dir, profile, analysis_targets, &browse_request)?;
+    insert_tail_timing(
+        &mut metrics,
+        "browse_under_analyze_ms",
+        analysis.browse_samples,
+    )?;
+    insert_metric(
+        &mut metrics,
+        "analysis_rayon_core_utilization_pct",
+        analysis.rayon_utilization_pct,
+        "percent",
+        Direction::HigherIsBetter,
+        vec![analysis.rayon_utilization_pct],
+    )?;
     let rss = peak_rss_bytes().ok_or("peak RSS is unavailable on this platform")? as f64;
     insert_metric(
         &mut metrics,
@@ -1006,6 +1192,183 @@ fn browse_while_writing(
         }
         std::thread::sleep(PACE);
     }
+}
+
+struct AnalysisMeasurements {
+    browse_samples: Vec<f64>,
+    rayon_utilization_pct: f64,
+}
+
+fn benchmark_analysis_under_browse(
+    data_dir: &Path,
+    profile: &Profile,
+    targets: Vec<AssetId>,
+    request: &QueryRequest,
+) -> Result<AnalysisMeasurements, String> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("build analysis runtime: {error}"))?;
+    let requested_workers = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1)
+        .saturating_sub(2)
+        .clamp(1, 4);
+    let library = runtime
+        .block_on(EmbeddedLibrary::open_with(
+            data_dir,
+            ResourceOptions {
+                background_threads: Some(requested_workers),
+                min_free_memory_mb: Some(0),
+                max_io_stall_pct: Some(f64::INFINITY),
+            },
+        ))
+        .map_err(|error| format!("open fixture for analysis: {error}"))?;
+    // The profile-sized derivative inventory uses the same pool. Join it before taking worker CPU
+    // snapshots so this metric contains only the analysis pass named in the report.
+    runtime
+        .block_on(library.storage_usage())
+        .map_err(|error| format!("join derivative inventory before analysis: {error}"))?;
+
+    let before = rayon_worker_cpu_nanos()?;
+    if before.is_empty() {
+        return Err("analysis Rayon pool exposed no dam-bg worker threads".into());
+    }
+    let analyzing = AtomicBool::new(true);
+    let started = Instant::now();
+    let browse_samples = std::thread::scope(|scope| {
+        let handle = runtime.handle().clone();
+        let sampler_library = &library;
+        let sampler_analyzing = &analyzing;
+        let sampler = scope.spawn(move || {
+            browse_while_analyzing(&handle, sampler_library, request, sampler_analyzing)
+        });
+        let analyzed = runtime.block_on(async {
+            let ctx = AuthContext::embedded();
+            let job = library
+                .submit_analyze(
+                    &ctx,
+                    AnalyzeRequest {
+                        assets: targets,
+                        force: false,
+                    },
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            wait_for_analysis(&library, &ctx, job, profile.upsert_sample as u64).await
+        });
+        // Release the sampler before propagating analysis failure, or the scope blocks forever.
+        analyzing.store(false, Ordering::Release);
+        let sampled = sampler
+            .join()
+            .unwrap_or_else(|_| Err("analysis browse sampler panicked".into()));
+        analyzed.and(sampled)
+    })?;
+    let elapsed = started.elapsed();
+    let after = rayon_worker_cpu_nanos()?;
+    let rayon_utilization_pct = worker_utilization_pct(&before, &after, elapsed)?;
+    Ok(AnalysisMeasurements {
+        browse_samples,
+        rayon_utilization_pct,
+    })
+}
+
+async fn wait_for_analysis(
+    library: &EmbeddedLibrary,
+    ctx: &AuthContext,
+    job: dam_api::id::JobId,
+    expected: u64,
+) -> Result<(), String> {
+    loop {
+        let status = library
+            .get_job(ctx, &job)
+            .await
+            .map_err(|error| error.to_string())?;
+        match status.state {
+            JobState::Done if status.progress.done == expected => return Ok(()),
+            JobState::Done => {
+                return Err(format!(
+                    "analysis completed {} targets, expected {expected}",
+                    status.progress.done
+                ));
+            }
+            JobState::Failed => {
+                return Err(status.error.unwrap_or_else(|| "analysis failed".into()));
+            }
+            JobState::Cancelled => return Err("analysis was cancelled".into()),
+            JobState::Queued | JobState::Running | JobState::Paused => {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+    }
+}
+
+fn browse_while_analyzing(
+    runtime: &tokio::runtime::Handle,
+    library: &EmbeddedLibrary,
+    request: &QueryRequest,
+    analyzing: &AtomicBool,
+) -> Result<Vec<f64>, String> {
+    const PACE: Duration = Duration::from_millis(1);
+    const RECORD_LIMIT: usize = 4_096;
+    let ctx = AuthContext::embedded();
+    let mut samples = Vec::new();
+    loop {
+        let started = Instant::now();
+        runtime
+            .block_on(library.query(&ctx, request.clone()))
+            .map_err(|error| error.to_string())?;
+        let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
+        if samples.len() < RECORD_LIMIT {
+            samples.push(elapsed);
+        }
+        if !analyzing.load(Ordering::Acquire) {
+            return Ok(samples);
+        }
+        std::thread::sleep(PACE);
+    }
+}
+
+/// Linux scheduler runtime for each production Rayon worker, keyed by stable kernel thread id.
+/// `/proc/.../schedstat`'s first field is nanoseconds actually executing, excluding runnable wait.
+fn rayon_worker_cpu_nanos() -> Result<BTreeMap<String, u64>, String> {
+    let tasks = fs::read_dir("/proc/self/task")
+        .map_err(|error| format!("list process threads for analysis utilization: {error}"))?;
+    let mut workers = BTreeMap::new();
+    for task in tasks.flatten() {
+        let tid = task.file_name().to_string_lossy().into_owned();
+        let comm = fs::read_to_string(task.path().join("comm")).unwrap_or_default();
+        if !comm.trim().starts_with("dam-bg-") {
+            continue;
+        }
+        let schedstat = fs::read_to_string(task.path().join("schedstat"))
+            .map_err(|error| format!("read scheduler runtime for dam-bg thread {tid}: {error}"))?;
+        let runtime = schedstat
+            .split_whitespace()
+            .next()
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or_else(|| format!("invalid scheduler runtime for dam-bg thread {tid}"))?;
+        workers.insert(tid, runtime);
+    }
+    Ok(workers)
+}
+
+fn worker_utilization_pct(
+    before: &BTreeMap<String, u64>,
+    after: &BTreeMap<String, u64>,
+    elapsed: Duration,
+) -> Result<f64, String> {
+    if before.is_empty() || elapsed.is_zero() {
+        return Err("analysis utilization needs workers and non-zero elapsed time".into());
+    }
+    let busy_nanos = before.iter().try_fold(0_u128, |total, (tid, start)| {
+        let end = after
+            .get(tid)
+            .ok_or_else(|| format!("analysis Rayon worker {tid} disappeared during measurement"))?;
+        Ok::<_, String>(total + u128::from(end.saturating_sub(*start)))
+    })?;
+    let capacity_nanos = elapsed.as_nanos() * before.len() as u128;
+    Ok(busy_nanos as f64 / capacity_nanos as f64 * 100.0)
 }
 
 /// Measure the incremental V26 trigger cost against the same indexed no-op asset update without an
@@ -1345,6 +1708,57 @@ mod tests {
         assert_eq!(deterministic_id(3, 42), deterministic_id(3, 42));
         assert_ne!(deterministic_id(3, 42), deterministic_id(3, 43));
         assert_eq!(deterministic_hash(8), deterministic_hash(8));
+        let png = deterministic_png(8);
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+        assert!(png.windows(4).any(|chunk| chunk == b"IEND"));
+    }
+
+    #[test]
+    fn analysis_tail_gate_exposes_bimodal_counterfactual() {
+        let mut samples = vec![1.0; 94];
+        samples.extend([100.0; 6]);
+        let mut metrics = BTreeMap::new();
+        insert_tail_timing(&mut metrics, "browse_under_analyze_ms", samples).unwrap();
+        let metric = &metrics["browse_under_analyze_ms"];
+        assert_eq!(metric.value, 100.0, "the gated value must be p95");
+        assert_eq!(metric.p95, 100.0);
+        assert_eq!(metric.samples[metric.samples.len() / 2], 1.0);
+    }
+
+    #[test]
+    fn rayon_utilization_exposes_serial_or_async_worker_counterfactual() {
+        let before = BTreeMap::from([
+            ("1".into(), 0),
+            ("2".into(), 0),
+            ("3".into(), 0),
+            ("4".into(), 0),
+        ]);
+        let parallel = BTreeMap::from([
+            ("1".into(), 900_000_000),
+            ("2".into(), 900_000_000),
+            ("3".into(), 900_000_000),
+            ("4".into(), 900_000_000),
+        ]);
+        let serial = BTreeMap::from([
+            ("1".into(), 900_000_000),
+            ("2".into(), 0),
+            ("3".into(), 0),
+            ("4".into(), 0),
+        ]);
+        let misplaced_async = before.clone();
+        let elapsed = Duration::from_secs(1);
+        assert_eq!(
+            worker_utilization_pct(&before, &parallel, elapsed).unwrap(),
+            90.0
+        );
+        assert_eq!(
+            worker_utilization_pct(&before, &serial, elapsed).unwrap(),
+            22.5
+        );
+        assert_eq!(
+            worker_utilization_pct(&before, &misplaced_async, elapsed).unwrap(),
+            0.0
+        );
     }
 
     #[test]

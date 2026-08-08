@@ -29,14 +29,15 @@ exact trigger definitions before any measurement. Production scans still exercis
 maintenance; bulk fixture construction avoids millions of redundant ancestor walks. V26 aggregate
 triggers remain enabled throughout generation so their production write cost is represented.
 
-The fixture contains local filesystem, SFTP, SMB, and federated sources; all five media types; paths up to the configured depth; confirmed tags; normalized embeddings; and repeatable exact-duplicate groups. Names include a stable search term. It also creates one tiny cached-thumbnail entry per profile asset in the production flat cache layout. The generated database, WAL, and cache tree never enter git.
+The fixture contains local filesystem, SFTP, SMB, and federated sources; all five media types; paths up to the configured depth; confirmed tags; normalized embeddings; and repeatable exact-duplicate groups. Names include a stable search term. It also creates one tiny cached-thumbnail entry per profile asset in the production flat cache layout, plus a bounded set of existing local image rows backed by hard links to one deterministic 512px PNG for the analysis load. The generated database, WAL, source bytes, and cache tree never enter git.
 
 ## Measurements and reports
 
 The harness measures median first-page, late-page, lexical-search, faceted-query, library-stats,
 and confirmed-tag-facet latency; analysis-planning and exact-duplicate latency; scan/upsert and
-bounded export throughput; browse latency sampled during that write workload; process peak RSS; and
-the serialized initial browse payload. The stats
+bounded export throughput; browse latency sampled during the write and production-analysis
+workloads; analysis Rayon-worker utilization; process peak RSS; and the serialized initial browse
+payload. The stats
 and tag-facet budgets are intentionally identical for smoke, 100k, and 1M profiles: growth in asset
 rows cannot buy a looser threshold, so a return to catalog scans fails the scale profile.
 
@@ -63,6 +64,24 @@ profiles share one 20 ms reference at a 2.0 ratio, because a browse under write 
 catalog size when keyset pagination and the read pool are both working — measured, the pooled p95 is
 1.18 ms on smoke and 1.10 ms on 100k. That leaves roughly 30x of headroom in the 40 ms ceiling for a
 loaded CI runner, while the serialised regression overshoots it by between 1.4x and 8x.
+
+Analysis evidence also comes from one workload with two concurrent views. The harness submits the
+production analysis job for `upsert_sample` existing local image rows (100/1,000/5,000 by profile)
+and a paced sampler thread issues the same no-total first-page browse through `EmbeddedLibrary` for
+the job's full lifetime. `browse_under_analyze_ms` gates that distribution's **p95**, for the same
+bimodal reason as browse-under-write: most requests preempt or land between analysis writes while
+the unlucky tail exposes CPU starvation or a blocked async lane. Every profile uses the same 20 ms
+reference and 2.0 ratio (40 ms ceiling), because Rayon leaves interactive headroom independent of
+catalog size.
+
+`analysis_rayon_core_utilization_pct` measures the other side of that exact interval. On Linux the
+harness snapshots `/proc/self/task/*/schedstat` for only the production pool's named `dam-bg-*`
+threads and divides their executing nanoseconds by elapsed time × observed pool width. Query,
+Tokio, SQLite, and harness CPU are therefore excluded rather than mislabelled as Rayon work. The
+90% reference and 1.25 ratio require at least 72% measured occupancy on every profile: enough CI
+headroom for image reads and batched commits, while a serial pass on a four-worker pool reports at
+most about 25% and CPU moved onto async workers reports near zero. Together the utilization and p95
+guards distinguish “all cores busy” from “the UI was sacrificed to make them busy.”
 
 The Node browser profile traverses every logical page while retaining only the production browse
 window and reports long-scroll p99 work time and post-midpoint heap growth.
