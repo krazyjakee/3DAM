@@ -8,6 +8,7 @@
 use glam::Vec3;
 use russimp_ng::material::{DataContent, Material as AiMaterial, PropertyTypeInfo, TextureType};
 use russimp_ng::scene::{PostProcess, Scene};
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 /// Axis-aligned bounding box in world space; drives camera framing.
@@ -269,23 +270,26 @@ fn load_material(m: &AiMaterial, dir: &Path) -> Material {
         .unwrap_or([1.0, 1.0, 1.0, 1.0]);
     // Non-PBR formats carry no metalness — default to dielectric. Roughness comes from the PBR
     // factor, else a legacy Phong `shininess` converted to a perceptual roughness, else moderate.
-    let metallic = prop_f32(m, "$mat.metallicFactor").unwrap_or(0.0);
-    let roughness = prop_f32(m, "$mat.roughnessFactor")
+    let metallic_factor = prop_f32(m, "$mat.metallicFactor");
+    let roughness_factor = prop_f32(m, "$mat.roughnessFactor");
+    let mut metallic = metallic_factor.unwrap_or(0.0);
+    let mut roughness = roughness_factor
         .or_else(|| prop_f32(m, "$mat.shininess").map(shininess_to_roughness))
         .unwrap_or(0.6);
     let emissive = prop_vec3(m, "$clr.emissive").unwrap_or([0.0, 0.0, 0.0]);
 
     // Textures as the material *declares* them.
     let mut base = load_tex(m, dir, &[TextureType::BaseColor, TextureType::Diffuse]);
-    let mut mr = load_tex(
-        m,
-        dir,
-        &[
-            TextureType::GltfMetallicRoughness,
-            TextureType::Metalness,
-            TextureType::Roughness,
-        ],
-    );
+    let (mut mr, standalone_metallic, standalone_roughness) = load_mr_tex(m, dir);
+    // A standalone map is the authored value, not a modulation of the fallback factor. Assimp does
+    // not synthesize a factor for classic FBX/OBJ materials, so use one unless the source really did
+    // declare one. The packed texture leaves absent channels white, preserving their factors.
+    if standalone_metallic && metallic_factor.is_none() {
+        metallic = 1.0;
+    }
+    if standalone_roughness && roughness_factor.is_none() {
+        roughness = 1.0;
+    }
     let mut normal = load_tex(m, dir, &[TextureType::Normals, TextureType::Height]);
     let mut emissive_tex = load_tex(m, dir, &[TextureType::Emissive, TextureType::EmissionColor]);
 
@@ -310,6 +314,16 @@ fn load_material(m: &AiMaterial, dir: &Path) -> Material {
         // onto the glTF metallic-roughness slot the shader samples.
         if mr.is_none() {
             mr = find_companion(&tex_dir, &name, ORM_SUFFIXES);
+            if mr.is_some() {
+                // Companion ORM maps carry both authored channels. Legacy materials generally have
+                // no PBR factors, so avoid multiplying them by the dielectric fallback (metal = 0).
+                if metallic_factor.is_none() {
+                    metallic = 1.0;
+                }
+                if roughness_factor.is_none() {
+                    roughness = 1.0;
+                }
+            }
         }
         if normal.is_none() {
             normal = find_companion(&tex_dir, &name, NORMAL_SUFFIXES);
@@ -321,7 +335,10 @@ fn load_material(m: &AiMaterial, dir: &Path) -> Material {
 
     // When an albedo map drives a legacy (non-PBR) surface, a grey diffuse factor (Unreal exports
     // 0.8) would needlessly darken it — let the map speak at full value, keeping only its alpha.
-    let base_color = if base.is_some() && !is_pbr && (discovered_base || base_factor[3] < 1.0) {
+    let base_color = if base.is_some()
+        && !is_pbr
+        && (discovered_base || is_neutral_colour_factor(base_factor))
+    {
         [1.0, 1.0, 1.0, base_factor[3]]
     } else {
         base_factor
@@ -341,6 +358,15 @@ fn load_material(m: &AiMaterial, dir: &Path) -> Material {
         alpha_mode,
         alpha_cutoff,
     }
+}
+
+/// Whether a legacy diffuse factor is effectively a neutral brightness multiplier. Game exporters
+/// commonly emit 0.8 grey alongside a complete albedo map; retaining it only muddies the texture.
+/// Coloured factors are preserved because they may be an intentional material tint.
+fn is_neutral_colour_factor(factor: [f32; 4]) -> bool {
+    let lo = factor[0].min(factor[1]).min(factor[2]);
+    let hi = factor[0].max(factor[1]).max(factor[2]);
+    hi - lo < 0.02
 }
 
 /// Resolve a material's alpha interpretation from the assorted signals Assimp exposes, returning the
@@ -493,6 +519,65 @@ fn load_tex(m: &AiMaterial, dir: &Path, types: &[TextureType]) -> Option<Resolve
     None
 }
 
+/// Resolve glTF's already-packed metallic/roughness texture or combine Assimp's separate classic
+/// metalness and roughness slots into the G/B layout both renderers consume. The booleans report
+/// which standalone channels were authored so [`load_material`] can neutralise absent factors.
+fn load_mr_tex(m: &AiMaterial, dir: &Path) -> (Option<ResolvedTex>, bool, bool) {
+    if let Some(packed) = load_tex(m, dir, &[TextureType::GltfMetallicRoughness]) {
+        return (Some(packed), false, false);
+    }
+    let metal = load_tex(m, dir, &[TextureType::Metalness]);
+    let rough = load_tex(m, dir, &[TextureType::Roughness]);
+    let has_metal = metal.is_some();
+    let has_rough = rough.is_some();
+    (pack_mr_textures(metal, rough), has_metal, has_rough)
+}
+
+/// Pack separate grayscale maps into glTF's `G = roughness, B = metallic` convention. Missing
+/// channels are white so the corresponding scalar factor remains unchanged in the shader.
+fn pack_mr_textures(metal: Option<ResolvedTex>, rough: Option<ResolvedTex>) -> Option<ResolvedTex> {
+    let (width, height) = metal
+        .as_ref()
+        .map(|t| (t.img.width, t.img.height))
+        .or_else(|| rough.as_ref().map(|t| (t.img.width, t.img.height)))?;
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
+    for y in 0..height {
+        for x in 0..width {
+            let r = rough
+                .as_ref()
+                .map_or(255, |t| sample_first_channel(&t.img, x, y, width, height));
+            let m = metal
+                .as_ref()
+                .map_or(255, |t| sample_first_channel(&t.img, x, y, width, height));
+            rgba.extend_from_slice(&[255, r, m, 255]);
+        }
+    }
+    let anchor = metal
+        .as_ref()
+        .and_then(|t| t.anchor.clone())
+        .or_else(|| rough.as_ref().and_then(|t| t.anchor.clone()));
+    Some(ResolvedTex {
+        img: TexImage {
+            rgba,
+            width,
+            height,
+        },
+        anchor,
+    })
+}
+
+/// Nearest-neighbour resampling is sufficient for the uncommon mismatched-dimension map pair; GPU
+/// filtering handles display scaling later, while this keeps channel packing deterministic.
+fn sample_first_channel(tex: &TexImage, x: u32, y: u32, width: u32, height: u32) -> u8 {
+    let sx = (u64::from(x) * u64::from(tex.width) / u64::from(width)) as u32;
+    let sy = (u64::from(y) * u64::from(tex.height) / u64::from(height)) as u32;
+    let idx = ((sy.min(tex.height - 1) * tex.width + sx.min(tex.width - 1)) * 4) as usize;
+    tex.rgba.get(idx).copied().unwrap_or(255)
+}
+
 /// Directory + file stem of a resolved texture path, for companion discovery.
 fn anchor_of(path: &Path) -> Option<(PathBuf, String)> {
     let dir = path.parent()?.to_path_buf();
@@ -553,10 +638,109 @@ fn load_external_tex(dir: &Path, rel: &str) -> Option<(TexImage, PathBuf)> {
             cands.push(dir.join(sib).join(f));
         }
     }
+    let mut tried = HashSet::new();
     for cand in cands {
-        if let Ok(bytes) = std::fs::read(&cand) {
-            if let Some(img) = decode_image_bytes(&bytes) {
-                return Some((img, cand));
+        if let Some(found) = decode_texture_path(&cand, &mut tried) {
+            return Some(found);
+        }
+    }
+
+    // Absolute paths baked on another machine often still retain a useful suffix below the pack
+    // root. Try every bounded suffix against nearby ancestors, resolving each component without
+    // case sensitivity (packs commonly move from Windows to Linux).
+    let parts: Vec<&str> = cleaned
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != "." && *part != ".." && !part.ends_with(':'))
+        .collect();
+    const MAX_ANCESTORS: usize = 5;
+    const MAX_SUFFIX_PARTS: usize = 8;
+    for root in dir.ancestors().take(MAX_ANCESTORS) {
+        for start in 0..parts.len() {
+            let suffix = &parts[start..];
+            if suffix.len() > MAX_SUFFIX_PARTS {
+                continue;
+            }
+            if let Some(cand) = resolve_case_insensitive(root, suffix) {
+                if let Some(found) = decode_texture_path(&cand, &mut tried) {
+                    return Some(found);
+                }
+            }
+        }
+    }
+
+    // If only the filename survived (a stale DCC export root with no shared suffix), perform a
+    // bounded nearest-first walk. The caps keep a hostile or enormous pack from turning one missing
+    // texture into an unbounded scan; unresolved maps continue to fail soft to material factors.
+    let filename = Path::new(cleaned).file_name()?.to_str()?;
+    find_nearby_file(dir, filename).and_then(|cand| decode_texture_path(&cand, &mut tried))
+}
+
+fn decode_texture_path(path: &Path, tried: &mut HashSet<PathBuf>) -> Option<(TexImage, PathBuf)> {
+    if !tried.insert(path.to_path_buf()) {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    Some((decode_image_bytes(&bytes)?, path.to_path_buf()))
+}
+
+/// Walk a relative component sequence by exact name first, then case-insensitive directory lookup.
+fn resolve_case_insensitive(root: &Path, parts: &[&str]) -> Option<PathBuf> {
+    let mut current = root.to_path_buf();
+    for part in parts {
+        let exact = current.join(part);
+        if exact.exists() {
+            current = exact;
+            continue;
+        }
+        current = std::fs::read_dir(&current)
+            .ok()?
+            .flatten()
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(part)
+            })?
+            .path();
+    }
+    current.is_file().then_some(current)
+}
+
+fn find_nearby_file(dir: &Path, filename: &str) -> Option<PathBuf> {
+    const MAX_ANCESTORS: usize = 5;
+    const MAX_DEPTH: usize = 6;
+    const MAX_ENTRIES: usize = 20_000;
+
+    let mut seen = HashSet::new();
+    let mut inspected = 0usize;
+    for root in dir.ancestors().take(MAX_ANCESTORS) {
+        let mut queue = VecDeque::from([(root.to_path_buf(), 0usize)]);
+        while let Some((current, depth)) = queue.pop_front() {
+            if !seen.insert(current.clone()) {
+                continue;
+            }
+            let Ok(entries) = std::fs::read_dir(current) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                inspected += 1;
+                if inspected > MAX_ENTRIES {
+                    return None;
+                }
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if file_type.is_file()
+                    && entry
+                        .file_name()
+                        .to_string_lossy()
+                        .eq_ignore_ascii_case(filename)
+                {
+                    return Some(entry.path());
+                }
+                if file_type.is_dir() && depth < MAX_DEPTH {
+                    queue.push_back((entry.path(), depth + 1));
+                }
             }
         }
     }
@@ -722,6 +906,67 @@ fn has_image_ext(p: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fixture_texture() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/quad.png")
+    }
+
+    #[test]
+    fn resolves_a_case_mismatched_suffix_from_a_baked_windows_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let model_dir = temp.path().join("Pack/Assets/Art/Meshes");
+        let texture = temp
+            .path()
+            .join("Pack/Assets/Textures/Armour/T_Boots_BaseColor.PNG");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::create_dir_all(texture.parent().unwrap()).unwrap();
+        std::fs::copy(fixture_texture(), &texture).unwrap();
+
+        let (img, resolved) = load_external_tex(
+            &model_dir,
+            r"C:\BuildAgent\Pack\Assets\Textures\Armour\t_boots_basecolor.png",
+        )
+        .expect("the useful pack-relative suffix and case-insensitive names should resolve");
+        assert_eq!(resolved, texture);
+        assert_eq!((img.width, img.height), (128, 128));
+    }
+
+    #[test]
+    fn resolves_a_stale_absolute_reference_by_filename_within_the_nearby_pack() {
+        let temp = tempfile::tempdir().unwrap();
+        let model_dir = temp.path().join("Pack/Assets/Art/Meshes");
+        let texture = temp
+            .path()
+            .join("Pack/Assets/Shared/SurfaceMaps/T_Armour_Unique.PNG");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::create_dir_all(texture.parent().unwrap()).unwrap();
+        std::fs::copy(fixture_texture(), &texture).unwrap();
+
+        let (_, resolved) =
+            load_external_tex(&model_dir, r"D:\Deleted\Exporter\Tree\t_armour_unique.png")
+                .expect("the bounded nearby search should salvage a stale absolute root");
+        assert_eq!(resolved, texture);
+    }
+
+    #[test]
+    fn separate_metalness_and_roughness_maps_are_packed_into_the_shader_slots() {
+        let tex = |values: [u8; 2]| ResolvedTex {
+            img: TexImage {
+                rgba: vec![values[0], 0, 0, 255, values[1], 0, 0, 255],
+                width: 2,
+                height: 1,
+            },
+            anchor: None,
+        };
+        let packed = pack_mr_textures(Some(tex([20, 40])), Some(tex([80, 100]))).unwrap();
+        assert_eq!(packed.img.rgba, vec![255, 80, 20, 255, 255, 100, 40, 255]);
+    }
+
+    #[test]
+    fn neutral_legacy_factors_are_distinguished_from_authored_colour_tints() {
+        assert!(is_neutral_colour_factor([0.8, 0.8, 0.8, 1.0]));
+        assert!(!is_neutral_colour_factor([0.8, 0.4, 0.2, 1.0]));
+    }
 
     /// UV orientation regression. Assimp normalises every format to OpenGL's lower-left UV origin,
     /// but the render/viewer pipeline uploads textures row-0-at-top and samples `v = 0` as the top
