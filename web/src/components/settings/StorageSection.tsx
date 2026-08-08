@@ -1,5 +1,13 @@
 import { useState } from "react";
-import { admin, type CacheTarget, type CacheUsage, type StorageUsage } from "@/api/admin";
+import type { CacheTarget, CacheUsage } from "@/api/admin";
+import {
+  useAdminStorageUsage,
+  useClearAdminAnalysis,
+  useClearAdminCache,
+  useFactoryResetAdmin,
+  useVacuumAdminStorage,
+  useWipeAdminCatalog,
+} from "@/api/admin-queries";
 import { useScan } from "@/api/queries";
 import { useDialogs } from "@/lib/dialogs";
 import { binaryBytes } from "@/lib/format";
@@ -46,24 +54,23 @@ function cacheUsage(value: CacheUsage): string {
 }
 
 /** Storage overview + maintenance actions (tech-spec 10 §5). */
-export function StorageSection({
-  usage,
-  error,
-  onChange,
-}: {
-  usage: StorageUsage | null;
-  error: string | null;
-  onChange: () => void;
-}) {
+export function StorageSection({ enabled = true }: { enabled?: boolean }) {
   const { confirm } = useDialogs();
   const scan = useScan();
   const [busy, setBusy] = useState<string | null>(null);
+  const usageQuery = useAdminStorageUsage({ enabled });
+  const clearCacheMutation = useClearAdminCache();
+  const clearAnalysisMutation = useClearAdminAnalysis();
+  const vacuumMutation = useVacuumAdminStorage();
+  const wipeMutation = useWipeAdminCatalog();
+  const factoryResetMutation = useFactoryResetAdmin();
+  const usage = usageQuery.data ?? null;
+  const error = usageQuery.error ? errorMessage(usageQuery.error) : null;
 
   const run = async (key: string, fn: () => Promise<string>) => {
     setBusy(key);
     try {
       toast.success(await fn());
-      onChange();
     } catch (error) {
       toast.error(errorMessage(error));
     } finally {
@@ -73,7 +80,7 @@ export function StorageSection({
 
   const clearCache = (target: CacheTarget, label: string) =>
     run(`cache:${target}`, async () => {
-      const result = await admin.clearCache(target);
+      const result = await clearCacheMutation.mutateAsync(target);
       return `Cleared ${label}: ${result.files_deleted} files, ${binaryBytes(result.bytes_freed)} freed`;
     });
 
@@ -94,14 +101,14 @@ export function StorageSection({
     )
       return;
     void run("analysis", async () => {
-      const result = await admin.clearAnalysis();
+      const result = await clearAnalysisMutation.mutateAsync(undefined);
       return `Cleared ${result.suggestions_removed} suggestions and ${result.embeddings_removed} embeddings`;
     });
   };
 
   const vacuum = () =>
     run("vacuum", async () => {
-      const result = await admin.vacuum();
+      const result = await vacuumMutation.mutateAsync(undefined);
       return `Database compacted — reclaimed ${binaryBytes(result.reclaimed_bytes)}`;
     });
 
@@ -117,7 +124,7 @@ export function StorageSection({
     )
       return;
     void run("wipe", async () => {
-      const result = await admin.wipe(true);
+      const result = await wipeMutation.mutateAsync(true);
       return `Catalog reset — ${result.assets_removed} assets, ${result.sources_removed} sources removed`;
     });
   };
@@ -134,7 +141,7 @@ export function StorageSection({
     )
       return;
     void run("factory", async () => {
-      const result = await admin.factoryReset(true);
+      const result = await factoryResetMutation.mutateAsync(true);
       return `Factory reset complete — ${result.catalog.assets_removed} assets and ${result.tokens_removed} tokens removed`;
     });
   };

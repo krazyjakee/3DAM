@@ -11,7 +11,7 @@
 import { HttpResponse, http } from "msw";
 import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { expect, test, vi } from "vitest";
+import { expect, test } from "vitest";
 import type { TokenInfo } from "../../src/api/admin";
 import type { OidcConfigInfo, OidcIdentity } from "../../src/api/types";
 import { OidcSection } from "../../src/components/settings/OidcSection";
@@ -64,21 +64,29 @@ function tokenRow(label: string): HTMLElement {
 
 test("issuing a token sends the ticked scopes and reveals the secret once", async () => {
   const user = userEvent.setup();
-  const changed = vi.fn();
+  let lists = 0;
+  let listedTokens = TOKENS;
   const bodies: unknown[] = [];
   server.use(
+    http.get("http://localhost/admin/api/tokens", () => {
+      lists += 1;
+      return HttpResponse.json(listedTokens);
+    }),
     http.post("http://localhost/admin/api/tokens", async ({ request }) => {
       bodies.push(await request.json());
-      return HttpResponse.json({
+      const created = {
         token_id: "tok-new",
         label: "ci-writer",
-        scopes: ["read", "mcp_use", "write"],
+        scopes: ["read", "mcp_use", "write"] as TokenInfo["scopes"],
         secret: "dam_pat_shown_once",
-      });
+      };
+      listedTokens = [...TOKENS, token("tok-new", "ci-writer", { scopes: created.scopes })];
+      return HttpResponse.json(created);
     }),
   );
 
-  renderApp(<TokensSection tokens={TOKENS} currentIdentity={null} onChange={changed} />);
+  renderApp(<TokensSection currentIdentity={null} />);
+  await screen.findByText("workstation");
 
   // No label yet, so the action is unavailable rather than a request that will 400.
   expect(screen.getByRole("button", { name: "Issue token" })).toBeDisabled();
@@ -87,7 +95,7 @@ test("issuing a token sends the ticked scopes and reveals the secret once", asyn
   await user.click(screen.getByRole("checkbox", { name: "write" }));
   await user.click(screen.getByRole("button", { name: "Issue token" }));
 
-  await waitFor(() => expect(changed).toHaveBeenCalledTimes(1));
+  await waitFor(() => expect(lists).toBe(2));
   expect(bodies).toEqual([
     { label: "ci-writer", scopes: ["read", "mcp_use", "write"], expires: null },
   ]);
@@ -100,15 +108,16 @@ test("revoking is confirmed, and the caller's own token is flagged before it sig
   const user = userEvent.setup();
   const revoked: string[] = [];
   server.use(
+    http.get("http://localhost/admin/api/tokens", () => HttpResponse.json(TOKENS)),
     http.delete("http://localhost/admin/api/tokens/:id", ({ params }) => {
       revoked.push(String(params.id));
       return new HttpResponse(null, { status: 204 });
     }),
   );
 
-  renderApp(
-    <TokensSection tokens={TOKENS} currentIdentity="workstation" onChange={() => {}} />,
-  );
+  renderApp(<TokensSection currentIdentity="workstation" />);
+
+  await screen.findByText("workstation");
 
   expect(
     within(tokenRow("workstation")).getByTitle("The token this browser is signed in with"),
@@ -211,7 +220,7 @@ test("the flag notices say what is still missing rather than hiding the controls
     await screen.findByText(/The Single sign-on capability is still off/),
   ).toBeInTheDocument();
   // Unconfigured: the form is still offered, and it adds rather than saves.
-  expect(screen.getByRole("button", { name: "Add provider" })).toBeDisabled();
+  expect(await screen.findByRole("button", { name: "Add provider" })).toBeDisabled();
   unmount();
 
   serveOidc(null, []);

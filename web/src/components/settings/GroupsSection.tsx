@@ -3,20 +3,26 @@
 // pane says so rather than pretending a group has no members.
 
 import { useState } from "react";
-import { admin, type AccountInfo, type GroupInfo } from "@/api/admin";
+import type { AccountInfo, GroupInfo } from "@/api/admin";
+import {
+  useCreateAdminGroup,
+  useDeleteAdminGroup,
+  useSetAdminGroupMembers,
+} from "@/api/admin-queries";
 import { useDialogs } from "@/lib/dialogs";
 import { errorMessage, toast } from "@/lib/toast";
 
 export function GroupsSection({
   groups,
   accounts,
-  onChange,
 }: {
   groups: GroupInfo[];
   accounts: AccountInfo[] | null;
-  onChange: () => void;
 }) {
   const { confirm, prompt } = useDialogs();
+  const createMutation = useCreateAdminGroup();
+  const deleteMutation = useDeleteAdminGroup();
+  const membersMutation = useSetAdminGroupMembers();
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
 
@@ -25,7 +31,6 @@ export function GroupsSection({
     setErr(null);
     try {
       const msg = await fn();
-      onChange();
       if (msg) toast.success(msg);
     } catch (e) {
       setErr(errorMessage(e));
@@ -40,7 +45,7 @@ export function GroupsSection({
     )?.trim();
     if (!name) return;
     void run("create", async () => {
-      await admin.createGroup(name);
+      await createMutation.mutateAsync(name);
       return `Group “${name}” created`;
     });
   };
@@ -56,7 +61,7 @@ export function GroupsSection({
     )
       return;
     void run(`del:${g.group_id}`, async () => {
-      await admin.deleteGroup(g.group_id);
+      await deleteMutation.mutateAsync(g.group_id);
       return "Group deleted";
     });
   };
@@ -65,7 +70,7 @@ export function GroupsSection({
   const toggleMember = (g: GroupInfo, accountId: string, on: boolean) => {
     const next = on ? [...g.members, accountId] : g.members.filter((m) => m !== accountId);
     void run(`members:${g.group_id}`, async () => {
-      await admin.setGroupMembers(g.group_id, next);
+      await membersMutation.mutateAsync({ id: g.group_id, accountIds: next });
       return null;
     });
   };

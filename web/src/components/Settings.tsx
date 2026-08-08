@@ -7,20 +7,22 @@
 // trail. Each capability pane lives in `./settings/` (issues #161, #162) and is composed in below,
 // so a pane can be mounted and tested without the whole surface.
 
-import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { Link } from "react-router";
 import {
-  admin,
   type AdminStatus,
-  type AuditEntry,
   type FlagInfo,
   type FlagKey,
   type FlagValue,
   type NewTokenReply,
   type SetFlagReply,
-  type StorageUsage,
-  type TokenInfo,
 } from "@/api/admin";
+import {
+  useAdminAudit,
+  useAdminFlags,
+  useAdminStatus,
+  useSetAdminFlag,
+} from "@/api/admin-queries";
 import { ApiError } from "@/api/client";
 import { useWhoami } from "@/api/queries";
 import { getServer, setServer } from "@/lib/server";
@@ -47,17 +49,6 @@ type AccessState =
   | { kind: "denied"; message: string };
 
 export function Administration() {
-  const [status, setStatus] = useState<AdminStatus | null>(null);
-  const [statusError, setStatusError] = useState<string | null>(null);
-  const [flags, setFlags] = useState<FlagInfo[] | null>(null);
-  const [flagsError, setFlagsError] = useState<string | null>(null);
-  const [tokens, setTokens] = useState<TokenInfo[] | null>(null);
-  const [tokensError, setTokensError] = useState<string | null>(null);
-  const [audit, setAudit] = useState<AuditEntry[] | null>(null);
-  const [auditError, setAuditError] = useState<string | null>(null);
-  const [usage, setUsage] = useState<StorageUsage | null>(null);
-  const [usageError, setUsageError] = useState<string | null>(null);
-  const [access, setAccess] = useState<AccessState>({ kind: "checking" });
   // The bootstrap owner token, when enabling authentication just minted it (never locked out).
   const [bootstrap, setBootstrap] = useState<NewTokenReply | null>(null);
   // Which flag write is in flight — disables the flag controls so a slow admin round-trip can't be
@@ -70,90 +61,56 @@ export function Administration() {
   const whoami = useWhoami();
   const { confirm } = useDialogs();
 
-  /** Refetch the admin surface. Each section renders as its call lands — the storage-usage walk
-   *  can take a while on a large cold cache, and it must not hold the flags/tokens/status
-   *  sections (or the whole screen) hostage. `withUsage: false` skips it for refreshes that
-   *  can't change storage (flag/token writes). */
-  const refresh = useCallback(async (opts?: { withUsage?: boolean }) => {
-    const settle = async <T,>(
-      p: Promise<T>,
-      set: (v: T) => void,
-      setSectionError: (message: string | null) => void,
-    ): Promise<void> => {
-      try {
-        set(await p);
-        setSectionError(null);
-      } catch (e) {
-        if (e instanceof ApiError && (e.status === 401 || e.status === 403)) {
-          setAccess({
-            kind: "denied",
-            message:
-              e.status === 401
-                ? "Sign in with an admin token to manage this server."
-                : "Your credential lacks the admin scope. Ask an admin for access or sign in with an admin token.",
-          });
-          return;
-        }
-        setSectionError(errorMessage(e));
-      }
-    };
-
-    // Status is the access probe. Do not reveal a populated-looking admin body until this request
-    // proves the caller may administer the server; it also prevents parallel 403 responses racing
-    // successful state updates and briefly reopening the body.
-    try {
-      setStatus(await admin.status());
-      setStatusError(null);
-      setAccess({ kind: "granted" });
-    } catch (e) {
-      if (e instanceof ApiError && (e.status === 401 || e.status === 403)) {
-        setAccess({
+  // Status remains the access probe. Capability queries wait for it, so a denied caller produces
+  // one clear response instead of a fan-out of parallel 403s. A network/status failure is not an
+  // authorization decision: the other independently framed sections still get a chance to load.
+  const statusQuery = useAdminStatus();
+  const accessError = statusQuery.error instanceof ApiError ? statusQuery.error : null;
+  const denied = accessError?.status === 401 || accessError?.status === 403;
+  const access: AccessState = statusQuery.isPending
+    ? { kind: "checking" }
+    : denied
+      ? {
           kind: "denied",
           message:
-            e.status === 401
+            accessError?.status === 401
               ? "Sign in with an admin token to manage this server."
               : "Your credential lacks the admin scope. Ask an admin for access or sign in with an admin token.",
-        });
-        return;
-      }
-      setStatusError(errorMessage(e));
-      // A status-specific/network failure is not evidence of denied access. Let the independently
-      // loaded sections report their own results instead of mislabelling it as a permissions issue.
-      setAccess({ kind: "granted" });
-    }
+        }
+      : { kind: "granted" };
+  const queriesEnabled = access.kind === "granted";
+  const flagsQuery = useAdminFlags({ enabled: queriesEnabled });
+  const auditQuery = useAdminAudit(25, { enabled: queriesEnabled });
+  const flagMutation = useSetAdminFlag();
 
-    const calls = [
-      settle(admin.flags(), setFlags, setFlagsError),
-      settle(admin.tokens(), setTokens, setTokensError),
-      settle(admin.audit(25), setAudit, setAuditError),
-    ];
-    if (opts?.withUsage !== false)
-      calls.push(settle(admin.storageUsage(), setUsage, setUsageError));
-    await Promise.all(calls);
-  }, []);
-
-  useEffect(() => {
-    void refresh();
-  }, [refresh]);
+  const status = statusQuery.data ?? null;
+  const statusError = statusQuery.error && !denied ? errorMessage(statusQuery.error) : null;
+  const flags = flagsQuery.data ?? null;
+  const flagsError = flagsQuery.error ? errorMessage(flagsQuery.error) : null;
+  const audit = auditQuery.data ?? null;
+  const auditError = auditQuery.error ? errorMessage(auditQuery.error) : null;
 
   /** Apply a flag-set reply. When enabling authentication minted the bootstrap owner token, adopt
    *  it as this client's credential in the same motion — the person flipping the switch must never
    *  be gated by their own action — and surface the secret once. */
-  const applied = useCallback(async (reply: SetFlagReply) => {
+  const applied = (reply: SetFlagReply) => {
     if (reply.bootstrap_token) {
       setServer(getServer().base, reply.bootstrap_token.secret);
       setBootstrap(reply.bootstrap_token);
     }
-    await refresh({ withUsage: false });
     toast.success("Setting updated");
-  }, [refresh]);
+  };
 
   /** Set a flag, retrying with `confirm` after an explicit warning on an exposure-increasing change. */
-  const setFlag = useCallback(
-    async (key: string, value: FlagValue, version: number) => {
+  const setFlag = async (key: FlagKey, value: FlagValue, version: number) => {
       setBusyFlag(key);
       try {
-        await applied(await admin.setFlag(key, { value, expected_version: version }));
+        applied(
+          await flagMutation.mutateAsync({
+            key,
+            request: { value, expected_version: version },
+          }),
+        );
       } catch (e) {
         if (e instanceof ApiError && e.status === 400 && /exposure/i.test(e.message)) {
           if (
@@ -165,8 +122,11 @@ export function Administration() {
             })
           ) {
             try {
-              await applied(
-                await admin.setFlag(key, { value, expected_version: version, confirm: true }),
+              applied(
+                await flagMutation.mutateAsync({
+                  key,
+                  request: { value, expected_version: version, confirm: true },
+                }),
               );
             } catch (e2) {
               toast.error(errorMessage(e2));
@@ -178,9 +138,7 @@ export function Administration() {
       } finally {
         setBusyFlag(null);
       }
-    },
-    [applied, confirm],
-  );
+    };
 
   const flag = (key: FlagKey) => flags?.find((f) => f.key === key);
 
@@ -447,22 +405,17 @@ export function Administration() {
               </div>
             )}
           </section>
-          <StorageSection usage={usage} error={usageError} onChange={refresh} />
+          <StorageSection enabled={queriesEnabled} />
 
       {/* User accounts + groups (issue #42) — only while the flag is on (the routes 404 off). */}
           {flag("user_accounts")?.value === true && (
             <AccountsAndGroups currentAccountId={whoami.data?.account?.account_id ?? null} />
           )}
 
-          <AdminSectionState name="API tokens" loading={!tokens && !tokensError} error={tokensError}>
-            {tokens && (
-              <TokensSection
-                tokens={tokens}
-                currentIdentity={whoami.data?.identity ?? null}
-                onChange={() => void refresh({ withUsage: false })}
-              />
-            )}
-          </AdminSectionState>
+          <TokensSection
+            currentIdentity={whoami.data?.identity ?? null}
+            enabled={queriesEnabled}
+          />
 
       {/* Single sign-on (issue #41). Gated on the flag's *presence*, not its value — the same
           "does this server support it" signal `FlagCard` uses. Deliberately not its value: the

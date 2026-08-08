@@ -19,6 +19,9 @@ export default defineConfig({
       reporter: ["text", "json-summary"],
       reportsDirectory: "coverage",
       include: [
+        // Settings server state moved behind its own TanStack Query hooks (issue #163). Both the
+        // orchestrator and hook module must remain visible to per-file thresholds.
+        "src/api/admin-queries.ts",
         "src/components/AuthGate.tsx",
         // Standalone forms extracted from AuthGate.tsx (issue #169). This is an allowlist, so each
         // new module must be named or per-file thresholds would silently stop applying to it.
@@ -45,6 +48,7 @@ export default defineConfig({
         "src/components/navigation/Collections.tsx",
         "src/components/navigation/SourceRow.tsx",
         "src/components/Inspector.tsx",
+        "src/components/Settings.tsx",
         // Extracted out of Inspector.tsx (issues #167, #166). `thresholds.perFile` is true and this
         // list is an allowlist, so code that leaves Inspector.tsx has to be named here or it leaves
         // coverage entirely and the threshold passes vacuously.

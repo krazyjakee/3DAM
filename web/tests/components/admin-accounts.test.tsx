@@ -10,7 +10,7 @@
 import { HttpResponse, http } from "msw";
 import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { expect, test, vi } from "vitest";
+import { expect, test } from "vitest";
 import type { AccountInfo, GroupInfo } from "../../src/api/admin";
 import { AccountsAndGroups } from "../../src/components/settings/AccountsSection";
 import { GroupsSection } from "../../src/components/settings/GroupsSection";
@@ -105,7 +105,6 @@ test("deleting an account is confirmed, and a server conflict stays visible on t
 
 test("a membership edit sends the whole member set, not a delta", async () => {
   const user = userEvent.setup();
-  const changed = vi.fn();
   const bodies: unknown[] = [];
   server.use(
     http.put("http://localhost/admin/api/groups/grp-1/members", async ({ request }) => {
@@ -114,16 +113,16 @@ test("a membership edit sends the whole member set, not a delta", async () => {
     }),
   );
 
-  renderApp(<GroupsSection groups={GROUPS} accounts={ACCOUNTS} onChange={changed} />);
+  renderApp(<GroupsSection groups={GROUPS} accounts={ACCOUNTS} />);
 
   await user.click(screen.getByRole("checkbox", { name: "owner" }));
 
-  await waitFor(() => expect(changed).toHaveBeenCalledTimes(1));
+  await waitFor(() => expect(bodies).toHaveLength(1));
   expect(bodies).toEqual([{ account_ids: ["acct-other", "acct-me"] }]);
 });
 
 test("groups stay usable when the account load failed", () => {
-  renderApp(<GroupsSection groups={GROUPS} accounts={null} onChange={() => {}} />);
+  renderApp(<GroupsSection groups={GROUPS} accounts={null} />);
 
   expect(screen.getByText("Level art")).toBeInTheDocument();
   expect(screen.queryByRole("checkbox")).toBeNull();

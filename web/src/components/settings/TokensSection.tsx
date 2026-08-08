@@ -1,30 +1,36 @@
 // API tokens (tech-spec 10 §5) — issue a token with a scope set and an optional expiry, and revoke
 // one. Extracted out of Settings.tsx by issue #162.
 //
-// The section is fed its list rather than loading it: the tokens read is part of the one
-// administration refresh (status/flags/tokens/audit), and a token write has to re-run that refresh
-// anyway — the status card reports the token count — so the parent stays the single owner of the
-// fetch and this module reports back through `onChange`.
+// The list is query-owned: token writes invalidate the shared administration overview, including
+// both this list and the status card's token count.
 
 import { useState } from "react";
-import { admin, type NewTokenReply, type Scope, type TokenInfo } from "@/api/admin";
+import type { NewTokenReply, Scope, TokenInfo } from "@/api/admin";
+import {
+  useAdminTokens,
+  useCreateAdminToken,
+  useRevokeAdminToken,
+} from "@/api/admin-queries";
 import { useDialogs } from "@/lib/dialogs";
 import { errorMessage, toast } from "@/lib/toast";
+import { AdminSectionState } from "./SectionState";
 
 /** Every scope a token may carry — the checkbox set offered when issuing one. */
 const ALL_SCOPES: Scope[] = ["read", "write", "admin", "mcp_use", "federate"];
 
 export function TokensSection({
-  tokens,
   currentIdentity,
-  onChange,
+  enabled = true,
 }: {
-  tokens: TokenInfo[];
   /** The label of the token this browser is signed in with (from /whoami), so its row can be
    *  flagged and its revoke warned about — never lock yourself out by accident. */
   currentIdentity: string | null;
-  onChange: () => void;
+  enabled?: boolean;
 }) {
+  const tokensQuery = useAdminTokens({ enabled });
+  const createMutation = useCreateAdminToken();
+  const revokeMutation = useRevokeAdminToken();
+  const tokens: TokenInfo[] = tokensQuery.data ?? [];
   const [label, setLabel] = useState("");
   const [scopes, setScopes] = useState<Scope[]>(["read", "mcp_use"]);
   // Optional expiry (the API's NewToken.expires) — a local `datetime-local` value, "" for no expiry.
@@ -43,11 +49,10 @@ export function TokensSection({
     try {
       // datetime-local is local wall-clock with no zone; parse to epoch ms for the API. No expiry → null.
       const expires = expiry ? new Date(expiry).getTime() : null;
-      const reply = await admin.createToken({ label, scopes, expires });
+      const reply = await createMutation.mutateAsync({ label, scopes, expires });
       setCreated(reply);
       setLabel("");
       setExpiry("");
-      onChange();
       toast.success(`Token “${reply.label}” issued`);
     } catch (e) {
       setErr(errorMessage(e));
@@ -72,8 +77,7 @@ export function TokensSection({
     if (!ok) return;
     setRevoking(t.token_id);
     try {
-      await admin.revokeToken(t.token_id);
-      onChange();
+      await revokeMutation.mutateAsync(t.token_id);
       toast.success("Token revoked");
     } catch (e) {
       toast.error(errorMessage(e));
@@ -83,7 +87,12 @@ export function TokensSection({
   };
 
   return (
-    <section className="flex flex-col gap-2">
+    <AdminSectionState
+      name="API tokens"
+      loading={tokensQuery.isPending}
+      error={tokensQuery.error ? errorMessage(tokensQuery.error) : null}
+    >
+      {tokensQuery.data && <section className="flex flex-col gap-2">
       <h2 className="font-medium text-fg-muted">API tokens</h2>
 
       <div className="flex flex-col gap-2 rounded border border-border p-3">
@@ -180,6 +189,7 @@ export function TokensSection({
           );
         })}
       </div>
-    </section>
+      </section>}
+    </AdminSectionState>
   );
 }

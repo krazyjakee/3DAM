@@ -61,6 +61,19 @@ export const qk = {
   blocklist: ["blocklist"] as const,
   similar: (id: AssetId) => ["similar", id] as const,
   folders: (source: string, prefix: string) => ["folders", source, prefix] as const,
+  // Administration server state (issue #163). `adminOverview` groups the reads every flag/token
+  // write can affect, while the capability-specific keys keep slow or optional sections isolated.
+  admin: ["admin"] as const,
+  adminOverview: ["admin", "overview"] as const,
+  adminStatus: ["admin", "overview", "status"] as const,
+  adminFlags: ["admin", "overview", "flags"] as const,
+  adminTokens: ["admin", "overview", "tokens"] as const,
+  adminAudit: ["admin", "overview", "audit"] as const,
+  adminStorage: ["admin", "storage"] as const,
+  adminAccounts: ["admin", "accounts"] as const,
+  adminGroups: ["admin", "groups"] as const,
+  adminOidcConfig: ["admin", "oidc", "config"] as const,
+  adminOidcIdentities: ["admin", "oidc", "identities"] as const,
 };
 
 const PAGE_LIMIT = BROWSE_PAGE_SIZE;

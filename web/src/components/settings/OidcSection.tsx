@@ -5,8 +5,14 @@
 // presence, so the parent's blanket administration refresh must not issue them (a server without
 // the routes would answer the SPA fallback), and nothing else on the screen depends on them.
 
-import { useCallback, useEffect, useState } from "react";
-import { admin } from "@/api/admin";
+import { useEffect, useState } from "react";
+import {
+  useAdminOidcConfig,
+  useAdminOidcIdentities,
+  useLinkAdminOidcIdentity,
+  useSetAdminOidcConfig,
+  useUnlinkAdminOidcIdentity,
+} from "@/api/admin-queries";
 import type { OidcConfigInfo, OidcIdentity, OidcProvisioning } from "@/api/types";
 import { useDialogs } from "@/lib/dialogs";
 import { errorMessage, toast } from "@/lib/toast";
@@ -37,13 +43,19 @@ export function OidcSection({
   accountsEnabled: boolean;
 }) {
   const { confirm } = useDialogs();
-  const [cfg, setCfg] = useState<OidcConfigInfo | null>(null);
-  const [identities, setIdentities] = useState<OidcIdentity[] | null>(null);
-  const [configError, setConfigError] = useState<string | null>(null);
-  const [identitiesError, setIdentitiesError] = useState<string | null>(null);
-  // False until the *config* read has actually answered. Without it a failed load is
-  // indistinguishable from "no provider yet", and saving from that state silently replaces one.
-  const [loaded, setLoaded] = useState(false);
+  const configQuery = useAdminOidcConfig();
+  const identitiesQuery = useAdminOidcIdentities();
+  const saveMutation = useSetAdminOidcConfig();
+  const linkMutation = useLinkAdminOidcIdentity();
+  const unlinkMutation = useUnlinkAdminOidcIdentity();
+  const cfg: OidcConfigInfo | null = configQuery.data ?? null;
+  const identities = identitiesQuery.data ?? null;
+  const configError = configQuery.error ? errorMessage(configQuery.error) : null;
+  const identitiesError = identitiesQuery.error ? errorMessage(identitiesQuery.error) : null;
+  // Success — including a `null` payload — distinguishes "no provider" from a failed read. Saving
+  // stays unavailable until the query has actually answered, so a blank form cannot replace an
+  // unseen configuration.
+  const loaded = configQuery.isSuccess;
   const [saving, setSaving] = useState(false);
   const [linking, setLinking] = useState(false);
   // Keyed by issuer *and* subject, matching the row identity — the same subject can appear under
@@ -60,44 +72,21 @@ export function OidcSection({
   const [linkSubject, setLinkSubject] = useState("");
   const [linkAccountId, setLinkAccountId] = useState("");
 
-  /** Load config and links independently.
-   *
-   *  Not `Promise.all`: it rejects on the first failure, so a links call that 404s would leave the
-   *  *config* unread even though it succeeded — and the form would render blank, say "Add
-   *  provider", and turn Save into a full replace of a configuration the operator never saw. The
-   *  same per-call settle shape the administration refresh uses, for the same reason. `loaded`
-   *  gates the form so nothing is offered before the truth is known. */
-  const load = useCallback(async () => {
-    const [c, ids] = await Promise.allSettled([admin.oidcConfig(), admin.oidcIdentities()]);
-    if (c.status === "fulfilled") {
-      setCfg(c.value);
-      if (c.value) {
-        setIssuer(c.value.issuer);
-        setClientId(c.value.client_id);
-        setRedirectUrl(c.value.redirect_url);
-        setScopes(c.value.scopes.join(", "));
-        setProvisioning(c.value.provisioning);
-      }
-      setLoaded(true);
-      setConfigError(null);
-    } else {
-      setConfigError(errorMessage(c.reason));
-    }
-    if (ids.status === "fulfilled") {
-      setIdentities(ids.value);
-      setIdentitiesError(null);
-    } else {
-      setIdentitiesError(errorMessage(ids.reason));
-    }
-  }, []);
+  // Query data seeds editable UI state; the client secret is deliberately absent from the read
+  // shape and therefore can never be copied back into the form.
   useEffect(() => {
-    void load();
-  }, [load]);
+    if (!configQuery.data) return;
+    setIssuer(configQuery.data.issuer);
+    setClientId(configQuery.data.client_id);
+    setRedirectUrl(configQuery.data.redirect_url);
+    setScopes(configQuery.data.scopes.join(", "));
+    setProvisioning(configQuery.data.provisioning);
+  }, [configQuery.data]);
 
   const save = async () => {
     setSaving(true);
     try {
-      const next = await admin.setOidcConfig({
+      await saveMutation.mutateAsync({
         issuer: issuer.trim(),
         client_id: clientId.trim(),
         redirect_url: redirectUrl.trim(),
@@ -114,15 +103,7 @@ export function OidcSection({
         // means "leave it alone" and one control cannot honestly mean both.)
         ...(secret.trim() ? { client_secret: secret.trim() } : {}),
       });
-      setCfg(next);
       setSecret("");
-      // Re-read the links: changing the issuer re-keys which of them still apply, and the list
-      // rendered above is otherwise a stale answer to a question the save just changed.
-      try {
-        setIdentities(await admin.oidcIdentities());
-      } catch {
-        /* the list is advisory here; the save itself already succeeded */
-      }
       toast.success("Provider saved");
     } catch (e) {
       toast.error(errorMessage(e));
@@ -134,12 +115,10 @@ export function OidcSection({
   const link = async () => {
     setLinking(true);
     try {
-      setIdentities(
-        await admin.linkOidcIdentity({
-          subject: linkSubject.trim(),
-          account_id: linkAccountId.trim(),
-        }),
-      );
+      await linkMutation.mutateAsync({
+        subject: linkSubject.trim(),
+        account_id: linkAccountId.trim(),
+      });
       setLinkSubject("");
       setLinkAccountId("");
       toast.success("Identity linked");
@@ -162,7 +141,7 @@ export function OidcSection({
     if (!ok) return;
     setUnlinking(rowKey(i));
     try {
-      setIdentities(await admin.unlinkOidcIdentity(i.subject, i.issuer));
+      await unlinkMutation.mutateAsync({ subject: i.subject, issuer: i.issuer });
       toast.success("Identity unlinked");
     } catch (e) {
       toast.error(errorMessage(e));

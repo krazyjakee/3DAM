@@ -2,8 +2,16 @@
 // feeds both this pane and the group pane. Only mounted while the `user_accounts` flag is on; the
 // routes 404 while it is off.
 
-import { useCallback, useEffect, useState } from "react";
-import { admin, type AccountInfo, type GroupInfo } from "@/api/admin";
+import { useState } from "react";
+import type { AccountInfo } from "@/api/admin";
+import {
+  useAdminAccounts,
+  useAdminGroups,
+  useCreateAdminAccount,
+  useDeleteAdminAccount,
+  useRevokeAdminAccountSessions,
+  useUpdateAdminAccount,
+} from "@/api/admin-queries";
 import type { AccountRole } from "@/api/types";
 import { useDialogs } from "@/lib/dialogs";
 import { errorMessage, toast } from "@/lib/toast";
@@ -16,45 +24,25 @@ const ROLES: AccountRole[] = ["admin", "editor", "viewer"];
 /** Loads accounts + groups once (they cross-reference: group membership lists accounts) and feeds
  *  both admin panes. Only mounted while the `user_accounts` flag is on — the routes 404 off. */
 export function AccountsAndGroups({ currentAccountId }: { currentAccountId: string | null }) {
-  const [accounts, setAccounts] = useState<AccountInfo[] | null>(null);
-  const [groups, setGroups] = useState<GroupInfo[] | null>(null);
-  const [accountsError, setAccountsError] = useState<string | null>(null);
-  const [groupsError, setGroupsError] = useState<string | null>(null);
-
-  const load = useCallback(async () => {
-    await Promise.all([
-      admin.accounts().then(
-        (value) => {
-          setAccounts(value);
-          setAccountsError(null);
-        },
-        (error) => setAccountsError(errorMessage(error)),
-      ),
-      admin.groups().then(
-        (value) => {
-          setGroups(value);
-          setGroupsError(null);
-        },
-        (error) => setGroupsError(errorMessage(error)),
-      ),
-    ]);
-  }, []);
-  useEffect(() => {
-    void load();
-  }, [load]);
+  const accountsQuery = useAdminAccounts();
+  const groupsQuery = useAdminGroups();
+  const accounts = accountsQuery.data ?? null;
+  const groups = groupsQuery.data ?? null;
+  const accountsError = accountsQuery.error ? errorMessage(accountsQuery.error) : null;
+  const groupsError = groupsQuery.error ? errorMessage(groupsQuery.error) : null;
 
   return (
     <>
       <AdminSectionState
         name="Accounts"
-        loading={!accounts && !accountsError}
+        loading={accountsQuery.isPending}
         error={accountsError}
       >
         {accounts && (
-          <AccountsSection accounts={accounts} currentAccountId={currentAccountId} onChange={load} />
+          <AccountsSection accounts={accounts} currentAccountId={currentAccountId} />
         )}
       </AdminSectionState>
-      <AdminSectionState name="Groups" loading={!groups && !groupsError} error={groupsError}>
+      <AdminSectionState name="Groups" loading={groupsQuery.isPending} error={groupsError}>
         {groups && (
           <>
             {!accounts && accountsError && (
@@ -63,7 +51,7 @@ export function AccountsAndGroups({ currentAccountId }: { currentAccountId: stri
                 and editing will return when the Accounts section can be loaded.
               </DependencyNote>
             )}
-            <GroupsSection groups={groups} accounts={accounts} onChange={load} />
+            <GroupsSection groups={groups} accounts={accounts} />
           </>
         )}
       </AdminSectionState>
@@ -74,14 +62,16 @@ export function AccountsAndGroups({ currentAccountId }: { currentAccountId: stri
 export function AccountsSection({
   accounts,
   currentAccountId,
-  onChange,
 }: {
   accounts: AccountInfo[];
   /** The signed-in account (from /whoami), so its row is flagged — don't lock yourself out. */
   currentAccountId: string | null;
-  onChange: () => void;
 }) {
   const { confirm, prompt } = useDialogs();
+  const createMutation = useCreateAdminAccount();
+  const updateMutation = useUpdateAdminAccount();
+  const deleteMutation = useDeleteAdminAccount();
+  const revokeSessionsMutation = useRevokeAdminAccountSessions();
   // Conflicts (409 — e.g. the last-admin guard) and other failures surface here, visibly, instead
   // of only as a transient toast.
   const [err, setErr] = useState<string | null>(null);
@@ -97,7 +87,6 @@ export function AccountsSection({
     setErr(null);
     try {
       const msg = await fn();
-      onChange();
       if (msg) toast.success(msg);
     } catch (e) {
       setErr(errorMessage(e));
@@ -110,11 +99,10 @@ export function AccountsSection({
     setCreating(true);
     setErr(null);
     try {
-      const a = await admin.createAccount({ username: username.trim(), password, role });
+      const a = await createMutation.mutateAsync({ username: username.trim(), password, role });
       setUsername("");
       setPassword("");
       setRole("viewer");
-      onChange();
       toast.success(`Account “${a.username}” created`);
     } catch (e) {
       setErr(errorMessage(e));
@@ -133,7 +121,7 @@ export function AccountsSection({
     });
     if (!pw) return;
     void run(`pw:${a.account_id}`, async () => {
-      await admin.updateAccount(a.account_id, { password: pw });
+      await updateMutation.mutateAsync({ id: a.account_id, request: { password: pw } });
       return "Password reset";
     });
   };
@@ -152,7 +140,7 @@ export function AccountsSection({
     )
       return;
     void run(`sess:${a.account_id}`, async () => {
-      const r = await admin.revokeAccountSessions(a.account_id);
+      const r = await revokeSessionsMutation.mutateAsync(a.account_id);
       return `Signed out ${r.revoked} session${r.revoked === 1 ? "" : "s"}`;
     });
   };
@@ -171,7 +159,7 @@ export function AccountsSection({
     )
       return;
     void run(`del:${a.account_id}`, async () => {
-      await admin.deleteAccount(a.account_id);
+      await deleteMutation.mutateAsync(a.account_id);
       return "Account deleted";
     });
   };
@@ -248,7 +236,10 @@ export function AccountsSection({
                 disabled={rowBusy}
                 onChange={(v) =>
                   void run(`role:${a.account_id}`, async () => {
-                    await admin.updateAccount(a.account_id, { role: v as AccountRole });
+                    await updateMutation.mutateAsync({
+                      id: a.account_id,
+                      request: { role: v as AccountRole },
+                    });
                     return null;
                   })
                 }
@@ -260,7 +251,10 @@ export function AccountsSection({
                   disabled={rowBusy}
                   onChange={(v) =>
                     void run(`dis:${a.account_id}`, async () => {
-                      await admin.updateAccount(a.account_id, { disabled: !v });
+                      await updateMutation.mutateAsync({
+                        id: a.account_id,
+                        request: { disabled: !v },
+                      });
                       return null;
                     })
                   }
