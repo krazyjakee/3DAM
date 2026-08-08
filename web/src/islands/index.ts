@@ -34,6 +34,8 @@ export interface ModelViewerHandle {
   setWireframe(on: boolean): void;
   /** New canvas backing size in device pixels — call on container resize (CSS owns layout). */
   resize(width: number, height: number): void;
+  /** Mark the current scene dirty so the next animation frame presents it. */
+  requestRedraw(): void;
   /** Whether a model has loaded (vs the empty neutral background). */
   hasModel(): boolean;
   /** Effective 4×/2×/1× MSAA count selected for the active backend. */

@@ -146,6 +146,14 @@ impl ModelViewer {
         inner.dirty = true;
     }
 
+    /// Ask the dirty-driven render loop to present another frame without changing viewer state.
+    /// The DOM wrapper uses this after its asynchronous canvas/surface size hand-off completes so
+    /// the first loaded frame cannot be stranded behind a compositor or resize transition.
+    #[wasm_bindgen(js_name = requestRedraw)]
+    pub fn request_redraw(&self) {
+        self.inner.borrow_mut().dirty = true;
+    }
+
     /// The backend actually chosen — `"webgpu"` or `"webgl2"`. For the web client to log/telemeter
     /// which path a browser took.
     #[wasm_bindgen(getter)]

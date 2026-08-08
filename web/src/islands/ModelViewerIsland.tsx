@@ -103,6 +103,18 @@ export function ModelViewerIsland({ src }: { src: string }) {
     setMessage("");
     setDiagnostics(null);
     fitCanvas(canvas, container);
+    // Canvas backing dimensions and the size configured on the GPU surface are separate state.
+    // A ResizeObserver notification may arrive while `createModelViewer` is still awaiting GPU
+    // setup; remember only sizes actually handed to a live handle so that notification cannot be
+    // swallowed merely because `fitCanvas` already changed canvas.width/height.
+    let appliedSurfaceSize: { w: number; h: number } | null = null;
+
+    const syncViewerSize = (handle: ModelViewerHandle) => {
+      const { w, h } = fitCanvas(canvas, container);
+      if (appliedSurfaceSize?.w === w && appliedSurfaceSize.h === h) return;
+      handle.resize(w, h);
+      appliedSurfaceSize = { w, h };
+    };
 
     const applyPose = (pose: ViewerPose) => {
       camRef.current = pose;
@@ -218,8 +230,8 @@ export function ModelViewerIsland({ src }: { src: string }) {
     };
 
     const ro = new ResizeObserver(() => {
-      const { w, h, changed } = fitCanvas(canvas, container);
-      if (changed && handleRef.current) handleRef.current.resize(w, h);
+      fitCanvas(canvas, container);
+      if (handleRef.current) syncViewerSize(handleRef.current);
     });
 
     (async () => {
@@ -230,6 +242,9 @@ export function ModelViewerIsland({ src }: { src: string }) {
           return;
         }
         handleRef.current = h;
+        // `fitCanvas` may have run from ResizeObserver before the async handle existed. Always
+        // establish the GPU surface's authoritative size once it does.
+        syncViewerSize(h);
         const res = await fetch(src, { signal: abort.signal });
         if (!res.ok) throw new Error(`preview ${res.status}`);
         const bytes = new Uint8Array(await res.arrayBuffer());
@@ -286,6 +301,11 @@ export function ModelViewerIsland({ src }: { src: string }) {
   useEffect(() => {
     if (status === "ready") handleRef.current?.setWireframe(wireframe);
   }, [wireframe, status]);
+  useEffect(() => {
+    // Rendering is dirty-driven. Invalidate after React has committed the ready state so the first
+    // loaded scene is presented without requiring a pointer event to wake the canvas.
+    if (status === "ready") handleRef.current?.requestRedraw();
+  }, [status]);
 
   // Auto-orbit: a rAF turntable that advances yaw and drives the shared camera. Stops on toggle-off
   // and unmount. Manual drag still composes — both mutate `camRef`.
