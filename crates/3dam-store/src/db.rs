@@ -179,6 +179,14 @@ impl std::fmt::Debug for Db {
 }
 
 impl Db {
+    #[cfg(feature = "ann")]
+    pub(crate) fn path(&self) -> Option<&Path> {
+        match self {
+            Db::File { path, .. } => Some(path),
+            Db::Memory { .. } => None,
+        }
+    }
+
     /// Open (creating if needed) the catalog at `path`: writer now, readers lazily.
     pub(crate) fn open_file(path: &Path) -> Result<Db, LibError> {
         Db::open_file_with_readers(path, reader_limit())

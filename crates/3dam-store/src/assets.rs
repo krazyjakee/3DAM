@@ -6,8 +6,8 @@ use crate::helpers::*;
 pub(crate) struct UpsertOutcome {
     pub(crate) id: AssetId,
     pub(crate) inserted: bool,
-    /// The upsert deleted this row's embeddings (a reclassification). The ANN cache generation
-    /// must be bumped by whoever commits, never before.
+    /// The upsert deleted this row's embeddings (a reclassification). The ANN lifecycle worker
+    /// must be woken by whoever commits, never before.
     pub(crate) dropped_embeddings: bool,
 }
 
@@ -30,10 +30,7 @@ impl Store {
             .map_err(internal)?;
         let out = Self::upsert_asset_in(&tx, a)?;
         tx.commit().map_err(internal)?;
-        if out.dropped_embeddings {
-            self.embed_gen
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
+        self.wake_ann(out.dropped_embeddings);
         Ok((out.id, out.inserted))
     }
 
@@ -41,9 +38,8 @@ impl Store {
     ///
     /// Deliberately opens **no** transaction and bumps **no** generation: both belong to whoever
     /// owns the enclosing statement group. `dropped_embeddings` travels back in
-    /// [`UpsertOutcome`] instead of being applied here, because bumping `embed_gen` for a write
-    /// that then rolls back (an item savepoint, a batch abort) would discard a still-valid cached
-    /// ANN index for nothing.
+    /// [`UpsertOutcome`] instead of being applied here, because waking the lifecycle for a write
+    /// that then rolls back would do needless reconciliation work.
     pub(crate) fn upsert_asset_in(
         tx: &Connection,
         a: &NewAsset,

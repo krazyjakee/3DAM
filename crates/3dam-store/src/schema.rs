@@ -163,7 +163,7 @@ pub const MIGRATIONS: &[&str] = &[
     // so V3 only adds the vector index. One row per (asset, embedding-space): the normalised f32
     // embedding is stored as little-endian bytes, tagged with the space id + extractor version so a
     // model bump can invalidate just its slice (§2.1, §3.1, §7.2). Similarity is a brute-force cosine
-    // scan over this table by default — correct and exact; the scale path is an `instant-distance`
+    // scan over this table by default — correct and exact; the scale path is a `usearch`
     // HNSW sidecar over these same rows, behind the `ann` feature (see `crate::ann`, ADR 0016).
     // Storage layout owned here per tech-spec 02.
     r#"
@@ -1091,6 +1091,123 @@ pub const MIGRATIONS: &[&str] = &[
             manual_count = manual_count + excluded.manual_count;
     END;
     "#,
+    // ── V27: durable per-space ANN lifecycle (issue #141) ────────────────────────────────
+    // SQLite embeddings remain canonical. A persisted HNSW is an immutable base at
+    // `indexed_generation`; this compact latest-change journal overlays inserts, updates, and
+    // tombstones until the background compactor atomically publishes a newer base. Triggers are
+    // deliberately feature-independent so a published base stays current even when an exact-scan
+    // build later writes the catalog, including cascaded asset/source deletions. Before the first
+    // base, only the generation is maintained: canonical rows are copied by the initial build, so
+    // retaining one journal row per embedding would only bloat ANN-disabled catalogs. Writes that
+    // race that initial snapshot are journalled while lifecycle='building'.
+    r#"
+    CREATE TABLE ann_space_state (
+        space_id           TEXT PRIMARY KEY,
+        generation         INTEGER NOT NULL,
+        indexed_generation INTEGER NOT NULL DEFAULT 0,
+        format_version     INTEGER NOT NULL DEFAULT 1,
+        lifecycle          TEXT NOT NULL DEFAULT 'pending'
+                           CHECK(lifecycle IN ('pending', 'building', 'ready', 'recovering')),
+        last_error         TEXT,
+        updated_at         INTEGER NOT NULL
+    ) STRICT;
+    CREATE TABLE ann_delta (
+        space_id   TEXT NOT NULL REFERENCES ann_space_state(space_id) ON DELETE CASCADE,
+        asset_id   BLOB NOT NULL,
+        generation INTEGER NOT NULL,
+        operation  TEXT NOT NULL CHECK(operation IN ('upsert', 'delete')),
+        PRIMARY KEY(space_id, asset_id)
+    ) STRICT;
+    CREATE INDEX idx_ann_delta_space_generation ON ann_delta(space_id, generation);
+
+    -- Near-duplicate review ids are opaque hashes. Remember the exact server-computed membership
+    -- returned with each page so a later mutation validates against that bounded listing snapshot
+    -- instead of rebuilding a potentially different component inside the write transaction.
+    CREATE TABLE near_duplicate_review_snapshot (
+        review_key TEXT PRIMARY KEY,
+        scan_id    TEXT NOT NULL,
+        space_id   TEXT NOT NULL REFERENCES ann_space_state(space_id) ON DELETE CASCADE,
+        generation INTEGER NOT NULL,
+        created_at INTEGER NOT NULL
+    ) STRICT;
+    CREATE INDEX idx_near_review_snapshot_created ON near_duplicate_review_snapshot(created_at);
+    CREATE TABLE near_duplicate_review_member (
+        review_key TEXT NOT NULL REFERENCES near_duplicate_review_snapshot(review_key)
+                            ON DELETE CASCADE,
+        asset_id   BLOB NOT NULL REFERENCES asset(id) ON DELETE CASCADE,
+        PRIMARY KEY(review_key, asset_id)
+    ) STRICT;
+    CREATE INDEX idx_near_review_member_asset ON near_duplicate_review_member(asset_id);
+    CREATE TABLE near_duplicate_scan_member (
+        scan_id    TEXT NOT NULL,
+        space_id   TEXT NOT NULL REFERENCES ann_space_state(space_id) ON DELETE CASCADE,
+        generation INTEGER NOT NULL,
+        asset_id   BLOB NOT NULL REFERENCES asset(id) ON DELETE CASCADE,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY(scan_id, space_id, asset_id)
+    ) STRICT;
+    CREATE INDEX idx_near_scan_member_created ON near_duplicate_scan_member(created_at);
+    CREATE INDEX idx_near_scan_member_asset ON near_duplicate_scan_member(asset_id);
+
+    INSERT INTO ann_space_state(space_id, generation, indexed_generation, updated_at)
+    SELECT space_id, 1, 0, unixepoch('subsec') * 1000 FROM embedding GROUP BY space_id;
+    CREATE TRIGGER ann_embedding_ai AFTER INSERT ON embedding BEGIN
+        INSERT INTO ann_space_state(space_id, generation, indexed_generation, updated_at)
+        VALUES(new.space_id, 1, 0, unixepoch('subsec') * 1000)
+        ON CONFLICT(space_id) DO UPDATE SET
+            generation = generation + 1, updated_at = excluded.updated_at;
+        INSERT INTO ann_delta(space_id, asset_id, generation, operation)
+        SELECT new.space_id, new.asset_id, generation, 'upsert'
+          FROM ann_space_state WHERE space_id = new.space_id
+            AND (indexed_generation > 0 OR lifecycle = 'building')
+        ON CONFLICT(space_id, asset_id) DO UPDATE SET
+            generation = excluded.generation, operation = excluded.operation;
+    END;
+    CREATE TRIGGER ann_embedding_ad AFTER DELETE ON embedding BEGIN
+        INSERT INTO ann_space_state(space_id, generation, indexed_generation, updated_at)
+        VALUES(old.space_id, 1, 0, unixepoch('subsec') * 1000)
+        ON CONFLICT(space_id) DO UPDATE SET
+            generation = generation + 1, updated_at = excluded.updated_at;
+        INSERT INTO ann_delta(space_id, asset_id, generation, operation)
+        SELECT old.space_id, old.asset_id, generation, 'delete'
+          FROM ann_space_state WHERE space_id = old.space_id
+            AND (indexed_generation > 0 OR lifecycle = 'building')
+        ON CONFLICT(space_id, asset_id) DO UPDATE SET
+            generation = excluded.generation, operation = excluded.operation;
+    END;
+    CREATE TRIGGER ann_embedding_au_same AFTER UPDATE ON embedding
+    WHEN old.space_id = new.space_id BEGIN
+        UPDATE ann_space_state SET generation = generation + 1,
+            updated_at = unixepoch('subsec') * 1000 WHERE space_id = new.space_id;
+        INSERT INTO ann_delta(space_id, asset_id, generation, operation)
+        SELECT new.space_id, new.asset_id, generation, 'upsert'
+          FROM ann_space_state WHERE space_id = new.space_id
+            AND (indexed_generation > 0 OR lifecycle = 'building')
+        ON CONFLICT(space_id, asset_id) DO UPDATE SET
+            generation = excluded.generation, operation = excluded.operation;
+    END;
+    CREATE TRIGGER ann_embedding_au_move AFTER UPDATE ON embedding
+    WHEN old.space_id <> new.space_id BEGIN
+        UPDATE ann_space_state SET generation = generation + 1,
+            updated_at = unixepoch('subsec') * 1000 WHERE space_id = old.space_id;
+        INSERT INTO ann_delta(space_id, asset_id, generation, operation)
+        SELECT old.space_id, old.asset_id, generation, 'delete'
+          FROM ann_space_state WHERE space_id = old.space_id
+            AND (indexed_generation > 0 OR lifecycle = 'building')
+        ON CONFLICT(space_id, asset_id) DO UPDATE SET
+            generation = excluded.generation, operation = excluded.operation;
+        INSERT INTO ann_space_state(space_id, generation, indexed_generation, updated_at)
+        VALUES(new.space_id, 1, 0, unixepoch('subsec') * 1000)
+        ON CONFLICT(space_id) DO UPDATE SET
+            generation = generation + 1, updated_at = excluded.updated_at;
+        INSERT INTO ann_delta(space_id, asset_id, generation, operation)
+        SELECT new.space_id, new.asset_id, generation, 'upsert'
+          FROM ann_space_state WHERE space_id = new.space_id
+            AND (indexed_generation > 0 OR lifecycle = 'building')
+        ON CONFLICT(space_id, asset_id) DO UPDATE SET
+            generation = excluded.generation, operation = excluded.operation;
+    END;
+    "#,
 ];
 
 #[cfg(test)]
@@ -1644,5 +1761,98 @@ mod tests {
         store.repair_aggregates().unwrap();
         store.repair_aggregates().unwrap();
         assert_aggregate_integrity(&store.read().unwrap());
+    }
+
+    #[test]
+    fn ann_lifecycle_migration_backfills_and_tracks_each_space_transactionally() {
+        let mut conn = db_at(26);
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        conn.execute_batch(
+            "INSERT INTO source(id,name,kind,connection,created_at,updated_at)
+             VALUES(x'01','one','local_fs','{}',0,0);
+             INSERT INTO asset(id,source_id,path,filename,scanned_at,media_type,format,
+                               created_at,updated_at)
+             VALUES(x'21',x'01','a.png','a.png',0,'image','png',0,0);
+             INSERT INTO embedding(asset_id,space_id,media_type,dim,vec,extractor,created_at)
+             VALUES(x'21','image@v1','image',2,x'0000803f00000000','test@1',0);",
+        )
+        .unwrap();
+        conn.execute_batch(MIGRATIONS[26]).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT generation,indexed_generation,lifecycle FROM ann_space_state
+                  WHERE space_id='image@v1'",
+                [],
+                |row| Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?
+                )),
+            )
+            .unwrap(),
+            (1, 0, "pending".into())
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM ann_delta", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "an ANN-disabled catalog does not retain a redundant full-copy journal"
+        );
+
+        conn.execute(
+            "UPDATE embedding SET vec=x'000000000000803f' WHERE asset_id=x'21'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT generation FROM ann_space_state WHERE space_id='image@v1'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM ann_delta", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+
+        conn.execute(
+            "UPDATE ann_space_state SET lifecycle='building' WHERE space_id='image@v1'",
+            [],
+        )
+        .unwrap();
+
+        let tx = conn.transaction().unwrap();
+        tx.execute("DELETE FROM embedding WHERE asset_id=x'21'", [])
+            .unwrap();
+        tx.rollback().unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT generation FROM ann_space_state WHERE space_id='image@v1'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            2,
+            "rolled-back trigger effects must not advance lifecycle"
+        );
+
+        conn.execute("DELETE FROM embedding WHERE asset_id=x'21'", [])
+            .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT s.generation,operation FROM ann_space_state s JOIN ann_delta d USING(space_id)
+                  WHERE s.space_id='image@v1' AND d.asset_id=x'21'",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap(),
+            (3, "delete".into())
+        );
     }
 }

@@ -1,127 +1,105 @@
-# ADR 0016 — Vector index backend: an `instant-distance` HNSW sidecar; `sqlite-vec` dropped
+# ADR 0016 — Vector index backend: a `usearch` HNSW sidecar; `sqlite-vec` dropped
 
-Status: **Accepted** · Date: 2026-08-05 · Deciders: 3DAM core
-Supersedes: the backend half of the [vector-index spike](../../spikes/vector-index/README.md)'s verdict (2026-07-06) as recorded in PRODUCT_SPEC §10 · Related: [ADR 0011](0011-assimp-import-backend.md) (the one native-toolchain dependency we do carry), [ADR 0015](0015-video-decode-backend.md) (the last time we declined a second one), [ADR 0006](0006-inference-runtime-candle.md) (what produces the vectors), [tech-spec 02 §7](../tech-spec/02-data-model-and-storage.md) (storage framing), [tech-spec 05 §3](../tech-spec/05-analysis-similarity-dedup.md) (query semantics), issues [#182](https://github.com/krazyjakee/3DAM/issues/182), [#141](https://github.com/krazyjakee/3DAM/issues/141) (index persistence)
+Status: **Accepted; amended after #141 tripped the original scale-revisit trigger** · Date:
+2026-08-05 · Amended: 2026-08-08 · Deciders: 3DAM core
+
+Related: [the vector-index spike](../../spikes/vector-index/README.md),
+[tech-spec 02 §7](../tech-spec/02-data-model-and-storage.md),
+[tech-spec 05 §3](../tech-spec/05-analysis-similarity-dedup.md), and issues
+[#182](https://github.com/krazyjakee/3DAM/issues/182) and
+[#141](https://github.com/krazyjakee/3DAM/issues/141).
 
 ## Context
 
-The [vector-index spike](../../spikes/vector-index/README.md) benchmarked two ways to serve
-"find similar" at the 1M-asset target, and the numbers were decisive. At 1M × 512-d, K=10:
+The spike established that an HNSW sidecar is the viable shape at 1M × 512 dimensions. Its
+reference `usearch` run built in 153 s and served raw K=10 in 0.48 ms; raising `ef_search` from 64
+to 256 moved raw recall from 85% to 100%. `sqlite-vec` 0.1.9 was an exact scan at 726 ms/query,
+slower than the existing 68 ms in-process exact cosine scan, so it has no primary-index or rerank
+role.
 
-| engine | build | query p50 | recall@10 | disk / memory |
-|---|---|---|---|---|
-| `usearch` (HNSW, ef=64) | 153 s | **0.48 ms** | 85 % (→ 100 % at ef=256) | 2196 MB in-mem |
-| `sqlite-vec` 0.1.9 (`vec0`) | 15.6 s | **726 ms** | 100 % | 2076 MB on-disk |
-| rayon brute-force baseline | — | **68 ms** | 100 % | — |
+The first version of this ADR selected pure-Rust `instant-distance` to avoid another C++ build.
+Issue #141 then measured that choice at the acceptance scale:
 
-PRODUCT_SPEC §10 wrote that up as *"sidecar HNSW (`usearch`) as the primary index, `sqlite-vec`
-for small libraries / exact re-rank."*
+| backend, 1M × 512 | build | lookup p50 | recall@10 | sidecar | graph/process memory |
+|---|---:|---:|---:|---:|---:|
+| `instant-distance` 0.6 | 1,173 s | 1.607 ms raw K=10 | 89.6% | 2.388 GB | 4.419 GiB process RSS |
+| spike `usearch` 2.25, f32/M16/ef128/64 | 153 s | 0.48 ms raw K=10 | 85% | ~2.2 GB | ~2.2 GB |
 
-**The shipped engine does neither.** `crates/3dam-store/src/ann.rs` wraps `instant-distance`'s
-HNSW behind the off-by-default `ann` Cargo feature; the default similarity path is the exact
-rayon cosine scan in `similarity.rs`, which is also the ground truth the ANN parity test checks
-against. Issue #141, which scopes index persistence and incremental maintenance, keeps that
-backend. So the spec has named one crate and the tree has shipped another for a full phase, and
-every downstream issue inherits the ambiguity. That divergence — not a performance problem — is
-what this ADR closes.
-
-It is worth being precise about what the spike settled and what it did not.
-
-- **It settled the *shape*, durably.** `sqlite-vec` 0.1.x's `vec0` is an exact linear scan with no
-  ANN graph at all; 726 ms/query at 1M is ~1500× off any "instant" budget. An HNSW graph held
-  beside the catalog, not an exact scan inside it, is the only structure that reaches the target.
-  Nothing here revises that.
-- **It did not price the backend.** `usearch` is the crate the spike benchmarked because it is the
-  reference HNSW implementation, not because a build-and-packaging review had been done on it. It
-  is a C++ library behind a `cxx` FFI bridge with a cmake build script. We carry exactly one
-  dependency of that class today — Assimp ([ADR 0011](0011-assimp-import-backend.md)) — and it is
-  the sole reason `.cargo/config.toml` exists at all. [ADR 0015](0015-video-decode-backend.md)
-  declined to take a second one for video poster frames. Release CI cross-builds four targets on
-  three OSes (#45), and `cargo xtask ci` *runs* dam-store's `ann` tests rather than merely linting
-  them; both of those get more expensive the moment the index needs a C++ toolchain.
-- **`instant-distance` is the same algorithm without that bill.** One pure-Rust crate, no build
-  script, no system library, no cross-compilation story to maintain — it builds wherever `rustc`
-  does. Same HNSW, same cosine metric over the same L2-normalised vectors.
+`instant-distance` missed build time, recall, sidecar size, and resident-memory bars by decisive
+margins. That was the ADR's explicit replacement trigger, not an optional optimization.
 
 ## Decision
 
-**Ship an `instant-distance` HNSW sidecar as the vector index. Do not take `usearch`. Drop
-`sqlite-vec` entirely.**
+Ship a pinned **`usearch = 2.25.3`** HNSW sidecar behind the off-by-default `ann` Cargo feature.
+Drop `instant-distance` and continue to exclude `sqlite-vec`.
 
-1. **The index shape is unchanged and is not up for revision.** An HNSW graph, **one logical index
-   per `EmbeddingSpace`** (tech-spec 05 §3.1 — image/audio/shape are never mixed), cosine metric
-   over L2-normalised vectors, **derived and rebuildable** from the `embedding` table (schema V3).
-   Losing the index is a re-index, never data loss.
-2. **The implementation crate is `instant-distance`** (`crates/3dam-store/src/ann.rs`), chosen for
-   being one pure-Rust crate with no build script and no C++ toolchain, which `usearch` is not.
-3. **It stays behind the off-by-default `ann` Cargo feature.** The exact rayon cosine scan remains
-   the default path, the fallback when the feature is off, and the parity ground truth. Golden
-   rule 4 applies to capabilities; this one is a build-time accelerator with an unchanged API, and
-   the parity test is what lets the store swap it in without changing results.
-4. **`sqlite-vec` is dropped, not reserved — including as the exact re-rank stage.** Both roles the
-   spike held open for it are already filled, better, by code we ship. The in-process rayon scan
-   over `embedding` measured **68 ms/query at 1M** in the same spike run: ~**10× faster than
-   `sqlite-vec`'s own exact scan** (726 ms) at identical 100 % recall, over vectors that are
-   already in `library.db`, with no loadable extension, no second copy of every vector, and no C
-   amalgamation compiled by a build script. A dependency that is dominated on latency, ties on
-   recall, and adds build weight has no role left to play. Exact re-rank over an ANN candidate set,
-   when we want it, is a dot-product loop over a few hundred vectors — not a database extension.
-5. **Vectors' canonical home stays the `embedding` table in `library.db`**, preserving tech-spec 02
-   §7's portability invariant (copy one file, get a complete library). `vectors/` holds only
-   derived index artefacts.
+- Keep one immutable graph per `EmbeddingSpace`; image, audio, and shape vectors never mix.
+- Use cosine distance over L2-normalised vectors, f16 graph storage, `M=16`,
+  `ef_construction=256`, and `ef_search=2048`.
+- For a requested K, retrieve `max(64, K×8)` approximate candidates (plus the bounded durable
+  overlay, capped at 8,192), then fetch current f32 vectors from SQLite and exact-rerank them.
+  Quantisation therefore affects candidate recall, never final score precision.
+- SQLite remains canonical. Schema V27 transactionally records each space's generation and latest
+  upsert/tombstone overlay. A background worker snapshots and builds outside interactive database
+  critical sections, fsyncs a checksummed/versioned generation sidecar, and atomically publishes it
+  while preserving newer deltas.
+- A missing, corrupt, wrong-version, wrong-backend, wrong-space, wrong-shape, or native-failed
+  sidecar is never published as a ready empty graph. Build errors leave exact fallback active;
+  lookup errors evict the process cache and return to exact fallback while the worker reloads or
+  rebuilds.
+- The feature remains off by default. The exact rayon cosine scan is the no-feature path, recovery
+  path, and parity ground truth.
+
+## Scale evidence
+
+The checked-in harness uses deterministic clusters with known exact top-10 truth and measures the
+same 80-candidate over-fetch used by a product K=10 query. Final results on a shared Linux host with
+31 GiB RAM were:
+
+| vectors × dims | build | ANN lookup p50 | CPU exact rerank p50 | candidate recall@10 | sidecar | graph RSS delta |
+|---:|---:|---:|---:|---:|---:|---:|
+| 100,000 × 512 | 4,575 ms | 4,800 µs | 59 µs | 1.000 | 119,647,296 B | 130,964 KiB |
+| 1,000,000 × 512 | 129,774 ms | 8,817 µs | 67 µs | 0.996 | 1,196,492,412 B | 1,264,320 KiB |
+
+The 1M run used:
+
+```sh
+DAM_ANN_BENCH_SIZE=1000000 DAM_ANN_BENCH_DIM=512 DAM_ANN_BENCH_QUERIES=50 \
+  cargo bench -p dam-store --features ann-bench --bench ann_scale --locked
+```
+
+The 1M JSON reported absolute process RSS of 2,075,664 KiB before build and 3,339,984 KiB with the
+graph, hence the 1,264,320 KiB graph delta. Its 5,774,476 KiB synthetic lifecycle peak deliberately
+retained the 2 GiB canonical input for rerank measurement while also holding encoded and reloaded
+graphs; production drops the build snapshot before publication, so that number is a conservative
+harness peak rather than steady-state graph memory. `exact_rerank_cpu_p50_us` measures in-memory ID
+lookup, f32 cosine, and sorting for 80 candidates; it excludes SQLite retrieval and metadata
+hydration. `ann_lookup_p50_us` is native lookup only. The old spike's 0.48 ms number is raw K=10 at
+`ef_search=64`, so it is not directly comparable to this higher-recall product-candidate query.
+
+The evidence-driven tuning path was also recorded: at 1M, product candidate recall was 0.910 with
+`ef_search=512`, 0.980 with 1024, and 0.996 with 2048; every other final parameter was held fixed.
 
 ## Consequences
 
-- **The store's build stays toolchain-free.** Enabling `ann` adds a crate and nothing else: no
-  cmake, no C++ compiler, no `.cargo/config.toml` entry, no per-target packaging work across the
-  four release legs. It is also why `cargo xtask ci` can afford to *run* the `ann` tests on every
-  leg rather than lint them, which is the only way the "swap HNSW in behind an unchanged API"
-  claim is actually verified.
-- **We accept a coarser recall knob than `usearch`, and no measurement at 1M.** `instant-distance`
-  sets `ef_search` on the `Builder`, so the recall/latency trade is fixed **when the index is
-  built**, not per query — there is no equivalent of the spike's 64→256 sweep at query time. We
-  have no 1M×512 numbers for it at all. This is a real, named gap and #141 owns closing it.
-- **We give up scalar quantization.** `usearch`'s f16/i8 modes (the spike's open follow-up, worth
-  2–4× on the ~2 GB/1M resident footprint) have no `instant-distance` equivalent. That matters for
-  the low-powered serve host, not the workstation, and it is the most likely trigger below.
-- **This ADR fixes the backend, not the lifecycle.** Today the index is an in-memory per-space
-  cache built lazily and invalidated by a global embedding generation
-  (`similarity.rs::ann_for_space`). Persistence, incremental per-space maintenance, atomic swap,
-  corruption recovery, and the 100k/1M recall+latency benchmarks are #141's scope, and they now
-  have a named backend to build against.
-- **The spike's numbers survive as the acceptance bar even though its crate did not.** They are the
-  target `instant-distance` has to hit, and the evidence any replacement would have to beat.
-- **Revisit if** #141's benchmarks show a **measured miss against those numbers** at 1M×512 — a p50
-  materially off **0.48 ms**, a recall that cannot be tuned to ~99 %+ at acceptable latency, or a
-  build time / resident footprint materially worse than **153 s / ~2 GB**. Also revisit if
-  quantization becomes load-bearing for a memory-constrained host. In either case the trade to
-  argue is a *measured* recall/latency/memory win against a cmake + C++ dependency on four
-  cross-built targets, and this ADR is the baseline that change has to beat.
-- **The decision is cheap to reverse, which is part of why the light option is defensible now.**
-  The whole seam is `AnnIndex::build` / `AnnIndex::nearest` in one small module behind one feature
-  flag, with a parity test against the exact scan already guarding the contract. Swapping the graph
-  implementation later is a module-local change, not an architectural one.
+- ANN now meets the acceptance scale: build is below 153 s, candidate recall is above 99%, and
+  graph resident size is below the ~2 GB comparison bar. An ~9 ms native candidate lookup remains
+  comfortably interactive, while exact rerank adds tens of microseconds of CPU work plus database
+  retrieval.
+- `usearch` adds `cxx`, a C++ compiler/build script, and native release-target work. Release CI must
+  continue to compile and run the `ann` feature on every supported target; this cost is accepted
+  because the measured pure-Rust backend failed the product scale.
+- f16 reduces graph/vector storage, but only because the 8× candidate recall guard passed at both
+  acceptance scales. Any change to quantisation, graph degree, construction/search breadth, or
+  over-fetch requires rerunning both scales.
+- Sidecars written by the former backend are rejected by backend/version metadata and rebuilt from
+  SQLite; they are derived data, so this is migration by recovery rather than catalog migration.
+- `sqlite-vec` remains rejected: it is an exact linear scan that duplicates vectors and loses to
+  the exact Rust fallback on measured latency.
 
-## Alternatives considered
+## Revisit triggers
 
-- **`usearch` (the spike's named winner)** — fastest measured by a wide margin, per-query
-  `ef_search` tuning, f16/i8 quantization, mmap/out-of-core. Rejected for v1 on **build weight
-  alone**: a C++ library over a `cxx` bridge with a cmake build script is a second dependency of
-  Assimp's class, paid on every cross-built release target and every CI leg, to buy headroom we
-  have not yet measured ourselves to need. Nothing about the *quality* of the option is disputed —
-  reconsider it under the triggers above, with numbers.
-- **`sqlite-vec`** — one extension, vectors transactional with the catalog, facet joins expressed
-  in plain SQL, 100 % recall, and a "just copy one file" story. Dropped, for two independent
-  reasons: `vec0` in 0.1.x is an exact linear scan with no ANN graph, so it never was a candidate
-  for the primary index; and at 1M it is ~10× slower than the exact scan we already run in-process,
-  so it loses even the small-library and exact-re-rank roles it was reserved for. It is also a C
-  amalgamation built by a build script and needs `load_extension` enabled on an otherwise
-  `bundled` rusqlite — not the free option it looks like.
-- **Exact cosine scan only, no ANN at all** — this is what the default build ships today, and at v1
-  scale it is honest: exact, rayon-parallel, 68 ms/query at 1M, zero extra dependencies. Rejected
-  as the *ceiling* because that cost is per query and does not compose with the interactive dedup
-  and hybrid-search paths that issue several, and because it scales with core count rather than
-  with the data structure. Kept as the default and the fallback rather than discarded.
-- **Deferring the pick again** — rejected on principle. The spec-versus-tree divergence is itself
-  the cost being paid, #141 cannot persist an index without a named backend, and "we benchmarked
-  `usearch` once" is not a decision record.
+Revisit if a supported release target cannot build the pinned native dependency, if representative
+production data falls below 99% candidate recall, if end-to-end SQLite retrieval plus rerank exceeds
+the interactive budget, or if memory-constrained deployments require a smaller graph. Compare any
+replacement against the reproducible 100k and 1M product-candidate harness, not raw K=10 alone.

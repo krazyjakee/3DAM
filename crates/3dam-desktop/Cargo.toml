@@ -42,6 +42,9 @@ tauri-plugin-opener = "2"
 # explicit `restore_state` call.
 tauri-plugin-window-state = "2"
 
+[features]
+ann = ["dam-server/ann"]
+
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { workspace = true, features = ["linux-native-async-persistent", "async-io", "crypto-rust"] }
 

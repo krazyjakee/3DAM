@@ -14,3 +14,7 @@ dam-frontend.workspace = true
 dam-cli.workspace = true
 dam-desktop.workspace = true
 tokio.workspace = true
+
+[features]
+# Opt-in production ANN acceleration; `cargo build -p dam --features ann`.
+ann = ["dam-cli/ann", "dam-desktop/ann"]

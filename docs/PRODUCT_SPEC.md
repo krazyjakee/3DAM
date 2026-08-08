@@ -627,8 +627,8 @@ Choices to be validated by spikes; listed to establish direction, not to lock in
   ([ADR 0005](adr/0005-gui-toolkit-egui.md)) — with **wgpu** for the embedded 3D viewer and
   custom thumbnail/waveform rendering.
 - **Database:** embedded **SQLite** (via `rusqlite`/`sqlx`) for metadata; the vector index for
-  similarity is a **sidecar HNSW** ([spike](../spikes/vector-index/README.md)) built on the
-  pure-Rust **`instant-distance`** crate, with an exact in-process cosine scan as the default and
+  similarity is a **sidecar HNSW** ([spike](../spikes/vector-index/README.md)) built on pinned
+  **`usearch` 2.25.3**, with an exact in-process cosine scan as the default and
   fallback ([ADR 0016](adr/0016-vector-index-backend.md)). Local, single-file, portable.
 - **Audio:** `symphonia` (decode) + FFT/DSP crates (`rustfft`/`realfft`) for feature
   extraction; playback via `cpal`/`rodio`.
@@ -760,8 +760,8 @@ Choices to be validated by spikes; listed to establish direction, not to lock in
   before dims freeze.
 - ~~Vector index: embedded extension vs standalone crate; on-disk vs in-memory at scale.~~
   **Decided:** a **sidecar HNSW** is the primary index, never an exact scan inside SQLite
-  ([spike](../spikes/vector-index/README.md)); the backend crate is **`instant-distance`**
-  (pure Rust, no C++ toolchain) and **`sqlite-vec` is dropped entirely** — the in-process exact
+  ([spike](../spikes/vector-index/README.md)); the backend crate is pinned **`usearch` 2.25.3**
+  (accepted after the pure-Rust alternative failed the 1M scale gate) and **`sqlite-vec` is dropped entirely** — the in-process exact
   cosine scan already beats it ~10× at 1M and covers both the small-library and exact-re-rank
   roles ([ADR 0016](adr/0016-vector-index-backend.md)).
 - ~~Extent of write-back to sources (rename/relocate) vs strictly-read-only default.~~

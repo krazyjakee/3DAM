@@ -222,15 +222,15 @@ view is rendered*.
 ### 3.1 Index
 
 - Similarity uses an **approximate nearest-neighbour (ANN)** index over the normalised
-  embeddings — an **HNSW graph** on the pure-Rust **`instant-distance`** crate
+  embeddings — an **HNSW graph** on pinned **`usearch` 2.25.3**
   ([ADR 0016](../adr/0016-vector-index-backend.md)). Cosine metric (dot product on normalised
   vectors). It sits behind dam-store's off-by-default `ann` feature; the **exact rayon cosine
   scan is the default path, the fallback, and the parity ground truth**.
 - **One logical index per embedding-space id** (§2.1): image, audio, and 3D vectors are never
   mixed in one graph — they're different spaces and different dims. Queries are always
   scoped to a media type's space.
-- The **on-disk persistence and storage layout** of the index (mmap vs in-memory, on-disk
-  format, how vectors associate to asset ids, out-of-core at 1M+) is owned by
+- The **on-disk persistence and storage layout** of the index (versioned/checksummed immutable base,
+  durable per-space delta overlay, background compaction and atomic publication) is owned by
   [02-data-model-and-storage.md](02-data-model-and-storage.md) and revisited for scale in
   [14](14-concurrency-performance-reliability.md). This file owns query semantics.
 
@@ -343,6 +343,27 @@ them be adjusted, because "duplicate" is a judgement call the user disposes (DES
   auto-deletes (PRODUCT_SPEC §6.2, DESIGN_GUIDELINES §1.2, §6).
 - The review view (PRODUCT_SPEC §6.3) reads these groups via the API (03). Federated near-dups
   can appear cross-peer where spaces match (§3.4), deferred to 07.
+- Near-duplicate reads use a bounded 2,000-row keyset seed page. With `ann`, each seed expands through
+  bounded HNSW candidates (8,192 discovered-node ceiling per media/space partition of a page), rechecks the exact cosine from
+  current SQLite vectors, and filters media/dimension/visibility before union. The cursor advances
+  by `(media, space, asset id)`, so later spaces remain reachable without a global first-N window or
+  a request-time catalog scan. An expansion ceiling is reported as partial and its truncated
+  component is not returned.
+- Without a safe ANN base, exact fallback computes true connected components when the complete
+  eligible set fits within the 2,000-row bound. Larger sets advance through stable keyset windows
+  and are explicitly **partial**: edges crossing window boundaries can be omitted, so no response
+  claims catalog-wide completeness. This is a bounded fail-soft path, not an unbounded request-time
+  reconstruction of the graph.
+- An ANN pagination cursor is bound to the published base generation and its scan history. If that
+  base disappears or changes before the next page, the cursor is invalid and the client must
+  restart the scan; the server must not silently reset to exact window zero under the same scan id,
+  which could repeat groups already emitted by ANN.
+- A returned near group records only its bounded visible member page in a server-created review
+  snapshot. That snapshot is tied to the embedding-space generation, expires after 15 minutes, and
+  is invalidated by any embedding change; destructive review therefore cannot authorize against a
+  stale or differently filtered recomputation. Each cursor also carries a distinct scan id whose
+  member history suppresses overlaps only within that pagination session, never across another
+  visibility scope or refresh. Old snapshots and scan history are cleaned after 24 hours.
 
 ---
 
@@ -503,12 +524,12 @@ Carried from PRODUCT_SPEC §10 and rolled up in [00-overview.md](00-overview.md)
   before dims freeze. Still gated on the `Embedder` contract (§2.1), so any swap is a `model_version`
   bump (§7).
 - ~~**Inference runtime pick**~~ — **Decided: `candle`** ([ADR 0006](../adr/0006-inference-runtime-candle.md), 2026-07-06), `ort` as a feature-gated fallback. Only the *concrete models* (above) remain open.
-- ~~**Vector index choice** (§3.1)~~ — **Decided 2026-08-05** ([ADR 0016](../adr/0016-vector-index-backend.md)):
-  a sidecar **HNSW on `instant-distance`** (pure Rust, no C++ toolchain), **`sqlite-vec` dropped**
+- ~~**Vector index choice** (§3.1)~~ — **Decided 2026-08-05; scale-amended 2026-08-08** ([ADR 0016](../adr/0016-vector-index-backend.md)):
+  a sidecar **HNSW on `usearch` 2.25.3**, **`sqlite-vec` dropped**
   entirely — the in-process exact cosine scan already beats its 726 ms/query at 1M by ~10×, so it
-  loses even the exact-re-rank role. **Remaining:** persistence and incremental maintenance, plus
-  the 100k/1M recall+latency numbers that would trigger a revisit (issue
-  [#141](https://github.com/krazyjakee/3DAM/issues/141)). Storage layout is 02's; the
+  loses even the exact-re-rank role. Persistence, incremental maintenance, exact candidate rerank,
+  corruption recovery, and the reproducible 100k/1M harness were implemented by issue
+  [#141](https://github.com/krazyjakee/3DAM/issues/141). Storage layout is 02's; the
   perf/out-of-core call is shared with [14](14-concurrency-performance-reliability.md).
 - ~~**Cross-peer similarity** (§3.4)~~ — **Decided 2026-07-06** ([`spikes/cross-peer-similarity/`](../../spikes/cross-peer-similarity/README.md)):
   **advertise the `EmbeddingSpace` `space_id` and gate cross-peer ranking on exact match**; fall

@@ -20,10 +20,11 @@ tracing.workspace = true
 blake3.workspace = true
 # Optional HNSW ANN index (semantic-search M6). Off by default: the brute-force cosine scan is exact
 # and adequate at v1 scale. The `ann` feature swaps in an approximate index for large embedding
-# spaces (100k+), keeping brute-force as the fallback. `instant-distance` is the decided backend
-# (docs/adr/0016-vector-index-backend.md): one pure-Rust crate, no build script and no C++
-# toolchain, which the spike's faster `usearch` is not. `sqlite-vec` was dropped outright.
-instant-distance = { version = "0.6.1", optional = true }
+# spaces (100k+), keeping brute-force as the fallback. `usearch` is the scale-qualified backend
+# (docs/adr/0016-vector-index-backend.md); `sqlite-vec` was dropped outright.
+usearch = { version = "=2.25.3", optional = true }
+bincode = { version = "1.3", optional = true }
+rayon = { version = "1", optional = true }
 
 [dev-dependencies]
 # The connection-pool tests (src/db.rs) need a real file-backed catalog; in-memory stores are
@@ -33,4 +34,10 @@ tempfile.workspace = true
 [features]
 # HNSW nearest-neighbour acceleration for similarity/hybrid search (M6). See src/ann.rs and
 # docs/adr/0016-vector-index-backend.md.
-ann = ["dep:instant-distance"]
+ann = ["dep:usearch", "dep:bincode", "dep:rayon"]
+ann-bench = ["ann"]
+
+[[bench]]
+name = "ann_scale"
+harness = false
+required-features = ["ann-bench"]

@@ -187,36 +187,16 @@ impl Store {
     ) -> Result<Vec<(AssetId, f32)>, LibError> {
         #[cfg(feature = "ann")]
         {
-            match self.ann_for_space(space_id) {
-                Ok(index) => Ok(index.nearest(qvec, k)),
-                Err(_) => Ok(Vec::new()), // empty/absent space
+            if let Some(ids) = self.ann_candidate_ids(space_id, qvec, k)? {
+                return self.exact_rank_candidates(space_id, qvec, &ids, k);
             }
+            // Startup/corruption recovery has no published base yet. Exact scan is a correctness
+            // fallback only; the lifecycle worker is already rebuilding outside this request.
+            self.exact_nearest_in_space(space_id, qvec, k)
         }
         #[cfg(not(feature = "ann"))]
         {
-            // Read the space, hand the connection back, *then* score it.
-            let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-            {
-                let conn = self.read()?;
-                let mut stmt = conn
-                    .prepare("SELECT asset_id, vec FROM embedding WHERE space_id = ?1")
-                    .map_err(internal)?;
-                let mapped = stmt
-                    .query_map(params![space_id], |r| {
-                        Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?))
-                    })
-                    .map_err(internal)?;
-                for r in mapped {
-                    rows.push(r.map_err(internal)?);
-                }
-            }
-            let mut scored: Vec<(AssetId, f32)> = Vec::new();
-            for (idb, vb) in rows {
-                scored.push((blob_to_asset_id(&idb), cosine(qvec, &bytes_to_f32(&vb))));
-            }
-            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            scored.truncate(k);
-            Ok(scored)
+            self.exact_nearest_in_space(space_id, qvec, k)
         }
     }
 
@@ -230,9 +210,8 @@ impl Store {
         self_id: &AssetId,
         k: usize,
     ) -> Result<Vec<(AssetId, f32)>, LibError> {
-        let index = self.ann_for_space(space_id)?;
-        let mut out: Vec<(AssetId, f32)> = index
-            .nearest(qvec, k + 1)
+        let mut out: Vec<(AssetId, f32)> = self
+            .nearest_in_space(space_id, qvec, k + 1)?
             .into_iter()
             .filter(|(id, _)| id != self_id)
             .collect();
@@ -240,55 +219,186 @@ impl Store {
         Ok(out)
     }
 
-    /// Get (or lazily build + cache) the HNSW index for a space (M6). Rebuilt when an embedding
-    /// write has bumped `embed_gen` since the cached copy.
-    ///
-    /// **Checks out its own read connection, so no caller may hold one** (the debug guard-depth
-    /// check panics otherwise, and on an in-memory store a nested acquisition would hang). Building
-    /// an HNSW over a whole space is the single heaviest CPU step in the store, and a read guard
-    /// pins a WAL snapshot for its whole lifetime — a cold build under the caller's guard would keep
-    /// the write-ahead log growing for the duration (issue #137 step 5). So the SELECT runs under a
-    /// guard of its own, that guard is dropped, and `AnnIndex::build` runs against the owned copy.
-    /// The index therefore reflects the snapshot at SELECT time, not the caller's.
+    /// Bounded approximate candidates from the published base plus durable incremental upserts.
+    /// `None` means there is no safe base yet (startup/recovery/oversized overlay), so the caller
+    /// uses exact fallback. No index is ever built on this path.
     #[cfg(feature = "ann")]
-    fn ann_for_space(
+    pub(crate) fn ann_candidate_ids(
         &self,
         space_id: &str,
-    ) -> Result<std::sync::Arc<crate::ann::AnnIndex>, LibError> {
-        use std::sync::atomic::Ordering;
-        let generation = self.embed_gen.load(Ordering::Relaxed);
-        if let Some((g, idx)) = self.ann_cache.lock().unwrap().get(space_id) {
-            if *g == generation {
-                return Ok(idx.clone());
+        qvec: &[f32],
+        requested: usize,
+    ) -> Result<Option<Vec<AssetId>>, LibError> {
+        let conn = self.read()?;
+        self.ann_candidate_ids_in(&conn, space_id, qvec, requested)
+    }
+
+    #[cfg(feature = "ann")]
+    pub(crate) fn ann_candidate_ids_in(
+        &self,
+        conn: &Connection,
+        space_id: &str,
+        qvec: &[f32],
+        requested: usize,
+    ) -> Result<Option<Vec<AssetId>>, LibError> {
+        const ANN_CANDIDATE_MAX: usize = 8_192;
+        let Some(manager) = &self.ann else {
+            return Ok(None);
+        };
+        let Some(base) = manager.cached(space_id) else {
+            manager.kick();
+            return Ok(None);
+        };
+        let mut overlay = Vec::new();
+        let mut indexed_generation = None;
+        // Publication commits the new base generation and removes its journal before swapping the
+        // process cache. The state row and bounded journal are deliberately read by one statement:
+        // two autocommit SELECTs on the same connection would still observe separate SQLite
+        // snapshots and could combine an old cached base with an already-cleared new journal.
+        let mut stmt = conn
+            .prepare(
+                "SELECT state.indexed_generation, delta.asset_id, delta.operation
+                   FROM (SELECT indexed_generation FROM ann_space_state WHERE space_id=?1) state
+                   LEFT JOIN (
+                     SELECT asset_id, operation FROM ann_delta
+                      WHERE space_id=?1 AND generation>?2
+                      ORDER BY generation DESC LIMIT ?3
+                   ) delta ON TRUE",
+            )
+            .map_err(internal)?;
+        let rows = stmt
+            .query_map(
+                params![
+                    space_id,
+                    base.generation,
+                    (crate::ann::OVERLAY_CANDIDATE_MAX + 1) as i64
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<Vec<u8>>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .map_err(internal)?;
+        for row in rows {
+            let (generation, id, operation) = row.map_err(internal)?;
+            indexed_generation = Some(generation);
+            if let (Some(id), Some(operation)) = (id, operation) {
+                overlay.push((blob_to_asset_id(&id), operation));
             }
         }
-        // (Re)build from the space's current vectors, off the connection.
-        let mut items: Vec<(AssetId, Vec<f32>)> = Vec::new();
+        if indexed_generation != Some(base.generation) {
+            manager.kick();
+            return Ok(None);
+        }
+        if overlay.len() > crate::ann::OVERLAY_CANDIDATE_MAX {
+            manager.kick();
+            return Ok(None);
+        }
+        // Every changed base point can consume one approximate slot at its stale location (updates
+        // and tombstones alike). Search past all of them, then append live upserts explicitly.
+        let budget = requested
+            .saturating_mul(8)
+            .max(64)
+            .saturating_add(overlay.len())
+            .min(ANN_CANDIDATE_MAX);
+        let mut ids = match base.index.as_ref() {
+            Some(index) => match index.candidates(qvec, budget) {
+                Ok(ids) => ids,
+                Err(error) => {
+                    tracing::warn!(space_id, %error, "ANN lookup failed; evicting base for exact fallback");
+                    manager.evict(space_id);
+                    return Ok(None);
+                }
+            },
+            None => Vec::new(),
+        };
+        ids.extend(
+            overlay
+                .into_iter()
+                .filter_map(|(id, operation)| (operation == "upsert").then_some(id)),
+        );
+        ids.sort_unstable();
+        ids.dedup();
+        Ok(Some(ids))
+    }
+
+    fn exact_nearest_in_space(
+        &self,
+        space_id: &str,
+        qvec: &[f32],
+        k: usize,
+    ) -> Result<Vec<(AssetId, f32)>, LibError> {
+        let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         {
             let conn = self.read()?;
             let mut stmt = conn
                 .prepare("SELECT asset_id, vec FROM embedding WHERE space_id = ?1")
                 .map_err(internal)?;
-            let rows = stmt
-                .query_map(params![space_id], |r| {
-                    Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?))
-                })
+            let mapped = stmt
+                .query_map(params![space_id], |r| Ok((r.get(0)?, r.get(1)?)))
                 .map_err(internal)?;
-            for r in rows {
-                let (idb, vb) = r.map_err(internal)?;
-                items.push((blob_to_asset_id(&idb), bytes_to_f32(&vb)));
+            for row in mapped {
+                rows.push(row.map_err(internal)?);
             }
         }
-        let idx = std::sync::Arc::new(
-            crate::ann::AnnIndex::build(items)
-                .ok_or_else(|| LibError::Internal("empty embedding space".into()))?,
-        );
-        self.ann_cache
-            .lock()
-            .unwrap()
-            .insert(space_id.to_string(), (generation, idx.clone()));
-        Ok(idx)
+        let mut scored: Vec<_> = rows
+            .into_iter()
+            .map(|(id, vector)| (blob_to_asset_id(&id), cosine(qvec, &bytes_to_f32(&vector))))
+            .collect();
+        sort_scored(&mut scored);
+        scored.truncate(k);
+        Ok(scored)
     }
+
+    #[cfg(feature = "ann")]
+    fn exact_rank_candidates(
+        &self,
+        space_id: &str,
+        qvec: &[f32],
+        ids: &[AssetId],
+        k: usize,
+    ) -> Result<Vec<(AssetId, f32)>, LibError> {
+        let mut vectors = Vec::new();
+        for chunk in ids.chunks(400) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT asset_id, vec FROM embedding WHERE space_id=? AND asset_id IN ({placeholders})"
+            );
+            let mut values = vec![Value::Text(space_id.to_string())];
+            values.extend(chunk.iter().map(|id| Value::Blob(id.as_bytes().to_vec())));
+            let conn = self.read()?;
+            let mut stmt = conn.prepare(&sql).map_err(internal)?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(values.iter()), |row| {
+                    Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })
+                .map_err(internal)?;
+            for row in rows {
+                vectors.push(row.map_err(internal)?);
+            }
+        }
+        let mut scored: Vec<_> = vectors
+            .into_iter()
+            .map(|(id, vector)| (blob_to_asset_id(&id), cosine(qvec, &bytes_to_f32(&vector))))
+            .collect();
+        sort_scored(&mut scored);
+        scored.truncate(k);
+        Ok(scored)
+    }
+}
+
+fn sort_scored(scored: &mut [(AssetId, f32)]) {
+    scored.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
 }
 
 /// Decode a little-endian f32 blob (an embedding row's `vec`).

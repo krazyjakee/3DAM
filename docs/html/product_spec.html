@@ -801,7 +801,7 @@ can read and set it too — so nothing is browser-only and a headless operator i
   custom thumbnail/waveform rendering.</li>
 <li><strong>Database:</strong> embedded <strong>SQLite</strong> (via <code>rusqlite</code>/<code>sqlx</code>) for metadata; the vector index for
   similarity is a <strong>sidecar HNSW</strong> (<a href="../spikes/vector-index/README.md">spike</a>) built on the
-  pure-Rust <strong><code>instant-distance</code></strong> crate, with an exact in-process cosine scan as the default and
+  pinned <strong><code>usearch</code> 2.25.3</strong> crate, with an exact in-process cosine scan as the default and
   fallback (<a href="adr/0016-vector-index-backend.md">ADR 0016</a>). Local, single-file, portable.</li>
 <li><strong>Audio:</strong> <code>symphonia</code> (decode) + FFT/DSP crates (<code>rustfft</code>/<code>realfft</code>) for feature
   extraction; playback via <code>cpal</code>/<code>rodio</code>.</li>
@@ -900,8 +900,8 @@ build phasing; where a step mentions a GUI or web client, that web-first orderin
   before dims freeze.</li>
 <li>~~Vector index: embedded extension vs standalone crate; on-disk vs in-memory at scale.~~
   <strong>Decided:</strong> a <strong>sidecar HNSW</strong> is the primary index, never an exact scan inside SQLite
-  (<a href="../spikes/vector-index/README.md">spike</a>); the backend crate is <strong><code>instant-distance</code></strong>
-  (pure Rust, no C++ toolchain) and <strong><code>sqlite-vec</code> is dropped entirely</strong> — the in-process exact
+  (<a href="../spikes/vector-index/README.md">spike</a>); the backend crate is pinned <strong><code>usearch</code> 2.25.3</strong>
+  (accepted after the pure-Rust alternative failed the 1M scale gate) and <strong><code>sqlite-vec</code> is dropped entirely</strong> — the in-process exact
   cosine scan already beats it ~10× at 1M and covers both the small-library and exact-re-rank
   roles (<a href="adr/0016-vector-index-backend.md">ADR 0016</a>).</li>
 <li>~~Extent of write-back to sources (rename/relocate) vs strictly-read-only default.~~

@@ -62,6 +62,8 @@ keyring = { workspace = true, features = ["apple-native"] }
 keyring = { workspace = true, features = ["windows-native"] }
 
 [features]
+# Persistent per-embedding-space HNSW indexes (ADR 0016). Exact scan remains the default.
+ann = ["dam-store/ann"]
 # 3D model thumbnails via the wgpu renderer. Pulls wgpu in transitively — enabled by `serve`, kept
 # off for lean CLI/GUI builds where the honest typed tile is the intended 3D grid affordance.
 render = ["dep:dam-render"]

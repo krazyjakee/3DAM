@@ -63,9 +63,11 @@ struct FeatureProfile {
 /// `:1220`, `:1257`, `:1285`) — a different algorithm behind the same API, which is exactly the kind
 /// of substitution a type check cannot vouch for. Its own tests in `src/ann.rs` were dead code here.
 ///
-/// Deliberately only `ann`: it pulls one pure-Rust crate (`instant-distance`). The other
-/// off-by-default features need external toolchains (Assimp for `render`/`model-convert`, live
-/// servers for `sftp`/`smb`), so running their tests would make this gate depend on the host.
+/// Deliberately only `ann`: its `usearch` backend requires the C++ toolchain already required by
+/// supported release/CI hosts, and backend parity is load-bearing enough to execute on every leg.
+/// Other off-by-default features need additional external systems (Assimp for
+/// `render`/`model-convert`, live servers for `sftp`/`smb`), so running their tests would make this
+/// gate depend on more than the standard build host.
 const FEATURE_TESTS: &[&[&str]] = &[&["test", "-p", "dam-store", "--features", "ann", "--locked"]];
 
 fn feature_tests() -> bool {

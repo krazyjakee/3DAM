@@ -4,13 +4,82 @@
 use super::*;
 use crate::helpers::*;
 use crate::similarity::{bytes_to_f32, cosine};
+use base64::Engine as _;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 const NEAR_DUP_COSINE: f32 = 0.92;
-const NEAR_DUP_CANDIDATE_MAX: usize = 2_000;
+// ANN seeds are deliberately much wider than one response page: HNSW supplies the bounded
+// candidate edges, so this does not turn into an O(n^2) request. The same established bound keeps
+// exact fallback complete for ordinary catalogs without materialising a scale catalog or emitting
+// overlapping fragments that pretend to be global connected components.
+const NEAR_DUP_SEED_PAGE: usize = 2_000;
+#[cfg(feature = "ann")]
+const NEAR_DUP_EXPANSION_MAX: usize = 8_192;
+const NEAR_DUP_EXPANSION_CURSOR_MAX: usize = 8_192;
+const NEAR_DUP_CURSOR_PREFIX: &str = "n3.";
 type NearCandidate = (AssetId, String, String, Vec<f32>);
+#[cfg(feature = "ann")]
+type NearNeighbour = (AssetId, Vec<f32>);
 type NearComponent = (String, String, Vec<AssetId>);
 type NearPartitions = BTreeMap<(String, String, usize), Vec<(AssetId, Vec<f32>)>>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum NearDupMode {
+    Ann,
+    Exact,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+struct NearDupKey {
+    media: String,
+    space: String,
+    id: String,
+}
+
+impl NearDupKey {
+    fn from_candidate(candidate: &NearCandidate) -> Self {
+        Self {
+            media: candidate.2.clone(),
+            space: candidate.1.clone(),
+            id: candidate.0.to_string(),
+        }
+    }
+
+    fn asset_id(&self) -> Result<AssetId, LibError> {
+        self.id
+            .parse()
+            .map_err(|_| LibError::BadRequest("invalid near-duplicate cursor id".into()))
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct NearDupCursor {
+    version: u8,
+    scan_id: String,
+    media: Option<String>,
+    mode: Option<NearDupMode>,
+    after: Option<NearDupKey>,
+    right_after: Option<NearDupKey>,
+    component_offset: usize,
+}
+
+struct NearDupWindow {
+    components: Vec<NearComponent>,
+    generations: BTreeMap<String, i64>,
+    current: NearDupCursor,
+    next: Option<NearDupCursor>,
+    suppress_existing_overlap: bool,
+}
+
+#[derive(Clone)]
+struct NearDupBlock {
+    candidates: Vec<NearCandidate>,
+    generations: BTreeMap<String, i64>,
+    has_next: bool,
+    end: Option<NearDupKey>,
+}
 
 struct DupGroupSeed<'a> {
     kind: DupKind,
@@ -32,7 +101,6 @@ impl Store {
     ) -> Result<Page<DupGroup>, LibError> {
         let mut groups: Vec<DupGroup> = Vec::new();
         let limit = req.limit.clamp(1, DUP_GROUP_PAGE_MAX) as usize;
-        let has_more;
         let mut next_cursor = None;
         let mut partial = dam_api::PartialStatus::default();
 
@@ -69,7 +137,7 @@ impl Store {
                 let mut exact: Vec<(Vec<u8>, u32)> = rows
                     .collect::<rusqlite::Result<Vec<_>>>()
                     .map_err(internal)?;
-                has_more = exact.len() > limit;
+                let has_more = exact.len() > limit;
                 exact.truncate(limit);
                 if has_more {
                     next_cursor = exact
@@ -151,68 +219,15 @@ impl Store {
                 }
             }
             DupKind::Near => {
-                let offset = decode_near_dup_cursor(req.after.as_ref(), NEAR_DUP_CANDIDATE_MAX)?;
-                // Compare only embeddings from the same declared space and media. The old flat
-                // candidate list compared unrelated dimensions (for example image stats against
-                // document text) whenever "All media" was selected, manufacturing groups from a
-                // signal that had no meaning. A media appears in near review only if it has rows in
-                // a real embedding space; exact review remains independent and covers all five.
-                let mut sql = String::from(
-                    "SELECT e.asset_id, e.space_id, e.media_type, e.vec
-                       FROM embedding e JOIN asset a ON a.id = e.asset_id",
-                );
-                let mut where_sql = String::from(" WHERE 1=1");
-                let mut binds: Vec<Value> = Vec::new();
-                if let Some(m) = req.media {
-                    where_sql.push_str(" AND e.media_type = ?");
-                    binds.push(Value::Text(m.as_str().to_string()));
+                let cursor = decode_near_dup_cursor(req.after.as_ref(), req.media)?;
+                let window = self.near_duplicate_window(cursor, req.media, vis, &mut partial)?;
+                let offset = window.current.component_offset;
+                if offset > window.components.len() {
+                    return Err(LibError::BadRequest(
+                        "near-duplicate cursor is outside its comparison window".into(),
+                    ));
                 }
-                push_visibility(vis, "a", &mut where_sql, &mut binds);
-                sql.push_str(&where_sql);
-                sql.push_str(" ORDER BY e.media_type, e.space_id, e.asset_id LIMIT ?");
-                binds.push(Value::Integer((NEAR_DUP_CANDIDATE_MAX + 1) as i64));
-                // Scoped: the pairwise union-find below is CPU work over up to
-                // `NEAR_DUP_CANDIDATE_MAX` vectors, and a read guard pins a WAL snapshot for as long
-                // as it lives. The candidates are owned by then, so the connection goes back to the
-                // pool first and a second guard hydrates the surviving members.
-                let mut candidates = Vec::new();
-                {
-                    let conn = self.read()?;
-                    let mut stmt = conn.prepare(&sql).map_err(internal)?;
-                    let rows = stmt
-                        .query_map(rusqlite::params_from_iter(binds.iter()), |r| {
-                            Ok((
-                                r.get::<_, Vec<u8>>(0)?,
-                                r.get::<_, String>(1)?,
-                                r.get::<_, String>(2)?,
-                                r.get::<_, Vec<u8>>(3)?,
-                            ))
-                        })
-                        .map_err(internal)?;
-                    for r in rows {
-                        let (id_blob, space, media, vbytes) = r.map_err(internal)?;
-                        candidates.push((
-                            blob_to_asset_id(&id_blob),
-                            space,
-                            media,
-                            bytes_to_f32(&vbytes),
-                        ));
-                    }
-                }
-                if candidates.len() > NEAR_DUP_CANDIDATE_MAX {
-                    candidates.truncate(NEAR_DUP_CANDIDATE_MAX);
-                    partial.complete = false;
-                    partial.warnings.push(dam_api::ItemWarning {
-                        subject: "near-duplicates".into(),
-                        code: "duplicate_candidates_capped".into(),
-                        message: format!(
-                            "near-duplicate analysis is capped at {NEAR_DUP_CANDIDATE_MAX} candidates"
-                        ),
-                    });
-                }
-
-                let computed = near_components(candidates);
-                let remaining = computed.get(offset..).unwrap_or_default();
+                let remaining = &window.components[offset..];
                 let all_ids: Vec<AssetId> = remaining
                     .iter()
                     .flat_map(|(_, _, ids)| ids.iter().take(DUP_GROUP_MEMBER_MAX).copied())
@@ -220,11 +235,21 @@ impl Store {
                 let conn = self.read()?;
                 let member_details = Self::duplicate_members_for_ids(&conn, &all_ids, vis)?;
                 let mut consumed = 0usize;
+                let mut remembered = Vec::new();
                 for (_media, space, ids) in remaining {
                     consumed += 1;
                     let member_ids: Vec<AssetId> =
                         ids.iter().take(DUP_GROUP_MEMBER_MAX).copied().collect();
                     let review = near_review_id(space, ids);
+                    let generation = window.generations.get(space).copied().ok_or_else(|| {
+                        LibError::Internal(format!("missing seed generation for {space:?}"))
+                    })?;
+                    remembered.push((
+                        review.clone(),
+                        space.clone(),
+                        generation,
+                        member_ids.clone(),
+                    ));
                     if let Some(g) = Self::build_dup_group_from_summaries(
                         DupGroupSeed {
                             kind: DupKind::Near,
@@ -245,10 +270,21 @@ impl Store {
                         }
                     }
                 }
+                drop(conn);
+                let saved_reviews = self.remember_near_duplicate_groups(
+                    &remembered,
+                    &window.current.scan_id,
+                    window.suppress_existing_overlap,
+                )?;
+                groups.retain(|group| saved_reviews.contains(&group.review));
+
                 let next_offset = offset.saturating_add(consumed);
-                has_more = next_offset < computed.len();
-                if has_more {
-                    next_cursor = Some(Cursor(format!("near:{next_offset}")));
+                if next_offset < window.components.len() {
+                    let mut current = window.current;
+                    current.component_offset = next_offset;
+                    next_cursor = Some(encode_near_dup_cursor(current)?);
+                } else if let Some(next) = window.next {
+                    next_cursor = Some(encode_near_dup_cursor(next)?);
                 }
             }
         }
@@ -374,6 +410,274 @@ impl Store {
         Ok(DuplicateReviewOutcome {
             removed_assets: removed.into_iter().collect(),
         })
+    }
+
+    /// Select one bounded near-duplicate comparison window. A scan pins its first successful mode:
+    /// exact fallback stays exact, while an ANN cursor whose graph disappears must be restarted
+    /// because switching component algorithms mid-scan cannot preserve membership semantics.
+    fn near_duplicate_window(
+        &self,
+        cursor: NearDupCursor,
+        media: Option<MediaType>,
+        vis: &Visibility,
+        partial: &mut dam_api::PartialStatus,
+    ) -> Result<NearDupWindow, LibError> {
+        if cursor.mode == Some(NearDupMode::Exact) {
+            return self.near_duplicate_exact_window(cursor, media, vis, partial);
+        }
+
+        #[cfg(feature = "ann")]
+        {
+            let block =
+                load_near_dup_block(self, media, vis, cursor.after.as_ref(), NEAR_DUP_SEED_PAGE)?;
+            if let Some((components, expansion_capped)) =
+                near_components_ann(self, &block.candidates, vis)?
+            {
+                if expansion_capped {
+                    partial.complete = false;
+                    partial.warnings.push(dam_api::ItemWarning {
+                        subject: "near-duplicates".into(),
+                        code: "duplicate_component_expansion_capped".into(),
+                        message: format!(
+                            "near-duplicate component expansion is capped at {NEAR_DUP_EXPANSION_MAX} assets per seed page"
+                        ),
+                    });
+                }
+                let current = NearDupCursor {
+                    mode: Some(NearDupMode::Ann),
+                    right_after: None,
+                    ..cursor
+                };
+                let next = block.has_next.then(|| NearDupCursor {
+                    version: 3,
+                    scan_id: current.scan_id.clone(),
+                    media: current.media.clone(),
+                    mode: Some(NearDupMode::Ann),
+                    after: block.end,
+                    right_after: None,
+                    component_offset: 0,
+                });
+                return Ok(NearDupWindow {
+                    components,
+                    generations: block.generations,
+                    suppress_existing_overlap: current.after.is_some(),
+                    current,
+                    next,
+                });
+            }
+
+            // An ANN cursor describes components and overlap history from one published graph.
+            // Falling back mid-scan cannot be a lossless continuation: the exact component may
+            // strictly contain a previously emitted approximate component, and suppressing that
+            // overlap would hide its newly discovered members. Require a fresh scan instead of
+            // returning a deceptively complete continuation.
+            if cursor.mode == Some(NearDupMode::Ann) {
+                return Err(LibError::BadRequest(
+                    "near-duplicate ANN state changed; restart the scan without its cursor".into(),
+                ));
+            }
+        }
+
+        // No ANN page has been emitted for this scan, so pin the bounded exact-window fallback.
+        let exact = NearDupCursor {
+            version: 3,
+            scan_id: cursor.scan_id,
+            media: cursor.media,
+            mode: Some(NearDupMode::Exact),
+            after: None,
+            right_after: None,
+            component_offset: 0,
+        };
+        self.near_duplicate_exact_window(exact, media, vis, partial)
+    }
+
+    fn near_duplicate_exact_window(
+        &self,
+        mut cursor: NearDupCursor,
+        media: Option<MediaType>,
+        vis: &Visibility,
+        partial: &mut dam_api::PartialStatus,
+    ) -> Result<NearDupWindow, LibError> {
+        cursor.mode = Some(NearDupMode::Exact);
+        cursor.right_after = None;
+        // Copy one bounded window under a SQLite snapshot, then release the guard before cosine
+        // work. Within the 2,000-vector window this preserves the original exact connected-
+        // component semantics. A larger catalog is keyset-paged and explicitly partial: combining
+        // independently scored block pairs would manufacture overlapping, non-global components.
+        let block = {
+            let conn = self.read()?;
+            load_near_dup_block_from_conn(
+                &conn,
+                media,
+                vis,
+                cursor.after.as_ref(),
+                NEAR_DUP_SEED_PAGE,
+            )?
+        };
+
+        if cursor.after.is_some() || block.has_next {
+            partial.complete = false;
+            partial.warnings.push(dam_api::ItemWarning {
+                subject: "near-duplicates".into(),
+                code: "duplicate_exact_seed_page".into(),
+                message: format!(
+                    "without a ready ANN base, near-duplicate components are exact within each {NEAR_DUP_SEED_PAGE}-asset window; cross-window relations may be omitted"
+                ),
+            });
+        }
+        let components = near_components(block.candidates);
+        let next = block.has_next.then(|| NearDupCursor {
+            version: 3,
+            scan_id: cursor.scan_id.clone(),
+            media: cursor.media.clone(),
+            mode: Some(NearDupMode::Exact),
+            after: block.end,
+            right_after: None,
+            component_offset: 0,
+        });
+
+        Ok(NearDupWindow {
+            components,
+            generations: block.generations,
+            current: cursor,
+            next,
+            // Exact pages are disjoint, so suppression cannot hide an intra-page component.
+            suppress_existing_overlap: true,
+        })
+    }
+
+    /// Persist the exact bounded component membership that produced an opaque near-review id.
+    /// Review mutations can then validate against the page the server actually returned instead
+    /// of recomputing under a different ANN generation, visibility scope, or seed page.
+    fn remember_near_duplicate_groups(
+        &self,
+        groups: &[(String, String, i64, Vec<AssetId>)],
+        scan_id: &str,
+        suppress_existing_overlap: bool,
+    ) -> Result<std::collections::HashSet<String>, LibError> {
+        if groups.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let mut conn = self.write();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(internal)?;
+        let recorded_at = now_ms();
+        tx.execute(
+            "DELETE FROM near_duplicate_review_snapshot WHERE created_at < ?1",
+            params![recorded_at - 86_400_000],
+        )
+        .map_err(internal)?;
+        tx.execute(
+            "DELETE FROM near_duplicate_scan_member WHERE created_at < ?1",
+            params![recorded_at - 86_400_000],
+        )
+        .map_err(internal)?;
+        let mut saved = std::collections::HashSet::new();
+        for (review, space, expected_generation, ids) in groups {
+            let current_generation: Option<i64> = tx
+                .query_row(
+                    "SELECT generation FROM ann_space_state WHERE space_id=?1",
+                    params![space],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(internal)?;
+            if current_generation != Some(*expected_generation) {
+                continue;
+            }
+            let scan_generation_changed: bool = tx
+                .query_row(
+                    "SELECT EXISTS(
+                       SELECT 1 FROM near_duplicate_scan_member
+                        WHERE scan_id=?1 AND space_id=?2 AND generation<>?3
+                          AND created_at>=?4
+                     )",
+                    params![scan_id, space, expected_generation, recorded_at - 900_000],
+                    |row| row.get(0),
+                )
+                .map_err(internal)?;
+            if scan_generation_changed {
+                return Err(LibError::BadRequest(
+                    "near-duplicate ANN state changed; restart the scan without its cursor".into(),
+                ));
+            }
+            if suppress_existing_overlap && !ids.is_empty() {
+                let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                let sql = format!(
+                    "SELECT EXISTS(
+                       SELECT 1 FROM near_duplicate_scan_member member
+                      WHERE member.space_id=? AND member.generation=? AND member.scan_id=?
+                        AND member.created_at>=? AND member.asset_id IN ({placeholders})
+                     )"
+                );
+                let mut binds = vec![
+                    Value::Text(space.clone()),
+                    Value::Integer(*expected_generation),
+                    Value::Text(scan_id.to_string()),
+                    Value::Integer(recorded_at - 900_000),
+                ];
+                binds.extend(ids.iter().map(|id| Value::Blob(id.as_bytes().to_vec())));
+                let overlaps: bool = tx
+                    .query_row(&sql, rusqlite::params_from_iter(binds.iter()), |row| {
+                        row.get(0)
+                    })
+                    .map_err(internal)?;
+                if overlaps {
+                    continue;
+                }
+            }
+            tx.execute(
+                "DELETE FROM near_duplicate_review_snapshot WHERE review_key=?1",
+                params![review],
+            )
+            .map_err(internal)?;
+            tx.execute(
+                "INSERT INTO near_duplicate_review_snapshot
+                     (review_key,scan_id,space_id,generation,created_at) VALUES(?1,?2,?3,?4,?5)",
+                params![review, scan_id, space, expected_generation, recorded_at],
+            )
+            .map_err(internal)?;
+            let mut inserted = 0usize;
+            for id in ids {
+                inserted += tx
+                    .execute(
+                        "INSERT INTO near_duplicate_review_member(review_key,asset_id)
+                     SELECT ?1,?2 WHERE EXISTS(SELECT 1 FROM asset WHERE id=?2)",
+                        params![review, id.as_bytes().to_vec()],
+                    )
+                    .map_err(internal)?;
+            }
+            if inserted == ids.len() && inserted >= 2 {
+                for id in ids {
+                    tx.execute(
+                        "INSERT INTO near_duplicate_scan_member
+                             (scan_id,space_id,generation,asset_id,created_at)
+                         VALUES(?1,?2,?3,?4,?5)
+                         ON CONFLICT(scan_id,space_id,asset_id) DO UPDATE SET
+                             generation=excluded.generation,
+                             created_at=excluded.created_at",
+                        params![
+                            scan_id,
+                            space,
+                            expected_generation,
+                            id.as_bytes().to_vec(),
+                            recorded_at
+                        ],
+                    )
+                    .map_err(internal)?;
+                }
+                saved.insert(review.clone());
+            } else {
+                tx.execute(
+                    "DELETE FROM near_duplicate_review_snapshot WHERE review_key=?1",
+                    params![review],
+                )
+                .map_err(internal)?;
+            }
+        }
+        tx.commit().map_err(internal)?;
+        Ok(saved)
     }
 
     /// Set-based exact-duplicate membership for the currently retained browse rows. The request is
@@ -720,6 +1024,87 @@ fn license_rank(status: LicenseStatus) -> u8 {
     }
 }
 
+#[cfg(feature = "ann")]
+fn load_near_dup_block(
+    store: &Store,
+    media: Option<MediaType>,
+    vis: &Visibility,
+    after: Option<&NearDupKey>,
+    size: usize,
+) -> Result<NearDupBlock, LibError> {
+    let conn = store.read()?;
+    load_near_dup_block_from_conn(&conn, media, vis, after, size)
+}
+
+fn load_near_dup_block_from_conn(
+    conn: &Connection,
+    media: Option<MediaType>,
+    vis: &Visibility,
+    after: Option<&NearDupKey>,
+    size: usize,
+) -> Result<NearDupBlock, LibError> {
+    // Compare only embeddings from the same declared space and media. Ordering by the complete
+    // `(media, space, id)` key makes both ANN seed pages and exact pair blocks stable keysets.
+    let mut where_sql = String::from(" WHERE 1=1");
+    let mut binds: Vec<Value> = Vec::new();
+    if let Some(media) = media {
+        where_sql.push_str(" AND e.media_type = ?");
+        binds.push(Value::Text(media.as_str().to_string()));
+    }
+    push_visibility(vis, "a", &mut where_sql, &mut binds);
+    if let Some(after) = after {
+        let id = after.asset_id()?;
+        where_sql.push_str(
+            " AND (e.media_type > ? OR
+                  (e.media_type = ? AND e.space_id > ?) OR
+                  (e.media_type = ? AND e.space_id = ? AND e.asset_id > ?))",
+        );
+        binds.push(Value::Text(after.media.clone()));
+        binds.push(Value::Text(after.media.clone()));
+        binds.push(Value::Text(after.space.clone()));
+        binds.push(Value::Text(after.media.clone()));
+        binds.push(Value::Text(after.space.clone()));
+        binds.push(Value::Blob(id.as_bytes().to_vec()));
+    }
+    let sql = format!(
+        "SELECT e.asset_id, e.space_id, e.media_type, e.vec, state.generation
+           FROM embedding e JOIN asset a ON a.id = e.asset_id
+           JOIN ann_space_state state ON state.space_id=e.space_id
+           {where_sql}
+          ORDER BY e.media_type, e.space_id, e.asset_id LIMIT ?"
+    );
+    binds.push(Value::Integer((size + 1) as i64));
+
+    let mut candidates = Vec::new();
+    let mut generations = BTreeMap::new();
+    let mut stmt = conn.prepare(&sql).map_err(internal)?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(binds.iter()), |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })
+        .map_err(internal)?;
+    for row in rows {
+        let (id, space, media, vector, generation) = row.map_err(internal)?;
+        generations.insert(space.clone(), generation);
+        candidates.push((blob_to_asset_id(&id), space, media, bytes_to_f32(&vector)));
+    }
+    let has_next = candidates.len() > size;
+    candidates.truncate(size);
+    let end = candidates.last().map(NearDupKey::from_candidate);
+    Ok(NearDupBlock {
+        candidates,
+        generations,
+        has_next,
+        end,
+    })
+}
+
 fn near_components(candidates: Vec<NearCandidate>) -> Vec<NearComponent> {
     let mut partitions = NearPartitions::new();
     for (id, space, media, vector) in candidates {
@@ -763,6 +1148,172 @@ fn near_components(candidates: Vec<NearCandidate>) -> Vec<NearComponent> {
     computed
 }
 
+/// Bounded HNSW edge generation followed by the same exact cosine threshold used by the scan
+/// path. Only candidates already admitted by media + visibility SQL may form an edge, so hidden
+/// assets cannot bridge two visible components. `None` requests exact fallback while a base is
+/// being built or recovered.
+#[cfg(feature = "ann")]
+fn near_components_ann(
+    store: &Store,
+    candidates: &[NearCandidate],
+    vis: &Visibility,
+) -> Result<Option<(Vec<NearComponent>, bool)>, LibError> {
+    near_components_ann_with(candidates, |media, space, dimension, vector, count| {
+        ann_near_neighbors(store, media, space, dimension, vector, count, vis)
+    })
+}
+
+#[cfg(feature = "ann")]
+fn ann_near_neighbors(
+    store: &Store,
+    media: &str,
+    space: &str,
+    dimension: usize,
+    vector: &[f32],
+    count: usize,
+    vis: &Visibility,
+) -> Result<Option<Vec<NearNeighbour>>, LibError> {
+    let Some(ids) = store.ann_candidate_ids(space, vector, count)? else {
+        return Ok(None);
+    };
+    let mut vectors = Vec::new();
+    {
+        let conn = store.read()?;
+        for chunk in ids.chunks(400) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let mut where_sql = format!(
+                " WHERE e.space_id=? AND e.media_type=? AND LENGTH(e.vec)=?
+                    AND e.asset_id IN ({placeholders})"
+            );
+            let mut binds = vec![
+                Value::Text(space.to_string()),
+                Value::Text(media.to_string()),
+                Value::Integer((dimension.saturating_mul(4)) as i64),
+            ];
+            binds.extend(chunk.iter().map(|id| Value::Blob(id.as_bytes().to_vec())));
+            push_visibility(vis, "a", &mut where_sql, &mut binds);
+            let sql = format!(
+                "SELECT e.asset_id,e.vec FROM embedding e JOIN asset a ON a.id=e.asset_id {where_sql}"
+            );
+            let mut stmt = conn.prepare(&sql).map_err(internal)?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(binds.iter()), |row| {
+                    Ok((
+                        blob_to_asset_id(&row.get::<_, Vec<u8>>(0)?),
+                        bytes_to_f32(&row.get::<_, Vec<u8>>(1)?),
+                    ))
+                })
+                .map_err(internal)?;
+            for row in rows {
+                vectors.push(row.map_err(internal)?);
+            }
+        }
+    }
+    vectors.sort_by(|(left_id, left), (right_id, right)| {
+        cosine(vector, right)
+            .total_cmp(&cosine(vector, left))
+            .then_with(|| left_id.cmp(right_id))
+    });
+    vectors.truncate(count);
+    Ok(Some(vectors))
+}
+
+#[cfg(feature = "ann")]
+fn near_components_ann_with(
+    candidates: &[NearCandidate],
+    mut find: impl FnMut(
+        &str,
+        &str,
+        usize,
+        &[f32],
+        usize,
+    ) -> Result<Option<Vec<NearNeighbour>>, LibError>,
+) -> Result<Option<(Vec<NearComponent>, bool)>, LibError> {
+    const ANN_NEIGHBOURS: usize = 32; // store overfetches to 256 base candidates, then exact tests
+    let mut partitions = NearPartitions::new();
+    for (id, space, media, vector) in candidates {
+        if !vector.is_empty() {
+            partitions
+                .entry((media.clone(), space.clone(), vector.len()))
+                .or_default()
+                .push((*id, vector.clone()));
+        }
+    }
+
+    let mut computed = Vec::new();
+    let mut expansion_capped = false;
+    for ((media, space, dimension), mut partition) in partitions {
+        let mut positions: std::collections::HashMap<AssetId, usize> = partition
+            .iter()
+            .enumerate()
+            .map(|(index, (id, _))| (*id, index))
+            .collect();
+        let mut uf = UnionFind::new(partition.len());
+        let mut index = 0usize;
+        let mut capped_nodes = std::collections::HashSet::new();
+        while index < partition.len() {
+            let vector = partition[index].1.clone();
+            let Some(neighbours) = find(&media, &space, dimension, &vector, ANN_NEIGHBOURS)? else {
+                return Ok(None);
+            };
+            for (candidate, candidate_vector) in neighbours {
+                if candidate == partition[index].0
+                    || cosine(&vector, &candidate_vector) < NEAR_DUP_COSINE
+                {
+                    continue;
+                }
+                let other = if let Some(&position) = positions.get(&candidate) {
+                    position
+                } else {
+                    if partition.len() == NEAR_DUP_EXPANSION_MAX {
+                        expansion_capped = true;
+                        capped_nodes.insert(index);
+                        continue;
+                    }
+                    let position = partition.len();
+                    partition.push((candidate, candidate_vector));
+                    positions.insert(candidate, position);
+                    uf.push();
+                    position
+                };
+                // kNN is directed: the higher-index point may be the only endpoint that returns
+                // this edge. Union in either direction; UnionFind makes repeated edges harmless.
+                uf.union(index, other);
+            }
+            index += 1;
+        }
+        let capped_roots: std::collections::HashSet<_> = capped_nodes
+            .into_iter()
+            .map(|index| uf.find(index))
+            .collect();
+        for component in uf.components() {
+            if component.len() < 2 {
+                continue;
+            }
+            let root = uf.find(component[0]);
+            if capped_roots.contains(&root) {
+                // Never return a component known to be truncated; unrelated components in this
+                // partition remain valid and are still surfaced with an honest partial warning.
+                continue;
+            }
+            let mut ids: Vec<_> = component
+                .into_iter()
+                .map(|index| partition[index].0)
+                .collect();
+            ids.sort_unstable();
+            ids.dedup();
+            if ids.len() >= 2 {
+                computed.push((media.clone(), space.clone(), ids));
+            }
+        }
+    }
+    computed.sort_by(|a, b| (&a.0, &a.1, &a.2).cmp(&(&b.0, &b.1, &b.2)));
+    Ok(Some((computed, expansion_capped)))
+}
+
 fn near_review_id(space: &str, ids: &[AssetId]) -> String {
     let mut hash = blake3::Hasher::new();
     hash.update(space.as_bytes());
@@ -774,7 +1325,7 @@ fn near_review_id(space: &str, ids: &[AssetId]) -> String {
 
 /// Resolve a review id back to its current server-computed membership. Mutations must never trust
 /// caller-supplied asset ids: an exact review proves the content hash, while a near review is
-/// reconstructed from the same bounded, media/space/dimension-partitioned signal set as listing.
+/// reconstructed from the same complete, media/space/dimension-partitioned signal set as listing.
 fn duplicate_review_members(
     conn: &Connection,
     review: &str,
@@ -806,31 +1357,41 @@ fn duplicate_review_members(
     if !review.starts_with("near:") || review.len() != "near:".len() + 64 {
         return Err(LibError::BadRequest("invalid duplicate review id".into()));
     }
+    let fresh: bool = conn
+        .query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM near_duplicate_review_snapshot snapshot
+               JOIN ann_space_state state ON state.space_id=snapshot.space_id
+              WHERE snapshot.review_key=?1 AND snapshot.generation=state.generation
+                AND snapshot.created_at>=?2
+             )",
+            params![review, now_ms() - 900_000],
+            |row| row.get(0),
+        )
+        .map_err(internal)?;
+    if !fresh {
+        return Err(LibError::BadRequest(
+            "duplicate review group changed; refresh the review page".into(),
+        ));
+    }
     let mut stmt = conn
         .prepare(
-            "SELECT e.asset_id, e.space_id, e.media_type, e.vec
-             FROM embedding e JOIN asset a ON a.id = e.asset_id
-             ORDER BY e.media_type, e.space_id, e.asset_id LIMIT ?1",
+            "SELECT member.asset_id
+               FROM near_duplicate_review_member member
+               JOIN asset ON asset.id=member.asset_id
+              WHERE member.review_key=?1 ORDER BY member.asset_id",
         )
         .map_err(internal)?;
     let rows = stmt
-        .query_map(params![(NEAR_DUP_CANDIDATE_MAX + 1) as i64], |row| {
-            Ok((
-                blob_to_asset_id(&row.get::<_, Vec<u8>>(0)?),
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                bytes_to_f32(&row.get::<_, Vec<u8>>(3)?),
-            ))
+        .query_map(params![review], |row| {
+            Ok(blob_to_asset_id(&row.get::<_, Vec<u8>>(0)?))
         })
         .map_err(internal)?;
-    let mut candidates = rows
-        .collect::<rusqlite::Result<Vec<_>>>()
+    let members = rows
+        .collect::<rusqlite::Result<std::collections::BTreeSet<_>>>()
         .map_err(internal)?;
-    candidates.truncate(NEAR_DUP_CANDIDATE_MAX);
-    for (_media, space, ids) in near_components(candidates) {
-        if near_review_id(&space, &ids) == review {
-            return Ok(ids.into_iter().collect());
-        }
+    if members.len() >= 2 {
+        return Ok(members);
     }
     Err(LibError::BadRequest(
         "duplicate review group is no longer available".into(),
@@ -888,18 +1449,70 @@ fn member_cursor(
     Some(Cursor(format!("members:{size}:{id}")))
 }
 
-fn decode_near_dup_cursor(cursor: Option<&Cursor>, max: usize) -> Result<usize, LibError> {
+fn encode_near_dup_cursor(cursor: NearDupCursor) -> Result<Cursor, LibError> {
+    let payload = serde_json::to_vec(&cursor).map_err(internal)?;
+    Ok(Cursor(format!(
+        "{NEAR_DUP_CURSOR_PREFIX}{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload)
+    )))
+}
+
+fn decode_near_dup_cursor(
+    cursor: Option<&Cursor>,
+    media: Option<MediaType>,
+) -> Result<NearDupCursor, LibError> {
+    let expected_media = media.map(|value| value.as_str().to_string());
     let Some(Cursor(raw)) = cursor else {
-        return Ok(0);
+        return Ok(NearDupCursor {
+            version: 3,
+            scan_id: Uuid::now_v7().to_string(),
+            media: expected_media,
+            mode: None,
+            after: None,
+            right_after: None,
+            component_offset: 0,
+        });
     };
-    let Some(offset) = raw
-        .strip_prefix("near:")
-        .and_then(|part| part.parse::<usize>().ok())
-        .filter(|offset| *offset <= max)
-    else {
-        return Err(LibError::BadRequest("invalid near-duplicate cursor".into()));
+    if raw.len() > 4_096 {
+        return Err(LibError::BadRequest(
+            "near-duplicate cursor is too large".into(),
+        ));
+    }
+    let encoded = raw
+        .strip_prefix(NEAR_DUP_CURSOR_PREFIX)
+        .ok_or_else(|| LibError::BadRequest("invalid near-duplicate cursor version".into()))?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| LibError::BadRequest("invalid near-duplicate cursor encoding".into()))?;
+    let decoded: NearDupCursor = serde_json::from_slice(&bytes)
+        .map_err(|_| LibError::BadRequest("invalid near-duplicate cursor payload".into()))?;
+    let keys_valid = decoded
+        .after
+        .iter()
+        .chain(decoded.right_after.iter())
+        .all(|key| {
+            key.asset_id().is_ok()
+                && expected_media
+                    .as_ref()
+                    .is_none_or(|media| &key.media == media)
+        });
+    let mode_valid = match decoded.mode {
+        Some(NearDupMode::Ann) => decoded.right_after.is_none(),
+        Some(NearDupMode::Exact) => decoded.right_after.is_none(),
+        None => false,
     };
-    Ok(offset)
+    if decoded.version != 3
+        || decoded.scan_id.parse::<Uuid>().is_err()
+        || decoded.media != expected_media
+        || !keys_valid
+        || !mode_valid
+        || decoded.component_offset > NEAR_DUP_EXPANSION_CURSOR_MAX
+    {
+        return Err(LibError::BadRequest(
+            "near-duplicate cursor does not match this request".into(),
+        ));
+    }
+    Ok(decoded)
 }
 
 fn decode_dup_member_cursor(cursor: Option<&Cursor>) -> Result<Option<(u64, AssetId)>, LibError> {
@@ -943,6 +1556,10 @@ impl UnionFind {
             cur = next;
         }
         root
+    }
+    #[cfg(feature = "ann")]
+    fn push(&mut self) {
+        self.parent.push(self.parent.len());
     }
     fn union(&mut self, a: usize, b: usize) {
         let (ra, rb) = (self.find(a), self.find(b));
@@ -1034,6 +1651,84 @@ mod tests {
             })
             .unwrap()
             .0
+    }
+
+    fn exact_fallback_boundary_store(count: usize) -> (Store, AssetId, AssetId) {
+        let store = Store::open_in_memory().unwrap();
+        let source = store
+            .add_source(
+                &SourceConnection::LocalFs {
+                    root: format!("/exact-fallback-{count}"),
+                },
+                "exact fallback",
+                false,
+            )
+            .unwrap();
+        let mut ids: Vec<_> = (0..count)
+            .map(|index| {
+                insert_test_asset(
+                    &store,
+                    source,
+                    &format!("asset-{index:05}.png"),
+                    MediaType::Image,
+                    None,
+                )
+            })
+            .collect();
+        ids.sort_unstable();
+        let first = ids[0];
+        let last = *ids.last().unwrap();
+        for id in ids {
+            let vector = if id == first || id == last {
+                [1.0]
+            } else {
+                [-1.0]
+            };
+            store
+                .set_embedding(&id, "exact-fallback", MediaType::Image, &vector, "test@1")
+                .unwrap();
+        }
+        (store, first, last)
+    }
+
+    fn find_exact_fallback_pair(
+        store: &Store,
+        first: AssetId,
+        last: AssetId,
+        max_pages: usize,
+    ) -> DupGroup {
+        let wanted: std::collections::BTreeSet<_> = [first, last].into_iter().collect();
+        let mut after = None;
+        for _ in 0..max_pages {
+            let page = store
+                .duplicates(
+                    &DupRequest {
+                        after,
+                        ..duplicate_request(DupKind::Near, Some(MediaType::Image))
+                    },
+                    &Visibility::Full,
+                )
+                .unwrap();
+            assert!(
+                page.partial.complete,
+                "ordinary-catalog exact fallback must remain complete"
+            );
+            if let Some(group) = page.items.into_iter().find(|group| {
+                group
+                    .members
+                    .iter()
+                    .map(|member| member.asset.id)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    == wanted
+            }) {
+                return group;
+            }
+            after = page.cursor;
+            if after.is_none() {
+                break;
+            }
+        }
+        panic!("cross-block near-duplicate pair was not reachable")
     }
 
     #[test]
@@ -1199,6 +1894,568 @@ mod tests {
             .map(|member| member.asset.id)
             .collect();
         assert_eq!(ids, [image, matching].into_iter().collect());
+    }
+
+    #[test]
+    fn exact_fallback_is_complete_and_actionable_for_an_ordinary_catalog() {
+        let (store, first, last) = exact_fallback_boundary_store(129);
+        let group = find_exact_fallback_pair(&store, first, last, 3);
+        store
+            .review_duplicate(&DupReviewRequest {
+                review: group.review,
+                state: DupReviewState::Resolved,
+                keep: Some(first),
+                removals: Vec::new(),
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn exact_fallback_marks_cross_window_relations_partial_at_scale() {
+        let (store, first, last) = exact_fallback_boundary_store(2_002);
+        let wanted: std::collections::BTreeSet<_> = [first, last].into_iter().collect();
+        let first_page = store
+            .duplicates(
+                &duplicate_request(DupKind::Near, Some(MediaType::Image)),
+                &Visibility::Full,
+            )
+            .unwrap();
+        assert!(!first_page.partial.complete);
+        assert!(first_page.partial.warnings.iter().any(|warning| {
+            warning.code == "duplicate_exact_seed_page"
+                && warning
+                    .message
+                    .contains("cross-window relations may be omitted")
+        }));
+        assert!(!first_page.items.iter().any(|group| {
+            group
+                .members
+                .iter()
+                .map(|member| member.asset.id)
+                .collect::<std::collections::BTreeSet<_>>()
+                == wanted
+        }));
+        let second_page = store
+            .duplicates(
+                &DupRequest {
+                    after: first_page.cursor,
+                    ..duplicate_request(DupKind::Near, Some(MediaType::Image))
+                },
+                &Visibility::Full,
+            )
+            .unwrap();
+        assert!(!second_page.partial.complete);
+    }
+
+    #[test]
+    fn near_duplicate_visibility_does_not_use_hidden_bridge_assets() {
+        let store = Store::open_in_memory().unwrap();
+        let visible_one = store
+            .add_source(
+                &SourceConnection::LocalFs {
+                    root: "/near-visible-one".into(),
+                },
+                "near visible one",
+                false,
+            )
+            .unwrap();
+        let hidden = store
+            .add_source(
+                &SourceConnection::LocalFs {
+                    root: "/near-hidden".into(),
+                },
+                "near hidden",
+                false,
+            )
+            .unwrap();
+        let visible_two = store
+            .add_source(
+                &SourceConnection::LocalFs {
+                    root: "/near-visible-two".into(),
+                },
+                "near visible two",
+                false,
+            )
+            .unwrap();
+        let first = insert_test_asset(&store, visible_one, "first.png", MediaType::Image, None);
+        let bridge = insert_test_asset(&store, hidden, "bridge.png", MediaType::Image, None);
+        let third = insert_test_asset(&store, visible_two, "third.png", MediaType::Image, None);
+        for (id, vector) in [
+            (first, [1.0, 0.0]),
+            (bridge, [0.9553, 0.2955]),
+            (third, [0.8253, 0.5646]),
+        ] {
+            store
+                .set_embedding(&id, "bridge-space", MediaType::Image, &vector, "test@1")
+                .unwrap();
+        }
+        assert_eq!(
+            store
+                .duplicates(&duplicate_request(DupKind::Near, None), &Visibility::Full)
+                .unwrap()
+                .items[0]
+                .total_members,
+            3
+        );
+
+        let visibility = Visibility::Restricted(dam_api::service::VisibilityScope {
+            sources: [visible_one, visible_two].into_iter().collect(),
+            ..Default::default()
+        });
+        assert!(store
+            .duplicates(&duplicate_request(DupKind::Near, None), &visibility)
+            .unwrap()
+            .items
+            .is_empty());
+    }
+
+    #[test]
+    fn near_duplicate_listing_reaches_spaces_after_the_old_global_window() {
+        let store = Store::open_in_memory().unwrap();
+        let source = store
+            .add_source(
+                &SourceConnection::LocalFs {
+                    root: "/near-complete-catalog".into(),
+                },
+                "near complete catalog",
+                false,
+            )
+            .unwrap();
+        for index in 0..2_001 {
+            let id = insert_test_asset(
+                &store,
+                source,
+                &format!("prefix-{index}.png"),
+                MediaType::Image,
+                None,
+            );
+            store
+                .set_embedding(&id, "a-prefix", MediaType::Image, &[1.0, 0.0], "test@1")
+                .unwrap();
+        }
+        let first = insert_test_asset(&store, source, "later-first.png", MediaType::Image, None);
+        let second = insert_test_asset(&store, source, "later-second.png", MediaType::Image, None);
+        for id in [first, second] {
+            store
+                .set_embedding(&id, "z-target", MediaType::Image, &[0.0, 1.0], "test@1")
+                .unwrap();
+        }
+
+        let mut after = None;
+        let mut found = false;
+        for _ in 0..200 {
+            let page = store
+                .duplicates(
+                    &DupRequest {
+                        after,
+                        ..duplicate_request(DupKind::Near, None)
+                    },
+                    &Visibility::Full,
+                )
+                .unwrap();
+            found |= page.items.iter().any(|group| {
+                let ids: std::collections::BTreeSet<_> =
+                    group.members.iter().map(|member| member.asset.id).collect();
+                ids == [first, second].into_iter().collect()
+            });
+            assert!(
+                !page.partial.complete,
+                "a paged exact fallback must disclose omitted cross-window relations"
+            );
+            after = page.cursor;
+            if after.is_none() {
+                break;
+            }
+        }
+        assert!(found, "keyset pages must eventually reach the later space");
+    }
+
+    #[cfg(feature = "ann")]
+    #[test]
+    fn file_backed_ann_listing_review_token_remains_actionable() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let source = store
+            .add_source(
+                &SourceConnection::LocalFs {
+                    root: "/ann-review".into(),
+                },
+                "ann review",
+                false,
+            )
+            .unwrap();
+        let first = insert_test_asset(
+            &store,
+            source,
+            "ann-review-first.png",
+            MediaType::Image,
+            None,
+        );
+        let second = insert_test_asset(
+            &store,
+            source,
+            "ann-review-second.png",
+            MediaType::Image,
+            None,
+        );
+        store
+            .set_embedding(
+                &first,
+                "ann-review",
+                MediaType::Image,
+                &[1.0, 0.0],
+                "test@1",
+            )
+            .unwrap();
+        store
+            .set_embedding(
+                &second,
+                "ann-review",
+                MediaType::Image,
+                &[0.999, 0.001],
+                "test@1",
+            )
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        loop {
+            if store
+                .ann_candidate_ids("ann-review", &[1.0, 0.0], 2)
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "ANN index did not become queryable"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+
+        let page = store
+            .duplicates(&duplicate_request(DupKind::Near, None), &Visibility::Full)
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        let group = &page.items[0];
+        store
+            .review_duplicate(&DupReviewRequest {
+                review: group.review.clone(),
+                state: DupReviewState::Resolved,
+                keep: Some(group.suggested_keep),
+                removals: Vec::new(),
+            })
+            .unwrap();
+    }
+
+    #[cfg(feature = "ann")]
+    #[test]
+    fn ann_cursor_requires_restart_when_its_base_is_unavailable() {
+        let store = Store::open_in_memory().unwrap();
+        let source = store
+            .add_source(
+                &SourceConnection::LocalFs {
+                    root: "/ann-cursor-restart".into(),
+                },
+                "ann cursor restart",
+                false,
+            )
+            .unwrap();
+        let asset = insert_test_asset(
+            &store,
+            source,
+            "ann-cursor-restart.png",
+            MediaType::Image,
+            None,
+        );
+        store
+            .set_embedding(
+                &asset,
+                "ann-cursor-restart",
+                MediaType::Image,
+                &[1.0, 0.0],
+                "test@1",
+            )
+            .unwrap();
+        let cursor = encode_near_dup_cursor(NearDupCursor {
+            version: 3,
+            scan_id: Uuid::now_v7().to_string(),
+            media: None,
+            mode: Some(NearDupMode::Ann),
+            after: None,
+            right_after: None,
+            component_offset: 0,
+        })
+        .unwrap();
+        let error = store
+            .duplicates(
+                &DupRequest {
+                    after: Some(cursor),
+                    ..duplicate_request(DupKind::Near, None)
+                },
+                &Visibility::Full,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            LibError::BadRequest(message)
+                if message.contains("restart the scan without its cursor")
+        ));
+    }
+
+    #[test]
+    fn near_duplicate_scan_rejects_an_embedding_generation_change() {
+        let store = Store::open_in_memory().unwrap();
+        let source = store
+            .add_source(
+                &SourceConnection::LocalFs {
+                    root: "/near-generation-change".into(),
+                },
+                "near generation change",
+                false,
+            )
+            .unwrap();
+        let first = insert_test_asset(
+            &store,
+            source,
+            "near-generation-first.png",
+            MediaType::Image,
+            None,
+        );
+        let second = insert_test_asset(
+            &store,
+            source,
+            "near-generation-second.png",
+            MediaType::Image,
+            None,
+        );
+        for id in [first, second] {
+            store
+                .set_embedding(
+                    &id,
+                    "near-generation",
+                    MediaType::Image,
+                    &[1.0, 0.0],
+                    "test@1",
+                )
+                .unwrap();
+        }
+        let generation = |store: &Store| {
+            store
+                .read()
+                .unwrap()
+                .query_row(
+                    "SELECT generation FROM ann_space_state WHERE space_id='near-generation'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+        };
+        let scan_id = Uuid::now_v7().to_string();
+        let ids = vec![first, second];
+        let first_review = near_review_id("near-generation", &ids);
+        assert!(store
+            .remember_near_duplicate_groups(
+                &[(
+                    first_review.clone(),
+                    "near-generation".into(),
+                    generation(&store),
+                    ids.clone(),
+                )],
+                &scan_id,
+                true,
+            )
+            .unwrap()
+            .contains(&first_review));
+
+        store
+            .set_embedding(
+                &second,
+                "near-generation",
+                MediaType::Image,
+                &[0.999, 0.001],
+                "test@1",
+            )
+            .unwrap();
+        let error = store
+            .remember_near_duplicate_groups(
+                &[(
+                    near_review_id("near-generation", &ids),
+                    "near-generation".into(),
+                    generation(&store),
+                    ids,
+                )],
+                &scan_id,
+                true,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            LibError::BadRequest(message)
+                if message.contains("restart the scan without its cursor")
+        ));
+    }
+
+    #[cfg(feature = "ann")]
+    #[test]
+    fn file_backed_ann_seed_pages_do_not_repeat_overlapping_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let source = store
+            .add_source(
+                &SourceConnection::LocalFs {
+                    root: "/ann-pages".into(),
+                },
+                "ann pages",
+                false,
+            )
+            .unwrap();
+        for index in 0..(NEAR_DUP_SEED_PAGE + 1) {
+            let id = insert_test_asset(
+                &store,
+                source,
+                &format!("ann-page-{index}.png"),
+                MediaType::Image,
+                None,
+            );
+            store
+                .set_embedding(&id, "ann-pages", MediaType::Image, &[1.0, 0.0], "test@1")
+                .unwrap();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        loop {
+            if store
+                .ann_candidate_ids("ann-pages", &[1.0, 0.0], 2)
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "ANN build timed out");
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+
+        let first = store
+            .duplicates(&duplicate_request(DupKind::Near, None), &Visibility::Full)
+            .unwrap();
+        assert_eq!(first.items.len(), 1);
+        let independent = store
+            .duplicates(&duplicate_request(DupKind::Near, None), &Visibility::Full)
+            .unwrap();
+        assert_eq!(independent.items.len(), 1, "a new scan is independent");
+        let second = store
+            .duplicates(
+                &DupRequest {
+                    after: first.cursor.clone(),
+                    ..duplicate_request(DupKind::Near, None)
+                },
+                &Visibility::Full,
+            )
+            .unwrap();
+        assert!(
+            second.items.is_empty(),
+            "later seed pages must suppress groups overlapping an earlier page"
+        );
+        assert!(second.cursor.is_none());
+        let independent_second = store
+            .duplicates(
+                &DupRequest {
+                    after: independent.cursor,
+                    ..duplicate_request(DupKind::Near, None)
+                },
+                &Visibility::Full,
+            )
+            .unwrap();
+        assert!(
+            independent_second.items.is_empty(),
+            "each scan retains its own overlap history"
+        );
+    }
+
+    #[cfg(feature = "ann")]
+    #[test]
+    fn asymmetric_ann_edge_is_emitted_by_the_page_that_discovers_it() {
+        let id = |suffix: u8| {
+            let mut bytes = [0_u8; 16];
+            bytes[15] = suffix;
+            AssetId::from_bytes(bytes)
+        };
+        let first = id(1);
+        let second = id(2);
+        let vector = |asset: AssetId| match asset {
+            value if value == first => vec![1.0, 0.0],
+            _ => vec![0.99, 0.01],
+        };
+        let neighbours = |query: &[f32]| {
+            if query == vector(first) {
+                Vec::new()
+            } else {
+                vec![(first, vector(first))]
+            }
+        };
+
+        let first_page = vec![(first, "space".into(), "image".into(), vector(first))];
+        let first_components =
+            near_components_ann_with(&first_page, |_media, _space, _dimension, query, _count| {
+                Ok(Some(neighbours(query)))
+            })
+            .unwrap()
+            .unwrap();
+        assert!(first_components.0.is_empty());
+
+        let second_page = vec![(second, "space".into(), "image".into(), vector(second))];
+        let second_components =
+            near_components_ann_with(&second_page, |_media, _space, _dimension, query, _count| {
+                Ok(Some(neighbours(query)))
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(second_components.0[0].2, vec![first, second]);
+    }
+
+    #[test]
+    fn near_review_token_expires_when_its_embedding_space_changes() {
+        let store = Store::open_in_memory().unwrap();
+        let source = store
+            .add_source(
+                &SourceConnection::LocalFs {
+                    root: "/near-stale-review".into(),
+                },
+                "near stale review",
+                false,
+            )
+            .unwrap();
+        let first = insert_test_asset(&store, source, "first.png", MediaType::Image, None);
+        let second = insert_test_asset(&store, source, "second.png", MediaType::Image, None);
+        for id in [first, second] {
+            store
+                .set_embedding(&id, "stale-space", MediaType::Image, &[1.0, 0.0], "test@1")
+                .unwrap();
+        }
+        let group = store
+            .duplicates(&duplicate_request(DupKind::Near, None), &Visibility::Full)
+            .unwrap()
+            .items
+            .pop()
+            .unwrap();
+        store
+            .set_embedding(
+                &second,
+                "stale-space",
+                MediaType::Image,
+                &[0.0, 1.0],
+                "test@1",
+            )
+            .unwrap();
+        let result = store.review_duplicate(&DupReviewRequest {
+            review: group.review,
+            state: DupReviewState::Resolved,
+            keep: Some(first),
+            removals: Vec::new(),
+        });
+        assert!(
+            matches!(result, Err(LibError::BadRequest(message)) if message.contains("refresh"))
+        );
     }
 
     #[test]

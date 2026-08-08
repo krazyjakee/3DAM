@@ -4,15 +4,16 @@ Status: **Decided** · Date: 2026-07-06 · Settles the open question in
 [tech-spec 02 §vector-index storage](../../docs/tech-spec/02-data-model-and-storage.md) and
 [tech-spec 05 similarity](../../docs/tech-spec/05-analysis-similarity-dedup.md) / PRODUCT_SPEC §10.
 
-> **Superseded in part by [ADR 0016](../../docs/adr/0016-vector-index-backend.md) (2026-08-05).**
+> **Superseded in part by [ADR 0016](../../docs/adr/0016-vector-index-backend.md) (2026-08-05,
+> scale-amended 2026-08-08).**
 > The *shape* this spike settled stands: the primary similarity index is a **sidecar HNSW**, not an
 > exact scan inside SQLite. The *crates* named in the verdict below do not. 3DAM ships
-> **`instant-distance`** — one pure-Rust crate with no build script and no C++ toolchain, which
-> `usearch` (C++ over `cxx` + cmake) is not — and **`sqlite-vec` is dropped entirely**, including
+> pinned **`usearch` 2.25.3** after #141 measured the pure-Rust replacement missing the 1M build,
+> recall, sidecar, and memory bars — and **`sqlite-vec` is dropped entirely**, including
 > the exact-re-rank role reserved for it here: the in-process rayon exact scan measured **68 ms/q**
 > below is ~10× faster than sqlite-vec's own 726 ms at the same 100% recall, over vectors already in
-> `library.db`. The numbers in this file remain the acceptance bar — a measured miss against them at
-> 1M is what would reopen `usearch`. Read the verdict below as the evidence, ADR 0016 as the call.
+> `library.db`. The checked-in product-candidate harness now qualifies `usearch` at 1M; read the
+> original numbers below as evidence and ADR 0016 as the current call.
 
 ## Question
 
@@ -69,8 +70,8 @@ cargo run --release -- [N] [DIM] [Q] [ef_search]   # default 1_000_000 512 200 6
 
 ## Verdict
 
-**Primary similarity index = a sidecar HNSW (usearch or equivalent — the shipped crate is
-`instant-distance`, [ADR 0016](../../docs/adr/0016-vector-index-backend.md)), not sqlite-vec**, for the
+**Primary similarity index = a sidecar HNSW (`usearch` 2.25.3,
+[ADR 0016](../../docs/adr/0016-vector-index-backend.md)), not sqlite-vec**, for the
 1M-asset target. Tech-spec 02/05 should record:
 
 - **HNSW sidecar** is the index for "find similar" at scale — sub-ms, recall-tunable. It is a

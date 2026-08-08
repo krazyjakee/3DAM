@@ -241,10 +241,7 @@ impl Store {
             ctx.current.as_deref(),
         )?;
         tx.commit().map_err(internal)?;
-        if dropped_embeddings {
-            self.embed_gen
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
+        self.wake_ann(dropped_embeddings);
         // Read back on the writer connection we already hold: a second guard would trip the
         // nested-guard check, and this is the caller's cancellation signal, so it must see the
         // state this very transaction just committed.
@@ -342,10 +339,7 @@ impl Store {
             ctx.current.as_deref(),
         )?;
         tx.commit().map_err(internal)?;
-        if touched_embeddings {
-            self.embed_gen
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
+        self.wake_ann(touched_embeddings);
         let job = Self::job_summary_in(&conn, &ctx.job)?;
         Ok(AnalysisBatchOutcome {
             items: results,

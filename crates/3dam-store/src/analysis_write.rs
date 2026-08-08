@@ -184,14 +184,12 @@ impl Store {
     ) -> Result<(), LibError> {
         let conn = self.write();
         Self::set_embedding_in(&conn, id, space_id, media, vec, extractor)?;
-        // Invalidate any cached ANN index (M6): the space's vectors just changed.
-        self.embed_gen
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.wake_ann(true);
         Ok(())
     }
 
     /// The vector upsert on a caller-owned connection. Like [`Self::upsert_asset_in`] it leaves
-    /// `embed_gen` alone: the batch bumps once, after its transaction has actually committed.
+    /// lifecycle alone: the batch wakes it once, after its transaction has actually committed.
     pub(crate) fn set_embedding_in(
         conn: &Connection,
         id: &AssetId,
@@ -229,15 +227,13 @@ impl Store {
     /// has. A no-op when there was nothing there.
     pub fn clear_embedding(&self, id: &AssetId, space_id: &str) -> Result<(), LibError> {
         let conn = self.write();
-        if Self::clear_embedding_in(&conn, id, space_id)? {
-            self.embed_gen
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
+        let changed = Self::clear_embedding_in(&conn, id, space_id)?;
+        self.wake_ann(changed);
         Ok(())
     }
 
     /// The delete on a caller-owned connection; `true` when a vector actually went away, which is
-    /// the caller's cue to bump `embed_gen` once its transaction commits.
+    /// the caller's cue to wake the lifecycle once its transaction commits.
     pub(crate) fn clear_embedding_in(
         conn: &Connection,
         id: &AssetId,

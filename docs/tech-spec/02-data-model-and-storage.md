@@ -352,22 +352,24 @@ The two storage strategies that were on the table (PRODUCT_SPEC §7/§10), as th
 | **On-disk** | one file — vectors ride in the library DB, one backup/copy unit | separate `*.hnsw` files beside the DB |
 | **Portability** | vectors travel with the portable library automatically | must copy the sidecar too (or regenerate from cache) |
 | **Query model** | SQL `WHERE embedding MATCH ?` — joins naturally with facet filters in one query | in-process ANN call, then join ids back to SQLite for facets |
-| **Scale / memory** | **exact linear scan** — measured **726 ms/query at 1M×512** (spike) | HNSW graph; **sub-ms/query at 1M**, recall tunable to ~100% (spike, `usearch`) |
-| **Ops** | no extra process, no extra file | mmap → out-of-core friendly (DESIGN_GUIDELINES §1.1's 1M-asset / not-in-RAM target) |
+| **Scale / memory** | **exact linear scan** — measured **726 ms/query at 1M×512** (spike) | HNSW graph; old spike raw K=10 was sub-ms, while final high-recall product K=10 over-fetch measured **8.817 ms** and 99.6% candidate recall at 1M |
+| **Ops** | no extra process, no extra file | `usearch` base is deserialized into process memory; lifecycle and graph RSS are measured explicitly |
 
 **Storage decision — [ADR 0016](../adr/0016-vector-index-backend.md), on the evidence of the
 [vector-index spike](../../spikes/vector-index/README.md) (2026-07-06):**
 The spike benchmarked both at 1M×512-d. `sqlite-vec 0.1.x` `vec0` is an **exact linear scan** (100%
 recall but **726 ms/query** at 1M — ~1500× slower than the ANN, far past "instant", and ~10× slower
-than our own in-process rayon exact scan at **68 ms/query**). An HNSW graph (`usearch` in the spike)
-does **sub-millisecond** queries with recall **tunable to ~100%**, at the cost of a ~2 GB in-memory
-index and a background build. **Decision: the primary similarity index is a sidecar HNSW under
-`vectors/`, built on the pure-Rust `instant-distance` crate** (no build script, no C++ toolchain —
-ADR 0016 §Decision); **`sqlite-vec` is dropped entirely**, including the exact-re-rank role, because
+than our own in-process rayon exact scan at **68 ms/query**). The old spike's raw K=10 `usearch`
+lookup was sub-millisecond; the final #141 configuration instead spends **8.817 ms** at 1M to fetch
+80 candidates with **99.6% candidate recall**, at the cost of a ~1.21 GiB graph RSS delta and a
+background build. **Decision: the primary similarity index is a sidecar HNSW under
+`vectors/`, built on pinned `usearch` 2.25.3** (f16/M16/ef-construction 256/search 2048; the native
+toolchain cost is accepted after the pure-Rust backend failed the 1M gate — ADR 0016 §Decision);
+**`sqlite-vec` is dropped entirely**, including the exact-re-rank role, because
 the exact cosine scan we already ship covers it faster and with no new dependency. Details below
 still hold:
 - **Vectors are derived data** and can always be rebuilt from the blob-cached embeddings (§8). Their canonical home is the `embedding` table inside the portable DB (convenience, one-file backup); the HNSW graph over them is a regenerable sidecar under `vectors/`. Either way, losing the index is a re-index, never data loss.
-- **The sidecar HNSW under `vectors/`** is the primary similarity index — decoupled from the DB write path so re-indexing doesn't bloat the WAL, and regenerable from the embedding cache. Facet filtering stays in SQLite; the ANN returns candidate ids that are then filtered/joined against `library.db`. Persistence, incremental per-space maintenance, and atomic swap are issue [#141](https://github.com/krazyjakee/3DAM/issues/141); today the index is an in-memory per-space cache behind dam-store's `ann` feature.
+- **The sidecar HNSW under `vectors/`** is the primary similarity index — decoupled from the DB write path so re-indexing doesn't bloat the WAL, and regenerable from the embedding table. Schema V27 stores a generation, explicit lifecycle (`pending`/`building`/`ready`/`recovering`), and a latest-change/tombstone overlay per space. Sidecars use a hash of the space id plus generation as the filename and carry a magic header, format/backend/space/dimension metadata, and BLAKE3 checksum. The immutable base plus overlay makes individual writes immediately queryable without global invalidation; after a bounded overlay threshold, a background worker copies one space's vectors and its generation in one SQLite snapshot, releases SQLite, builds and fsyncs the graph, then atomically renames and publishes that snapshot while retaining every newer journal entry in the overlay. Continuous analysis writes therefore do not starve compaction. Corrupt or missing files rebuild from canonical rows. Facet filtering stays in SQLite; bounded ANN ids are fetched from `embedding` for exact cosine rerank before metadata hydration.
 - **Federated similarity** does *not* use the local index for remote hits — the query embedding is sent to each peer's endpoint and merged locally ([05](05-analysis-similarity-dedup.md) / [07](07-sources-and-federation.md)); only local assets populate the local vector store.
 
 Dimensionality per media type and the one-index-per-`EmbeddingSpace` rule are carried in [05](05-analysis-similarity-dedup.md).
@@ -490,12 +492,12 @@ Config-file values *seed* `feature_flag` and the admin API/CLI edit the same row
 > `'inherited'` provenance). Feature-flag store, change-detection `strict` mode, and cache-size
 > policy → [ADR 0009 §2/§11](../adr/0009-v1-scope-decisions.md). Vector-index storage → the
 > [vector-index spike](../../spikes/vector-index/README.md) (sidecar HNSW) and
-> [ADR 0016](../adr/0016-vector-index-backend.md) (`instant-distance`; `sqlite-vec` dropped).
+> [ADR 0016](../adr/0016-vector-index-backend.md) (`usearch` 2.25.3; `sqlite-vec` dropped).
 > Kept below as rationale.
 
 Carried forward from PRODUCT_SPEC §10 where they touch storage; the analysis/auth files own the non-storage halves.
 
-- ~~**Vector index — embedded vs sidecar, backend crate**~~ (PRODUCT_SPEC §10) — **Decided** ([ADR 0016](../adr/0016-vector-index-backend.md)): a sidecar HNSW under `vectors/` on the pure-Rust `instant-distance` crate, one index per `EmbeddingSpace`, `sqlite-vec` dropped. **Remaining:** memory-map vs load, index persistence, and how re-index interacts with the WAL at 1M+ assets — issue [#141](https://github.com/krazyjakee/3DAM/issues/141). Storage framing is §7; production/query is [05](05-analysis-similarity-dedup.md).
+- ~~**Vector index — embedded vs sidecar, backend crate and lifecycle**~~ (PRODUCT_SPEC §10) — **Decided** ([ADR 0016](../adr/0016-vector-index-backend.md)) and implemented by [#141](https://github.com/krazyjakee/3DAM/issues/141): a persisted sidecar HNSW under `vectors/` on pinned `usearch` 2.25.3, one immutable base plus durable incremental overlay per `EmbeddingSpace`, background atomic compaction, corruption recovery, bounded candidates and exact Rust rerank; `sqlite-vec` is dropped. Storage framing is §7; production/query is [05](05-analysis-similarity-dedup.md).
 - **License taxonomy & storage shape** (PRODUCT_SPEC §10): how far to lean on SPDX ids vs a 3DAM rights model in `license_id`/`license_status`; how to represent **per-asset overrides within a pack** that has one blanket license (inherit-from-source column? explicit override flag?); and the enum set for `license_status`/`license_provenance` as detection matures. This file fixes the columns; the taxonomy is not final.
 - **Feature-flag store & lifecycle** (PRODUCT_SPEC §10, §6.11): whether flag state persists in `server.db.feature_flag` (§10) vs a watched config file, and how config-file and admin-UI edits reconcile — the *store shape* is here, the *reconciliation/live-vs-restart lifecycle* is [10-auth-accounts-and-flags.md](10-auth-accounts-and-flags.md)'s.
 - **Change-detection gate robustness:** the `(size, mtime)` fast gate can miss same-size/same-mtime edits and mis-fire on touch-only changes; whether to offer a "trust content hash only" strict mode for correctness-critical libraries, at re-scan cost.

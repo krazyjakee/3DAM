@@ -305,11 +305,18 @@ The design target is **1M+ assets and datasets that don't fit in RAM** ([DESIGN_
 
 - **Paged reads only.** No `LibraryService` call returns "the whole library." `query` is cursor-paginated ([03](03-library-service-and-api.md) §6.1); the data access underneath is a keyset (seek) query — `WHERE (sort_key, id) > (cursor)` `ORDER BY … LIMIT page` — so page *N* costs the same as page 1 regardless of library size. Offset pagination is banned (it degrades linearly). The engine holds at most a small window of pages, matched to the viewport plus a look-ahead margin the grid requests.
 - **Derivatives are lazy and cache-bounded.** Thumbnails/waveforms/embeddings load on demand from the blob cache ([02](02-data-model-and-storage.md) §8), keyed by content hash, into an **LRU with a byte budget**. Scrolling past an asset evicts its decoded thumbnail; the on-disk derivative stays. So a million-asset grid holds a few hundred live thumbnails, not a million.
-- **The vector index is memory-mappable.** The leaning design ([02](02-data-model-and-storage.md) §7) is a sidecar HNSW under `vectors/`, `mmap`-ed so ANN queries touch only the graph pages they traverse — the OS page cache is the working-set governor, and the index need not fit in RAM. ANN returns candidate ids that are then facet-filtered/joined in SQLite ([02](02-data-model-and-storage.md) §7), so similarity at scale is *candidate set → page*, never *load all vectors*.
+- **The vector index is a persisted, loaded sidecar.** The versioned `usearch` HNSW base is
+  checksummed and deserialized once by the
+  lifecycle worker; the checked-in 100k/1M benchmark records build time and resident memory so this
+  deliberate cost remains visible. ANN returns bounded candidate ids that are exact-reranked and
+  then facet-filtered/joined in SQLite ([02](02-data-model-and-storage.md) §7), so steady-state
+  similarity is *candidate set → page*, never *load all canonical vectors per request*.
 - **Scan streams, never accumulates.** Stage 1 emits paths into a bounded channel (§3) and never materialises the full file list; enumeration state is a cursor, not a `Vec<Path>` of a million entries.
 - **Counts are estimated, not scanned.** Facet counts and `library_stats` come from maintained aggregates/indexed counts ([02](02-data-model-and-storage.md)), so the filter chips ([03](03-library-service-and-api.md) §2) don't table-scan a million rows on every keystroke.
 
-The net effect: RSS is a function of the byte budget (§3.3) + LRU cache budget + the mmap'd index's hot pages — all bounded, all configured, none proportional to asset count.
+The net effect: apart from the deliberately loaded ANN base (whose 100k/1M RSS is recorded by the
+scale harness), RSS is a function of the byte budget (§3.3) + LRU cache budget — bounded and
+configured rather than an accidental second copy of the catalog's vectors.
 
 ---
 
@@ -325,6 +332,7 @@ The numbers are [PRODUCT_SPEC](../PRODUCT_SPEC.md) §8; this file maps each to a
 | **1M assets / out-of-core** | RSS bounded by budgets (§7), not asset count | RSS vs library size curve; page-N latency flat | assert RSS ceiling and O(1) page latency across sizes |
 | **Fail-soft** | 0 crashes on a corrupt-file corpus; every bad item captured | soft-failure count vs injected-corruption count | fault-injection fixture (truncated/garbage files) must complete with 0 panics |
 | **Cancel/resume** | cancel lands ≤ 1 item latency; resume skips done work | time-to-quiescent after cancel; resume re-work ratio | test kills mid-scan/analyze, asserts prompt stop and cheap resume |
+| **ANN at 1M × 512** | ≤153 s build, ≥99% product candidate recall, ≤~2 GB graph resident; interactive lookup | `ann_scale` build/load/80-candidate search/CPU rerank/RSS lifecycle | #141's final `usearch` run: 129.8 s build, 8.817 ms ANN lookup, 67 µs CPU rerank, 99.6% candidate recall, 1,264,320 KiB graph RSS delta; `ann` remains off by default |
 
 Principles for the harness (owned by [15](15-observability-config-testing-packaging.md), stated here so the numbers are honest):
 

@@ -71,3 +71,6 @@ flate2 = "1"
 [[bench]]
 name = "compression"
 harness = false
+
+[features]
+ann = ["dam-core/ann"]
