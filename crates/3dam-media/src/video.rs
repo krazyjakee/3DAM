@@ -13,12 +13,58 @@
 //! Playback never comes through here: the browser plays the original bytes via `<video>` off the
 //! asset-content route, so we decode exactly one frame, exactly once, for the grid tile.
 
-use dam_api::dto::VideoAttributes;
+use dam_api::dto::{MediaAttributes, MediaType, VideoAttributes};
 use serde_json::Value;
 use std::path::Path;
 
 use crate::proc::Tool;
 use crate::HandlerError;
+
+pub(crate) struct Handler;
+pub(crate) static HANDLER: Handler = Handler;
+
+impl crate::MediaHandler for Handler {
+    fn media_type(&self) -> MediaType {
+        MediaType::Video
+    }
+
+    fn detect(&self, path: &Path) -> Option<crate::FormatId> {
+        let ext = crate::ext(path)?;
+        let format = match ext.as_str() {
+            "mkv" => "mkv",
+            "webm" => "webm",
+            "avi" => "avi",
+            "ogv" => "ogv",
+            "mp4" => "mp4",
+            "mov" => "mov",
+            "m4v" => "m4v",
+            _ => return None,
+        };
+        Some(crate::FormatId {
+            media: MediaType::Video,
+            format,
+            confidence: crate::Confidence::ExtensionOnly,
+        })
+    }
+
+    fn extract_metadata(&self, path: &Path, format: &str) -> MediaAttributes {
+        MediaAttributes::Video(metadata(path, format))
+    }
+
+    fn render_thumbnail(
+        &self,
+        path: &Path,
+        _format: &str,
+        max_edge: u32,
+    ) -> Result<crate::ThumbPng, HandlerError> {
+        let (bytes, width, height) = thumbnail(path, max_edge)?;
+        Ok(crate::ThumbPng {
+            bytes,
+            width,
+            height,
+        })
+    }
+}
 
 static FFPROBE: Tool = Tool::new("ffprobe", "DAM_FFPROBE");
 static FFMPEG: Tool = Tool::new("ffmpeg", "DAM_FFMPEG");

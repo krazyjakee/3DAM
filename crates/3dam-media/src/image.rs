@@ -5,13 +5,76 @@
 //! (the CHEAP contract, §4). `thumbnail` is the one place a full decode happens, and only on
 //! demand (preview open), producing a downscaled PNG the DOM shows via `<img>`.
 
-use dam_api::dto::ImageAttributes;
+use dam_api::dto::{ImageAttributes, MediaAttributes, MediaType};
 use image::imageops::FilterType;
 use image::{ImageFormat, ImageReader};
 use std::io::Cursor;
 use std::path::Path;
 
 use crate::HandlerError;
+
+pub(crate) struct Handler;
+pub(crate) static HANDLER: Handler = Handler;
+
+impl crate::MediaHandler for Handler {
+    fn media_type(&self) -> MediaType {
+        MediaType::Image
+    }
+
+    fn detect(&self, path: &Path) -> Option<crate::FormatId> {
+        let ext = crate::ext(path)?;
+        let format = match ext.as_str() {
+            "png" | "jpg" | "gif" | "bmp" | "tga" | "tiff" | "webp" | "psd" | "exr" | "hdr"
+            | "dds" | "ktx" | "ktx2" | "svg" => ext.as_str(),
+            "jpeg" => "jpg",
+            "tif" => "tiff",
+            _ => return None,
+        };
+        Some(crate::FormatId {
+            media: MediaType::Image,
+            format: canonical_format(format),
+            confidence: crate::Confidence::ExtensionOnly,
+        })
+    }
+
+    fn extract_metadata(&self, path: &Path, format: &str) -> MediaAttributes {
+        MediaAttributes::Image(metadata(path, format))
+    }
+
+    fn render_thumbnail(
+        &self,
+        path: &Path,
+        format: &str,
+        max_edge: u32,
+    ) -> Result<crate::ThumbPng, HandlerError> {
+        let (bytes, width, height) = thumbnail(path, max_edge, format)?;
+        Ok(crate::ThumbPng {
+            bytes,
+            width,
+            height,
+        })
+    }
+}
+
+fn canonical_format(format: &str) -> &'static str {
+    match format {
+        "png" => "png",
+        "jpg" => "jpg",
+        "gif" => "gif",
+        "bmp" => "bmp",
+        "tga" => "tga",
+        "tiff" => "tiff",
+        "webp" => "webp",
+        "psd" => "psd",
+        "exr" => "exr",
+        "hdr" => "hdr",
+        "dds" => "dds",
+        "ktx" => "ktx",
+        "ktx2" => "ktx2",
+        "svg" => "svg",
+        _ => unreachable!("image detection canonicalises every accepted extension"),
+    }
+}
 
 /// Cheap header read: dimensions always; alpha/bit-depth/colour-space where the container gives
 /// them without a pixel decode.

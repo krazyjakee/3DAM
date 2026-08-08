@@ -25,7 +25,7 @@ pub use audio_features::{
     compute_waveform_peaks, decode_mono, extract_audio_analysis, extract_audio_features,
     AudioAnalysis, AudioFeatures, LoopSource, WAVEFORM_BUCKETS,
 };
-pub use document::{extract_text, text_descriptor, MAX_TEXT_BYTES, TEXT_DIM};
+pub use document::{text_descriptor, MAX_TEXT_BYTES, TEXT_DIM};
 pub use features::{extract_image_features, l2_normalise, ImageFeatures};
 pub use mel::{log_mel, mel_from_samples, MelConfig, MelSpectrogram};
 pub use video::probe_available as video_probe_available;
@@ -39,6 +39,25 @@ pub struct Detected {
     pub media: MediaType,
     /// Concrete format, lowercase (`wav`, `png`, `gltf`, …).
     pub format: String,
+}
+
+/// How confidently a handler identified a format.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Confidence {
+    /// Exact magic bytes identify the format.
+    Magic,
+    /// A handler recognised content/container structure.
+    Container,
+    /// The filename extension is the only available signal.
+    ExtensionOnly,
+}
+
+/// Registry selection result before it is reduced to the persisted [`Detected`] shape.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FormatId {
+    pub media: MediaType,
+    pub format: &'static str,
+    pub confidence: Confidence,
 }
 
 /// A per-asset handler fault. Always fail-soft at the call site (tech-spec 04 §6): the orchestrator
@@ -75,6 +94,82 @@ pub struct ThumbPng {
     pub height: u32,
 }
 
+/// Stateless media implementation split across the ingest-safe CHEAP tier and deferred EXPENSIVE
+/// tier (tech-spec 04 §2.2). Implementations are thin adapters over the established format modules.
+pub trait MediaHandler: Send + Sync {
+    /// The media family served by this handler.
+    fn media_type(&self) -> MediaType;
+
+    // CHEAP tier: detection and header/container metadata only.
+    fn detect(&self, path: &Path) -> Option<FormatId>;
+    fn extract_metadata(&self, path: &Path, format: &str) -> MediaAttributes;
+
+    // EXPENSIVE tier: full decode/render work, called only on demand.
+    fn render_thumbnail(
+        &self,
+        _path: &Path,
+        _format: &str,
+        _max_edge: u32,
+    ) -> Result<ThumbPng, HandlerError> {
+        Err(HandlerError::Unsupported(format!(
+            "{} previews render client-side, not as a server thumbnail",
+            self.media_type().as_str()
+        )))
+    }
+
+    /// Full document text extraction. Non-document handlers have no text surface.
+    fn extract_text(&self, _path: &Path, _format: &str) -> Option<String> {
+        None
+    }
+}
+
+/// The built-in handler set and its deterministic selection order.
+pub struct HandlerRegistry {
+    handlers: &'static [&'static dyn MediaHandler],
+}
+
+static BUILTIN_HANDLERS: [&dyn MediaHandler; 5] = [
+    &audio::HANDLER,
+    &image::HANDLER,
+    &model::HANDLER,
+    &video::HANDLER,
+    &document::HANDLER,
+];
+
+impl HandlerRegistry {
+    /// Registry containing the five built-in media families.
+    pub const fn builtin() -> Self {
+        Self {
+            handlers: &BUILTIN_HANDLERS,
+        }
+    }
+
+    /// Select a handler using the same extension-only signal available during a source walk.
+    pub fn select_handler(&self, path: &Path) -> Option<(FormatId, &'static dyn MediaHandler)> {
+        self.handlers
+            .iter()
+            .find_map(|handler| handler.detect(path).map(|format| (format, *handler)))
+    }
+
+    fn for_media(&self, media: MediaType) -> Option<&'static dyn MediaHandler> {
+        self.handlers
+            .iter()
+            .copied()
+            .find(|handler| handler.media_type() == media)
+    }
+}
+
+impl Default for HandlerRegistry {
+    fn default() -> Self {
+        Self::builtin()
+    }
+}
+
+/// Select one of the built-in handlers for a logical asset path.
+pub fn select_handler(path: &Path) -> Option<(FormatId, &'static dyn MediaHandler)> {
+    HandlerRegistry::builtin().select_handler(path)
+}
+
 /// One encoded 3D container plus any companion files its format requires. GLB has no companions;
 /// textual glTF carries a `.bin`, and OBJ carries an `.mtl`. Names are safe single path components
 /// already rebased to the requested output stem.
@@ -91,7 +186,7 @@ pub struct ModelCompanion {
 }
 
 /// Lowercased final extension of a path, if any.
-fn ext(path: &Path) -> Option<String> {
+pub(crate) fn ext(path: &Path) -> Option<String> {
     path.extension()
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase())
@@ -111,49 +206,11 @@ const AMBIGUOUS_CONTAINERS: &[&str] = &["mp4", "mov", "m4v"];
 /// every walked entry including the progress pre-count, so it must not spawn a process or open a
 /// file. Where the extension genuinely doesn't determine the answer, see [`refine_with_content`].
 pub fn detect(path: &Path) -> Option<Detected> {
-    let Some(e) = ext(path) else {
-        // Extension-less licence files (`LICENSE`, `COPYING`, `NOTICE`) are the one case where the
-        // *name* determines the type. They are also the dominant real-world spelling — bare
-        // `LICENSE` is far more common than `LICENSE.txt` — so treating them as undetectable would
-        // leave the licence surface with nothing to cite for most projects, which is one of the
-        // motivations for cataloguing documents at all. They are plaintext; read them as such.
-        return is_licence_evidence(path).then(|| Detected {
-            media: MediaType::Document,
-            format: "txt".to_string(),
-        });
-    };
-    let media = match e.as_str() {
-        // audio. `.m4a` is the audio-only ISO-BMFF extension by convention and is not probed —
-        // an `.m4a` carrying a video track is a file that has already lied about itself.
-        "wav" | "flac" | "mp3" | "ogg" | "oga" | "opus" | "aiff" | "aif" | "m4a" | "aac"
-        | "wma" | "it" | "xm" | "mod" | "s3m" => MediaType::Audio,
-        // image
-        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "tga" | "tiff" | "tif" | "webp" | "psd"
-        | "exr" | "hdr" | "dds" | "ktx" | "ktx2" | "svg" => MediaType::Image,
-        // 3d models
-        "gltf" | "glb" | "fbx" | "obj" | "stl" | "ply" | "dae" | "3ds" | "blend" | "usd"
-        | "usdz" | "usda" | "usdc" => MediaType::Model,
-        // video. The shared containers provisionally classify as video here and are settled by
-        // [`refine_with_content`] once real bytes exist — see that function for why.
-        "mkv" | "webm" | "avi" | "ogv" => MediaType::Video,
-        c if AMBIGUOUS_CONTAINERS.contains(&c) => MediaType::Video,
-        // documents. `csv`/`json` are deliberately absent: they are structured data rather than
-        // prose, and indexing them as documents would put machine output into a text index built
-        // for language (PRODUCT_SPEC §9 phase 2b).
-        "pdf" | "md" | "markdown" | "txt" | "rtf" | "docx" | "odt" => MediaType::Document,
-        _ => return None,
-    };
-    // Normalise a few aliases to a canonical format tag.
-    let format = match e.as_str() {
-        "jpeg" => "jpg",
-        "tif" => "tiff",
-        "aif" => "aiff",
-        "oga" => "ogg",
-        "markdown" => "md",
-        other => other,
-    }
-    .to_string();
-    Some(Detected { media, format })
+    let (format, _) = select_handler(path)?;
+    Some(Detected {
+        media: format.media,
+        format: format.format.to_string(),
+    })
 }
 
 /// Path segments whose contents are dependencies, build output, or VCS internals rather than
@@ -268,13 +325,10 @@ pub fn refine_with_content(det: &Detected, abs: &Path) -> Option<Detected> {
 /// asset at ingest. Best-effort and fail-soft: a partial or empty struct is returned on fault,
 /// never an error that would sink the scan.
 pub fn extract_metadata(path: &Path, det: &Detected) -> MediaAttributes {
-    match det.media {
-        MediaType::Audio => MediaAttributes::Audio(audio::metadata(path, &det.format)),
-        MediaType::Image => MediaAttributes::Image(image::metadata(path, &det.format)),
-        MediaType::Model => MediaAttributes::Model(model::metadata(path, &det.format)),
-        MediaType::Video => MediaAttributes::Video(video::metadata(path, &det.format)),
-        MediaType::Document => MediaAttributes::Document(document::metadata(path, &det.format)),
-    }
+    HandlerRegistry::builtin()
+        .for_media(det.media)
+        .expect("every MediaType has a built-in handler")
+        .extract_metadata(path, &det.format)
 }
 
 /// DEEP tier: exact 3D geometry counts via a full Assimp import (issue #49).
@@ -304,37 +358,18 @@ pub fn render_thumbnail(
     det: &Detected,
     max_edge: u32,
 ) -> Result<ThumbPng, HandlerError> {
-    match det.media {
-        MediaType::Image => {
-            // The format is what routes a DDS/KTX2 to the texture decoder (issue #49); the raster
-            // path ignores it.
-            let (bytes, width, height) = image::thumbnail(path, max_edge, &det.format)?;
-            Ok(ThumbPng {
-                bytes,
-                width,
-                height,
-            })
-        }
-        MediaType::Video => {
-            let (bytes, width, height) = video::thumbnail(path, max_edge)?;
-            Ok(ThumbPng {
-                bytes,
-                width,
-                height,
-            })
-        }
-        // A document's "thumbnail" is its opening text, which the client already has as
-        // `DocumentAttributes::excerpt` and can render with real fonts, real theming, and
-        // selectable text. Rasterising type server-side would need a font stack and a PDF
-        // renderer — the native-dependency class ADR 0015 declined for video — to produce a
-        // strictly worse tile.
-        MediaType::Audio | MediaType::Model | MediaType::Document => {
-            Err(HandlerError::Unsupported(format!(
-                "{} previews render client-side, not as a server thumbnail",
-                det.media.as_str()
-            )))
-        }
-    }
+    HandlerRegistry::builtin()
+        .for_media(det.media)
+        .expect("every MediaType has a built-in handler")
+        .render_thumbnail(path, &det.format, max_edge)
+}
+
+/// EXPENSIVE tier: extract a document's normalised body text through its registered handler.
+pub fn extract_text(path: &Path, format: &str) -> Option<String> {
+    HandlerRegistry::builtin()
+        .for_media(MediaType::Document)
+        .expect("the document handler is built in")
+        .extract_text(path, format)
 }
 
 /// EXPENSIVE tier: decode + re-encode an image to a raster target (convert pipeline, tech-spec 08
@@ -503,6 +538,23 @@ mod tests {
             detect(Path::new("a.markdown")).map(|d| d.format),
             Some("md".to_string())
         );
+    }
+
+    #[test]
+    fn registry_selects_the_same_canonical_formats_as_detect() {
+        for (path, media, format) in [
+            ("kick.oga", MediaType::Audio, "ogg"),
+            ("cover.jpeg", MediaType::Image, "jpg"),
+            ("mesh.glb", MediaType::Model, "glb"),
+            ("clip.mp4", MediaType::Video, "mp4"),
+            ("notes.markdown", MediaType::Document, "md"),
+        ] {
+            let (selected, handler) = select_handler(Path::new(path)).unwrap();
+            assert_eq!(selected.media, media, "{path}");
+            assert_eq!(selected.format, format, "{path}");
+            assert_eq!(selected.confidence, Confidence::ExtensionOnly, "{path}");
+            assert_eq!(handler.media_type(), media, "{path}");
+        }
     }
 
     #[test]

@@ -32,11 +32,49 @@ mod tds;
 #[cfg(feature = "model-convert")]
 mod probe;
 
-use dam_api::dto::ModelAttributes;
+use dam_api::dto::{MediaAttributes, MediaType, ModelAttributes};
 #[cfg(test)]
 use deps::asset_base;
 use deps::dependency_bytes;
 use std::path::Path;
+
+pub(crate) struct Handler;
+pub(crate) static HANDLER: Handler = Handler;
+
+impl crate::MediaHandler for Handler {
+    fn media_type(&self) -> MediaType {
+        MediaType::Model
+    }
+
+    fn detect(&self, path: &Path) -> Option<crate::FormatId> {
+        let ext = crate::ext(path)?;
+        let format = match ext.as_str() {
+            "gltf" => "gltf",
+            "glb" => "glb",
+            "fbx" => "fbx",
+            "obj" => "obj",
+            "stl" => "stl",
+            "ply" => "ply",
+            "dae" => "dae",
+            "3ds" => "3ds",
+            "blend" => "blend",
+            "usd" => "usd",
+            "usdz" => "usdz",
+            "usda" => "usda",
+            "usdc" => "usdc",
+            _ => return None,
+        };
+        Some(crate::FormatId {
+            media: MediaType::Model,
+            format,
+            confidence: crate::Confidence::ExtensionOnly,
+        })
+    }
+
+    fn extract_metadata(&self, path: &Path, format: &str) -> MediaAttributes {
+        MediaAttributes::Model(metadata(path, format))
+    }
+}
 
 /// Extract cheap model attributes; best-effort, fail-soft (a parse fault yields whatever was read).
 pub fn metadata(path: &Path, format: &str) -> ModelAttributes {

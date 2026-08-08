@@ -3,8 +3,8 @@
 Status: **Draft v0.1** · Scope: the `MediaHandler` plugin layer — detection, decode, cost-tiered metadata/thumbnail/feature extraction, and the per-media format matrix.
 
 This file specifies the **media-handler seam**: the trait every media type (audio, image, 3D)
-implements, how a handler is selected for a file by sniffing content rather than trusting an
-extension, and the **cost-tiered contract** that keeps ingest cheap. It is the low-level design
+implements, how a handler is selected from the logical-path signal available during a source walk
+and refined from content after fetch, and the **cost-tiered contract** that keeps ingest cheap. It is the low-level design
 under [PRODUCT_SPEC](../PRODUCT_SPEC.md) §5 (media-specific attributes), §6.2 (the cost-tiered
 extraction rule), and §6.4 (preview), and under [DESIGN_GUIDELINES](../DESIGN_GUIDELINES.md) §2
 (media plugins) and §3.2 (previews).
@@ -26,13 +26,13 @@ for how a handler failure becomes a fail-soft per-asset error, not a scan abort.
 
 A handler is a **pure, stateless transformer** of bytes into structured facts and derivatives.
 It knows nothing about the database, the source layer, sources, jobs, or transports. `3dam-core`
-owns a **handler registry**; scanning, analysis, and preview orchestration call *into* handlers
-and persist what comes back.
+calls the handler registry owned by `3dam-media`; scanning, analysis, and preview orchestration call
+*into* handlers and persist what comes back.
 
 ```
    scan/analysis/preview orchestration  (3dam-core — owns concurrency, persistence, fail-soft)
                     │
-                    ▼   selects one handler by sniffing bytes
+                    ▼   selects by logical path; refines ambiguous containers after fetch
         ┌────────────────────────────┐
         │      MediaHandler (04)      │   detect · decode · extract_metadata
         │  audio · image · 3d impls   │   · thumbnail · extract_features
@@ -52,185 +52,117 @@ work to `3dam-render` (06).
 
 ## 2. The `MediaHandler` trait
 
-Rust-ish pseudocode; indicative, not a frozen API (see [00-overview.md](00-overview.md) conventions).
+The implementation lives in `dam-media` and is intentionally path-based today. Scan discovery has
+a source-relative logical path before it has local bytes (a remote fetch receives a random temporary
+name), while the existing format modules operate on a local `Path` once bytes are fetched. The
+trait therefore captures the real dispatch seam without inventing a reader/decoded abstraction the
+code cannot yet honour.
 
 ### 2.1 Shared types
 
 ```rust
-/// The media types. Audio/Image/Model are the three *deep* ones this spec is written around;
-/// Video and Document (PRODUCT_SPEC §9 phase 2b) are deliberately shallower — see §7.4/§7.5.
-/// The concrete format is a separate string/enum on the asset.
-pub enum MediaType { Audio, Image, Model, Video, Document }
-
-/// Result of sniffing: which media type + concrete format a byte stream is.
 pub struct FormatId {
     pub media: MediaType,
-    pub format: &'static str,   // "wav", "png", "glb", "fbx", "obj", ...
-    pub confidence: Confidence, // Magic | Container | ExtensionOnly
+    pub format: &'static str,
+    pub confidence: Confidence,
 }
 
 pub enum Confidence { Magic, Container, ExtensionOnly }
 
-/// A cheap, seekable byte source. Handlers read through this; the caller owns the
-/// underlying file/network handle and the read budget (§4). Sources (07) that cannot
-/// seek are buffered by the caller before a handler sees them.
-pub trait AssetReader: Read + Seek + Send {}
-
-/// Everything a handler may need about the file it did not read itself.
-pub struct AssetInput<'a> {
-    pub reader: &'a mut dyn AssetReader,
-    pub hint_ext: Option<&'a str>,   // filename extension, a hint only — never trusted alone
-    pub declared_size: Option<u64>,  // from the source listing, if known
-}
-
-/// Per-media attribute payloads (§5 of the product spec). One variant per media type.
-/// These are the *cheap-tier* outputs — the CHEAP contract (§4) is what fills them.
-pub enum MediaAttributes {
-    Audio(AudioAttributes),
-    Image(ImageAttributes),
-    Model(ModelAttributes),
-}
-
-/// A decoded, in-memory representation, media-specific. Only produced on demand
-/// (preview/analysis/convert), never at ingest.
-pub enum Decoded {
-    Audio(DecodedAudio),   // PCM frames + spec
-    Image(DecodedImage),   // pixel buffer + colour space
-    Model(DecodedModel),   // meshes, materials, node graph (full gltf/fbxcel decode)
-}
-
-/// A generated preview derivative, tagged so the caller can cache/store it (02).
-pub struct Thumbnail {
-    pub kind: ThumbKind,      // Png | WaveformPng | (3D turntable is Png from 06)
+pub struct ThumbPng {
+    pub bytes: Vec<u8>,
     pub width: u32,
     pub height: u32,
-    pub bytes: Vec<u8>,       // encoded (PNG); waveform peaks may be a compact peak file
-}
-
-/// Opaque feature payload handed to analysis (05) — raw material for embeddings,
-/// perceptual hashes, spectral descriptors, tileability, multi-view render sets.
-/// This file defines that handlers *produce* it; 05 defines what it *becomes*.
-pub struct FeatureBundle {
-    pub extractor_versions: Vec<(&'static str, u32)>, // for re-analysis gating (05)
-    pub payload: FeaturePayload,                       // media-specific, defined per handler
 }
 ```
+
+`Detected` remains the persisted/API compatibility shape: an owned concrete-format string plus
+`MediaType`. `FormatId` is the registry-selection result and records how the choice was made.
 
 ### 2.2 The trait
 
 ```rust
 pub trait MediaHandler: Send + Sync {
-    /// Which media type this handler serves. Used to shard the registry (§3).
     fn media_type(&self) -> MediaType;
 
-    /// CHEAP. Sniff the leading bytes / container structure and report whether this
-    /// handler claims the stream, and as which concrete format. Reads only a small,
-    /// bounded prefix (and may seek to a trailer for a few formats). MUST NOT decode
-    /// payload, allocate large buffers, or touch the GPU. Returns None if unclaimed.
-    fn detect(&self, input: &mut AssetInput) -> Result<Option<FormatId>, HandlerError>;
+    // CHEAP: logical-path detection, then header/container metadata.
+    fn detect(&self, path: &Path) -> Option<FormatId>;
+    fn extract_metadata(&self, path: &Path, format: &str) -> MediaAttributes;
 
-    /// CHEAP tier. Extract the media-specific attribute struct (§5) from container
-    /// headers / metadata chunks ONLY. No geometry decode, no full audio decode, no
-    /// pixel decode beyond the header, no GPU. This is what runs on every asset at
-    /// ingest scale — see the cost contract (§4).
-    fn extract_metadata(&self, input: &mut AssetInput, fmt: &FormatId)
-        -> Result<MediaAttributes, HandlerError>;
+    // EXPENSIVE: full decode/render work, only on demand.
+    fn render_thumbnail(
+        &self,
+        path: &Path,
+        format: &str,
+        max_edge: u32,
+    ) -> Result<ThumbPng, HandlerError>;
 
-    /// EXPENSIVE tier. Fully decode into an in-memory representation. Called for
-    /// preview, feature extraction, and convert (08) — never at ingest. May allocate
-    /// large buffers (vertex data, PCM, pixels).
-    fn decode(&self, input: &mut AssetInput, fmt: &FormatId)
-        -> Result<Decoded, HandlerError>;
-
-    /// EXPENSIVE tier. Produce a preview derivative (§6.4). Image: downscaled PNG.
-    /// Audio: waveform peaks / waveform PNG. 3D: delegates to 3dam-render (06) for a
-    /// turntable/still — the handler supplies the decoded mesh + deterministic framing,
-    /// 06 owns the wgpu path and the software-raster fallback. May take a pre-`decode`d
-    /// value to avoid decoding twice.
-    fn thumbnail(&self, decoded: &Decoded, req: ThumbRequest)
-        -> Result<Thumbnail, HandlerError>;
-
-    /// EXPENSIVE tier. Produce the raw feature material for analysis (05): image
-    /// perceptual hash + colour + tileability inputs + CLIP-ready pixels; audio
-    /// spectral/temporal descriptors + embedding-ready frames; 3D geometry-derived
-    /// features + the multi-view render set (rendered via 06). This file defines the
-    /// *output type*; 05 owns embeddings, ANN, dedup, and auto-tag.
-    fn extract_features(&self, decoded: &Decoded, req: FeatureRequest)
-        -> Result<FeatureBundle, HandlerError>;
-}
-
-/// A handler failure is always per-asset and fail-soft (DESIGN_GUIDELINES §2). The
-/// caller records it against the one asset and continues the scan — never aborts it.
-pub enum HandlerError {
-    Unrecognised,                 // detect() found nothing it owns
-    Truncated { at: u64 },        // stream ended mid-structure
-    Corrupt { detail: String },   // structurally invalid container/chunk
-    Unsupported { detail: String},// recognised format, unsupported sub-feature/codec
-    Io(std::io::Error),
+    // EXPENSIVE document-only surface; other handlers return None.
+    fn extract_text(&self, path: &Path, format: &str) -> Option<String>;
 }
 ```
 
-**Why the split.** `detect` + `extract_metadata` are the **CHEAP tier**; `decode` + `thumbnail`
-+ `extract_features` are the **EXPENSIVE tier**. The trait is split on this line precisely so the
-scanner can run the cheap tier across a million assets at ingest and *defer* every expensive method
-to when the user opens or the analysis pipeline reaches an asset (PRODUCT_SPEC §6.2). Keeping
-`extract_metadata` a separate method — rather than a mode flag on `decode` — makes the cheap
-contract enforceable and testable: a cheap-tier method that reaches for a vertex buffer or a GPU
-is a bug, not a slow path.
+There are five stateless built-in implementations: audio, image (including DDS/KTX texture
+routing), model, video, and document. They are deliberately thin wrappers over the established
+module functions, so installing the seam changes dispatch rather than media behaviour. Unsupported
+thumbnail/text methods use trait defaults.
+
+**Why the split.** `detect` + `extract_metadata` are the **CHEAP tier**;
+`render_thumbnail` + `extract_text` are the **EXPENSIVE tier**. Decode, convert, and feature
+entry points retain their existing typed APIs until they have a real common decoded representation;
+they remain expensive by contract and can be added to the trait without changing registry
+selection.
 
 ---
 
 ## 3. Format detection & handler selection
 
-Selection is **content-first**, never extension-first (DESIGN_GUIDELINES §2 "detect"; PRODUCT_SPEC
-§4.3 "detect"). The extension is a *hint* used only to order the sniff and as a last-resort
-tie-break, never as the sole decider.
+Selection has two stages because source walking and byte access happen at different times.
 
 ### 3.1 The registry
 
-`3dam-core` holds a `HandlerRegistry` — a set of `MediaHandler` implementations, one (or more) per
-media type, plus a small **sniff table** mapping magic signatures and container markers to a
-handler + candidate format. Registration is compile-time via feature gates
-([01-architecture-and-crates.md](01-architecture-and-crates.md)); a disabled format simply is not
-in the table.
+`dam-media::HandlerRegistry` owns the deterministic built-in handler list. `routes` through the
+registry are used by the public `detect`, `detect_for_ingest`, `extract_metadata`,
+`render_thumbnail`, and `extract_text` entry points. `select_handler(path)` returns
+`(FormatId, &dyn MediaHandler)`; callers that already hold a persisted `Detected` select the
+same handler by `MediaType`.
 
-### 3.2 The sniff flow
+Registration is currently compile-time and stateless. Optional capabilities remain feature-gated
+inside their handler (for example model conversion/Assimp), so a disabled expensive capability
+answers `Unsupported` without removing cheap detection coverage.
 
+### 3.2 The selection flow
+
+```text
+select_handler(logical_path):
+  1. each built-in handler sees the lowercase extension hint in registry order
+  2. the first exact family/format mapping returns FormatId { ExtensionOnly }
+  3. no claim returns None; the caller catalogs/skips it exactly as before
+
+after fetch, for an ambiguous ISO-BMFF extension:
+  4. refine_with_content runs the bounded ffprobe stream check
+  5. an audio-only mp4/mov/m4v corrects Video -> Audio; otherwise the provisional result stands
 ```
-select_handler(input):
-  1. peek up to N bytes (N ≈ 64 for magic; a few formats need a trailer seek)
-  2. match the prefix against the sniff table:
-       - exact magic  → FormatId{ confidence: Magic }        e.g. "RIFF..WAVE", 0x89PNG,
-                                                              "glTF"(0x46546C67), "OggS", ID3
-       - container probe → ask the owning handler's detect()  e.g. RIFF subtype, ISOBMFF ftyp,
-                                confidence: Container          gltf JSON vs glb binary, FBX magic
-  3. if the prefix is ambiguous, consult hint_ext to ORDER remaining candidates,
-     then call each candidate handler.detect() until one claims it (Magic/Container)
-  4. if nothing claims it but hint_ext maps to exactly one handler, offer it that
-     stream at ExtensionOnly confidence; the handler MAY still reject in detect()
-  5. nothing claims it → HandlerError::Unrecognised → asset catalogued as "unknown
-     format", fail-soft (§6), never dropped from the library
-```
 
-Key points:
+This preserves two load-bearing behaviours:
 
-- **Magic bytes / container sniff win over extension.** A `.wav` that is really an Ogg stream is
-  detected as Ogg; a `.txt` that is really a PNG is detected as PNG. A mismatched extension is
-  recorded (so it can surface as a data-quality flag) but does not change the handler chosen.
-- **`detect` is bounded and side-effect-free.** It reads a small prefix (and, for the few formats
-  that carry data in a trailer, one seek to the end), then rewinds. It never decodes payload.
-- **`ExtensionOnly` confidence is degraded, not trusted.** Extension-only claims are marked so
-  the UI/CLI can surface "format inferred from name" and analysis can be re-run if a better sniff
-  path lands.
-- **OBJ and other text formats** have no reliable magic. Their handler's `detect` does a *bounded*
-  structural probe (first non-comment tokens look like `v`/`vn`/`vt`/`f`/`mtllib`), gated behind the
-  extension hint to avoid scanning every text file — still content-checked, just extension-ordered.
+- `detect` is pure, cheap, and filesystem-independent because scans call it with a logical remote
+  path before bytes exist locally.
+- The document ingest ignore policy remains outside handler selection. `detect_for_ingest` first
+  obtains the registry result, then filters only documents under dependency/build/VCS directories,
+  except licence evidence at any depth. Non-document media is never filtered.
+
+Aliases are normalised by the owning handler (`jpeg -> jpg`, `tif -> tiff`, `aif -> aiff`,
+`oga -> ogg`, `markdown -> md`). Extension-less licence evidence is claimed by the document
+handler as plaintext.
 
 ### 3.3 Selection output
 
-`select_handler` returns `(FormatId, &dyn MediaHandler)`. The `FormatId` (media type + concrete
-format + confidence) is persisted on the asset (02); the concrete-format string is what the format
-matrix (§7) and the convert pipeline (08) key off.
+`select_handler` returns `(FormatId, &dyn MediaHandler)`. Current walk-time selections carry
+`ExtensionOnly`; `Magic` and `Container` are represented so a future reader-based sniff can
+strengthen confidence without changing the persisted `Detected` compatibility type. The later
+ISO-BMFF refinement is content-based but currently returns only a corrected `Detected`, matching
+the scan API that consumes it.
 
 ---
 
@@ -469,14 +401,19 @@ The **shape embedding** those multi-view renders feed is owned by
 > **Resolved 2026-07-06 in [ADR 0009 §8](../adr/0009-v1-scope-decisions.md).** The v1 format-decode
 > matrix is frozen there (incl. DDS/KTX2, AAC-MP4, PLY/STL; FBX decode-only; USD post-v1), geometry
 > counts are marked approximate when accessor counts are absent, and the one-bounded-trailer-seek
-> budget stands. Kept below as rationale.
+> budget stands.
 
-- **Format-coverage rationale.** The cheap-tier sniff can land ahead of an expensive decoder, so a
-  recognised later/cost-tier format can appear in the catalog (metadata-only) while preview/convert
-  answers `Unsupported`. The frozen v1 boundary itself is the table above and ADR 0009.
-- **Cheap-tier trailer reads.** A few formats carry needed data in a trailer (or require a second
-  seek). The read budget (§4.2) assumes one bounded trailer seek is acceptable at ingest scale;
-  formats that would need more than that may have to defer some "cheap" fields to the expensive tier.
-- **Estimate vs exact geometry counts.** Where accessor `count` fields are absent (some OBJ/FBX
-  paths), `ModelAttributes.vertex_count`/`triangle_count` are estimates; whether the cheap tier does
-  a bounded second pass for exactness, or marks the value approximate, is unsettled.
+> **Handler seam resolved 2026-08-08 (issue #170).** `MediaHandler`, the five built-in wrappers,
+> `HandlerRegistry`, and `select_handler` now exist. All public detect/metadata/thumbnail/text
+> dispatch passes through that registry, with document ingest filtering retained as a caller policy.
+
+- **Reader-based confidence upgrades.** Walk-time detection must remain filesystem-independent for
+  remote sources, so current registry choices are `ExtensionOnly` and ambiguous ISO-BMFF content
+  is refined after fetch. A future source-neutral bounded reader can add `Magic`/`Container`
+  confidence without changing the handler or registry shapes.
+- **Common decoded representation.** Convert and feature APIs remain strongly typed because the
+  code has no honest shared `Decoded` value yet. Add trait methods only when that representation
+  exists; an enum added merely to box today's unrelated return types would not create a plugin seam.
+- **Format-coverage rationale.** Cheap detection may land ahead of an expensive decoder, so a
+  recognised format can appear in the catalog while preview/convert answers `Unsupported`. The
+  frozen v1 boundary is the table above and ADR 0009.

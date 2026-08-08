@@ -15,9 +15,44 @@
 //! Everything is pure-Rust and fail-soft: an encrypted PDF, a truncated ZIP, or a binary file
 //! misnamed `.txt` yields a partial or empty struct, never an error that sinks a scan.
 
-use dam_api::dto::DocumentAttributes;
+use dam_api::dto::{DocumentAttributes, MediaAttributes, MediaType};
 use std::io::Read;
 use std::path::Path;
+
+pub(crate) struct Handler;
+pub(crate) static HANDLER: Handler = Handler;
+
+impl crate::MediaHandler for Handler {
+    fn media_type(&self) -> MediaType {
+        MediaType::Document
+    }
+
+    fn detect(&self, path: &Path) -> Option<crate::FormatId> {
+        let format = match crate::ext(path).as_deref() {
+            Some("pdf") => "pdf",
+            Some("md" | "markdown") => "md",
+            Some("txt") => "txt",
+            Some("rtf") => "rtf",
+            Some("docx") => "docx",
+            Some("odt") => "odt",
+            None if crate::is_licence_evidence(path) => "txt",
+            _ => return None,
+        };
+        Some(crate::FormatId {
+            media: MediaType::Document,
+            format,
+            confidence: crate::Confidence::ExtensionOnly,
+        })
+    }
+
+    fn extract_metadata(&self, path: &Path, format: &str) -> MediaAttributes {
+        MediaAttributes::Document(metadata(path, format))
+    }
+
+    fn extract_text(&self, path: &Path, format: &str) -> Option<String> {
+        extract_text(path, format)
+    }
+}
 
 /// Ceiling on extracted body text. A 1 MiB cap is far past any design doc while bounding what a
 /// pathological (or generated) document can push into the FTS index and the embedding pass.

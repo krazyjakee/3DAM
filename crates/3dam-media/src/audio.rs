@@ -5,7 +5,7 @@
 //! CHEAP contract, §4). `convert` is the EXPENSIVE path: it decodes packets to PCM and writes a
 //! canonical WAV (the lossless v1 encode target, 08 §3.1).
 
-use dam_api::dto::AudioAttributes;
+use dam_api::dto::{AudioAttributes, MediaAttributes, MediaType};
 use std::path::Path;
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
@@ -15,6 +15,54 @@ use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
 use crate::HandlerError;
+
+pub(crate) struct Handler;
+pub(crate) static HANDLER: Handler = Handler;
+
+impl crate::MediaHandler for Handler {
+    fn media_type(&self) -> MediaType {
+        MediaType::Audio
+    }
+
+    fn detect(&self, path: &Path) -> Option<crate::FormatId> {
+        let ext = crate::ext(path)?;
+        let format = match ext.as_str() {
+            "wav" | "flac" | "mp3" | "ogg" | "opus" | "aiff" | "m4a" | "aac" | "wma" | "it"
+            | "xm" | "mod" | "s3m" => ext.as_str(),
+            "oga" => "ogg",
+            "aif" => "aiff",
+            _ => return None,
+        };
+        Some(crate::FormatId {
+            media: MediaType::Audio,
+            format: canonical_format(format),
+            confidence: crate::Confidence::ExtensionOnly,
+        })
+    }
+
+    fn extract_metadata(&self, path: &Path, format: &str) -> MediaAttributes {
+        MediaAttributes::Audio(metadata(path, format))
+    }
+}
+
+fn canonical_format(format: &str) -> &'static str {
+    match format {
+        "wav" => "wav",
+        "flac" => "flac",
+        "mp3" => "mp3",
+        "ogg" => "ogg",
+        "opus" => "opus",
+        "aiff" => "aiff",
+        "m4a" => "m4a",
+        "aac" => "aac",
+        "wma" => "wma",
+        "it" => "it",
+        "xm" => "xm",
+        "mod" => "mod",
+        "s3m" => "s3m",
+        _ => unreachable!("audio detection canonicalises every accepted extension"),
+    }
+}
 
 /// Probe container + default-track params. Best-effort/fail-soft: an unreadable file yields the
 /// default (all-`None`) struct rather than aborting the scan.
