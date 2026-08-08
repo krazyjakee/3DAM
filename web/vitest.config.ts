@@ -20,6 +20,11 @@ export default defineConfig({
       reportsDirectory: "coverage",
       include: [
         "src/components/AuthGate.tsx",
+        // Standalone forms extracted from AuthGate.tsx (issue #169). This is an allowlist, so each
+        // new module must be named or per-file thresholds would silently stop applying to it.
+        "src/components/auth/AccountLoginForm.tsx",
+        "src/components/auth/ClaimScreen.tsx",
+        "src/components/auth/TokenLoginForm.tsx",
         "src/components/Browser.tsx",
         // Extracted out of Browser.tsx (issue #164) — same allowlist rule as the Inspector split
         // below: unnamed extractions silently leave coverage.
@@ -35,6 +40,10 @@ export default defineConfig({
         "src/components/browser/types.ts",
         "src/components/browser/useBrowseWindowLoading.ts",
         "src/components/browser/useRovingFocus.ts",
+        // Extracted out of Navigation.tsx (issue #168). Keep both modules named explicitly:
+        // `thresholds.perFile` cannot protect files omitted from this allowlist.
+        "src/components/navigation/Collections.tsx",
+        "src/components/navigation/SourceRow.tsx",
         "src/components/Inspector.tsx",
         // Extracted out of Inspector.tsx (issues #167, #166). `thresholds.perFile` is true and this
         // list is an allowlist, so code that leaves Inspector.tsx has to be named here or it leaves
@@ -54,6 +63,9 @@ export default defineConfig({
         "src/components/settings/OidcSection.tsx",
         "src/components/settings/StorageSection.tsx",
         "src/components/settings/TokensSection.tsx",
+        // The ref-backed upload batch and its row renderer extracted from Upload.tsx (issue #169).
+        "src/components/upload/UploadRow.tsx",
+        "src/components/upload/useUploadQueue.ts",
         "src/lib/dialogs.tsx",
         "src/lib/use-focus-trap.ts",
       ],
