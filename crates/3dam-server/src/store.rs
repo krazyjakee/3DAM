@@ -779,9 +779,12 @@ fn hash_secret(secret: &str) -> String {
 
 mod schema;
 
-// The accounts/sessions/groups/shares surface (issue #42) — a child module so it can reach the
-// private `conn`/`flags` fields while keeping this file to flags/tokens/audit.
+// Account, session, group, and share concerns are separate children so each can reach the private
+// `conn`/`flags` fields while keeping this file to flags/tokens/audit.
 pub(crate) mod accounts;
+mod groups;
+mod sessions;
+mod shares;
 
 // The OIDC/OAuth2 login surface (issue #41) — provider config, in-flight authorization requests,
 // and identity links. Same child-module reasoning as `accounts`.
