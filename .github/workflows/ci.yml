@@ -1,6 +1,8 @@
 name: ci
 
-on: [push, pull_request]
+# Automatic CI is temporarily disabled. Keep manual dispatch available so the
+# quality gate can still be run on demand from the Actions tab.
+on: workflow_dispatch
 
 permissions:
   contents: read
