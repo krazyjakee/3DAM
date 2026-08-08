@@ -1,6 +1,6 @@
 # Reproducible scale and performance harness
 
-The scale harness turns the 100,000- and 1,000,000-asset targets into repeatable regression checks without committing a generated catalog. It creates a migrated SQLite library under `target/`, measures store and browser browse-window behavior, compares the result with a profile-specific ratio baseline, writes JSON, and removes the catalog.
+The scale harness turns the 100,000- and 1,000,000-asset targets into repeatable regression checks without committing a generated catalog. It creates a migrated SQLite library and a profile-sized derivative-cache tree under `target/`, measures store, derivative-cache startup, and browser browse-window behavior, compares the result with a profile-specific ratio baseline, writes JSON, and removes the fixtures.
 
 ## Running it
 
@@ -29,7 +29,7 @@ exact trigger definitions before any measurement. Production scans still exercis
 maintenance; bulk fixture construction avoids millions of redundant ancestor walks. V26 aggregate
 triggers remain enabled throughout generation so their production write cost is represented.
 
-The fixture contains local filesystem, SFTP, SMB, and federated sources; all five media types; paths up to the configured depth; confirmed tags; normalized embeddings; and repeatable exact-duplicate groups. Names include a stable search term. The generated database and WAL never enter git.
+The fixture contains local filesystem, SFTP, SMB, and federated sources; all five media types; paths up to the configured depth; confirmed tags; normalized embeddings; and repeatable exact-duplicate groups. Names include a stable search term. It also creates one tiny cached-thumbnail entry per profile asset in the production flat cache layout. The generated database, WAL, and cache tree never enter git.
 
 ## Measurements and reports
 
@@ -66,6 +66,13 @@ loaded CI runner, while the serialised regression overshoots it by between 1.4x 
 
 The Node browser profile traverses every logical page while retaining only the production browse
 window and reports long-scroll p99 work time and post-midpoint heap growth.
+
+`derivative_cache_first_thumbnail_hit_ms` measures an existing thumbnail read immediately after the
+production cache controller starts its inventory against that profile-sized tree. The inventory is
+joined after the timed hit so its I/O cannot leak into later store/browser samples or fixture
+cleanup. All profiles deliberately share the same 5 ms reference and 5.0 ratio (25 ms ceiling): a
+first hit may not buy a looser budget as the cache grows from 2,000 to one million entries. The
+metric therefore fails a regression that puts the recursive inventory back on the request path.
 
 Reports include every raw timing sample, median and p95, units, lower/higher-is-better direction, fixture seed/version/profile, database size, OS/architecture/CPU/memory, Rust version, git revision, browser status, comparisons, and the overall result. Missing/non-finite metrics, unknown baseline keys, direction mismatches, and browser failures are errors rather than silent passes.
 

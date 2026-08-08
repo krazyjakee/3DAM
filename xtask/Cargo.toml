@@ -8,6 +8,7 @@ description = "Dev-only automation: dependency-direction checks and CI aggregati
 
 [dependencies]
 dam-api.workspace = true
+dam-core.workspace = true
 dam-store.workspace = true
 rusqlite.workspace = true
 serde.workspace = true

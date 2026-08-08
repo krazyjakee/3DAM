@@ -11142,6 +11142,7 @@ name = "xtask"
 version = "0.1.2"
 dependencies = [
  "dam-api",
+ "dam-core",
  "dam-store",
  "rusqlite",
  "serde",

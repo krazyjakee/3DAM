@@ -32,6 +32,7 @@ const STORE_METRICS: &[&str] = &[
     "export_assets_per_second",
     "peak_rss_bytes",
     "browser_initial_payload_bytes",
+    "derivative_cache_first_thumbnail_hit_ms",
 ];
 const BROWSER_METRICS: &[&str] = &["browser_long_scroll_p99_ms", "browser_heap_growth_bytes"];
 
@@ -216,14 +217,29 @@ fn execute(options: Result<Options, String>) -> Result<(), String> {
     );
     let generation_started = Instant::now();
     generate_catalog(&options.work_dir, &profile)?;
+    let thumbnail_hit = populate_derivative_cache(&options.work_dir, profile.asset_count)?;
     let fixture_generate_seconds = generation_started.elapsed().as_secs_f64();
     let database_path = options.work_dir.join("library.db");
     let database_bytes = fs::metadata(&database_path)
         .map_err(|e| format!("stat {}: {e}", database_path.display()))?
         .len();
 
+    let derivative_cache_first_thumbnail_hit_ms =
+        dam_core::measure_derivative_cache_first_hit(&options.work_dir, &thumbnail_hit)
+            .map_err(|e| format!("measure derivative cache first hit: {e}"))?
+            .as_secs_f64()
+            * 1_000.0;
+
     let store = Store::open(&options.work_dir).map_err(|e| format!("open fixture: {e}"))?;
     let mut metrics = benchmark_store(&store, &profile, &database_path)?;
+    insert_metric(
+        &mut metrics,
+        "derivative_cache_first_thumbnail_hit_ms",
+        derivative_cache_first_thumbnail_hit_ms,
+        "ms",
+        Direction::LowerIsBetter,
+        vec![derivative_cache_first_thumbnail_hit_ms],
+    )?;
     let browser = if options.skip_browser {
         BrowserStatus::Skipped {
             reason: "requested with --skip-browser".into(),
@@ -617,6 +633,27 @@ fn generate_catalog(data_dir: &Path, profile: &Profile) -> Result<(), String> {
         .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); ANALYZE;")
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Populate the same flat thumbnail tree production uses. The bytes are deliberately tiny: this
+/// metric is about directory-entry count and first-hit latency, not cache capacity or image decode.
+/// The final file is non-empty and is the known hit the production controller reads.
+fn populate_derivative_cache(data_dir: &Path, entry_count: usize) -> Result<PathBuf, String> {
+    let thumbnails = data_dir.join("cache/thumbnails");
+    fs::create_dir_all(&thumbnails).map_err(|e| {
+        format!(
+            "create derivative cache fixture {}: {e}",
+            thumbnails.display()
+        )
+    })?;
+    let hit = thumbnails.join(format!("perf-{:08}.png", entry_count - 1));
+    for index in 0..entry_count {
+        let path = thumbnails.join(format!("perf-{index:08}.png"));
+        let bytes: &[u8] = if path == hit { b"thumbnail-hit" } else { b"" };
+        fs::write(&path, bytes)
+            .map_err(|e| format!("write derivative cache fixture {}: {e}", path.display()))?;
+    }
+    Ok(hit)
 }
 
 fn suspend_triggers(conn: &Connection, prefix: &str) -> Result<Vec<String>, String> {

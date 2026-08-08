@@ -1,15 +1,17 @@
 //! Bounded derivative-cache controller (issue #144).
 //!
-//! One startup-built inventory owns byte accounting for local and federated derivatives. Every
-//! subsequent hit, publication, eviction, metric read, and explicit removal updates
-//! that inventory, so the hot path never walks the cache tree. Preview entries are evicted before
-//! thumbnails, then LRU within a tier; peer entries have their own budget and seven-day freshness.
+//! One background-built startup inventory owns byte accounting for local and federated
+//! derivatives. Existing hits remain readable while that snapshot is built; publications wait by
+//! declining to cache until accounting is authoritative. Every subsequent hit, publication,
+//! eviction, metric read, and explicit removal updates the inventory, so the hot path never walks
+//! the cache tree. Preview entries are evicted before thumbnails, then LRU within a tier; peer
+//! entries have their own budget and seven-day freshness.
 
 use dam_api::admin::CacheUsage;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime};
 
 pub(crate) const PEER_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
@@ -96,6 +98,11 @@ struct Counters {
 #[derive(Default)]
 struct State {
     initialized: bool,
+    inventory_running: bool,
+    /// Paths read while the background snapshot is in flight. The final O(1) swap replays only
+    /// this normally tiny set, so a hit/miss concurrent with the walk cannot be resurrected or
+    /// lose its fresher LRU position.
+    inventory_touched: HashSet<PathBuf>,
     clock: u64,
     entries: HashMap<PathBuf, Entry>,
     usage_bytes: [u64; 3],
@@ -173,6 +180,7 @@ pub(crate) struct Controller {
     options: ResolvedOptions,
     peer_ttl: Duration,
     state: Mutex<State>,
+    inventory_ready: Condvar,
     flights: Flights,
     inventory_runs: AtomicU64,
     model_derivative_generations: AtomicU64,
@@ -181,11 +189,18 @@ pub(crate) struct Controller {
 impl Controller {
     pub(crate) fn new(data_dir: &Path, options: CacheOptions) -> Arc<Self> {
         let root = data_dir.join("cache");
+        // A brand-new data directory has nothing to inventory, so publications are immediately
+        // enabled. An existing cache is accounted in the background by `EmbeddedLibrary::new`.
+        let state = State {
+            initialized: !root.exists(),
+            ..State::default()
+        };
         Arc::new(Self {
             options: options.resolve(&root),
             root,
             peer_ttl: PEER_TTL,
-            state: Mutex::new(State::default()),
+            state: Mutex::new(state),
+            inventory_ready: Condvar::new(),
             flights: Flights {
                 map: Mutex::new(HashMap::new()),
                 current: AtomicUsize::new(0),
@@ -203,7 +218,11 @@ impl Controller {
             root: controller.root.clone(),
             options: controller.options,
             peer_ttl,
-            state: Mutex::new(State::default()),
+            state: Mutex::new(State {
+                initialized: !controller.root.exists(),
+                ..State::default()
+            }),
+            inventory_ready: Condvar::new(),
             flights: Flights {
                 map: Mutex::new(HashMap::new()),
                 current: AtomicUsize::new(0),
@@ -242,8 +261,70 @@ impl Controller {
     }
 
     pub(crate) fn initialize_now(&self) {
+        {
+            let mut state = self.state.lock().unwrap();
+            loop {
+                if state.initialized {
+                    return;
+                }
+                if !state.inventory_running {
+                    state.inventory_running = true;
+                    self.inventory_runs.fetch_add(1, Ordering::Relaxed);
+                    break;
+                }
+                state = self.inventory_ready.wait(state).unwrap();
+            }
+        }
+
+        // The million-file walk and HashMap construction happen without the live state lock. A
+        // request needs that lock only long enough to record its one touched path.
+        let mut inventory = self.build_inventory();
+        self.evict_to_fit(&mut inventory, Tier::Thumbnail, 0);
+        self.evict_to_fit(&mut inventory, Tier::Peer, 0);
+
         let mut state = self.state.lock().unwrap();
-        self.initialize(&mut state);
+        for index in 0..state.counters.len() {
+            inventory.counters[index].hits = inventory.counters[index]
+                .hits
+                .saturating_add(state.counters[index].hits);
+            inventory.counters[index].misses = inventory.counters[index]
+                .misses
+                .saturating_add(state.counters[index].misses);
+            inventory.counters[index].evictions = inventory.counters[index]
+                .evictions
+                .saturating_add(state.counters[index].evictions);
+            inventory.counters[index].stale_deleted = inventory.counters[index]
+                .stale_deleted
+                .saturating_add(state.counters[index].stale_deleted);
+        }
+        // Snapshot entries for concurrently touched paths may be stale. Replace them from the live
+        // overlay only when the file still exists; this is bounded by requests during startup, not
+        // by the cache's total entry count.
+        let touched: Vec<_> = state.inventory_touched.drain().collect();
+        for path in touched {
+            inventory.remove_entry(&path);
+            let Some(live) = state.entries.get(&path) else {
+                continue;
+            };
+            let Ok(metadata) = std::fs::metadata(&path) else {
+                continue;
+            };
+            inventory.clock += 1;
+            inventory.insert_entry(
+                path,
+                Entry {
+                    bytes: metadata.len(),
+                    tier: live.tier,
+                    eviction_priority: live.eviction_priority,
+                    used: inventory.clock,
+                },
+            );
+        }
+        inventory.initialized = true;
+        inventory.inventory_running = false;
+        *state = inventory;
+        drop(state);
+        self.inventory_ready.notify_all();
     }
 
     /// Opportunistically join the same keyed flight from synchronous background workers. If an
@@ -294,7 +375,9 @@ impl Controller {
 
     pub(crate) fn read(&self, path: &Path, tier: Tier) -> Option<Vec<u8>> {
         let mut state = self.state.lock().unwrap();
-        self.initialize(&mut state);
+        if !state.initialized {
+            state.inventory_touched.insert(path.to_path_buf());
+        }
         if tier == Tier::Peer && is_stale(path, self.peer_ttl) {
             match std::fs::remove_file(path) {
                 Ok(()) => {
@@ -349,7 +432,13 @@ impl Controller {
     /// Atomically publish one derivative and enforce its budget before the rename makes it visible.
     pub(crate) fn publish(&self, path: &Path, bytes: &[u8], tier: Tier) {
         let mut state = self.state.lock().unwrap();
-        self.initialize(&mut state);
+        if !state.initialized {
+            state.inventory_touched.insert(path.to_path_buf());
+            // Serving the generated bytes is still correct, but publishing before existing usage
+            // is known could exceed the disk budget with no accounted victim to evict. Decline the
+            // cache write until the background inventory completes.
+            return;
+        }
         // Derivative keys are immutable. Another publisher may have won between the caller's
         // cache probe and this lock; preserving that complete file is both cheaper and genuinely
         // atomic (a later temp-write failure can never destroy a valid target).
@@ -415,8 +504,10 @@ impl Controller {
     }
 
     pub(crate) fn usage(&self, tier: Tier) -> CacheUsage {
-        let mut state = self.state.lock().unwrap();
-        self.initialize(&mut state);
+        // Administration asks for authoritative byte totals and may pay the wait; interactive
+        // derivative reads never come through this path.
+        self.initialize_now();
+        let state = self.state.lock().unwrap();
         let index = tier_index(tier);
         let bytes = state.usage_bytes[index];
         let files = state.usage_files[index];
@@ -433,8 +524,8 @@ impl Controller {
     }
 
     pub(crate) fn clear(&self, tiers: &[Tier]) -> (u64, u64) {
+        self.initialize_now();
         let mut state = self.state.lock().unwrap();
-        self.initialize(&mut state);
         let paths: Vec<_> = state
             .entries
             .iter()
@@ -470,8 +561,8 @@ impl Controller {
     }
 
     pub(crate) fn remove_prefix(&self, tier: Tier, prefix: &str) -> u64 {
+        self.initialize_now();
         let mut state = self.state.lock().unwrap();
-        self.initialize(&mut state);
         let paths: Vec<_> = state
             .entries
             .iter()
@@ -497,8 +588,8 @@ impl Controller {
     /// Explicit lifecycle cleanup for one cache subtree (for example a removed peer owner). This
     /// may walk that subtree; unlike a read/metric request it is an infrequent maintenance event.
     pub(crate) fn remove_tree(&self, dir: &Path) -> (u64, u64) {
+        self.initialize_now();
         let mut state = self.state.lock().unwrap();
-        self.initialize(&mut state);
         let mut bytes = 0u64;
         let mut files = 0u64;
         walk_files(
@@ -592,11 +683,8 @@ impl Controller {
         }
     }
 
-    fn initialize(&self, state: &mut State) {
-        if state.initialized {
-            return;
-        }
-        self.inventory_runs.fetch_add(1, Ordering::Relaxed);
+    fn build_inventory(&self) -> State {
+        let mut state = State::default();
         for (dir, tier) in [
             (self.root.join("thumbnails"), Tier::Thumbnail),
             (self.root.join("previews"), Tier::Preview),
@@ -625,9 +713,41 @@ impl Controller {
             });
         }
         state.initialized = true;
-        self.evict_to_fit(state, Tier::Thumbnail, 0);
-        self.evict_to_fit(state, Tier::Peer, 0);
+        state
     }
+}
+
+/// Perf-harness seam over the production controller. The inventory thread is joined only after the
+/// hit duration has been captured, keeping later harness metrics and work-directory cleanup free of
+/// background I/O.
+pub(crate) fn measure_first_thumbnail_hit(
+    data_dir: &Path,
+    hit_path: &Path,
+) -> std::io::Result<Duration> {
+    let cache = Controller::new(
+        data_dir,
+        CacheOptions {
+            local_bytes: Some(u64::MAX),
+            peer_bytes: Some(u64::MAX),
+        },
+    );
+    std::thread::scope(|scope| {
+        let inventory_cache = cache.clone();
+        let inventory = scope.spawn(move || inventory_cache.initialize_now());
+        let started = std::time::Instant::now();
+        let hit = cache.read(hit_path, Tier::Thumbnail);
+        let elapsed = started.elapsed();
+        inventory
+            .join()
+            .map_err(|_| std::io::Error::other("derivative cache inventory thread panicked"))?;
+        hit.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("thumbnail cache hit missing at {}", hit_path.display()),
+            )
+        })?;
+        Ok(elapsed)
+    })
 }
 
 fn walk_files(dir: &Path, visit: &mut impl FnMut(&Path, &std::fs::Metadata)) {
@@ -824,6 +944,34 @@ mod tests {
             let _ = cache.usage(Tier::Peer);
             let _ = cache.read(&stale, Tier::Peer);
         }
+        assert_eq!(cache.inventory_runs.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn first_existing_hit_does_not_wait_for_or_start_inventory() {
+        let dir = tempfile::tempdir().unwrap();
+        let thumbnails = dir.path().join("cache/thumbnails");
+        std::fs::create_dir_all(&thumbnails).unwrap();
+        for index in 0..1_000 {
+            std::fs::write(thumbnails.join(format!("entry-{index}.png")), [index as u8]).unwrap();
+        }
+        let hit = thumbnails.join("entry-999.png");
+        let cache = Controller::new(
+            dir.path(),
+            CacheOptions {
+                local_bytes: Some(2_000),
+                peer_bytes: Some(1),
+            },
+        );
+
+        assert_eq!(cache.read(&hit, Tier::Thumbnail), Some(vec![231]));
+        assert_eq!(cache.inventory_runs.load(Ordering::Relaxed), 0);
+
+        cache.initialize_now();
+        let usage = cache.usage(Tier::Thumbnail);
+        assert_eq!(usage.files, 1_000);
+        assert_eq!(usage.bytes, 1_000);
+        assert_eq!(usage.hits, 1);
         assert_eq!(cache.inventory_runs.load(Ordering::Relaxed), 1);
     }
 

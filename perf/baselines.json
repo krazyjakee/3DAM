@@ -17,6 +17,7 @@
         "export_assets_per_second": { "reference": 2000, "max_ratio": 2.0, "direction": "higher_is_better" },
         "peak_rss_bytes": { "reference": 536870912, "max_ratio": 1.5, "direction": "lower_is_better" },
         "browser_initial_payload_bytes": { "reference": 2097152, "max_ratio": 1.5, "direction": "lower_is_better" },
+        "derivative_cache_first_thumbnail_hit_ms": { "reference": 5, "max_ratio": 5.0, "direction": "lower_is_better" },
         "browser_long_scroll_p99_ms": { "reference": 16, "max_ratio": 1.25, "direction": "lower_is_better" },
         "browser_heap_growth_bytes": { "reference": 25165824, "max_ratio": 1.25, "direction": "lower_is_better" }
       }
@@ -37,6 +38,7 @@
         "export_assets_per_second": { "reference": 10000, "max_ratio": 2.0, "direction": "higher_is_better" },
         "peak_rss_bytes": { "reference": 1073741824, "max_ratio": 1.5, "direction": "lower_is_better" },
         "browser_initial_payload_bytes": { "reference": 2097152, "max_ratio": 1.5, "direction": "lower_is_better" },
+        "derivative_cache_first_thumbnail_hit_ms": { "reference": 5, "max_ratio": 5.0, "direction": "lower_is_better" },
         "browser_long_scroll_p99_ms": { "reference": 16, "max_ratio": 1.25, "direction": "lower_is_better" },
         "browser_heap_growth_bytes": { "reference": 25165824, "max_ratio": 1.25, "direction": "lower_is_better" }
       }
@@ -57,6 +59,7 @@
         "export_assets_per_second": { "reference": 10000, "max_ratio": 2.0, "direction": "higher_is_better" },
         "peak_rss_bytes": { "reference": 4294967296, "max_ratio": 1.5, "direction": "lower_is_better" },
         "browser_initial_payload_bytes": { "reference": 2097152, "max_ratio": 1.5, "direction": "lower_is_better" },
+        "derivative_cache_first_thumbnail_hit_ms": { "reference": 5, "max_ratio": 5.0, "direction": "lower_is_better" },
         "browser_long_scroll_p99_ms": { "reference": 16, "max_ratio": 1.25, "direction": "lower_is_better" },
         "browser_heap_growth_bytes": { "reference": 25165824, "max_ratio": 1.25, "direction": "lower_is_better" }
       }
