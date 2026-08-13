@@ -91,6 +91,23 @@ test("a double-click autoplay request starts only the player the user can see", 
   expect(played).toEqual([rail]);
 });
 
+test("a player that is hidden by a layout change hands playback back", () => {
+  const view = renderBothInspectorCopies();
+
+  act(() => emitShortcut("play-pause"));
+  expect(played).toEqual([view.rail]);
+
+  // Crossing the `lg` breakpoint hides the rail and reveals the drawer without unmounting either —
+  // whoever was playing must stop, since the controls now address the other copy.
+  act(() => {
+    view.getByTestId("rail").style.display = "none";
+    view.getByTestId("drawer").style.display = "";
+    window.dispatchEvent(new Event("resize"));
+  });
+
+  expect(paused).toEqual([view.rail]);
+});
+
 test("the play/pause shortcut drives the same single visible player", () => {
   const { rail, drawer } = renderBothInspectorCopies();
 

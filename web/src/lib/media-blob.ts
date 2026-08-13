@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { authenticatedFetch, csrfHeaders, resolveUrl } from "./server";
 
 type MediaBlob = {
@@ -51,14 +51,22 @@ export function useMediaBlob(path: string | null, active = true): MediaBlob {
 export function useMediaTicket(path: string | null, active = true): MediaBlob {
   const [state, setState] = useState<Omit<MediaBlob, "renew">>({ url: null, status: "idle" });
   const [generation, setGeneration] = useState(0);
+  /** The target the URL on screen was minted for, so a re-mint for the same one is recognisable. */
+  const mintedFor = useRef<string | null>(null);
 
   useEffect(() => {
     if (!path || !active) {
+      mintedFor.current = null;
       setState({ url: null, status: "idle" });
       return;
     }
     const abort = new AbortController();
-    setState({ url: null, status: "loading" });
+    // A renewal re-mints in the background, keeping the expiring URL mounted. Blanking it would
+    // unmount the very <audio>/<video> that asked for the new ticket — taking its transport (and
+    // the resume position both leaves keep for exactly this moment) with it, which is how a
+    // five-minute ticket used to turn mid-playback into "Loading preview…" and back to 0:00.
+    // A different target is a real navigation: blank, because the old URL is now the wrong media.
+    if (mintedFor.current !== path) setState({ url: null, status: "loading" });
     const resource = new URL(resolveUrl(path), location.origin);
     const targetResource = new URL(path, location.origin);
     const target = `${targetResource.pathname}${targetResource.search}`;
@@ -81,13 +89,17 @@ export function useMediaTicket(path: string | null, active = true): MediaBlob {
         // Append without reserializing the existing query: the server binds the ticket to the
         // exact encoded target, including order and escaping.
         const separator = resource.search ? "&" : "?";
+        mintedFor.current = path;
         setState({
           url: `${resource.toString()}${separator}ticket=${encodeURIComponent(ticket)}`,
           status: "ready",
         });
       })
       .catch(() => {
-        if (!abort.signal.aborted) setState({ url: null, status: "error" });
+        if (abort.signal.aborted) return;
+        // A failed renewal has no usable URL left to keep — drop the stale one and say so.
+        mintedFor.current = null;
+        setState({ url: null, status: "error" });
       });
     return () => abort.abort();
   }, [path, active, generation]);

@@ -47,6 +47,29 @@ export function AudioPlayer({
   // play/pause shortcut already drives.
   const visible = () => (rootRef.current?.getClientRects().length ?? 0) > 0;
 
+  // Crossing the `lg` breakpoint mid-playback hides one copy and reveals the other *without*
+  // unmounting either (they differ by a `hidden`/`lg:hidden` class, not by being rendered), so a
+  // playing player can become the one nothing controls. Hand playback back with the visibility.
+  useEffect(() => {
+    const onResize = () => {
+      const a = audioRef.current;
+      if (a && !a.paused && !visible()) a.pause();
+    };
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  // A media-ticket renewal swaps `src` under a live element (`useMediaTicket`). The load algorithm
+  // then aborts playback, fires `pause`, and reports currentTime 0 — so the position and the intent
+  // to be playing must be captured in the render that introduces the new URL, before any of that
+  // reaches state. Restored once the replacement source has metadata.
+  const shownSrc = useRef(src);
+  const resume = useRef<{ at: number; playing: boolean } | null>(null);
+  if (shownSrc.current !== src) {
+    shownSrc.current = src;
+    resume.current = { at: time, playing };
+  }
+
   // Double-click-to-play (issue #52): when the Browser requests autoplay for this asset, start
   // playback and clear the request so single-click selecting it later never auto-starts.
   const autoplaySignal = useAutoplaySignal(assetId);
@@ -133,9 +156,15 @@ export function AudioPlayer({
         src={src}
         preload="metadata"
         onLoadedMetadata={(e) => {
-          setDur(e.currentTarget.duration);
-          if (time > 0) e.currentTarget.currentTime = time;
+          const el = e.currentTarget;
+          setDur(el.duration);
           setError(false);
+          const restore = resume.current;
+          resume.current = null;
+          if (!restore) return;
+          if (restore.at > 0) el.currentTime = restore.at;
+          // The interruption was a credential rotation the listener never asked for; carry on.
+          if (restore.playing) el.play().catch(() => setError(true));
         }}
         onDurationChange={(e) => setDur(e.currentTarget.duration)}
         onTimeUpdate={(e) => setTime(e.currentTarget.currentTime)}
