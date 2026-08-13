@@ -39,11 +39,19 @@ export function AudioPlayer({
 
   const progress = dur > 0 ? time / dur : 0;
 
+  // The `lg` rail and the responsive drawer are both mounted, so a selected audio asset always has
+  // *two* players in the DOM — and a `display:none` <audio> still makes sound. Every path that
+  // starts playback must therefore address only the player the user can see, or the file plays
+  // twice, a beat apart, and the audible copy can't be paused. `display:none` reports no client
+  // rects; the closed (translated off-screen) drawer panel does, which is the same instance the
+  // play/pause shortcut already drives.
+  const visible = () => (rootRef.current?.getClientRects().length ?? 0) > 0;
+
   // Double-click-to-play (issue #52): when the Browser requests autoplay for this asset, start
   // playback and clear the request so single-click selecting it later never auto-starts.
   const autoplaySignal = useAutoplaySignal(assetId);
   useEffect(() => {
-    if (autoplaySignal > 0) {
+    if (autoplaySignal > 0 && visible()) {
       audioRef.current?.play().catch(() => setError(true));
       clearAutoplay();
     }
@@ -59,8 +67,7 @@ export function AudioPlayer({
   useEffect(() => {
     const onShortcut = (event: Event) => {
       if ((event as CustomEvent<ShortcutId>).detail !== "play-pause") return;
-      // The rail and responsive drawer are both mounted; only control the player users can see.
-      if (rootRef.current?.getClientRects().length) toggle();
+      if (visible()) toggle();
     };
     window.addEventListener(SHORTCUT_EVENT, onShortcut);
     return () => window.removeEventListener(SHORTCUT_EVENT, onShortcut);
