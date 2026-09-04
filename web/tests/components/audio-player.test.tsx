@@ -118,3 +118,38 @@ test("the play/pause shortcut drives the same single visible player", () => {
   expect(paused).toEqual([rail]);
   expect(played).not.toContain(drawer);
 });
+
+// The failure copy used to be a single sentence — "can't play this audio format in the browser" —
+// shown for every `error` event. It named the wrong cause (a 404 from an expired ticket or a peer
+// that can't serve the bytes raises the same event as an undecodable codec) and the wrong shell
+// (the desktop app is a webview; it is the same UI, so the copy cannot claim a browser).
+test("a failed load reports what the element said, not a guess about the format", () => {
+  const { rail, getByText, queryByText } = renderBothInspectorCopies();
+
+  act(() => {
+    Object.defineProperty(rail, "error", {
+      configurable: true,
+      value: { code: 4 } as MediaError,
+    });
+    rail.dispatchEvent(new Event("error"));
+  });
+
+  expect(queryByText(/browser/i)).toBeNull();
+  expect(queryByText(/audio format/i)).toBeNull();
+  expect(getByText(/couldn’t fetch the file, or nothing here can decode it/i)).toBeTruthy();
+});
+
+// A ticket renewal swaps `src` under a live element on purpose, and the load that follows rejects
+// the in-flight `play()` with AbortError. Reporting that as a playback failure disabled the
+// transport on a file that was playing a moment ago and would play again.
+test("a play() interrupted by a src swap is not reported as a failure", async () => {
+  vi.spyOn(HTMLMediaElement.prototype, "play").mockImplementation(() =>
+    Promise.reject(Object.assign(new Error("interrupted"), { name: "AbortError" })),
+  );
+  const view = renderBothInspectorCopies();
+
+  await act(async () => emitShortcut("play-pause"));
+
+  expect(view.queryByText(/couldn’t play/i)).toBeNull();
+  expect(view.getByRole("button", { name: "Play" })).not.toHaveProperty("disabled", true);
+});

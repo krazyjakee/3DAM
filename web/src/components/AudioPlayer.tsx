@@ -10,6 +10,34 @@ import { WaveformIsland } from "@/islands/WaveformIsland";
 import { clearAutoplay, useAutoplaySignal } from "@/lib/audio-intent";
 import { shortcutLabel, SHORTCUT_EVENT, type ShortcutId } from "@/lib/shortcuts";
 
+/** `MediaError` codes, spelled out: jsdom ships no `MediaError` global, so reading the constants off
+ *  it would work in both shells and throw in the component test. */
+const MEDIA_ERR_NETWORK = 2;
+const MEDIA_ERR_DECODE = 3;
+const MEDIA_ERR_SRC_NOT_SUPPORTED = 4;
+
+/** What actually went wrong, read off the element instead of guessed.
+ *
+ *  This used to read "can't play this audio format in the browser" for every failure, which was
+ *  wrong twice over. The desktop shell is a webview, not a browser — same UI, so the copy cannot
+ *  name one of them. And the format is rarely the cause: a content request that 404s (an expired
+ *  media ticket, or a federated peer that can't serve the bytes) raises the same `error` event as a
+ *  codec nothing here can decode. `MediaError` separates the transfer from the decode, so say only
+ *  what the code actually supports; code 4 means "never became a playable stream" and genuinely
+ *  does not distinguish the two, so it names both. */
+function playbackFailure(el: HTMLAudioElement | null): string {
+  switch (el?.error?.code) {
+    case MEDIA_ERR_NETWORK:
+      return "Lost the connection while loading this audio.";
+    case MEDIA_ERR_DECODE:
+      return "This audio stopped decoding partway — the file may be damaged.";
+    case MEDIA_ERR_SRC_NOT_SUPPORTED:
+      return "Couldn’t play this audio — 3DAM couldn’t fetch the file, or nothing here can decode it.";
+    default:
+      return "Couldn’t play this audio.";
+  }
+}
+
 /** m:ss, guarding the NaN/Infinity that HTMLMediaElement reports before metadata loads. */
 function fmtTime(sec: number): string {
   if (!Number.isFinite(sec) || sec < 0) return "0:00";
@@ -34,10 +62,18 @@ export function AudioPlayer({
   const [playing, setPlaying] = useState(false);
   const [time, setTime] = useState(0);
   const [dur, setDur] = useState(0);
-  const [error, setError] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const lastRenewal = useRef(0);
 
   const progress = dur > 0 ? time / dur : 0;
+
+  // A `play()` promise rejects with `AbortError` whenever a load or a pause interrupts it, and this
+  // component swaps `src` under a live element on every ticket renewal — routine, and not something
+  // to report as a failure. Anything else did stop playback, so ask the element why.
+  const reportPlayFailure = (reason: unknown) => {
+    if ((reason as { name?: string } | null)?.name === "AbortError") return;
+    setError(playbackFailure(audioRef.current));
+  };
 
   // The `lg` rail and the responsive drawer are both mounted, so a selected audio asset always has
   // *two* players in the DOM — and a `display:none` <audio> still makes sound. Every path that
@@ -75,7 +111,7 @@ export function AudioPlayer({
   const autoplaySignal = useAutoplaySignal(assetId);
   useEffect(() => {
     if (autoplaySignal > 0 && visible()) {
-      audioRef.current?.play().catch(() => setError(true));
+      audioRef.current?.play().catch(reportPlayFailure);
       clearAutoplay();
     }
   }, [autoplaySignal]);
@@ -83,7 +119,7 @@ export function AudioPlayer({
   const toggle = () => {
     const a = audioRef.current;
     if (!a) return;
-    if (a.paused) a.play().catch(() => setError(true));
+    if (a.paused) a.play().catch(reportPlayFailure);
     else a.pause();
   };
 
@@ -120,7 +156,7 @@ export function AudioPlayer({
         <button
           type="button"
           onClick={toggle}
-          disabled={error}
+          disabled={error !== null}
           aria-label={playing ? "Pause" : "Play"}
           aria-keyshortcuts="Space"
           title={`${playing ? "Pause" : "Play"} (${shortcutLabel("play-pause")})`}
@@ -134,7 +170,7 @@ export function AudioPlayer({
           max={1}
           step={0.001}
           value={progress}
-          disabled={error || dur === 0}
+          disabled={error !== null || dur === 0}
           onChange={(e) => seekToFraction(Number(e.target.value))}
           aria-label="Seek"
           className="h-1 flex-1 cursor-pointer coarse:h-2"
@@ -145,11 +181,7 @@ export function AudioPlayer({
         </span>
       </div>
 
-      {error && (
-        <p className="px-2 pb-1.5 text-[10px] text-danger">
-          Can’t play this audio format in the browser.
-        </p>
-      )}
+      {error !== null && <p className="px-2 pb-1.5 text-[10px] text-danger">{error}</p>}
 
       <audio
         ref={audioRef}
@@ -158,25 +190,25 @@ export function AudioPlayer({
         onLoadedMetadata={(e) => {
           const el = e.currentTarget;
           setDur(el.duration);
-          setError(false);
+          setError(null);
           const restore = resume.current;
           resume.current = null;
           if (!restore) return;
           if (restore.at > 0) el.currentTime = restore.at;
           // The interruption was a credential rotation the listener never asked for; carry on.
-          if (restore.playing) el.play().catch(() => setError(true));
+          if (restore.playing) el.play().catch(reportPlayFailure);
         }}
         onDurationChange={(e) => setDur(e.currentTarget.duration)}
         onTimeUpdate={(e) => setTime(e.currentTarget.currentTime)}
         onPlay={() => setPlaying(true)}
         onPause={() => setPlaying(false)}
         onEnded={() => setPlaying(false)}
-        onError={() => {
+        onError={(e) => {
           if (onCredentialExpired && Date.now() - lastRenewal.current >= 60_000) {
             lastRenewal.current = Date.now();
             onCredentialExpired();
           } else {
-            setError(true);
+            setError(playbackFailure(e.currentTarget));
           }
         }}
       />

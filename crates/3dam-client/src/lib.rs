@@ -39,6 +39,32 @@ pub struct ApiClient {
     http: reqwest::Client,
 }
 
+/// Trim one upstream chunk down to the still-wanted slice of a whole-body response, for the
+/// no-range-support fallback in `stream_content_from`. `window` is `(bytes still to skip, bytes
+/// still wanted)`; returning `None` ends the stream, which drops the upstream response and stops
+/// the peer's transfer as soon as the window is full rather than draining the rest of the file.
+/// Chunks that fall entirely inside the skipped prefix yield an empty slice — a body stream may
+/// produce those, and swallowing them would mean ending the stream early.
+fn clip_to_window<B: AsRef<[u8]>>(
+    (skip, wanted): &mut (u64, u64),
+    item: Result<B, LibError>,
+) -> Option<Result<Vec<u8>, LibError>> {
+    let chunk = match item {
+        Ok(chunk) => chunk,
+        Err(error) => return Some(Err(error)),
+    };
+    if *wanted == 0 {
+        return None;
+    }
+    let chunk = chunk.as_ref();
+    let dropped = (*skip).min(chunk.len() as u64);
+    *skip -= dropped;
+    let chunk = &chunk[dropped as usize..];
+    let taken = (*wanted).min(chunk.len() as u64);
+    *wanted -= taken;
+    Some(Ok(chunk[..taken as usize].to_vec()))
+}
+
 /// Recover `(media, format)` from a `Content-Type` — the inverse of `dam_api::dto::content_type_for`.
 /// Only informational on the client side (the bytes are what matter); unknown types default to model.
 fn media_from_content_type(ct: &str) -> (MediaType, String) {
@@ -264,6 +290,35 @@ impl LibraryService for ApiClient {
             .send()
             .await
             .map_err(|error| LibError::SourceUnavailable(error.to_string()))?;
+        // A peer answering `200` did not honour the `Range` header, which is its right: RFC 9110
+        // §14.2 makes range support optional, and every 3DAM peer older than the streaming work
+        // (issue #125) materialises the whole representation instead. Demanding `206` here broke
+        // those peers outright — audio and video are the only media that take this path, so the
+        // proxy failed, federation folded the error into `NotFound`, and the media element reported
+        // an unsupported source while images and meshes (which go through `read_content`) kept
+        // working. Clip the requested window out of the full body instead: seeking still works, it
+        // just costs the peer a whole send, so a peer that does implement ranges stays strictly
+        // cheaper. Fail-soft, and the caller cannot tell the difference.
+        if response.status() == reqwest::StatusCode::OK {
+            let total_len = Self::response_content_len(response.headers())?;
+            if range.last() >= total_len {
+                return Err(LibError::Upstream(
+                    "content response is shorter than the requested range".into(),
+                ));
+            }
+            let metadata = Self::content_metadata_from_headers(response.headers(), total_len);
+            let bytes = response
+                .bytes_stream()
+                .map(|item| item.map_err(|error| LibError::Upstream(error.to_string())))
+                .scan((range.first(), range.len()), |window, item| {
+                    futures::future::ready(clip_to_window(window, item))
+                });
+            return Ok(AssetContentStream {
+                metadata,
+                range,
+                bytes: Box::pin(bytes),
+            });
+        }
         if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
             return Err(LibError::Upstream(format!(
                 "range endpoint returned HTTP {}",
@@ -968,6 +1023,14 @@ mod tests {
         headers: &'static str,
         body: &'static [u8],
     ) -> (Url, tokio::task::JoinHandle<String>) {
+        status_server("206 Partial Content", headers, body).await
+    }
+
+    async fn status_server(
+        status: &'static str,
+        headers: &'static str,
+        body: &'static [u8],
+    ) -> (Url, tokio::task::JoinHandle<String>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -978,7 +1041,7 @@ mod tests {
             let read = socket.read(&mut request).await.unwrap();
             let request = String::from_utf8_lossy(&request[..read]).into_owned();
             socket
-                .write_all(format!("HTTP/1.1 206 Partial Content\r\n{headers}\r\n").as_bytes())
+                .write_all(format!("HTTP/1.1 {status}\r\n{headers}\r\n").as_bytes())
                 .await
                 .unwrap();
             for chunk in body.chunks(3) {
@@ -1098,5 +1161,65 @@ mod tests {
             .await
             .expect_err("actual streamed bytes must enforce the materialisation cap");
         assert!(matches!(error, LibError::Unsupported(_)));
+    }
+
+    /// A peer may ignore `Range` — RFC 9110 §14.2 allows it and every 3DAM older than issue #125
+    /// does it — and answer `200` with the whole file. Audio and video are the only media that
+    /// stream, so rejecting that reply used to make a peer's entire sound library unplayable while
+    /// its images kept working. The window must instead be cut out of the full body, exactly, and
+    /// the stream must stop once it is full rather than draining the remainder.
+    #[tokio::test]
+    async fn a_peer_that_ignores_range_still_yields_the_requested_window() {
+        let (endpoint, request) = status_server(
+            "200 OK",
+            "Content-Type: audio/wav\r\nContent-Length: 12\r\nConnection: close\r\n",
+            b"0123456789ab",
+        )
+        .await;
+        let client = ApiClient::connect(endpoint).await.unwrap();
+        let mut content = client
+            .stream_content(
+                &AuthContext::embedded(),
+                &AssetId::new(),
+                ContentRange::new(4, 7).unwrap(),
+            )
+            .await
+            .expect("a whole-body reply is a usable representation, not a failure");
+        // `metadata.len` stays the complete representation; `range` is what the stream produces.
+        assert_eq!(content.metadata.len, 12);
+        assert_eq!(content.metadata.media, MediaType::Audio);
+        assert_eq!(content.range.len(), 4);
+        let mut received = Vec::new();
+        while let Some(chunk) = content.bytes.next().await {
+            received.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(received, b"4567");
+        let request = request.await.unwrap();
+        assert!(request
+            .to_ascii_lowercase()
+            .contains("range: bytes=4-7\r\n"));
+
+        // A range the whole-body reply cannot contain is still an error: serving short would let
+        // the local server promise a Content-Length it never delivers.
+        let (endpoint, request) = status_server(
+            "200 OK",
+            "Content-Type: audio/wav\r\nContent-Length: 6\r\nConnection: close\r\n",
+            b"012345",
+        )
+        .await;
+        let client = ApiClient::connect(endpoint).await.unwrap();
+        let error = match client
+            .stream_content(
+                &AuthContext::embedded(),
+                &AssetId::new(),
+                ContentRange::new(4, 7).unwrap(),
+            )
+            .await
+        {
+            Ok(_) => panic!("a body shorter than the requested window is not a usable stream"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, LibError::Upstream(_)));
+        request.await.unwrap();
     }
 }
