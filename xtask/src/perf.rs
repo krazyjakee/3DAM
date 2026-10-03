@@ -899,7 +899,7 @@ fn deterministic_id(namespace: u8, index: u64) -> [u8; 16] {
 
 fn deterministic_hash(index: u64) -> [u8; 32] {
     let mut bytes = [0_u8; 32];
-    for chunk in bytes.chunks_exact_mut(8) {
+    for chunk in bytes.as_chunks_mut::<8>().0 {
         chunk.copy_from_slice(&index.wrapping_mul(0x9e37_79b9_7f4a_7c15).to_le_bytes());
     }
     bytes

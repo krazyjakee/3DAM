@@ -747,7 +747,7 @@ fn upload_texture(
 /// and cheaper than deduping for a downscaled preview mesh. A trailing partial triangle is ignored.
 fn triangle_edges(indices: &[u32]) -> Vec<u32> {
     let mut edges = Vec::with_capacity(indices.len() / 3 * 6);
-    for tri in indices.chunks_exact(3) {
+    for tri in indices.as_chunks::<3>().0 {
         edges.extend_from_slice(&[tri[0], tri[1], tri[1], tri[2], tri[2], tri[0]]);
     }
     edges
