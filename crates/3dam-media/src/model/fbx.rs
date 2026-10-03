@@ -300,7 +300,12 @@ impl Fbx {
         {
             let mut buf = vec![0u8; a.payload as usize];
             if self.take(&mut buf).is_some() {
-                let polygons = buf.chunks_exact(4).filter(|c| c[3] & 0x80 != 0).count() as i64;
+                let polygons = buf
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .filter(|c| c[3] & 0x80 != 0)
+                    .count() as i64;
                 if polygons > 0 {
                     return a.len as i64 - 2 * polygons;
                 }

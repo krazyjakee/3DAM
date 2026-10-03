@@ -310,7 +310,7 @@ fn ktx2_decode(path: &Path) -> Result<RgbaImage, HandlerError> {
         if data.len() < need {
             return Err(HandlerError::Corrupt("KTX2 level is short".into()));
         }
-        for px in data[..need].chunks_exact_mut(4) {
+        for px in data[..need].as_chunks_mut::<4>().0 {
             px.swap(0, 2);
         }
         data.truncate(need);
