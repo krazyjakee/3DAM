@@ -1,0 +1,64 @@
+{
+  "scenario": "Serial simulated HDD: 8 ms/request, 32 MiB/s, shared source/scratch/cache, foreground catalog/thumbnail reads and competing 4 KiB reads",
+  "date": "2026-10-03",
+  "base_commit": "66d05a6",
+  "baseline": "Replay of current-main unpaced source-copy and eager cache-warming access patterns; not an older production deployment or an unmodified-main binary benchmark",
+  "foreground_and_competitor_p95_budget_ms": 60,
+  "physical_host_or_cgroup_psi": null,
+  "measurements": {
+    "cold_cache": {
+      "before": {
+        "elapsed_s": 1.145877282,
+        "progress": 4,
+        "foreground_samples": 5,
+        "foreground_p95_ms": 270.959572,
+        "competitor_samples": 5,
+        "competitor_p95_ms": 270.96084399999995,
+        "disk_request_p95_ms": 282.325964,
+        "max_queue": 3,
+        "transferred_bytes": 33595392,
+        "throughput_mib_s": 27.960291213802073
+      },
+      "after": {
+        "elapsed_s": 0.097432857,
+        "progress": 4,
+        "foreground_samples": 3,
+        "foreground_p95_ms": 23.94729,
+        "competitor_samples": 3,
+        "competitor_p95_ms": 23.945366999999997,
+        "disk_request_p95_ms": 26.557205,
+        "max_queue": 3,
+        "transferred_bytes": 40960,
+        "throughput_mib_s": 0.4009171156707434
+      }
+    },
+    "sustained_copy": {
+      "before": {
+        "elapsed_s": 3.808871725,
+        "progress": 4,
+        "foreground_samples": 39,
+        "foreground_p95_ms": 106.08744300000001,
+        "competitor_samples": 39,
+        "competitor_p95_ms": 106.10056700000001,
+        "disk_request_p95_ms": 114.824905,
+        "max_queue": 6,
+        "transferred_bytes": 67428360,
+        "throughput_mib_s": 16.88287234965744
+      },
+      "after": {
+        "elapsed_s": 12.858832567,
+        "progress": 4,
+        "foreground_samples": 494,
+        "foreground_p95_ms": 31.942725,
+        "competitor_samples": 494,
+        "competitor_p95_ms": 33.89443,
+        "disk_request_p95_ms": 33.117127,
+        "max_queue": 3,
+        "transferred_bytes": 71155720,
+        "throughput_mib_s": 5.277258435073185
+      }
+    }
+  },
+  "cold_cache_workers": 1,
+  "sustained_copy_workers": 4
+}

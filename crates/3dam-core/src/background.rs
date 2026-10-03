@@ -177,14 +177,17 @@ impl EmbeddedLibrary {
             let governor = self.governor.clone();
             let cache = self.cache.clone();
             let (generated, failed) = self
-                .run_bg(move |store| {
-                    let never_cancelled = AtomicBool::new(false);
+                .run_background(move |store| {
+                    let cancel = cache.background_cancel();
                     let mut generated = 0u64;
                     let mut failed = 0u64;
                     for t in targets {
+                        if cancel.load(Ordering::Relaxed) {
+                            break;
+                        }
                         // Good-neighbour pacing (tech-spec 14 §3.4): pre-rendering is pure opportunism — it
                         // parks whenever the host is short on memory or CPU and resumes on recovery.
-                        governor.pace(&never_cancelled);
+                        governor.pace(cancel);
                         let Ok(asset) = store.get_asset(&t.id) else {
                             continue; // vanished between listing and read — fail-soft
                         };
@@ -194,28 +197,17 @@ impl EmbeddedLibrary {
                         } else {
                             format!("thumbnail:{}:{PREGEN_THUMB_EDGE}", t.id)
                         };
-                        let warmed = cache.singleflight_blocking(key, || {
-                            if is_model {
-                                gen_model_derivatives(
-                                    &cache,
-                                    &data_dir,
-                                    store,
-                                    &secrets,
-                                    &asset,
-                                    PREGEN_THUMB_EDGE,
-                                )
-                                .map(|_| ())
-                            } else {
-                                gen_thumbnail(
-                                    &cache,
-                                    &data_dir,
-                                    store,
-                                    &secrets,
-                                    &asset,
-                                    PREGEN_THUMB_EDGE,
-                                )
-                                .map(|_| ())
-                            }
+                        let warmed = cache.singleflight_blocking(key, |priority_cancel| {
+                            crate::derivatives::warm_derivatives(
+                                &cache,
+                                &data_dir,
+                                store,
+                                &secrets,
+                                &asset,
+                                PREGEN_THUMB_EDGE,
+                                &governor,
+                                priority_cancel,
+                            )
                         });
                         if warmed.is_some_and(|result| result.is_ok()) {
                             if store.mark_derivative_ready(

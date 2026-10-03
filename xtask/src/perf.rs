@@ -1218,6 +1218,11 @@ fn benchmark_analysis_under_browse(
         .block_on(EmbeddedLibrary::open_with(
             data_dir,
             ResourceOptions {
+                io: dam_core::IoOptions {
+                    max_mib_per_sec: Some(1024),
+                    concurrency: Some(requested_workers),
+                    ..Default::default()
+                },
                 background_threads: Some(requested_workers),
                 min_free_memory_mb: Some(0),
                 max_io_stall_pct: Some(f64::INFINITY),
@@ -1227,7 +1232,7 @@ fn benchmark_analysis_under_browse(
     // The profile-sized derivative inventory uses the same pool. Join it before taking worker CPU
     // snapshots so this metric contains only the analysis pass named in the report.
     runtime
-        .block_on(library.storage_usage())
+        .block_on(library.wait_for_cache_inventory())
         .map_err(|error| format!("join derivative inventory before analysis: {error}"))?;
 
     let before = rayon_worker_cpu_nanos()?;

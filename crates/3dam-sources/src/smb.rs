@@ -132,11 +132,19 @@ impl FileSource for SmbSource {
     /// blocks; it used to accumulate them into one `Vec<u8>` that was then written out, so a large
     /// asset sat in memory twice over. Now each block goes straight to disk.
     fn fetch(&self, rel_path: &str) -> Result<Fetched, LibError> {
+        self.fetch_paced(rel_path, &mut |_| Ok(()))
+    }
+
+    fn fetch_paced(
+        &self,
+        rel_path: &str,
+        pace: &mut dyn FnMut(u64) -> Result<(), LibError>,
+    ) -> Result<Fetched, LibError> {
         let rel_path = guard_rel_path(rel_path)?;
         let unc = self.unc_for(&rel_path);
         let mut sink = crate::temp_sink(&rel_path, &self.scratch)?;
         self.rt
-            .block_on(read_file_into(&self.client, &unc, &mut sink))?;
+            .block_on(read_file_into(&self.client, &unc, &mut sink, pace))?;
         std::io::Write::flush(&mut sink).ok();
         Ok(Fetched::Temp(sink))
     }
@@ -436,6 +444,7 @@ async fn read_file_into<W: std::io::Write>(
     client: &Client,
     unc: &UncPath,
     out: &mut W,
+    pace: &mut dyn FnMut(u64) -> Result<(), LibError>,
 ) -> Result<(), LibError> {
     let args = FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_read(true));
     let resource = client
@@ -449,6 +458,7 @@ async fn read_file_into<W: std::io::Write>(
     let mut buf = vec![0u8; crate::FETCH_CHUNK];
     let mut pos: u64 = 0;
     loop {
+        pace(crate::FETCH_CHUNK as u64)?;
         let n = file
             .read_block(&mut buf, pos, None, false)
             .await

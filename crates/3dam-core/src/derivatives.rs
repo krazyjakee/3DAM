@@ -1,3 +1,4 @@
+use crate::resources::Cancellation;
 use crate::{cache, content::fetch_asset, credentials, paths, reliability};
 use dam_api::dto::{Asset, AssetContent, ConvertReport, JobState, MediaType};
 use dam_api::event::LibraryEvent;
@@ -79,6 +80,19 @@ pub(super) fn gen_thumbnail(
     asset: &Asset,
     max_edge: u32,
 ) -> Result<AssetContent, LibError> {
+    gen_thumbnail_with_io(cache, data_dir, store, secrets, asset, max_edge, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gen_thumbnail_with_io(
+    cache: &cache::Controller,
+    data_dir: &Path,
+    store: &Store,
+    secrets: &credentials::SecretVault,
+    asset: &Asset,
+    max_edge: u32,
+    io: Option<(&crate::resources::Governor, &dyn Cancellation)>,
+) -> Result<AssetContent, LibError> {
     if let Some(hit) = thumb_cache_lookup(cache, data_dir, asset, max_edge) {
         return Ok(hit); // cache hit → no source access at all
     }
@@ -86,14 +100,15 @@ pub(super) fn gen_thumbnail(
 
     // Cache miss: resolve the source file (in place for local, downloaded for remote). `fetch`
     // guards `..` traversal out of the source root.
-    let fetched = fetch_asset(store, secrets, asset, &paths::scratch_dir(data_dir))?;
+    let (fetched, work) = fetch_derivative(store, secrets, asset, data_dir, io)?;
     let det = dam_media::Detected {
         media: asset.summary.media,
         format: asset.summary.format.clone(),
     };
     let bytes = render_thumbnail_bytes(fetched.path(), &det, max_edge)?;
+    drop(work);
 
-    cache.publish(&cache_path, &bytes, cache::Tier::Thumbnail);
+    publish_derivative(cache, &cache_path, &bytes, cache::Tier::Thumbnail, io);
     Ok(png_content(bytes))
 }
 
@@ -223,27 +238,61 @@ pub(super) fn gen_model_derivatives(
     asset: &Asset,
     edge: u32,
 ) -> Result<ModelDerivativeContent, LibError> {
+    gen_model_derivatives_with_io(cache, data_dir, store, secrets, asset, edge, None)
+}
+
+#[cfg(feature = "render")]
+#[allow(clippy::too_many_arguments)]
+fn gen_model_derivatives_with_io(
+    cache: &cache::Controller,
+    data_dir: &Path,
+    store: &Store,
+    secrets: &credentials::SecretVault,
+    asset: &Asset,
+    edge: u32,
+    io: Option<(&crate::resources::Governor, &dyn Cancellation)>,
+) -> Result<ModelDerivativeContent, LibError> {
     let thumbnail_path = thumb_cache_path(data_dir, asset, edge);
     let preview_path = model_preview_cache_path(data_dir, asset);
-    let thumbnail_hit = cache.read(&thumbnail_path, cache::Tier::Thumbnail);
-    let preview_hit = cache.read(&preview_path, cache::Tier::Preview);
+    // Background callers discard the result: even a partial cache hit only needs metadata.
+    let thumbnail_hit = if io.is_some() {
+        cache
+            .contains(&thumbnail_path, cache::Tier::Thumbnail)
+            .then(Vec::new)
+    } else {
+        cache.read(&thumbnail_path, cache::Tier::Thumbnail)
+    };
+    let preview_hit = if io.is_some() {
+        cache
+            .contains(&preview_path, cache::Tier::Preview)
+            .then(Vec::new)
+    } else {
+        cache.read(&preview_path, cache::Tier::Preview)
+    };
     if let (Some(thumbnail), Some(preview)) = (thumbnail_hit.as_ref(), preview_hit.as_ref()) {
         return Ok(ModelDerivativeContent {
             thumbnail: Some(thumbnail.clone()),
             preview: preview.clone(),
         });
     }
+    let (fetched, work) = fetch_derivative(store, secrets, asset, data_dir, io)?;
     cache.record_model_derivative_generation();
-    let fetched = fetch_asset(store, secrets, asset, &paths::scratch_dir(data_dir))?;
     let derivatives = dam_render::model_derivatives(fetched.path(), &asset.summary.format, edge)
         .map_err(|error| LibError::Unsupported(error.to_string()))?;
+    drop(work);
     if preview_hit.is_none() {
-        cache.publish(&preview_path, &derivatives.preview, cache::Tier::Preview);
+        publish_derivative(
+            cache,
+            &preview_path,
+            &derivatives.preview,
+            cache::Tier::Preview,
+            io,
+        );
     }
     let generated_thumbnail = match derivatives.thumbnail {
         Ok(bytes) => {
             if thumbnail_hit.is_none() {
-                cache.publish(&thumbnail_path, &bytes, cache::Tier::Thumbnail);
+                publish_derivative(cache, &thumbnail_path, &bytes, cache::Tier::Thumbnail, io);
             }
             Some(bytes)
         }
@@ -279,6 +328,149 @@ pub(super) fn png_content(bytes: Vec<u8>) -> AssetContent {
         format: "png".to_string(),
         media: MediaType::Image,
     }
+}
+
+fn fetch_derivative<'a>(
+    store: &Store,
+    secrets: &credentials::SecretVault,
+    asset: &Asset,
+    data_dir: &Path,
+    io: Option<(&'a crate::resources::Governor, &'a dyn Cancellation)>,
+) -> Result<(dam_sources::Fetched, Option<crate::resources::io::Work<'a>>), LibError> {
+    let scratch = paths::scratch_dir(data_dir);
+    if let Some((governor, cancel)) = io {
+        let conn = secrets.resolve(store.get_source_connection(&asset.source_id)?)?;
+        let source = dam_sources::open_source(&conn, &scratch)?;
+        let (fetched, work) = governor.fetch(source.as_ref(), &asset.path, &scratch, cancel)?;
+        work.pace(
+            std::fs::metadata(fetched.path())
+                .map(|m| m.len())
+                .unwrap_or(0),
+        )?;
+        if cancel.cancelled() {
+            return Err(LibError::Internal("background derivative deferred".into()));
+        }
+        Ok((fetched, Some(work)))
+    } else {
+        Ok((fetch_asset(store, secrets, asset, &scratch)?, None))
+    }
+}
+
+fn publish_derivative(
+    cache: &cache::Controller,
+    path: &Path,
+    bytes: &[u8],
+    tier: cache::Tier,
+    io: Option<(&crate::resources::Governor, &dyn Cancellation)>,
+) {
+    if let Some((governor, cancel)) = io {
+        // Completed results claimed by a foreground waiter are foreground work now. Preserve
+        // them instead of making that waiter repeat the fetch/decode after preemption.
+        if let Ok(work) = governor.io.acquire(governor, &[Some(path)], cancel) {
+            cache.publish_paced(path, bytes, tier, &mut |n| work.pace(n));
+        }
+        if cancel.preempted() {
+            cache.publish(path, bytes, tier);
+        }
+    } else {
+        cache.publish(path, bytes, tier);
+    }
+}
+
+/// Warm immutable derivatives without loading existing payloads. Prefetch and the durable
+/// pipeline share this check, so repeated browser hints never stream cached DMSH files.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn warm_derivatives(
+    cache: &cache::Controller,
+    data_dir: &Path,
+    store: &Store,
+    secrets: &credentials::SecretVault,
+    asset: &Asset,
+    edge: u32,
+    governor: &crate::resources::Governor,
+    cancel: &dyn Cancellation,
+) -> Result<(), LibError> {
+    let thumbnail_ready = warm_cache_probe(
+        cache,
+        &thumb_cache_path(data_dir, asset, edge),
+        cache::Tier::Thumbnail,
+        governor,
+        cancel,
+    )?;
+    if asset.summary.media == MediaType::Model {
+        #[cfg(feature = "render")]
+        {
+            let preview_ready = warm_cache_probe(
+                cache,
+                &model_preview_cache_path(data_dir, asset),
+                cache::Tier::Preview,
+                governor,
+                cancel,
+            )?;
+            if thumbnail_ready && preview_ready {
+                return Ok(());
+            }
+            gen_model_derivatives_with_io(
+                cache,
+                data_dir,
+                store,
+                secrets,
+                asset,
+                edge,
+                Some((governor, cancel)),
+            )?;
+            if cache.contains(
+                &thumb_cache_path(data_dir, asset, edge),
+                cache::Tier::Thumbnail,
+            ) && cache.contains(
+                &model_preview_cache_path(data_dir, asset),
+                cache::Tier::Preview,
+            ) {
+                return Ok(());
+            }
+            return Err(LibError::Internal(
+                "model derivatives deferred until cache publication succeeds".into(),
+            ));
+        }
+        #[cfg(not(feature = "render"))]
+        return Err(LibError::Unsupported(
+            "model derivatives need the server `render` feature".into(),
+        ));
+    }
+    if thumbnail_ready {
+        return Ok(());
+    }
+    gen_thumbnail_with_io(
+        cache,
+        data_dir,
+        store,
+        secrets,
+        asset,
+        edge,
+        Some((governor, cancel)),
+    )?;
+    if cache.contains(
+        &thumb_cache_path(data_dir, asset, edge),
+        cache::Tier::Thumbnail,
+    ) {
+        Ok(())
+    } else {
+        Err(LibError::Internal(
+            "thumbnail deferred until cache publication succeeds".into(),
+        ))
+    }
+}
+
+fn warm_cache_probe(
+    cache: &cache::Controller,
+    path: &Path,
+    tier: cache::Tier,
+    governor: &crate::resources::Governor,
+    cancel: &dyn Cancellation,
+) -> Result<bool, LibError> {
+    let work = governor.io.acquire(governor, &[Some(path)], cancel)?;
+    work.pace(4096)?;
+    Ok(cache.contains(path, tier))
 }
 
 /// Map a media-handler fault onto the service error model (tech-spec 03 §5). `Unsupported` becomes
@@ -351,5 +543,55 @@ pub(super) fn convert_summary(report: &ConvertReport, state: JobState) -> String
             report.done,
             report.items.len()
         )
+    }
+}
+
+#[cfg(test)]
+mod priority_tests {
+    use super::*;
+
+    struct ForegroundClaim;
+    impl Cancellation for ForegroundClaim {
+        fn cancelled(&self) -> bool {
+            true
+        }
+        fn preempted(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn completed_render_is_reused_by_foreground_even_while_background_admission_is_paused() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache::Controller::new(
+            dir.path(),
+            cache::CacheOptions {
+                local_bytes: Some(1024),
+                peer_bytes: Some(1024),
+            },
+        );
+        let governor = crate::resources::Governor::new(Some(10_000_000), Some(100.0));
+        let path = dir.path().join("cache/previews/complete.dmsh");
+        publish_derivative(
+            &cache,
+            &path,
+            b"finished render",
+            cache::Tier::Preview,
+            Some((&governor, &ForegroundClaim)),
+        );
+        assert_eq!(
+            cache.read(&path, cache::Tier::Preview).unwrap(),
+            b"finished render"
+        );
+        let shutdown = std::sync::atomic::AtomicBool::new(true);
+        let abandoned = dir.path().join("cache/previews/shutdown.dmsh");
+        publish_derivative(
+            &cache,
+            &abandoned,
+            b"finished render",
+            cache::Tier::Preview,
+            Some((&governor, &shutdown)),
+        );
+        assert!(!abandoned.exists(), "shutdown does not publish new work");
     }
 }

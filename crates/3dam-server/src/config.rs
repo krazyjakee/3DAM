@@ -69,6 +69,13 @@ impl UploadBlock {
 /// live exposure toggle.
 #[derive(Debug, Default, serde::Deserialize)]
 pub struct ResourcesBlock {
+    #[serde(default)]
+    pub storage: Vec<dam_core::StorageOverride>,
+    /// Per backing device background read + write cap (MiB/s). Defaults: HDD 8, SSD 128,
+    /// unknown/network 4. Queue/latency feedback may lower this while the host is busy.
+    pub io_max_mib_per_sec: Option<u64>,
+    /// Per device concurrency cap. Defaults: HDD/unknown 1, SSD 2.
+    pub io_concurrency: Option<usize>,
     /// Background pool size (thumbnail/analysis grind). Default: effective CPUs − 2, capped at 4.
     pub background_threads: Option<usize>,
     /// Pause background work while host available memory is below this floor (MiB).
@@ -244,4 +251,31 @@ mod tests {
         assert_eq!(file.resources.derivative_cache_mb, None);
         assert_eq!(file.resources.peer_cache_mb, None);
     }
+}
+#[test]
+fn parses_storage_resource_overrides() {
+    let file: ServeFile = toml::from_str(
+        r#"
+            [resources]
+            io_max_mib_per_sec = 8
+            io_concurrency = 1
+            [[resources.storage]]
+            path = "/data"
+            resource = "shared-hdd"
+            kind = "rotational"
+            max_mib_per_sec = 2
+            [[resources.storage]]
+            path = "/assets"
+            resource = "shared-hdd"
+            kind = "rotational"
+        "#,
+    )
+    .unwrap();
+    assert_eq!(file.resources.io_max_mib_per_sec, Some(8));
+    assert_eq!(file.resources.storage.len(), 2);
+    assert_eq!(
+        file.resources.storage[0].resource,
+        file.resources.storage[1].resource
+    );
+    assert_eq!(file.resources.storage[0].max_mib_per_sec, Some(2));
 }

@@ -245,7 +245,7 @@ impl EmbeddedLibrary {
             .join("cache")
             .join("peer")
             .join(id.to_string());
-        self.run_bg(move |_| {
+        self.run_interactive(move |_| {
             cache.remove_tree(&peer_dir);
             Ok(())
         })

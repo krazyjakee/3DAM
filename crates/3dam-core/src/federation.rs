@@ -995,7 +995,7 @@ fn peer_cache_dir(lib: &EmbeddedLibrary) -> std::path::PathBuf {
 async fn peer_cache_read(lib: &EmbeddedLibrary, name: &str) -> Option<Vec<u8>> {
     let path = peer_cache_dir(lib).join(name);
     let cache = lib.cache.clone();
-    lib.run_bg(move |_| Ok(cache.read(&path, crate::cache::Tier::Peer)))
+    lib.run_interactive(move |_| Ok(cache.read(&path, crate::cache::Tier::Peer)))
         .await
         .ok()
         .flatten()
@@ -1005,7 +1005,7 @@ async fn peer_cache_write(lib: &EmbeddedLibrary, name: &str, bytes: Vec<u8>) {
     let path = peer_cache_dir(lib).join(name);
     let cache = lib.cache.clone();
     let _ = lib
-        .run_bg(move |_| {
+        .run_interactive(move |_| {
             cache.publish(&path, &bytes, crate::cache::Tier::Peer);
             Ok(())
         })

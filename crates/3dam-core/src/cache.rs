@@ -10,7 +10,7 @@
 use dam_api::admin::CacheUsage;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -98,6 +98,7 @@ struct Counters {
 #[derive(Default)]
 struct State {
     initialized: bool,
+    reserved: [u64; 2],
     inventory_running: bool,
     /// Paths read while the background snapshot is in flight. The final O(1) swap replays only
     /// this normally tiny set, so a hit/miss concurrent with the walk cannot be resurrected or
@@ -170,12 +171,68 @@ fn path_priority(path: &Path, tier: Tier) -> u8 {
 /// Shared keyed-flight table. The map entry disappears after the last waiter completes, keeping RAM
 /// proportional to concurrent misses rather than total historical cache keys.
 struct Flights {
-    map: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    map: Mutex<HashMap<String, Arc<Flight>>>,
     current: AtomicUsize,
     maximum: AtomicUsize,
 }
 
+#[derive(Default)]
+struct Flight {
+    lock: tokio::sync::Mutex<()>,
+    foreground_waiters: AtomicUsize,
+    registrations: AtomicUsize,
+}
+
+struct ForegroundWaiter(Arc<Flight>);
+
+impl Drop for ForegroundWaiter {
+    fn drop(&mut self) {
+        self.0.foreground_waiters.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Releases a flight even when an HTTP future is cancelled or a worker unwinds.
+struct FlightLease<'a> {
+    flights: &'a Flights,
+    key: String,
+    flight: Arc<Flight>,
+}
+
+impl std::ops::Deref for FlightLease<'_> {
+    type Target = Flight;
+    fn deref(&self) -> &Flight {
+        &self.flight
+    }
+}
+
+impl Drop for FlightLease<'_> {
+    fn drop(&mut self) {
+        let mut flights = self.flights.map.lock().unwrap();
+        if self.flight.registrations.fetch_sub(1, Ordering::Relaxed) == 1 {
+            flights.remove(&self.key);
+            self.flights.current.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+struct WarmCancellation<'a> {
+    shutdown: &'a AtomicBool,
+    foreground_waiters: &'a AtomicUsize,
+}
+
+impl crate::resources::Cancellation for WarmCancellation<'_> {
+    fn cancelled(&self) -> bool {
+        self.shutdown.load(Ordering::Relaxed) || self.foreground_waiters.load(Ordering::Relaxed) > 0
+    }
+    fn preempted(&self) -> bool {
+        !self.shutdown.load(Ordering::Relaxed)
+            && self.foreground_waiters.load(Ordering::Relaxed) > 0
+    }
+}
+
 pub(crate) struct Controller {
+    governor: Option<Arc<crate::resources::Governor>>,
+    cancel: AtomicBool,
     root: PathBuf,
     options: ResolvedOptions,
     peer_ttl: Duration,
@@ -196,6 +253,8 @@ impl Controller {
             ..State::default()
         };
         Arc::new(Self {
+            governor: None,
+            cancel: AtomicBool::new(false),
             options: options.resolve(&root),
             root,
             peer_ttl: PEER_TTL,
@@ -211,10 +270,35 @@ impl Controller {
         })
     }
 
+    pub(crate) fn with_governor(
+        data_dir: &Path,
+        options: CacheOptions,
+        governor: Arc<crate::resources::Governor>,
+    ) -> Arc<Self> {
+        let mut controller = Self::new(data_dir, options);
+        Arc::get_mut(&mut controller).unwrap().governor = Some(governor);
+        controller
+    }
+
+    pub(crate) fn cancel_inventory(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        self.inventory_ready.notify_all();
+    }
+
+    pub(crate) fn background_cancel(&self) -> &AtomicBool {
+        &self.cancel
+    }
+
+    pub(crate) fn inventory_initialized(&self) -> bool {
+        self.state.lock().unwrap().initialized
+    }
+
     #[cfg(test)]
     fn new_with_ttl(data_dir: &Path, options: CacheOptions, peer_ttl: Duration) -> Arc<Self> {
         let controller = Self::new(data_dir, options);
         Arc::new(Self {
+            governor: None,
+            cancel: AtomicBool::new(false),
             root: controller.root.clone(),
             options: controller.options,
             peer_ttl,
@@ -240,23 +324,28 @@ impl Controller {
     {
         let flight = {
             let mut flights = self.flights.map.lock().unwrap();
-            flights
+            let flight = flights
                 .entry(key.clone())
                 .or_insert_with(|| {
                     let current = self.flights.current.fetch_add(1, Ordering::Relaxed) + 1;
                     self.flights.maximum.fetch_max(current, Ordering::Relaxed);
-                    Arc::new(tokio::sync::Mutex::new(()))
+                    Arc::new(Flight::default())
                 })
-                .clone()
+                .clone();
+            flight.registrations.fetch_add(1, Ordering::Relaxed);
+            flight
         };
-        let guard = flight.lock().await;
+        let flight = FlightLease {
+            flights: &self.flights,
+            key,
+            flight,
+        };
+        flight.foreground_waiters.fetch_add(1, Ordering::Relaxed);
+        let waiting = ForegroundWaiter(flight.flight.clone());
+        let guard = flight.lock.lock().await;
+        drop(waiting);
         let result = work().await;
         drop(guard);
-        let mut flights = self.flights.map.lock().unwrap();
-        if Arc::strong_count(&flight) == 2 {
-            flights.remove(&key);
-            self.flights.current.fetch_sub(1, Ordering::Relaxed);
-        }
         result
     }
 
@@ -264,7 +353,7 @@ impl Controller {
         {
             let mut state = self.state.lock().unwrap();
             loop {
-                if state.initialized {
+                if state.initialized || self.cancel.load(Ordering::Relaxed) {
                     return;
                 }
                 if !state.inventory_running {
@@ -278,9 +367,33 @@ impl Controller {
 
         // The million-file walk and HashMap construction happen without the live state lock. A
         // request needs that lock only long enough to record its one touched path.
-        let mut inventory = self.build_inventory();
-        self.evict_to_fit(&mut inventory, Tier::Thumbnail, 0);
-        self.evict_to_fit(&mut inventory, Tier::Peer, 0);
+        let Some(mut inventory) = self.build_inventory() else {
+            self.state.lock().unwrap().inventory_running = false;
+            self.inventory_ready.notify_all();
+            return;
+        };
+        let reclaim = match &self.governor {
+            Some(governor) => match governor
+                .io
+                .acquire(governor, &[Some(&self.root)], &self.cancel)
+            {
+                Ok(work) => Some(work),
+                Err(_) => {
+                    self.state.lock().unwrap().inventory_running = false;
+                    self.inventory_ready.notify_all();
+                    return;
+                }
+            },
+            None => None,
+        };
+        let mut before = || reclaim.as_ref().is_none_or(|work| work.pace(4096).is_ok());
+        if !self.evict_to_fit_paced(&mut inventory, Tier::Thumbnail, 0, &mut before)
+            || !self.evict_to_fit_paced(&mut inventory, Tier::Peer, 0, &mut before)
+        {
+            self.state.lock().unwrap().inventory_running = false;
+            self.inventory_ready.notify_all();
+            return;
+        }
 
         let mut state = self.state.lock().unwrap();
         for index in 0..state.counters.len() {
@@ -332,29 +445,35 @@ impl Controller {
     /// pool the request's queued generation must remain able to run.
     pub(crate) fn singleflight_blocking<T, F>(&self, key: String, work: F) -> Option<T>
     where
-        F: FnOnce() -> T,
+        F: FnOnce(&dyn crate::resources::Cancellation) -> T,
     {
         let flight = {
             let mut flights = self.flights.map.lock().unwrap();
-            flights
+            let flight = flights
                 .entry(key.clone())
                 .or_insert_with(|| {
                     let current = self.flights.current.fetch_add(1, Ordering::Relaxed) + 1;
                     self.flights.maximum.fetch_max(current, Ordering::Relaxed);
-                    Arc::new(tokio::sync::Mutex::new(()))
+                    Arc::new(Flight::default())
                 })
-                .clone()
+                .clone();
+            flight.registrations.fetch_add(1, Ordering::Relaxed);
+            flight
         };
-        let Ok(guard) = flight.try_lock() else {
+        let flight = FlightLease {
+            flights: &self.flights,
+            key,
+            flight,
+        };
+        let Ok(guard) = flight.lock.try_lock() else {
             return None;
         };
-        let result = work();
+        let cancel = WarmCancellation {
+            shutdown: &self.cancel,
+            foreground_waiters: &flight.foreground_waiters,
+        };
+        let result = work(&cancel);
         drop(guard);
-        let mut flights = self.flights.map.lock().unwrap();
-        if Arc::strong_count(&flight) == 2 {
-            flights.remove(&key);
-            self.flights.current.fetch_sub(1, Ordering::Relaxed);
-        }
         Some(result)
     }
 
@@ -374,6 +493,12 @@ impl Controller {
     }
 
     pub(crate) fn read(&self, path: &Path, tier: Tier) -> Option<Vec<u8>> {
+        // A mesh read can stall on an HDD. Do not hold the inventory mutex while reading it:
+        // unrelated thumbnails and health/diagnostic requests must remain able to progress.
+        if !self.contains(path, tier) {
+            return None;
+        }
+        let bytes = std::fs::read(path);
         let mut state = self.state.lock().unwrap();
         if !state.initialized {
             state.inventory_touched.insert(path.to_path_buf());
@@ -396,7 +521,7 @@ impl Controller {
             state.counter(tier).misses += 1;
             return None;
         }
-        match std::fs::read(path) {
+        match bytes {
             Ok(bytes) => {
                 if bytes.len() as u64 > self.budget(tier) {
                     state.remove_entry(path);
@@ -429,8 +554,64 @@ impl Controller {
         }
     }
 
+    /// Background warming only needs to know that immutable bytes exist. Never read a cached
+    /// mesh merely to throw its payload away. Check the budget before allocating on real reads.
+    pub(crate) fn contains(&self, path: &Path, tier: Tier) -> bool {
+        let metadata = std::fs::metadata(path).ok();
+        let mut state = self.state.lock().unwrap();
+        if !state.initialized {
+            state.inventory_touched.insert(path.to_path_buf());
+        }
+        if metadata
+            .as_ref()
+            .is_some_and(|m| m.is_file() && m.len() > self.budget(tier))
+        {
+            if let Err(error) = std::fs::remove_file(path) {
+                tracing::warn!(path = %path.display(), %error, "oversized cache entry cleanup failed");
+            }
+        }
+        let Some(metadata) = metadata.filter(|m| m.is_file() && m.len() <= self.budget(tier))
+        else {
+            state.remove_entry(path);
+            state.counter(tier).misses += 1;
+            return false;
+        };
+        if tier == Tier::Peer && metadata_is_stale(&metadata, self.peer_ttl) {
+            if std::fs::remove_file(path).is_ok() {
+                state.counter(tier).evictions += 1;
+                state.counter(tier).stale_deleted += 1;
+            }
+            state.remove_entry(path);
+            state.counter(tier).misses += 1;
+            return false;
+        }
+        state.clock += 1;
+        let used = state.clock;
+        state.insert_entry(
+            path.to_path_buf(),
+            Entry {
+                bytes: metadata.len(),
+                tier,
+                eviction_priority: path_priority(path, tier),
+                used,
+            },
+        );
+        true
+    }
+
     /// Atomically publish one derivative and enforce its budget before the rename makes it visible.
     pub(crate) fn publish(&self, path: &Path, bytes: &[u8], tier: Tier) {
+        self.publish_paced(path, bytes, tier, &mut |_| Ok(()));
+    }
+
+    pub(crate) fn publish_paced(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+        tier: Tier,
+        pace: &mut dyn FnMut(u64) -> Result<(), dam_api::LibError>,
+    ) {
+        use std::io::Write;
         let mut state = self.state.lock().unwrap();
         if !state.initialized {
             state.inventory_touched.insert(path.to_path_buf());
@@ -466,28 +647,51 @@ impl Controller {
         if size > budget {
             return;
         }
-        if !self.evict_for_publish(&mut state, tier, size) {
+        let group = usize::from(tier.is_peer());
+        let incoming = size.saturating_add(state.reserved[group]);
+        if !self.evict_for_publish(&mut state, tier, incoming) {
             return;
         }
         let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|v| v.to_str()))
         else {
             return;
         };
-        if let Err(error) = std::fs::create_dir_all(dir) {
-            tracing::warn!(path = %dir.display(), %error, "cache directory creation failed");
-            return;
-        }
+        state.reserved[group] = state.reserved[group].saturating_add(size);
+        drop(state);
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let tmp = dir.join(format!(".{name}.{}.{}.tmp", std::process::id(), sequence));
-        if let Err(error) = std::fs::write(&tmp, bytes) {
-            tracing::warn!(path = %tmp.display(), %error, "cache temp write failed");
+        // Disk I/O and pressure waits happen outside the shared accounting lock. Reservations
+        // keep simultaneous publications within the cap until the atomic rename completes.
+        let written = (|| -> Result<(), dam_api::LibError> {
+            std::fs::create_dir_all(dir).map_err(|e| dam_api::LibError::Internal(e.to_string()))?;
+            let mut file = std::fs::File::create(&tmp)
+                .map_err(|e| dam_api::LibError::Internal(e.to_string()))?;
+            for chunk in bytes.chunks(crate::resources::io::CHUNK) {
+                pace(chunk.len() as u64)?;
+                file.write_all(chunk)
+                    .map_err(|e| dam_api::LibError::Internal(e.to_string()))?;
+            }
+            Ok(())
+        })();
+        let mut state = self.state.lock().unwrap();
+        state.reserved[group] = state.reserved[group].saturating_sub(size);
+        if let Err(error) = written {
+            let _ = std::fs::remove_file(&tmp);
+            tracing::warn!(path = %path.display(), %error, "cache temp write failed");
+            return;
+        }
+        if path.exists() {
+            let _ = std::fs::remove_file(&tmp);
+            return;
+        }
+        let incoming = size.saturating_add(state.reserved[group]);
+        if !self.evict_for_publish(&mut state, tier, incoming) {
+            let _ = std::fs::remove_file(&tmp);
             return;
         }
         if let Err(error) = std::fs::rename(&tmp, path) {
-            tracing::warn!(from = %tmp.display(), to = %path.display(), %error, "cache publish failed");
-            if let Err(cleanup) = std::fs::remove_file(&tmp) {
-                tracing::warn!(path = %tmp.display(), error = %cleanup, "cache temp cleanup failed");
-            }
+            let _ = std::fs::remove_file(&tmp);
+            tracing::warn!(path = %path.display(), %error, "cache publish failed");
             return;
         }
         state.clock += 1;
@@ -504,9 +708,8 @@ impl Controller {
     }
 
     pub(crate) fn usage(&self, tier: Tier) -> CacheUsage {
-        // Administration asks for authoritative byte totals and may pay the wait; interactive
-        // derivative reads never come through this path.
-        self.initialize_now();
+        // Startup diagnostics must remain responsive even while inventory yields to pressure.
+        // `StorageUsage::cache_inventory_ready` distinguishes a partial snapshot.
         let state = self.state.lock().unwrap();
         let index = tier_index(tier);
         let bytes = state.usage_bytes[index];
@@ -622,20 +825,42 @@ impl Controller {
     }
 
     fn evict_to_fit(&self, state: &mut State, tier: Tier, incoming: u64) {
-        loop {
-            let used = state.budget_usage(tier);
-            if used.saturating_add(incoming) <= self.budget(tier) {
+        self.evict_to_fit_paced(state, tier, incoming, &mut || true);
+    }
+
+    fn evict_to_fit_paced(
+        &self,
+        state: &mut State,
+        tier: Tier,
+        incoming: u64,
+        before: &mut impl FnMut() -> bool,
+    ) -> bool {
+        if state.budget_usage(tier).saturating_add(incoming) <= self.budget(tier) {
+            return true;
+        }
+        // Sort once: a large over-budget startup inventory must not rescan the full map for
+        // every victim. Publications generally reclaim just one or two entries.
+        let mut victims: Vec<_> = state
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.tier.is_peer() == tier.is_peer())
+            .map(|(path, entry)| {
+                (
+                    entry.eviction_priority,
+                    entry.used,
+                    path.clone(),
+                    entry.tier,
+                )
+            })
+            .collect();
+        victims.sort_unstable_by_key(|(priority, used, _, _)| (*priority, *used));
+        for (_, _, path, victim_tier) in victims {
+            if state.budget_usage(tier).saturating_add(incoming) <= self.budget(tier) {
                 break;
             }
-            let victim = state
-                .entries
-                .iter()
-                .filter(|(_, entry)| entry.tier.is_peer() == tier.is_peer())
-                .min_by_key(|(_, entry)| (entry.eviction_priority, entry.used))
-                .map(|(path, entry)| (path.clone(), entry.tier));
-            let Some((path, victim_tier)) = victim else {
-                break;
-            };
+            if !before() {
+                return false;
+            }
             match std::fs::remove_file(&path) {
                 Ok(()) => {
                     state.counter(victim_tier).evictions += 1;
@@ -647,6 +872,7 @@ impl Controller {
                 Err(_) => break,
             }
         }
+        true
     }
 
     fn evict_for_publish(&self, state: &mut State, tier: Tier, incoming: u64) -> bool {
@@ -683,37 +909,56 @@ impl Controller {
         }
     }
 
-    fn build_inventory(&self) -> State {
+    fn build_inventory(&self) -> Option<State> {
+        let work = match &self.governor {
+            Some(governor) => Some(
+                governor
+                    .io
+                    .acquire(governor, &[Some(&self.root)], &self.cancel)
+                    .ok()?,
+            ),
+            None => None,
+        };
         let mut state = State::default();
         for (dir, tier) in [
             (self.root.join("thumbnails"), Tier::Thumbnail),
             (self.root.join("previews"), Tier::Preview),
             (self.root.join("peer"), Tier::Peer),
         ] {
-            walk_files(&dir, &mut |path, metadata| {
-                if tier == Tier::Peer && metadata_is_stale(metadata, self.peer_ttl) {
-                    if std::fs::remove_file(path).is_ok() {
-                        let counter = state.counter(tier);
-                        counter.evictions += 1;
-                        counter.stale_deleted += 1;
+            let complete = walk_files_paced(
+                &dir,
+                &mut || {
+                    !self.cancel.load(Ordering::Relaxed)
+                        && work.as_ref().is_none_or(|w| w.pace(4096).is_ok())
+                },
+                &mut |path, metadata| {
+                    if tier == Tier::Peer && metadata_is_stale(metadata, self.peer_ttl) {
+                        if std::fs::remove_file(path).is_ok() {
+                            let counter = state.counter(tier);
+                            counter.evictions += 1;
+                            counter.stale_deleted += 1;
+                        }
+                        return;
                     }
-                    return;
-                }
-                state.clock += 1;
-                let used = state.clock;
-                state.insert_entry(
-                    path.to_path_buf(),
-                    Entry {
-                        bytes: metadata.len(),
-                        tier,
-                        eviction_priority: path_priority(path, tier),
-                        used,
-                    },
-                );
-            });
+                    state.clock += 1;
+                    let used = state.clock;
+                    state.insert_entry(
+                        path.to_path_buf(),
+                        Entry {
+                            bytes: metadata.len(),
+                            tier,
+                            eviction_priority: path_priority(path, tier),
+                            used,
+                        },
+                    );
+                },
+            );
+            if !complete {
+                return None;
+            }
         }
         state.initialized = true;
-        state
+        Some(state)
     }
 }
 
@@ -751,20 +996,37 @@ pub(crate) fn measure_first_thumbnail_hit(
 }
 
 fn walk_files(dir: &Path, visit: &mut impl FnMut(&Path, &std::fs::Metadata)) {
+    walk_files_paced(dir, &mut || true, visit);
+}
+
+fn walk_files_paced(
+    dir: &Path,
+    before: &mut impl FnMut() -> bool,
+    visit: &mut impl FnMut(&Path, &std::fs::Metadata),
+) -> bool {
+    if !before() {
+        return false;
+    }
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+        return true;
     };
     for entry in entries.flatten() {
+        if !before() {
+            return false;
+        }
         let path = entry.path();
         let Ok(metadata) = entry.metadata() else {
             continue;
         };
         if metadata.is_dir() {
-            walk_files(&path, visit);
+            if !walk_files_paced(&path, before, visit) {
+                return false;
+            }
         } else if metadata.is_file() && !entry.file_name().to_string_lossy().starts_with('.') {
             visit(&path, &metadata);
         }
     }
+    true
 }
 
 fn metadata_is_stale(metadata: &std::fs::Metadata, ttl: Duration) -> bool {
@@ -805,6 +1067,123 @@ fn free_disk_bytes(_path: &Path) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn cancelling_foreground_work_releases_its_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Controller::new(dir.path(), CacheOptions::default());
+        let worker_cache = cache.clone();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            worker_cache
+                .singleflight("cancelled-request".into(), || async {
+                    entered_tx.send(()).unwrap();
+                    std::future::pending::<()>().await;
+                })
+                .await;
+        });
+        entered_rx.await.unwrap();
+        assert_eq!(cache.flights.current.load(Ordering::Relaxed), 1);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(cache.flights.current.load(Ordering::Relaxed), 0);
+        assert!(cache.flights.map.lock().unwrap().is_empty());
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn foreground_miss_preempts_pressure_paused_background_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Controller::new(dir.path(), CacheOptions::default());
+        let governor = Arc::new(crate::resources::Governor::new(
+            Some(10_000_000),
+            Some(100.0),
+        ));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let worker_cache = cache.clone();
+        let worker = tokio::task::spawn_blocking(move || {
+            worker_cache.singleflight_blocking("same-asset".into(), |cancel| {
+                started_tx.send(()).unwrap();
+                governor.io.acquire(&governor, &[None], cancel).map(|_| ())
+            })
+        });
+        started_rx.await.unwrap();
+        let foreground = tokio::time::timeout(
+            Duration::from_secs(1),
+            cache.singleflight("same-asset".into(), || async { "ready" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(foreground, "ready");
+        assert!(
+            worker.await.unwrap().unwrap().is_err(),
+            "warming yields its flight while the host stays pressured"
+        );
+        assert_eq!(cache.flights.current.load(Ordering::Relaxed), 0);
+    }
+    #[test]
+    fn paused_publication_reserves_space_without_blocking_hits_or_metrics() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Controller::new(
+            dir.path(),
+            CacheOptions {
+                local_bytes: Some(16),
+                peer_bytes: Some(16),
+            },
+        );
+        let hit = dir.path().join("cache/thumbnails/hit.png");
+        cache.publish(&hit, b"hit!", Tier::Thumbnail);
+        let target = dir.path().join("cache/previews/new.dmsh");
+        let competing = dir.path().join("cache/previews/competing.dmsh");
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let cache = &cache;
+            let target = &target;
+            scope.spawn(move || {
+                cache.publish_paced(target, &[7; 12], Tier::Preview, &mut |_| {
+                    entered_tx.send(()).unwrap();
+                    resume_rx.recv().unwrap();
+                    Ok(())
+                });
+            });
+            entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert_eq!(cache.read(&hit, Tier::Thumbnail).unwrap(), b"hit!");
+            assert_eq!(cache.usage(Tier::Thumbnail).bytes, 4);
+            cache.publish(&competing, &[8; 12], Tier::Preview);
+            assert!(
+                !competing.exists(),
+                "in-flight bytes count against the budget"
+            );
+            resume_tx.send(()).unwrap();
+        });
+        assert_eq!(cache.read(&target, Tier::Preview).unwrap(), vec![7; 12]);
+        assert_eq!(
+            cache.usage(Tier::Thumbnail).bytes + cache.usage(Tier::Preview).bytes,
+            16
+        );
+    }
+
+    #[test]
+    fn cancelled_cache_write_removes_temp_and_releases_reservation() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Controller::new(
+            dir.path(),
+            CacheOptions {
+                local_bytes: Some(16),
+                peer_bytes: Some(16),
+            },
+        );
+        let target = dir.path().join("cache/previews/new.dmsh");
+        cache.publish_paced(&target, &[7; 16], Tier::Preview, &mut |_| {
+            Err(dam_api::LibError::Internal("cancelled".into()))
+        });
+        assert!(!target.exists());
+        assert_eq!(
+            std::fs::read_dir(target.parent().unwrap()).unwrap().count(),
+            0
+        );
+        cache.publish(&target, &[8; 16], Tier::Preview);
+        assert_eq!(cache.read(&target, Tier::Preview).unwrap(), vec![8; 16]);
+    }
+
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
@@ -928,6 +1307,7 @@ mod tests {
             Duration::ZERO,
         );
 
+        cache.initialize_now();
         let first = cache.usage(Tier::Peer);
         assert_eq!(first.files, 0);
         assert_eq!(first.stale_deleted, 1);

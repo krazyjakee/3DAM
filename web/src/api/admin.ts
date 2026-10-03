@@ -175,6 +175,9 @@ export interface CacheUsage {
 }
 
 export interface StorageUsage {
+  io_budgets: IoBudget[];
+  io_stall_pct: number | null;
+  cache_inventory_ready: boolean;
   data_dir: string;
   library_db_bytes: number;
   server_db_bytes: number;
@@ -183,6 +186,22 @@ export interface StorageUsage {
   peer_previews: CacheUsage;
   asset_count: number;
   source_count: number;
+}
+
+export interface IoBudget {
+  device: string;
+  kind: string;
+  limit_bytes_per_sec: number;
+  current_bytes_per_sec: number;
+  concurrency: number;
+  active: number;
+  deferred: number;
+  accounted_bytes: number;
+  observed_bytes_per_sec: number | null;
+  queue_depth: number | null;
+  request_latency_ms: number | null;
+  yield_reason: string;
+  probes_available: boolean;
 }
 
 export type CacheTarget = "thumbnails" | "previews" | "all";

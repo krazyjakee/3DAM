@@ -400,12 +400,19 @@ pub(crate) fn run_analyze(
                     if cancel.load(Ordering::Relaxed) {
                         return;
                     }
-                    governor.pace(&cancel);
+                    governor.pace(cancel.as_ref());
                     if cancel.load(Ordering::Relaxed) {
                         return;
                     }
                     let outcome = match backends.get(&target.source_id) {
-                        Some(Ok(source)) => analyze_one(target, model.as_deref(), source.as_ref()),
+                        Some(Ok(source)) => analyze_one(
+                            target,
+                            model.as_deref(),
+                            source.as_ref(),
+                            governor,
+                            scratch,
+                            &cancel,
+                        ),
                         Some(Err(error)) => Err(error.clone()),
                         None => Err("source backend missing".to_string()),
                     };
@@ -417,6 +424,7 @@ pub(crate) fn run_analyze(
                             source_id: target.source_id,
                             path: target.path.clone(),
                         }),
+                        Err(_) if cancel.load(Ordering::Relaxed) => {}
                         Err(error) => sink.fail(target, &error),
                     }
                 });
@@ -524,8 +532,21 @@ fn analyze_one(
     t: &AnalysisPlanTarget,
     model: Option<&dyn crate::semantic::SemanticModel>,
     fs: &dyn dam_sources::FileSource,
+    governor: &crate::resources::Governor,
+    scratch: &Path,
+    cancel: &AtomicBool,
 ) -> Result<AnalysisWrite, String> {
-    let fetched = fs.fetch(&t.path).map_err(|e| e.to_string())?;
+    let (fetched, work) = governor
+        .fetch(fs, &t.path, scratch, cancel)
+        .map_err(|e| e.to_string())?;
+    // Opaque decoders are protected by device concurrency; their entry read is budgeted before
+    // execution. The fetched copy itself yields and cancels between every 256 KiB chunk.
+    work.pace(
+        std::fs::metadata(fetched.path())
+            .map(|m| m.len())
+            .unwrap_or(0),
+    )
+    .map_err(|e| e.to_string())?;
     let abs = fetched.path().to_path_buf();
     let det = dam_media::Detected {
         media: t.media,

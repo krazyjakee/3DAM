@@ -15,7 +15,7 @@
 //!    sample of host memory + load + disk stall. Under pressure (available memory below the
 //!    floor, load beyond the CPU budget, or I/O stall beyond the ceiling) the loop *pauses* —
 //!    work resumes when the host recovers. Fail-soft: on platforms without `/proc` / cgroups
-//!    every probe returns `None` and the governor never pauses (the pre-existing behaviour).
+//!    pressure probes return `None`; conservative storage admission limits still apply.
 //!
 //! The I/O signal exists because the other two can't see a disk blockade: bulk reads (scan
 //! hashing, decode for analysis/thumbnails) on a slow HDD queue behind each other until *every*
@@ -26,10 +26,26 @@
 //! All probes are best-effort text reads of `/proc` and `/sys/fs/cgroup`; a missing or malformed
 //! file simply yields `None`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+pub mod io;
+pub use io::{IoOptions, StorageKind, StorageOverride};
+
+pub(crate) trait Cancellation: Sync {
+    fn cancelled(&self) -> bool;
+    fn preempted(&self) -> bool {
+        false
+    }
+}
+
+impl Cancellation for AtomicBool {
+    fn cancelled(&self) -> bool {
+        self.load(Ordering::Relaxed)
+    }
+}
 
 /// Default hard cap for the background pool. Deliberately modest: the pipeline is a warm-cache
 /// optimisation, not the product — leaving cores free *is* the feature on a shared host.
@@ -37,10 +53,10 @@ pub const DEFAULT_BG_THREAD_CAP: usize = 4;
 
 /// Re-sample host pressure at most this often — the probes are cheap file reads, but per-item
 /// (thousands of assets) would still be noise.
-const SAMPLE_EVERY: Duration = Duration::from_secs(2);
+const SAMPLE_EVERY: Duration = Duration::from_millis(250);
 
 /// How long a paused loop sleeps between pressure re-checks.
-const PAUSE_TICK: Duration = Duration::from_millis(500);
+const PAUSE_TICK: Duration = Duration::from_millis(25);
 
 /// Default I/O full-stall ceiling (%). At 25% the `avg10` decay makes a saturated HDD duty-cycle
 /// the grind to roughly a few seconds of reads per ~15 s pause — the disk keeps breathing for
@@ -53,6 +69,67 @@ fn read_trimmed(path: &str) -> Option<String> {
     std::fs::read_to_string(path)
         .ok()
         .map(|s| s.trim().to_string())
+}
+
+/// Resolve this process's cgroup and every visible ancestor. Reading only the mount root misses
+/// service slices and Docker-in-LXC limits; reading only the leaf misses parent quotas.
+fn cgroup_dirs() -> &'static [PathBuf] {
+    static DIRS: OnceLock<Vec<PathBuf>> = OnceLock::new();
+    DIRS.get_or_init(|| {
+        let membership = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+        let mounts = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+        resolve_cgroups(&membership, &mounts)
+    })
+}
+
+fn resolve_cgroups(membership: &str, mounts: &str) -> Vec<PathBuf> {
+    let Some(group) = membership.lines().find_map(|line| line.strip_prefix("0::")) else {
+        return vec![PathBuf::from("/sys/fs/cgroup")];
+    };
+    for mount in mounts.lines().filter(|line| line.contains(" - cgroup2 ")) {
+        let fields: Vec<_> = mount.split_whitespace().collect();
+        let (Some(root), Some(point)) = (fields.get(3), fields.get(4)) else {
+            continue;
+        };
+        let decode = |s: &str| {
+            s.replace("\\040", " ")
+                .replace("\\011", "\t")
+                .replace("\\134", "\\")
+        };
+        let root = PathBuf::from(decode(root));
+        let point = PathBuf::from(decode(point));
+        let group = Path::new(group);
+        // A cgroup namespace can expose '/' even when mountinfo names a host-side root.
+        let relative = if group == Path::new("/") {
+            Path::new("")
+        } else {
+            let Ok(relative) = group.strip_prefix(&root) else {
+                continue;
+            };
+            relative
+        };
+        if relative
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            continue;
+        }
+        let leaf = point.join(relative);
+        return leaf
+            .ancestors()
+            .take_while(|path| path.starts_with(&point))
+            .map(Path::to_path_buf)
+            .collect();
+    }
+    vec![PathBuf::from("/sys/fs/cgroup")]
+}
+
+fn cgroup_values(file: &str) -> impl Iterator<Item = (PathBuf, String)> + '_ {
+    cgroup_dirs().iter().filter_map(move |dir| {
+        std::fs::read_to_string(dir.join(file))
+            .ok()
+            .map(|s| (dir.clone(), s.trim().to_string()))
+    })
 }
 
 /// Parse a cgroup v2 `cpu.max` ("<quota> <period>" or "max <period>") into a whole-CPU count.
@@ -68,8 +145,11 @@ fn parse_cpu_max(s: &str) -> Option<usize> {
 
 /// The container CPU quota, when one is imposed (cgroup v2, then the v1 fallback).
 fn cgroup_cpu_quota() -> Option<usize> {
-    if let Some(s) = read_trimmed("/sys/fs/cgroup/cpu.max") {
-        return parse_cpu_max(&s);
+    if let Some(quota) = cgroup_values("cpu.max")
+        .filter_map(|(_, s)| parse_cpu_max(&s))
+        .min()
+    {
+        return Some(quota);
     }
     // cgroup v1: separate quota/period files; quota -1 = unlimited.
     let quota: f64 = read_trimmed("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")?
@@ -99,9 +179,12 @@ pub fn effective_cpus() -> usize {
 /// The memory ceiling this process runs under: the cgroup limit when one is imposed, else the
 /// host's total. `None` when neither is readable (non-Linux).
 pub fn memory_limit() -> Option<u64> {
-    let cg = read_trimmed("/sys/fs/cgroup/memory.max")
-        .or_else(|| read_trimmed("/sys/fs/cgroup/memory/memory.limit_in_bytes"))
-        .and_then(|s| s.parse::<u64>().ok()); // "max" fails the parse → unlimited
+    let cg = cgroup_values("memory.max")
+        .filter_map(|(_, s)| s.parse::<u64>().ok())
+        .min()
+        .or_else(|| {
+            read_trimmed("/sys/fs/cgroup/memory/memory.limit_in_bytes").and_then(|s| s.parse().ok())
+        });
     let host = meminfo_kb("MemTotal").map(|kb| kb * 1024);
     match (cg, host) {
         (Some(c), Some(h)) => Some(c.min(h)),
@@ -114,13 +197,17 @@ pub fn memory_limit() -> Option<u64> {
 /// nowhere near our own limit — swapping the *box* to death is exactly the failure mode.
 pub fn available_memory() -> Option<u64> {
     let host = meminfo_kb("MemAvailable").map(|kb| kb * 1024);
-    let cg_headroom = (|| {
-        let limit: u64 = read_trimmed("/sys/fs/cgroup/memory.max")?.parse().ok()?;
-        let current: u64 = read_trimmed("/sys/fs/cgroup/memory.current")?
-            .parse()
-            .ok()?;
-        Some(limit.saturating_sub(current))
-    })();
+    let cg_headroom = cgroup_values("memory.max")
+        .filter_map(|(dir, s)| {
+            let limit: u64 = s.parse().ok()?;
+            let current: u64 = std::fs::read_to_string(dir.join("memory.current"))
+                .ok()?
+                .trim()
+                .parse()
+                .ok()?;
+            Some(limit.saturating_sub(current))
+        })
+        .min();
     match (host, cg_headroom) {
         (Some(h), Some(c)) => Some(h.min(c)),
         (h, c) => h.or(c),
@@ -162,6 +249,30 @@ fn parse_psi_full_avg10(text: &str) -> Option<f64> {
         .and_then(|v| v.parse().ok())
 }
 
+fn parse_psi_full_total(text: &str) -> Option<u64> {
+    text.lines()
+        .find(|line| line.starts_with("full "))?
+        .split_whitespace()
+        .find_map(|token| token.strip_prefix("total="))?
+        .parse()
+        .ok()
+}
+
+fn io_totals() -> [Option<u64>; 2] {
+    let read = |path: &Path| {
+        std::fs::read_to_string(path)
+            .ok()
+            .as_deref()
+            .and_then(parse_psi_full_total)
+    };
+    [
+        read(Path::new("/proc/pressure/io")),
+        cgroup_dirs()
+            .first()
+            .and_then(|dir| read(&dir.join("io.pressure"))),
+    ]
+}
+
 /// Current I/O stall (%), the worse of two views: the host's (`/proc/pressure/io` — the whole box
 /// is I/O-blocked, the incident mode) and our cgroup's (`io.pressure` — *our* bulk reads have a
 /// slow disk saturated, even if the rest of the host still runs). `None` where PSI is absent
@@ -171,10 +282,9 @@ pub fn io_stall_pct() -> Option<f64> {
         .ok()
         .as_deref()
         .and_then(parse_psi_full_avg10);
-    let cg = std::fs::read_to_string("/sys/fs/cgroup/io.pressure")
-        .ok()
-        .as_deref()
-        .and_then(parse_psi_full_avg10);
+    let cg = cgroup_values("io.pressure")
+        .filter_map(|(_, text)| parse_psi_full_avg10(&text))
+        .reduce(f64::max);
     match (host, cg) {
         (Some(h), Some(c)) => Some(h.max(c)),
         (h, c) => h.or(c),
@@ -187,6 +297,7 @@ pub fn io_stall_pct() -> Option<f64> {
 /// say on a busy CI runner.
 #[derive(Clone, Copy)]
 struct Sample {
+    io_totals: [Option<u64>; 2],
     available: Option<u64>,
     load1: Option<f64>,
     io_stall: Option<f64>,
@@ -196,6 +307,7 @@ struct Sample {
 /// Read the live host probes. The only place the governor touches the filesystem.
 fn sample_host() -> Sample {
     Sample {
+        io_totals: io_totals(),
         available: available_memory(),
         load1: loadavg_1(),
         io_stall: io_stall_pct(),
@@ -219,6 +331,7 @@ pub fn background_thread_count(configured: Option<usize>) -> usize {
 /// Pressure thresholds + a cached sample. One instance per engine; background loops call
 /// [`Governor::pace`] between items.
 pub struct Governor {
+    pub(crate) io: io::Scheduler,
     /// Pause background work while host available memory is below this floor.
     min_free_bytes: u64,
     /// Pause while the 1-min loadavg exceeds this multiple of the effective CPU budget.
@@ -229,6 +342,9 @@ pub struct Governor {
 }
 
 struct GovState {
+    io_stall: Option<f64>,
+    reason: Option<&'static str>,
+    io_totals: [Option<u64>; 2],
     sampled_at: Option<Instant>,
     pressured: bool,
     /// For logging state transitions once, not per item.
@@ -236,22 +352,49 @@ struct GovState {
 }
 
 impl Governor {
+    pub(crate) fn fetch<'a>(
+        &'a self,
+        source: &dyn dam_sources::FileSource,
+        rel: &str,
+        scratch: &Path,
+        cancel: &'a dyn Cancellation,
+    ) -> Result<(dam_sources::Fetched, io::Work<'a>), dam_api::LibError> {
+        let source_path = source.storage_path().map(|root| root.join(rel));
+        let work = self
+            .io
+            .acquire(self, &[source_path.as_deref(), Some(scratch)], cancel)?;
+        let fetched = source.fetch_paced(rel, &mut |bytes| work.pace(bytes.saturating_mul(2)))?;
+        Ok((fetched, work))
+    }
     /// `min_free_memory_mb = None` picks the default floor: 10% of the memory ceiling, clamped to
     /// [256 MiB, 2 GiB]. On a host where no ceiling is readable the floor is 512 MiB.
     /// `max_io_stall_pct = None` picks [`DEFAULT_MAX_IO_STALL_PCT`]; ≥ 100 disables the I/O gate.
+    #[cfg(test)]
     pub fn new(min_free_memory_mb: Option<u64>, max_io_stall_pct: Option<f64>) -> Governor {
+        Self::with_io(min_free_memory_mb, max_io_stall_pct, IoOptions::default())
+    }
+
+    pub fn with_io(
+        min_free_memory_mb: Option<u64>,
+        max_io_stall_pct: Option<f64>,
+        options: IoOptions,
+    ) -> Governor {
         let min_free_bytes = match min_free_memory_mb {
-            Some(mb) => mb * 1024 * 1024,
+            Some(mb) => mb.saturating_mul(1024 * 1024),
             None => match memory_limit() {
                 Some(total) => (total / 10).clamp(256 * 1024 * 1024, 2 * 1024 * 1024 * 1024),
                 None => 512 * 1024 * 1024,
             },
         };
         Governor {
+            io: io::Scheduler::new(options),
             min_free_bytes,
             max_load_per_cpu: 1.5,
             max_io_stall_pct: max_io_stall_pct.unwrap_or(DEFAULT_MAX_IO_STALL_PCT),
             state: Mutex::new(GovState {
+                io_stall: None,
+                reason: None,
+                io_totals: [None, None],
                 sampled_at: None,
                 pressured: false,
                 was_pressured: false,
@@ -279,6 +422,16 @@ impl Governor {
         self.pressured_at(Instant::now(), sample_host)
     }
 
+    pub(crate) fn pressure_reason(&self) -> Option<&'static str> {
+        self.pressured();
+        self.state.lock().unwrap().reason
+    }
+
+    pub(crate) fn observed_io_stall(&self) -> Option<f64> {
+        self.pressured();
+        self.state.lock().unwrap().io_stall
+    }
+
     /// [`Governor::pressured`] against an injected clock and host reading — the seam that lets the
     /// caching and transition logic be tested against a fixed host and a fixed `now`, instead of
     /// whatever `/proc` and the wall clock happen to say on a loaded CI runner.
@@ -295,11 +448,47 @@ impl Governor {
             return st.pressured;
         }
         let Sample {
+            io_totals,
             available,
             load1: load,
             io_stall,
             cpus,
         } = sample();
+        // PSI avg10 takes seconds to rise. Counter deltas catch a new blockade within one
+        // sample window, while avg10 retains recovery hysteresis. Resets never create pressure.
+        let recent = st.sampled_at.and_then(|at| {
+            let micros = now.duration_since(at).as_micros() as f64;
+            if micros <= 0.0 {
+                return None;
+            }
+            io_totals
+                .iter()
+                .zip(st.io_totals)
+                .filter_map(|(current, previous)| {
+                    let (Some(current), Some(previous)) = (current, previous) else {
+                        return None;
+                    };
+                    current
+                        .checked_sub(previous)
+                        .map(|delta| (delta as f64 * 100.0 / micros).min(100.0))
+                })
+                .reduce(f64::max)
+        });
+        let io_stall = match (io_stall, recent) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        st.io_totals = io_totals;
+        st.io_stall = io_stall;
+        st.reason = if available.is_some_and(|a| a < self.min_free_bytes) {
+            Some("memory")
+        } else if load.is_some_and(|l| l > self.max_load_per_cpu * cpus as f64) {
+            Some("cpu_load")
+        } else if io_stall.is_some_and(|s| s > self.max_io_stall_pct) {
+            Some("io_stall")
+        } else {
+            None
+        };
         st.pressured = self.decide(available, load, io_stall, cpus);
         st.sampled_at = Some(now);
         if st.pressured != st.was_pressured {
@@ -322,8 +511,8 @@ impl Governor {
     /// Blocking pace point for background worker loops: returns immediately when the host is
     /// healthy, otherwise sleeps in [`PAUSE_TICK`]s until pressure clears or `cancel` is set.
     /// Call between work items — never inside one.
-    pub fn pace(&self, cancel: &AtomicBool) {
-        while self.pressured() && !cancel.load(Ordering::Relaxed) {
+    pub fn pace(&self, cancel: &dyn Cancellation) {
+        while self.pressured() && !cancel.cancelled() {
             std::thread::sleep(PAUSE_TICK);
         }
     }
@@ -363,6 +552,7 @@ pub fn deprioritize_current_thread() {
 /// config file.
 #[derive(Default, Clone)]
 pub struct ResourceOptions {
+    pub io: IoOptions,
     /// Background pool size override (clamped to the effective CPU budget).
     pub background_threads: Option<usize>,
     /// Pause background work when host available memory dips below this (MiB).
@@ -377,6 +567,11 @@ impl ResourceOptions {
             std::env::var(k).ok().and_then(|v| v.parse().ok())
         }
         ResourceOptions {
+            io: IoOptions {
+                max_mib_per_sec: parse("3DAM_IO_MAX_MIB_PER_SEC"),
+                concurrency: parse("3DAM_IO_CONCURRENCY"),
+                storage: Vec::new(),
+            },
             background_threads: parse("3DAM_BG_THREADS"),
             min_free_memory_mb: parse("3DAM_MIN_FREE_MEMORY_MB"),
             max_io_stall_pct: parse("3DAM_MAX_IO_STALL_PCT"),
@@ -389,6 +584,11 @@ impl ResourceOptions {
     /// Every knob is `Some`, so `or_env()` leaves these as-is.
     pub fn ungoverned() -> ResourceOptions {
         ResourceOptions {
+            io: IoOptions {
+                max_mib_per_sec: Some(1024),
+                concurrency: Some(DEFAULT_BG_THREAD_CAP),
+                storage: Vec::new(),
+            },
             background_threads: None,
             min_free_memory_mb: Some(0),
             max_io_stall_pct: Some(f64::INFINITY),
@@ -399,6 +599,11 @@ impl ResourceOptions {
     pub fn or_env(self) -> ResourceOptions {
         let env = ResourceOptions::from_env();
         ResourceOptions {
+            io: IoOptions {
+                max_mib_per_sec: self.io.max_mib_per_sec.or(env.io.max_mib_per_sec),
+                concurrency: self.io.concurrency.or(env.io.concurrency),
+                storage: self.io.storage,
+            },
             background_threads: self.background_threads.or(env.background_threads),
             min_free_memory_mb: self.min_free_memory_mb.or(env.min_free_memory_mb),
             max_io_stall_pct: self.max_io_stall_pct.or(env.max_io_stall_pct),
@@ -409,8 +614,7 @@ impl ResourceOptions {
 /// True when running under a container-ish cgroup limit (used only for log context).
 pub fn is_resource_limited() -> bool {
     cgroup_cpu_quota().is_some()
-        || Path::new("/sys/fs/cgroup/memory.max").exists()
-            && read_trimmed("/sys/fs/cgroup/memory.max").is_some_and(|s| s != "max")
+        || cgroup_values("memory.max").any(|(_, s)| s.parse::<u64>().is_ok())
 }
 
 #[cfg(test)]
@@ -486,6 +690,7 @@ mod tests {
     /// load and disk deliberately healthy so only the memory gate is under test.
     fn starved_host() -> Sample {
         Sample {
+            io_totals: [None, None],
             available: Some(0),
             load1: Some(0.1),
             io_stall: Some(0.0),
@@ -544,6 +749,46 @@ mod tests {
         // Past it: re-probes.
         assert!(g.pressured_at(t0 + SAMPLE_EVERY, sample));
         assert_eq!(calls.get(), 2, "the window expires");
+    }
+
+    #[test]
+    fn nested_cgroups_include_visible_parents_without_escaping_mount() {
+        let mounts = "1 2 0:3 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n";
+        assert_eq!(
+            resolve_cgroups("0::/lxc/docker/app\n", mounts),
+            vec![
+                PathBuf::from("/sys/fs/cgroup/lxc/docker/app"),
+                PathBuf::from("/sys/fs/cgroup/lxc/docker"),
+                PathBuf::from("/sys/fs/cgroup/lxc"),
+                PathBuf::from("/sys/fs/cgroup"),
+            ]
+        );
+        let bound = "1 2 0:3 /lxc /sys/fs/cgroup rw - cgroup2 cgroup rw\n";
+        assert_eq!(
+            resolve_cgroups("0::/\n", bound),
+            vec![PathBuf::from("/sys/fs/cgroup")]
+        );
+        assert_eq!(
+            resolve_cgroups("0::/../../outside\n", mounts),
+            vec![PathBuf::from("/sys/fs/cgroup")]
+        );
+    }
+
+    #[test]
+    fn psi_counter_delta_pauses_before_avg10_rises_and_recovers() {
+        let governor = Governor::new(Some(0), Some(25.0));
+        let start = Instant::now();
+        let sample = |total| Sample {
+            available: None,
+            load1: None,
+            io_stall: Some(0.0),
+            cpus: 4,
+            io_totals: [Some(total), None],
+        };
+        assert!(!governor.pressured_at(start, || sample(0)));
+        assert!(governor.pressured_at(start + SAMPLE_EVERY, || sample(200_000)));
+        assert!(!governor.pressured_at(start + SAMPLE_EVERY * 2, || sample(200_000)));
+        assert!(!governor.pressured_at(start + SAMPLE_EVERY * 3, || sample(0)));
     }
 }
 

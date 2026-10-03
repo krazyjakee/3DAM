@@ -93,6 +93,11 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
     // 2. Stores: open the engine and the server store; seed flags from the config file (seed-only).
     // The `[resources]` block bounds the engine's background appetite (tech-spec 14 §5).
     let resources = dam_core::ResourceOptions {
+        io: dam_core::IoOptions {
+            max_mib_per_sec: file.resources.io_max_mib_per_sec,
+            concurrency: file.resources.io_concurrency,
+            storage: file.resources.storage.clone(),
+        },
         background_threads: file.resources.background_threads,
         min_free_memory_mb: file.resources.min_free_memory_mb,
         max_io_stall_pct: file.resources.max_io_stall_pct,

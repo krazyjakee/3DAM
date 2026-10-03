@@ -175,6 +175,14 @@ impl FileSource for SftpSource {
     /// a file that may be gigabytes. `open` hands back an `AsyncRead` instead, so bytes go
     /// chunk-by-chunk from the socket to disk and peak memory is one buffer.
     fn fetch(&self, rel_path: &str) -> Result<Fetched, LibError> {
+        self.fetch_paced(rel_path, &mut |_| Ok(()))
+    }
+
+    fn fetch_paced(
+        &self,
+        rel_path: &str,
+        pace: &mut dyn FnMut(u64) -> Result<(), LibError>,
+    ) -> Result<Fetched, LibError> {
         let rel_path = guard_rel_path(rel_path)?;
         let abs = self.remote_path(&rel_path);
         let mut sink = crate::temp_sink(&rel_path, &self.scratch)?;
@@ -187,6 +195,7 @@ impl FileSource for SftpSource {
                 .map_err(|e| LibError::SourceUnavailable(format!("open {abs}: {e}")))?;
             let mut buf = vec![0u8; crate::FETCH_CHUNK];
             loop {
+                pace(crate::FETCH_CHUNK as u64)?;
                 let n = remote
                     .read(&mut buf)
                     .await

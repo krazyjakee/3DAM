@@ -29,7 +29,7 @@ pub use cache::CacheOptions;
 /// directly — frontends reach the engine, not around it.
 pub use dam_sources::UPLOAD_SCRATCH_PREFIX;
 pub use paths::default_data_dir;
-pub use resources::ResourceOptions;
+pub use resources::{IoOptions, ResourceOptions, StorageKind, StorageOverride};
 
 /// Measure the production derivative cache's first existing-thumbnail hit while its startup
 /// inventory runs concurrently. This narrow seam is public for `cargo xtask perf`; applications
@@ -104,6 +104,7 @@ pub struct EmbeddedLibrary {
     /// Bounded pool for heavy *background* CPU work (thumbnail generation + the analysis pass),
     /// sized to leave cores free so interactive inspector reads preempt it (see [`background_threads`]).
     bg_pool: Arc<rayon::ThreadPool>,
+    interactive_pool: Arc<rayon::ThreadPool>,
     /// Model-backed semantic embedder (semantic-search M4), or `None` when no weights ship — the
     /// default. When present, the analysis pass also writes its space and text search can encode a
     /// query into it. Held behind the [`semantic::SemanticModel`] seam.
@@ -133,6 +134,15 @@ pub struct EmbeddedLibrary {
     /// unrelated scan before it ever received an embedding or auto-tags — invisible to `similar`
     /// and `dedup` in the meantime, and on an unwatched source that could be indefinitely.
     pipeline_wake: Arc<tokio::sync::Notify>,
+}
+
+impl Drop for EmbeddedLibrary {
+    fn drop(&mut self) {
+        self.cache.cancel_inventory();
+        for cancel in self.cancels.lock().unwrap().values() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 impl EmbeddedLibrary {
@@ -182,9 +192,10 @@ impl EmbeddedLibrary {
         let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         // Built before the watch manager: watch-triggered delta scans are bulk readers too and
         // pace against the same governor as everything else (tech-spec 14 §3.4).
-        let governor = Arc::new(resources::Governor::new(
+        let governor = Arc::new(resources::Governor::with_io(
             resources.min_free_memory_mb,
             resources.max_io_stall_pct,
+            resources.io,
         ));
         let watchers = watch::WatchManager::new(
             store.clone(),
@@ -217,14 +228,22 @@ impl EmbeddedLibrary {
             .start_handler(|_| resources::deprioritize_current_thread())
             .build()
             .map_err(|e| LibError::Internal(e.to_string()))?;
-        let cache = cache::Controller::new(data_dir, cache_options);
+        let interactive_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .thread_name(|_| "dam-interactive".to_string())
+            .build()
+            .map_err(|e| LibError::Internal(e.to_string()))?;
+        let cache = cache::Controller::with_governor(data_dir, cache_options, governor.clone());
+        let pipeline_wake = Arc::new(tokio::sync::Notify::new());
         // Build the one-time cache inventory on the bounded worker pool without delaying startup.
         // Existing derivative hits remain readable while it runs; publications conservatively skip
         // caching until byte accounting is authoritative. The task owns an Arc and therefore may
         // safely outlive this constructor while the pool stays owned by the library.
         let inventory_cache = cache.clone();
+        let inventory_wake = pipeline_wake.clone();
         bg_pool.spawn(move || {
             inventory_cache.initialize_now();
+            inventory_wake.notify_one();
         });
         Ok(EmbeddedLibrary {
             store,
@@ -234,6 +253,7 @@ impl EmbeddedLibrary {
             cancels: Mutex::new(HashMap::new()),
             watchers,
             bg_pool: Arc::new(bg_pool),
+            interactive_pool: Arc::new(interactive_pool),
             semantic,
             fed: federation::PeerRegistry::new(),
             governor,
@@ -242,7 +262,7 @@ impl EmbeddedLibrary {
             prefetch_running: Arc::new(AtomicBool::new(false)),
             prefetch_max_pending: Arc::new(AtomicUsize::new(0)),
             prefetch_peer_running: Arc::new(AtomicBool::new(false)),
-            pipeline_wake: Arc::new(tokio::sync::Notify::new()),
+            pipeline_wake,
         })
     }
 
@@ -392,11 +412,22 @@ impl EmbeddedLibrary {
         (pending, usize::from(pending > 0))
     }
 
-    /// Like [`Self::db`], but runs the closure on the bounded background pool (`bg_pool`) instead of
-    /// the unbounded blocking pool. Use for heavy *background* generation (thumbnails) so a burst
-    /// can't saturate every core — interactive inspector reads stay on `db()` and preempt it. The
-    /// hand-off is a one-shot async→CPU hop (golden rule 5); the caller awaits the result.
-    async fn run_bg<T, F>(&self, f: F) -> Result<T, LibError>
+    /// Bounded interactive generation lane. Pressure-paused maintenance must never occupy the
+    /// worker needed by a foreground cache miss. Maintenance uses `run_background` instead.
+    async fn run_interactive<T, F>(&self, f: F) -> Result<T, LibError>
+    where
+        F: FnOnce(&Store) -> Result<T, LibError> + Send + 'static,
+        T: Send + 'static,
+    {
+        let store = self.store.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.interactive_pool.spawn(move || {
+            let _ = tx.send(f(&store));
+        });
+        rx.await.map_err(|e| LibError::Internal(e.to_string()))?
+    }
+
+    async fn run_background<T, F>(&self, f: F) -> Result<T, LibError>
     where
         F: FnOnce(&Store) -> Result<T, LibError> + Send + 'static,
         T: Send + 'static,
@@ -420,6 +451,9 @@ impl EmbeddedLibrary {
     /// walk); DB sizes and catalog counts are always live.
     pub async fn storage_usage(&self) -> Result<StorageUsage, LibError> {
         let stats = self.db(|s| s.stats(None, &Visibility::Full)).await?;
+        let cache_inventory_ready = self.cache.inventory_initialized();
+        let io_budgets = self.governor.io.diagnostics();
+        let io_stall_pct = self.governor.observed_io_stall();
         let thumbnails = self.cache.usage(cache::Tier::Thumbnail);
         let previews = self.cache.usage(cache::Tier::Preview);
         let peer_previews = self.cache.usage(cache::Tier::Peer);
@@ -427,6 +461,9 @@ impl EmbeddedLibrary {
         tokio::task::spawn_blocking(move || {
             let file_len = |p: PathBuf| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
             Ok(StorageUsage {
+                io_budgets,
+                io_stall_pct,
+                cache_inventory_ready,
                 data_dir: data_dir.display().to_string(),
                 library_db_bytes: file_len(data_dir.join("library.db")),
                 server_db_bytes: file_len(data_dir.join("server.db")),
@@ -439,6 +476,15 @@ impl EmbeddedLibrary {
         })
         .await
         .map_err(|e| LibError::Internal(e.to_string()))?
+    }
+
+    /// Explicit inventory barrier for benchmark setup, outside measured foreground requests.
+    #[doc(hidden)]
+    pub async fn wait_for_cache_inventory(&self) -> Result<(), LibError> {
+        let cache = self.cache.clone();
+        tokio::task::spawn_blocking(move || cache.initialize_now())
+            .await
+            .map_err(|e| LibError::Internal(e.to_string()))
     }
 
     /// Delete the selected regenerable cache tier(s) under `<data_dir>/cache/`. Non-destructive:

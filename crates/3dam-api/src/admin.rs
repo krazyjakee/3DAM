@@ -293,9 +293,33 @@ pub struct CacheUsage {
     pub stale_deleted: u64,
 }
 
-/// Storage report for the Settings surface: DB sizes, local/peer cache tiers, and catalog counts.
+/// One background storage resource's admission budget and most recent device observations.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct IoBudget {
+    pub device: String,
+    pub kind: String,
+    pub limit_bytes_per_sec: u64,
+    pub current_bytes_per_sec: u64,
+    pub concurrency: usize,
+    pub active: usize,
+    pub deferred: usize,
+    pub accounted_bytes: u64,
+    pub observed_bytes_per_sec: Option<f64>,
+    pub queue_depth: Option<f64>,
+    pub request_latency_ms: Option<f64>,
+    pub yield_reason: String,
+    pub probes_available: bool,
+}
+
+/// Storage report: cache inventories, catalog counts, and background I/O diagnostics.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StorageUsage {
+    #[serde(default)]
+    pub io_budgets: Vec<IoBudget>,
+    #[serde(default)]
+    pub io_stall_pct: Option<f64>,
+    #[serde(default)]
+    pub cache_inventory_ready: bool,
     /// The data directory the report is for (shown so the operator knows what they're clearing).
     pub data_dir: String,
     /// Size of `library.db` on disk (bytes; excludes the WAL/SHM sidecars).

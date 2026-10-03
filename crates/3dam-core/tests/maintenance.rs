@@ -30,7 +30,9 @@ async fn storage_usage_uses_live_inventory_and_clear_is_authoritative() {
 
     let lib = EmbeddedLibrary::open(&tmp).await.unwrap();
 
+    lib.wait_for_cache_inventory().await.unwrap();
     let first = lib.storage_usage().await.unwrap();
+    assert!(first.cache_inventory_ready);
     assert_eq!(first.thumbnails.files, 2);
     assert_eq!(first.thumbnails.bytes, 200);
 
@@ -50,4 +52,40 @@ async fn storage_usage_uses_live_inventory_and_clear_is_authoritative() {
     assert_eq!(fresh.thumbnails.bytes, 0);
 
     std::fs::remove_dir_all(&tmp).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diagnostics_and_catalog_remain_available_while_inventory_is_paused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let previews = tmp.path().join("cache/previews");
+    std::fs::create_dir_all(&previews).unwrap();
+    std::fs::write(previews.join("existing.dmsh"), [0u8; 1024]).unwrap();
+    let lib = EmbeddedLibrary::open_with(
+        tmp.path(),
+        dam_core::ResourceOptions {
+            min_free_memory_mb: Some(10_000_000),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let usage = tokio::time::timeout(std::time::Duration::from_secs(1), lib.storage_usage())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!usage.cache_inventory_ready);
+    use dam_api::service::LibraryService;
+    let page = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        lib.query(
+            &dam_api::service::AuthContext::embedded(),
+            Default::default(),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(page.items.is_empty());
+    // Dropping the library cancels the inventory even when pressure will never clear.
+    drop(lib);
 }

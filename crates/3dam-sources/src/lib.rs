@@ -75,6 +75,23 @@ pub trait FileSource: Send + Sync {
     /// prefixed, URL, and traversal shapes and pins local reads to the registered root capability.
     fn fetch(&self, rel_path: &str) -> Result<Fetched, LibError>;
 
+    /// Backing path for local reads; remote/third-party backends use the conservative network
+    /// fallback. The engine also budgets the scratch device, independently when appropriate.
+    fn storage_path(&self) -> Option<&Path> {
+        None
+    }
+
+    /// Background materialisation with a cancellable pace point before each bounded read/write.
+    /// Third-party backends retain compatibility; built-in backends override the chunk loop.
+    fn fetch_paced(
+        &self,
+        rel_path: &str,
+        pace: &mut dyn FnMut(u64) -> Result<(), LibError>,
+    ) -> Result<Fetched, LibError> {
+        pace(FETCH_CHUNK as u64)?;
+        self.fetch(rel_path)
+    }
+
     /// Stat one source-relative file without reading its contents.
     fn content_stat(&self, rel_path: &str) -> Result<ContentStat, LibError> {
         let fetched = self.fetch(rel_path)?;
@@ -1050,6 +1067,19 @@ impl FileSource for LocalFsSource {
         self.fetch_after_validation(&rel, || {})
     }
 
+    fn storage_path(&self) -> Option<&Path> {
+        Some(&self.root)
+    }
+
+    fn fetch_paced(
+        &self,
+        rel_path: &str,
+        pace: &mut dyn FnMut(u64) -> Result<(), LibError>,
+    ) -> Result<Fetched, LibError> {
+        let rel = guard_rel_path(rel_path)?;
+        self.fetch_copy(&rel, || {}, pace)
+    }
+
     fn content_stat(&self, rel_path: &str) -> Result<ContentStat, LibError> {
         let rel = guard_rel_path(rel_path)?;
         let file = self.open_content_file(&rel)?;
@@ -1263,14 +1293,42 @@ impl LocalFsSource {
         rel: &str,
         before_open: impl FnOnce(),
     ) -> Result<Fetched, LibError> {
+        self.fetch_copy(rel, before_open, &mut |_| Ok(()))
+    }
+
+    fn fetch_copy(
+        &self,
+        rel: &str,
+        before_open: impl FnOnce(),
+        pace: &mut dyn FnMut(u64) -> Result<(), LibError>,
+    ) -> Result<Fetched, LibError> {
+        use std::io::{Read, Write};
         before_open();
         let mut source = self.open_content_file(rel)?;
+        let mut length = source.metadata().map(|m| m.len()).unwrap_or(0);
+        let mut copied = 0u64;
         let scratch = self.scratch.as_deref().ok_or_else(|| {
             LibError::Internal("local source fetch has no configured scratch directory".into())
         })?;
         let mut sink = temp_sink(rel, scratch)?;
-        std::io::copy(&mut source, &mut sink)
-            .map_err(|e| LibError::Internal(format!("local fetch copy: {e}")))?;
+        let mut buffer = vec![0; FETCH_CHUNK];
+        loop {
+            if copied >= length {
+                length = source.metadata().map(|m| m.len()).unwrap_or(copied);
+            }
+            let remaining = length.saturating_sub(copied);
+            let wanted = remaining.clamp(1, FETCH_CHUNK as u64) as usize;
+            pace(wanted as u64)?;
+            let n = source
+                .read(&mut buffer[..wanted])
+                .map_err(|e| LibError::Internal(format!("local fetch read: {e}")))?;
+            if n == 0 {
+                break;
+            }
+            sink.write_all(&buffer[..n])
+                .map_err(|e| LibError::Internal(format!("local fetch write: {e}")))?;
+            copied = copied.saturating_add(n as u64);
+        }
         Ok(Fetched::Temp(sink))
     }
 }
@@ -1987,4 +2045,29 @@ mod tests {
             Err(LibError::Unsupported(_))
         ));
     }
+}
+#[test]
+fn paced_local_fetch_cancels_between_chunks_and_removes_partial_scratch() {
+    let root = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("large.bin"), vec![7u8; FETCH_CHUNK * 4]).unwrap();
+    let source = LocalFsSource::registered(root.path(), Some(scratch.path().to_path_buf()));
+    let mut chunks = 0;
+    let error = source.fetch_paced("large.bin", &mut |bytes| {
+        assert_eq!(bytes, FETCH_CHUNK as u64);
+        chunks += 1;
+        if chunks == 3 {
+            return Err(LibError::Internal("cancelled".into()));
+        }
+        Ok(())
+    });
+    assert!(error.is_err());
+    assert_eq!(chunks, 3);
+    assert_eq!(std::fs::read_dir(scratch.path()).unwrap().count(), 0);
+    assert_eq!(
+        std::fs::metadata(root.path().join("large.bin"))
+            .unwrap()
+            .len(),
+        (FETCH_CHUNK * 4) as u64
+    );
 }

@@ -285,7 +285,7 @@ impl EmbeddedLibrary {
         let cache = self.cache.clone();
         self.cache
             .singleflight(key, || async move {
-                self.run_bg(move |s| {
+                self.run_interactive(move |s| {
                     let asset = s.get_asset(&id)?;
                     if is_model {
                         let derivatives =
@@ -355,7 +355,7 @@ impl EmbeddedLibrary {
         let cache = self.cache.clone();
         self.cache
             .singleflight(key, || async move {
-                self.run_bg(move |store| {
+                self.run_interactive(move |store| {
                     let asset = store.get_asset(&id)?;
                     let derivatives =
                         gen_model_derivatives(&cache, &data_dir, store, &secrets, &asset, edge)?;
@@ -412,10 +412,16 @@ impl EmbeddedLibrary {
             let secrets = self.secrets.clone();
             let data_dir = self.data_dir.clone();
             let cache = self.cache.clone();
+            let governor = self.governor.clone();
             let pending = self.prefetch_pending.clone();
             let running = self.prefetch_running.clone();
             self.bg_pool.spawn(move || {
+                let cancel = cache.background_cancel();
                 loop {
+                    if cancel.load(Ordering::Relaxed) {
+                        running.store(false, Ordering::Release);
+                        break;
+                    }
                     let work = {
                         let mut pending = pending.lock().unwrap();
                         let Some(item) = pending.iter().next().copied() else {
@@ -436,15 +442,17 @@ impl EmbeddedLibrary {
                     } else {
                         format!("thumbnail:{id}:{edge}")
                     };
-                    let _ = cache.singleflight_blocking(key, || {
-                        if asset.summary.media == MediaType::Model {
-                            let _ = gen_model_derivatives(
-                                &cache, &data_dir, &store, &secrets, &asset, edge,
-                            );
-                        } else {
-                            let _ =
-                                gen_thumbnail(&cache, &data_dir, &store, &secrets, &asset, edge);
-                        }
+                    let _ = cache.singleflight_blocking(key, |priority_cancel| {
+                        let _ = crate::derivatives::warm_derivatives(
+                            &cache,
+                            &data_dir,
+                            &store,
+                            &secrets,
+                            &asset,
+                            edge,
+                            &governor,
+                            priority_cancel,
+                        );
                     });
                 }
             });

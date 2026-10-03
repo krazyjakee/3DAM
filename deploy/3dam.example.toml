@@ -90,6 +90,13 @@ federation = false
 #background_threads = 2
 #min_free_memory_mb = 2048
 #max_io_stall_pct = 25
+# Per backing resource background read + write limits. Hardware defaults: HDD 8 MiB/s and 1
+# operation, SSD 128 MiB/s and 2, unknown/network 4 MiB/s and 1. Queue/latency can lower the rate.
+# Environment equivalents: 3DAM_IO_MAX_MIB_PER_SEC / 3DAM_IO_CONCURRENCY.
+#io_max_mib_per_sec = 8
+#io_concurrency = 1
+# Hidden/shared mount topology can be named with [[resources.storage]] path/resource/kind/caps;
+# see docs/shared-storage.md for examples and diagnostics.
 # Local thumbnails + 3D previews: default min(10 GiB, 10% of current free disk).
 #derivative_cache_mb = 10240
 # Federated thumbnails + previews: default min(2 GiB, 10% free disk), stale after 7 days.

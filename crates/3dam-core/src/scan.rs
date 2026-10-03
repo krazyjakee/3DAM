@@ -118,6 +118,7 @@ struct Staged {
 /// One source's chunked ingest: entries queue here until the chunk is full or stale, then flush as
 /// probe → per-entry work → one write transaction → post-commit events (steps A–D of issue #138).
 struct ScanChunker<'a> {
+    scratch: &'a Path,
     store: &'a Store,
     events: &'a broadcast::Sender<LibraryEvent>,
     job: JobId,
@@ -253,25 +254,37 @@ impl ScanChunker<'_> {
                 break;
             }
             // Materialise bytes locally from the backend's pinned/opened source handle.
-            let fetched = match self.fs.fetch(&fe.rel_path) {
-                Ok(f) => f,
-                Err(error) => {
-                    self.tally.settled += 1;
-                    self.warn(format!(
-                        "“{}” could not be read from source “{}”",
-                        fe.rel_path, self.source_label
-                    ));
-                    tracing::warn!(path = %fe.rel_path, error = %error, "fetch failed");
-                    continue;
-                }
-            };
+            let (fetched, fetch_work) =
+                match self
+                    .governor
+                    .fetch(self.fs, &fe.rel_path, self.scratch, self.cancel)
+                {
+                    Ok(f) => f,
+                    Err(error) => {
+                        if self.cancelled() {
+                            break;
+                        }
+                        self.tally.settled += 1;
+                        self.warn(format!(
+                            "“{}” could not be read from source “{}”",
+                            fe.rel_path, self.source_label
+                        ));
+                        tracing::warn!(path = %fe.rel_path, error = %error, "fetch failed");
+                        continue;
+                    }
+                };
             let abs = fetched.path();
             // Now that real bytes exist locally, settle the container extensions whose media type
             // the path alone can't determine (`.mp4`/`.mov`/`.m4v` — audio-only or video?). This is
             // the only point in the scan where that question is answerable, and it's asked once per
             // asset, before the row is written.
             let det = dam_media::refine_with_content(&det, abs).unwrap_or(det);
-            let Some(hash) = hash_file(abs) else {
+            // Reacquire for scratch-only hashing after releasing the source/copy permits.
+            drop(fetch_work);
+            let Some(hash) = hash_file_paced(abs, self.governor, self.cancel) else {
+                if self.cancelled() {
+                    break;
+                }
                 self.tally.settled += 1;
                 self.warn(format!(
                     "“{}” could not be hashed; check file readability",
@@ -504,6 +517,7 @@ pub(crate) fn run_scan(
             }
         };
         let mut chunker = ScanChunker {
+            scratch,
             store: &store,
             events: &events,
             job,
@@ -706,6 +720,31 @@ pub(crate) fn hash_file(path: &Path) -> Option<dam_api::id::ContentHash> {
     let file = std::fs::File::open(path).ok()?;
     let mut reader = std::io::BufReader::new(file);
     std::io::copy(&mut reader, &mut hasher).ok()?;
+    Some(dam_api::id::ContentHash(*hasher.finalize().as_bytes()))
+}
+
+fn hash_file_paced(
+    path: &Path,
+    governor: &crate::resources::Governor,
+    cancel: &AtomicBool,
+) -> Option<dam_api::id::ContentHash> {
+    use std::io::Read;
+    let work = governor.io.acquire(governor, &[Some(path)], cancel).ok()?;
+    let mut file = std::fs::File::open(path).ok()?;
+    let length = file.metadata().ok()?.len();
+    let mut read = 0u64;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = vec![0; crate::resources::io::CHUNK];
+    loop {
+        let wanted = length.saturating_sub(read).clamp(1, buffer.len() as u64) as usize;
+        work.pace(wanted as u64).ok()?;
+        let n = file.read(&mut buffer[..wanted]).ok()?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+        read = read.saturating_add(n as u64);
+    }
     Some(dam_api::id::ContentHash(*hasher.finalize().as_bytes()))
 }
 
