@@ -410,6 +410,11 @@ impl Store {
         )
         .map_err(internal)?;
         tx.execute(
+            "DELETE FROM scan_spool.pending_observed WHERE source_id=?1",
+            params![source_id.as_bytes().to_vec()],
+        )
+        .map_err(internal)?;
+        tx.execute(
             "DELETE FROM scan_spool.observed WHERE source_id=?1",
             params![source_id.as_bytes().to_vec()],
         )

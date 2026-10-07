@@ -60,7 +60,8 @@ impl Store {
             .map_err(internal)?;
         let current: bool = tx
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM source WHERE id=?1 AND scan_generation=?2)",
+                "SELECT EXISTS(SELECT 1 FROM source WHERE id=?1 AND scan_generation=?2)
+                   AND EXISTS(SELECT 1 FROM scan_spool.active WHERE source_id=?1 AND generation=?2)",
                 params![source.as_bytes().to_vec(), generation],
                 |row| row.get(0),
             )
@@ -76,7 +77,8 @@ impl Store {
         }
         for entry in entries {
             let token = Self::observe_source_path_in(&tx, source, &entry.path, generation)?;
-            tx.execute("UPDATE pending_ingest SET seen_generation=?3 WHERE source_id=?1 AND path=?2 AND seen_generation<>?3",
+            tx.execute("INSERT OR IGNORE INTO scan_spool.pending_observed(source_id,generation,path)
+                SELECT ?1,?3,?2 WHERE EXISTS(SELECT 1 FROM pending_ingest WHERE source_id=?1 AND path=?2)",
                 params![source.as_bytes().to_vec(), entry.path, generation]).map_err(internal)?;
             let (Some(media), Some(format)) = (entry.media, entry.format.as_deref()) else {
                 continue;
@@ -236,7 +238,8 @@ impl Store {
             .map_err(internal)?;
         let current: bool = tx
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM source WHERE id=?1 AND scan_generation=?2)",
+                "SELECT EXISTS(SELECT 1 FROM source WHERE id=?1 AND scan_generation=?2)
+                   AND EXISTS(SELECT 1 FROM scan_spool.active WHERE source_id=?1 AND generation=?2)",
                 params![source.as_bytes().to_vec(), generation],
                 |row| row.get(0),
             )
@@ -246,7 +249,8 @@ impl Store {
         }
         if scopes.is_empty() {
             tx.execute(
-                "DELETE FROM pending_ingest WHERE source_id=?1 AND seen_generation<>?2",
+                "DELETE FROM pending_ingest WHERE source_id=?1 AND seen_generation<>?2
+                        AND NOT EXISTS(SELECT 1 FROM scan_spool.pending_observed o WHERE o.source_id=pending_ingest.source_id AND o.generation=?2 AND o.path=pending_ingest.path)",
                 params![source.as_bytes().to_vec(), generation],
             )
             .map_err(internal)?;
@@ -255,13 +259,15 @@ impl Store {
                 let root = scope.trim_matches('/');
                 if root.is_empty() {
                     tx.execute(
-                        "DELETE FROM pending_ingest WHERE source_id=?1 AND seen_generation<>?2",
+                        "DELETE FROM pending_ingest WHERE source_id=?1 AND seen_generation<>?2
+                        AND NOT EXISTS(SELECT 1 FROM scan_spool.pending_observed o WHERE o.source_id=pending_ingest.source_id AND o.generation=?2 AND o.path=pending_ingest.path)",
                         params![source.as_bytes().to_vec(), generation],
                     )
                     .map_err(internal)?;
                 } else {
                     let prefix = format!("{root}/");
-                    tx.execute("DELETE FROM pending_ingest WHERE source_id=?1 AND seen_generation<>?2 AND (path=?3 OR substr(path,1,length(?4))=?4)",
+                    tx.execute("DELETE FROM pending_ingest WHERE source_id=?1 AND seen_generation<>?2
+                        AND NOT EXISTS(SELECT 1 FROM scan_spool.pending_observed o WHERE o.source_id=pending_ingest.source_id AND o.generation=?2 AND o.path=pending_ingest.path) AND (path=?3 OR substr(path,1,length(?4))=?4)",
                         params![source.as_bytes().to_vec(),generation,root,prefix]).map_err(internal)?;
                 }
             }
@@ -609,7 +615,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(refreshed.revision, target.revision);
-        assert_eq!(refreshed.generation, second);
+        assert_eq!(refreshed.generation, first);
         assert!(matches!(
             store
                 .commit_pending_ingest(
@@ -621,6 +627,75 @@ mod tests {
                 .unwrap(),
             PendingCommitOutcome::Written { .. }
         ));
+    }
+
+    #[test]
+    fn unchanged_pending_discovery_does_not_rewrite_catalog_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let source = source(&store);
+        let entries: Vec<_> = (0..1024)
+            .map(|i| entry(&format!("{i}.png"), 10, 1))
+            .collect();
+        let first = store.begin_source_scan(&source).unwrap();
+        for chunk in entries.chunks(128) {
+            store.apply_quick_discovery(&source, first, chunk).unwrap();
+        }
+        let second = store.begin_source_scan(&source).unwrap();
+        store
+            .write()
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        let before = store
+            .pending_ingest_for_path(&source, "0.png")
+            .unwrap()
+            .unwrap();
+        for chunk in entries.chunks(128) {
+            assert_eq!(
+                store
+                    .apply_quick_discovery(&source, second, chunk)
+                    .unwrap()
+                    .queued,
+                0
+            );
+        }
+        assert_eq!(store.pending_ingest_count(&source).unwrap(), 1024);
+        let after = store
+            .pending_ingest_for_path(&source, "0.png")
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.revision, after.revision);
+        assert_eq!(before.generation, after.generation);
+        assert_eq!(
+            std::fs::metadata(dir.path().join("library.db-wal"))
+                .unwrap()
+                .len(),
+            0
+        );
+        assert!(store
+            .finish_pending_discovery(&source, second, &[])
+            .unwrap());
+        assert_eq!(store.pending_ingest_count(&source).unwrap(), 1024);
+    }
+
+    #[test]
+    fn restart_without_observation_spool_never_deletes_pending_revisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let source;
+        let generation;
+        {
+            let store = Store::open(dir.path()).unwrap();
+            source = self::source(&store);
+            generation = store.begin_source_scan(&source).unwrap();
+            store
+                .apply_quick_discovery(&source, generation, &[entry("a.png", 10, 1)])
+                .unwrap();
+        }
+        let store = Store::open(dir.path()).unwrap();
+        assert!(!store
+            .finish_pending_discovery(&source, generation, &[])
+            .unwrap());
+        assert_eq!(store.pending_ingest_count(&source).unwrap(), 1);
     }
 
     #[test]

@@ -327,6 +327,8 @@ impl Store {
                 CREATE TABLE scan_spool.active(source_id BLOB PRIMARY KEY,generation INTEGER NOT NULL) WITHOUT ROWID;
                 CREATE TABLE scan_spool.observed(source_id BLOB NOT NULL,generation INTEGER NOT NULL,
                     asset_rowid INTEGER NOT NULL,PRIMARY KEY(source_id,generation,asset_rowid)) WITHOUT ROWID;
+                CREATE TABLE scan_spool.pending_observed(source_id BLOB NOT NULL,generation INTEGER NOT NULL,
+                    path TEXT NOT NULL,PRIMARY KEY(source_id,generation,path)) WITHOUT ROWID;
                 CREATE TABLE scan_spool.scope(source_id BLOB NOT NULL,generation INTEGER NOT NULL,
                     path TEXT NOT NULL,PRIMARY KEY(source_id,generation,path)) WITHOUT ROWID;")
                 .map_err(internal)?;
