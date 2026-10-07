@@ -1,0 +1,29 @@
+{
+  "scope": "Read-only mount-table inspection; no enumeration, remote-client mutation, watch registration or payload reads. This is host context, not live SMB/NFS notification qualification.",
+  "observations": [
+    {
+      "path": "/mnt/Henry",
+      "mount": {
+        "target": "/mnt/Henry",
+        "fstype": "ext4"
+      },
+      "command": "rtk proxy findmnt -J -T /mnt/Henry -o TARGET,FSTYPE"
+    },
+    {
+      "path": "/mnt/Larry",
+      "mount": {
+        "target": "/mnt/Larry",
+        "fstype": "ext4"
+      },
+      "command": "rtk proxy findmnt -J -T /mnt/Larry -o TARGET,FSTYPE"
+    },
+    {
+      "path": "/mnt/assets",
+      "mount": {
+        "target": "/mnt/assets",
+        "fstype": "cifs"
+      },
+      "command": "rtk proxy findmnt -J -T /mnt/assets -o TARGET,FSTYPE"
+    }
+  ]
+}

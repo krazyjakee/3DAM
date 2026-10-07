@@ -2,15 +2,17 @@
   "implementation_revisions": [
     "7d778ad84ac53824f1566cec34799b479ccf1c44",
     "9b43439226d6e89ab06b9bd2c1ec24a6d4305a0b",
-    "1dd900232566bcc230258290fdb6d503727693f2"
+    "1dd900232566bcc230258290fdb6d503727693f2",
+    "dee9e4c3c58fe8bac683889869c8317e8365f23e"
   ],
   "target_branch": "main",
   "build_output": "/mnt/Rusty/cargo-target-3dam-performance",
   "checks": [
     {
       "command": "cargo test --workspace --locked",
-      "passed": 681,
-      "ignored": 8
+      "passed": 690,
+      "ignored": 8,
+      "tested_revision": "dee9e4c3c58fe8bac683889869c8317e8365f23e"
     },
     {
       "command": "cargo test -p dam-store --features ann --locked",
@@ -19,19 +21,23 @@
     },
     {
       "command": "cargo test -p dam-core --example scan_performance",
-      "passed": 5
+      "passed": 5,
+      "tested_revision": "dee9e4c3c58fe8bac683889869c8317e8365f23e"
     },
     {
       "command": "cargo build --workspace --locked",
-      "result": "passed"
+      "result": "passed",
+      "tested_revision": "dee9e4c3c58fe8bac683889869c8317e8365f23e"
     },
     {
       "command": "cargo fmt --all --check",
-      "result": "passed"
+      "result": "passed",
+      "tested_revision": "dee9e4c3c58fe8bac683889869c8317e8365f23e"
     },
     {
       "command": "cargo clippy --workspace --all-targets --all-features -- -D warnings",
-      "result": "passed"
+      "result": "passed",
+      "tested_revision": "dee9e4c3c58fe8bac683889869c8317e8365f23e"
     },
     {
       "command": "cargo xtask check-deps",
@@ -39,7 +45,7 @@
     },
     {
       "command": "canonical CI feature matrix, wasm-pack/wasm-opt, frozen web install, web tests/build/bundle budget",
-      "result": "passed component checks; affected core/binary configurations rerun after checkpoint fix"
+      "result": "passed component checks; affected core/binary configurations rerun after checkpoint and watcher fixes"
     },
     {
       "command": "pnpm lint; pnpm typecheck",
@@ -52,9 +58,13 @@
     {
       "command": "python3 docs/evidence/scan-performance-20261007/validate_evidence.py",
       "result": "passed; all12 reports checked, including explicitly retained failures"
+    },
+    {
+      "command": "documentation links, evidence JSON parsing, git diff --check for owned paths",
+      "result": "passed; 24 local links"
     }
   ],
-  "reuse": "The checkpoint follow-up reran strict all-target/all-feature lint, core/binary configurations, full workspace/ANN tests, example tests, workspace/release builds and formatting. Web/WASM, source/media/viewer feature inputs were unchanged by the store checkpoint change; their earlier passing checks were retained.",
+  "reuse": "The final watcher safeguard reran formatting, strict all-target/all-feature workspace lint, core/binary feature matrices, all workspace tests, native workspace build, example tests and release example build. Store ANN, web/WASM and source/media/viewer feature inputs are unchanged by the watcher change; earlier passing checks are retained. Existing production profiles do not enable a trusted notification journal, so their measured paths are unaffected; no physical/scale rerun is implied.",
   "preexisting_user_changes_preserved": [
     ".github/workflows/performance.yml",
     "docs/performance-harness.md",
@@ -70,5 +80,71 @@
     "foreground_p95_budget_ms": 60,
     "cancellation_source_quiescence_budget_ms": 30000,
     "implementation": "validate_evidence.py plus each report assertion_failures"
-  }
+  },
+  "tested_revision": "dee9e4c3c58fe8bac683889869c8317e8365f23e",
+  "watcher_tests": "Nine added tests cover known/unknown filesystem magic, mount coverage including bind/stacked mounts and mount identity, actual root directory rename/replacement with a retained descriptor, missing/symlinked roots, conservative trust establishment, claimed dirty work during filesystem probes, and stale registration tokens. Existing local watcher integration coverage passed too. All filesystem probes run on blocking workers.",
+  "final_watcher_checks": [
+    {
+      "name": "watch-fmt",
+      "command": "cargo fmt --all --check",
+      "exit_code": 0,
+      "seconds": 0.88,
+      "log": "/tmp/3dam-issue-implementation/validation/watch-fmt.log"
+    },
+    {
+      "name": "watch-workspace-lint",
+      "command": "cargo xtask feature-matrix workspace-all",
+      "exit_code": 0,
+      "seconds": 36.44,
+      "log": "/tmp/3dam-issue-implementation/validation/watch-workspace-lint.log"
+    },
+    {
+      "name": "watch-core-matrix",
+      "command": "cargo xtask feature-matrix core",
+      "exit_code": 0,
+      "seconds": 35.99,
+      "log": "/tmp/3dam-issue-implementation/validation/watch-core-matrix.log"
+    },
+    {
+      "name": "watch-binary-matrix",
+      "command": "cargo xtask feature-matrix binary",
+      "exit_code": 0,
+      "seconds": 19.65,
+      "log": "/tmp/3dam-issue-implementation/validation/watch-binary-matrix.log"
+    },
+    {
+      "name": "watch-workspace-tests",
+      "command": "cargo test --workspace --locked",
+      "exit_code": 0,
+      "seconds": 203.89,
+      "log": "/tmp/3dam-issue-implementation/validation/watch-workspace-tests.log",
+      "passed": 690,
+      "ignored": 8,
+      "suites": 72
+    },
+    {
+      "name": "watch-workspace-build",
+      "command": "cargo build --workspace --locked",
+      "exit_code": 0,
+      "seconds": 5.88,
+      "log": "/tmp/3dam-issue-implementation/validation/watch-workspace-build.log"
+    },
+    {
+      "name": "watch-example-tests",
+      "command": "cargo test -p dam-core --example scan_performance --locked",
+      "exit_code": 0,
+      "seconds": 6.18,
+      "log": "/tmp/3dam-issue-implementation/validation/watch-example-tests.log",
+      "passed": 5,
+      "ignored": 0,
+      "suites": 1
+    },
+    {
+      "name": "watch-release-build",
+      "command": "cargo build -p dam-core --release --example scan_performance --locked",
+      "exit_code": 0,
+      "seconds": 15.21,
+      "log": "/tmp/3dam-issue-implementation/validation/watch-release-build.log"
+    }
+  ]
 }

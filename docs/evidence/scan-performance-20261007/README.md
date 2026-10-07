@@ -165,3 +165,16 @@ aggregate throughput was 8.00 MiB/s at the 8 MiB/s shared-device cap. Both limit
 The cold-cache case avoids full preview-cache reads with bounded validation, so the governed and
 ungoverned cases transfer different bytes; its short duration is not a same-work throughput claim.
 No OS cache reset or physical disk queue measurement is implied by this scenario.
+
+## Filesystem notification qualification
+
+[#209](https://github.com/krazyjakee/3DAM/issues/209) closes a correctness gap in the watcher shortcut:
+`LocalFs` does not establish that remote-client changes produce notifications. Trusted clean skips
+and scoped walks require conservative filesystem coverage, unchanged mount topology and the original
+watched root identity. Network/unknown coverage uses full polling; other platforms keep notifications
+as full-reconciliation hints. Deterministic coverage and root-replacement tests are listed in
+[validation.json](validation.json). These benchmark profiles submit explicit scans without a trusted
+watch journal, so their reported scan counters and durations are unaffected by the capability gate.
+[Read-only mount context](watcher-mount-context.json) confirms the host has both ext4 HDD mounts
+and a CIFS mount; it does not exercise external-client notifications. Live remote/platform
+qualification remains #208.

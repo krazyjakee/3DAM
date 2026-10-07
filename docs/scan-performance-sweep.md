@@ -189,9 +189,14 @@ Metadata work has one bounded operation slot per resource and shares the byte bu
 it does not hold the catalog writer while waiting for admission. Large bulk permits therefore do not
 occupy the metadata lane for an entire multi-gigabyte read.
 
-Local notifications retain at most 512 dirty paths. Overflow or watcher errors request a full scan;
-initial registration is full, and a watchdog performs a full reconciliation within the configured
-maximum interval. Registration failure falls back to polling. Remote sources use
+Local notifications retain at most 512 dirty paths. Trusted clean Quick skips and scoped walks
+require complete filesystem notification coverage and a stable watched root. Linux uses a conservative
+local filesystem allow-list and rejects roots with descendant mounts or stacked covering mounts;
+network, FUSE and unknown filesystems use full polling reconciliation. Other platforms retain
+notifications as full-scan hints until completeness can be established. Root replacement or changed mount topology revokes trust.
+Overflow or watcher errors request a full scan; initial registration is full, and a watchdog performs
+full reconciliation within the configured maximum interval. Registration failure falls back to polling.
+Remote sources use
 `DAM_SOURCE_POLL_SECONDS` (default 60) and `DAM_SOURCE_POLL_MAX_SECONDS` (default 900, maximum 86,400).
 Idle/offline intervals double up to the ceiling, successful changes reset the interval, and jitter is
 stable, at most 10%, and bounded by the ceiling. A poll awaits completion before scheduling the next;
