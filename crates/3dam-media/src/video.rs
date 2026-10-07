@@ -440,11 +440,9 @@ mod tests {
 
     #[cfg(unix)]
     fn fake_tool(dir: &Path, body: &str) -> Tool {
-        use std::os::unix::fs::PermissionsExt;
         let path = dir.join("ffprobe");
         std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        Tool::at_path(path)
+        Tool::at_script(path)
     }
 
     #[cfg(unix)]

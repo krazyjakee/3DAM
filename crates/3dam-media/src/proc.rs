@@ -60,6 +60,8 @@ pub struct Tool {
     bin: &'static str,
     env_override: &'static str,
     cell: OnceLock<Option<PathBuf>>,
+    #[cfg(all(test, unix))]
+    fixture_script: Option<PathBuf>,
 }
 
 impl Tool {
@@ -68,6 +70,8 @@ impl Tool {
             bin,
             env_override,
             cell: OnceLock::new(),
+            #[cfg(all(test, unix))]
+            fixture_script: None,
         }
     }
 
@@ -91,14 +95,18 @@ impl Tool {
             .as_deref()
     }
 
-    #[cfg(test)]
-    pub(crate) fn at_path(path: PathBuf) -> Self {
+    #[cfg(all(test, unix))]
+    pub(crate) fn at_script(path: PathBuf) -> Self {
+        // Executing a newly written fixture directly can fail with ETXTBSY while a parallel
+        // spawn briefly retains its writable descriptor. Let an existing shell read the fixture
+        // as data; argv, deadlines, output limits and process groups still use the real runner.
         let cell = OnceLock::new();
-        let _ = cell.set(Some(path));
+        let _ = cell.set(Some(PathBuf::from("/bin/sh")));
         Self {
             bin: "fake ffprobe",
             env_override: "unused",
             cell,
+            fixture_script: Some(path),
         }
     }
 
@@ -132,6 +140,10 @@ impl Tool {
         }
         let exe = self.path()?;
         let mut cmd = Command::new(exe);
+        #[cfg(all(test, unix))]
+        if let Some(script) = &self.fixture_script {
+            cmd.arg(script);
+        }
         cmd.args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -250,13 +262,11 @@ fn terminate(child: &mut std::process::Child) {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     fn shell_tool(dir: &Path, body: &str) -> Tool {
         let path = dir.join("probe.sh");
         std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-        Tool::at_path(path)
+        Tool::at_script(path)
     }
 
     #[test]
@@ -294,6 +304,26 @@ mod tests {
             start.elapsed() < Duration::from_secs(2),
             "cancellation left inherited stdout open"
         );
+    }
+
+    #[test]
+    fn script_fixture_runs_with_a_retained_writable_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = shell_tool(dir.path(), "printf '{\"streams\":[]}'");
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.path().join("probe.sh"))
+            .unwrap();
+        assert_eq!(
+            tool.run_cancellable(
+                std::iter::empty::<&str>(),
+                Duration::from_secs(2),
+                4096,
+                &|| false
+            ),
+            Some(br#"{"streams":[]}"#.to_vec())
+        );
+        drop(writer);
     }
 
     #[test]
