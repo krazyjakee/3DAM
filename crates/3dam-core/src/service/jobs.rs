@@ -227,10 +227,13 @@ impl EmbeddedLibrary {
         // The resolved source set *is* the job's attribution (issue #42).
         let touched: Vec<SourceId> = sources.iter().map(|s| s.id).collect();
         let sources = if mode == ScanMode::Quick && source_override.is_none() {
-            sources
-                .into_iter()
-                .filter(|source| !self.watchers.trusted_clean(source.id))
-                .collect()
+            let mut needing_discovery = Vec::with_capacity(sources.len());
+            for source in sources {
+                if !self.watchers.trusted_clean(source.id).await {
+                    needing_discovery.push(source);
+                }
+            }
+            needing_discovery
         } else {
             sources
         };
