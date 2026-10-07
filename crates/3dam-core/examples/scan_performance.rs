@@ -727,7 +727,7 @@ fn checkpoint(path: &Path) -> Result<Value> {
     Ok(
         json!({"elapsed_ms": start.elapsed().as_secs_f64() * 1000.0, "busy": busy,
         "wal_frames": frames, "checkpointed_frames": checkpointed, "page_size": page_size,
-        "logical_checkpoint_bytes": checkpointed.max(0) as u64 * page_size as u64,
+        "logical_checkpoint_bytes": (checkpointed >= 0).then(|| checkpointed as u64 * page_size as u64),
         "physical_checkpoint_bytes": null}),
     )
 }

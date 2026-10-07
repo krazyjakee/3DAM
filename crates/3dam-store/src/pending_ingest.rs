@@ -642,10 +642,16 @@ mod tests {
             store.apply_quick_discovery(&source, first, chunk).unwrap();
         }
         let second = store.begin_source_scan(&source).unwrap();
-        store
-            .write()
-            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        let (busy, _, _): (i64, i64, i64) = store
+            .exclusive()
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
             .unwrap();
+        assert_eq!(
+            busy, 0,
+            "the fixture WAL baseline must actually be truncated"
+        );
         let before = store
             .pending_ingest_for_path(&source, "0.png")
             .unwrap()

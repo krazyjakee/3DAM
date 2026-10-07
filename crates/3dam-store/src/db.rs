@@ -5,6 +5,9 @@
 //! shape that fixes it: **one writer connection** plus a **small bounded pool of read-only
 //! connections**, with a `maint` `RwLock` that lets vacuum/checkpoint/migration drain everyone and
 //! run alone.
+//! Ordinary PASSIVE checkpoints use an independent connection under `maint.read()`, without the
+//! writer mutex, so ordinary commits with a healthy worker avoid holding it through checkpoint
+//! syncs. Setup/runtime fallback deliberately retains SQLite's automatic checkpoint policy.
 //!
 //! Three accessors, three contracts:
 //!
@@ -55,7 +58,9 @@ use dam_api::{internal, LibError};
 use rusqlite::{Connection, ErrorCode, OpenFlags};
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
-use std::sync::{Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// Pool ceiling when `3DAM_DB_READERS` is unset. Two is the floor that keeps a browse query off the
 /// writer at all; beyond four, extra readers mostly queue on the same page cache and disk.
@@ -132,6 +137,240 @@ fn busy(err: &rusqlite::Error) -> bool {
     )
 }
 
+/// SQLite's default checkpoint runs on the committing writer, including the WAL/database syncs.
+/// Move those syncs to an independent connection while keeping SQLite's PASSIVE lock protocol.
+/// One notification and one latest frame count cover arbitrarily many commits without retaining
+/// per-commit work. Every commit notifies the worker so disconnection is detected immediately, but
+/// counts below the original threshold cause no checkpoint I/O. An incomplete checkpoint retries
+/// only while there is a backlog; an idle catalog without backlog has no polling or I/O.
+/// Persistent reader snapshots can still prevent WAL recycling,
+/// exactly as with SQLite's default. PASSIVE may copy every eligible frame in one attempt, and a
+/// writer that outruns checkpoint I/O may also grow the WAL. This bounds queued work and retry
+/// activity; it does not promise a hard WAL-size or checkpoint-latency cap.
+pub(crate) struct Checkpointer {
+    notifier: Option<Box<CheckpointNotifier>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    #[cfg(test)]
+    progress: CheckpointProgress,
+}
+
+#[cfg(test)]
+type CheckpointProgress = Arc<Mutex<Option<(i32, i32, i32)>>>;
+
+struct CheckpointNotifier {
+    sender: SyncSender<()>,
+    latest_frames: Arc<AtomicI32>,
+    auto_pages: i32,
+}
+
+impl CheckpointNotifier {
+    fn notify(&self, frames: i32) -> bool {
+        self.latest_frames.store(frames, Ordering::Release);
+        match self.sender.try_send(()) {
+            Ok(()) | Err(TrySendError::Full(())) => true,
+            Err(TrySendError::Disconnected(())) => false,
+        }
+    }
+}
+
+impl Checkpointer {
+    fn start(writer: &Connection, path: &Path, maint: Arc<RwLock<()>>) -> Result<Self, LibError> {
+        let auto_pages: i32 = writer
+            .pragma_query_value(None, "wal_autocheckpoint", |row| row.get(0))
+            .map_err(internal)?;
+        let auto_pages = if auto_pages > 0 { auto_pages } else { 1000 };
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE.union(OpenFlags::SQLITE_OPEN_NO_MUTEX),
+        )
+        .map_err(internal)?;
+        configure(&conn, Role::Writer)?;
+        conn.pragma_update(None, "wal_autocheckpoint", 0)
+            .map_err(internal)?;
+        // PASSIVE never invokes the busy handler. Keep connection setup/cleanup from waiting for
+        // another process, too; failed work is retried or restores the writer's original policy.
+        conn.busy_timeout(std::time::Duration::ZERO)
+            .map_err(internal)?;
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let latest_frames = Arc::new(AtomicI32::new(0));
+        let worker_frames = latest_frames.clone();
+        #[cfg(test)]
+        let progress = Arc::new(Mutex::new(None));
+        #[cfg(test)]
+        let report = {
+            let progress = progress.clone();
+            move |busy, frames, copied| {
+                *progress.lock().unwrap() = Some((busy, frames, copied));
+            }
+        };
+        #[cfg(not(test))]
+        let report = |_: i32, _: i32, _: i32| {};
+        let worker = std::thread::Builder::new()
+            .name("3dam-wal-checkpoint".into())
+            .spawn(move || {
+                checkpoint_worker(conn, maint, receiver, worker_frames, auto_pages, report)
+            })
+            .map_err(|error| LibError::Internal(format!("start catalog checkpointer: {error}")))?;
+        let mut notifier = Box::new(CheckpointNotifier {
+            sender,
+            latest_frames,
+            auto_pages,
+        });
+        // Safety: SQLite calls this hook only while the writer connection is used under its
+        // mutex. The boxed context has a stable address and outlives that connection. Db::drop
+        // unregisters the hook before destroying the context. Installing a WAL hook replaces the
+        // auto-checkpoint hook only after the worker has successfully opened and started.
+        unsafe {
+            rusqlite::ffi::sqlite3_wal_hook(
+                writer.handle(),
+                Some(checkpoint_hook),
+                (&mut *notifier as *mut CheckpointNotifier).cast(),
+            );
+        }
+        Ok(Self {
+            notifier: Some(notifier),
+            worker: Some(worker),
+            #[cfg(test)]
+            progress,
+        })
+    }
+}
+
+unsafe extern "C" fn checkpoint_hook(
+    context: *mut std::ffi::c_void,
+    db: *mut rusqlite::ffi::sqlite3,
+    name: *const std::ffi::c_char,
+    frames: std::ffi::c_int,
+) -> std::ffi::c_int {
+    // Safety: start installs this pointer while its box is live; Db::drop removes the hook first.
+    let notifier = unsafe { &*context.cast::<CheckpointNotifier>() };
+    // This worker owns only the main catalog. Preserve the original automatic policy for any
+    // future attached WAL database rather than directing its frame count to the wrong connection.
+    // Safety: SQLite supplies the valid NUL-terminated database name for this callback.
+    let main = !name.is_null() && unsafe { std::ffi::CStr::from_ptr(name) }.to_bytes() == b"main";
+    if !main {
+        if frames >= notifier.auto_pages {
+            unsafe {
+                rusqlite::ffi::sqlite3_wal_checkpoint_v2(
+                    db,
+                    name,
+                    rusqlite::ffi::SQLITE_CHECKPOINT_PASSIVE,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                );
+            }
+        }
+        return rusqlite::ffi::SQLITE_OK;
+    }
+    let healthy =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| notifier.notify(frames)))
+            .unwrap_or(false);
+    if !healthy {
+        // Worker error/panic must not leave checkpointing disabled. Restore SQLite's prior hook
+        // on this very commit; checkpoint now if it already crossed that hook's threshold. WAL
+        // hooks run after the commit, so never turn a successfully committed write into an error.
+        unsafe {
+            rusqlite::ffi::sqlite3_wal_autocheckpoint(db, notifier.auto_pages);
+            if frames >= notifier.auto_pages {
+                rusqlite::ffi::sqlite3_wal_checkpoint_v2(
+                    db,
+                    name,
+                    rusqlite::ffi::SQLITE_CHECKPOINT_PASSIVE,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                );
+            }
+        }
+    }
+    rusqlite::ffi::SQLITE_OK
+}
+
+fn checkpoint_worker(
+    conn: Connection,
+    maint: Arc<RwLock<()>>,
+    receiver: Receiver<()>,
+    latest_frames: Arc<AtomicI32>,
+    threshold: i32,
+    report: impl Fn(i32, i32, i32),
+) {
+    const RETRY: std::time::Duration = std::time::Duration::from_millis(500);
+    let mut incomplete = false;
+    loop {
+        let mut received = if incomplete {
+            // A pinned reader may outlive thousands of commits. Coalesce their notifications
+            // during the retry interval rather than repeatedly checkpointing an unchanged prefix.
+            let deadline = std::time::Instant::now() + RETRY;
+            loop {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    break true;
+                }
+                match receiver.recv_timeout(remaining) {
+                    Ok(()) => {}
+                    Err(mpsc::RecvTimeoutError::Timeout) => break true,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break false,
+                }
+            }
+        } else {
+            receiver.recv().is_ok()
+        };
+        // Drain/coalesce before inspecting the shared latest count: a queued low-count commit
+        // must not hide a later threshold-crossing commit whose notification found the queue full.
+        loop {
+            match receiver.try_recv() {
+                Ok(()) => {}
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    received = false;
+                    break;
+                }
+            }
+        }
+        if !received || incomplete || latest_frames.load(Ordering::Acquire) >= threshold {
+            let _maint = maint.read().unwrap();
+            let started = std::time::Instant::now();
+            match conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                Ok((
+                    row.get::<_, i32>(0)?,
+                    row.get::<_, i32>(1)?,
+                    row.get::<_, i32>(2)?,
+                ))
+            }) {
+                Ok((busy, frames, copied)) => {
+                    report(busy, frames, copied);
+                    incomplete = busy != 0 || copied < frames;
+                    tracing::debug!(
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        wal_frames = frames,
+                        checkpointed_frames = copied,
+                        incomplete,
+                        "background catalog checkpoint"
+                    );
+                }
+                Err(error) if busy(&error) => incomplete = true,
+                Err(error) => {
+                    tracing::warn!(%error, "catalog checkpointer failed; next commit restores automatic checkpoints");
+                    return;
+                }
+            }
+        }
+        if !received {
+            break;
+        }
+    }
+}
+
+impl Drop for Checkpointer {
+    fn drop(&mut self) {
+        // Closing the only sender wakes an idle worker and asks it to drain one final PASSIVE
+        // checkpoint. Join before returning so shutdown leaves no connection/thread behind.
+        drop(self.notifier.take());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
 /// How many pooled readers to allow. `3DAM_DB_READERS` overrides (mirroring the `3DAM_BG_THREADS`
 /// convention in `dam-core`'s resource governor); otherwise CPU count, clamped.
 fn reader_limit() -> usize {
@@ -159,7 +398,8 @@ pub(crate) enum Db {
         readers: ReadPool,
         /// Held shared by every read/write guard and exclusively by [`Db::exclusive`], which is how
         /// a vacuum drains in-flight readers and blocks new checkouts without a global mutex.
-        maint: RwLock<()>,
+        maint: Arc<RwLock<()>>,
+        checkpointer: Option<Checkpointer>,
     },
     /// An in-memory store (tests, and `Store::from_conn`). One connection *is* the database.
     Memory { conn: Mutex<Connection> },
@@ -194,12 +434,21 @@ impl Db {
     fn open_file_with_readers(path: &Path, max: usize) -> Result<Db, LibError> {
         let writer = Connection::open(path).map_err(internal)?;
         configure(&writer, Role::Writer)?;
+        let maint = Arc::new(RwLock::new(()));
+        let checkpointer = match Checkpointer::start(&writer, path, maint.clone()) {
+            Ok(worker) => Some(worker),
+            Err(error) => {
+                tracing::warn!(%error, "catalog checkpointer unavailable; retaining automatic checkpoints");
+                None
+            }
+        };
         tracing::debug!(path = %path.display(), max_readers = max, "opened catalog");
         Ok(Db::File {
             path: path.to_path_buf(),
             writer: Mutex::new(writer),
             readers: ReadPool::new(path.to_path_buf(), max),
-            maint: RwLock::new(()),
+            maint,
+            checkpointer,
         })
     }
 
@@ -282,6 +531,23 @@ impl Db {
                     _depth: depth,
                 }
             }
+        }
+    }
+}
+
+impl Drop for Db {
+    fn drop(&mut self) {
+        if let Db::File {
+            writer,
+            checkpointer: Some(_),
+            ..
+        } = self
+        {
+            // Safe rusqlite unregistration removes our raw hook while the boxed context is live.
+            writer
+                .get_mut()
+                .unwrap_or_else(|error| error.into_inner())
+                .wal_hook(None);
         }
     }
 }
@@ -538,6 +804,298 @@ mod tests {
                 .unwrap();
         }
         (dir, db)
+    }
+
+    /// Observe the actual worker's result without another SQLite connection checkpointing the
+    /// database under test. The bundled runtime declares NOOP but rejects it in the public API.
+    fn checkpoint_progress(db: &Db) -> Option<(i32, i32, i32)> {
+        let Db::File {
+            checkpointer: Some(worker),
+            ..
+        } = db
+        else {
+            panic!("fixture must have an independent checkpointer");
+        };
+        *worker.progress.lock().unwrap()
+    }
+
+    fn wait_for_checkpoint(db: &Db, predicate: impl Fn(i32, i32) -> bool) {
+        let deadline = std::time::Instant::now() + PATIENCE;
+        loop {
+            if checkpoint_progress(db)
+                .is_some_and(|(busy, frames, copied)| busy == 0 && predicate(frames, copied))
+            {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "checkpointer did not make expected progress: {:?}",
+                checkpoint_progress(db),
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn checkpoint_notifications_coalesce_without_losing_a_threshold_crossing() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let latest_frames = Arc::new(AtomicI32::new(0));
+        let notifier = CheckpointNotifier {
+            sender,
+            latest_frames: latest_frames.clone(),
+            auto_pages: 1000,
+        };
+        assert!(notifier.notify(2));
+        for frames in 3..=1500 {
+            assert!(notifier.notify(frames));
+        }
+        assert_eq!(receiver.try_recv(), Ok(()));
+        assert_eq!(receiver.try_recv(), Err(mpsc::TryRecvError::Empty));
+        assert_eq!(latest_frames.load(Ordering::Acquire), 1500);
+        drop(receiver);
+        assert!(
+            !notifier.notify(1501),
+            "worker failure must be visible to the commit hook"
+        );
+    }
+
+    #[test]
+    fn a_checkpoint_completes_while_the_writer_mutex_is_held() {
+        let (dir, db) = file_db();
+        let held = db.write();
+        held.execute("INSERT INTO t(v) VALUES(zeroblob(6291456))", [])
+            .unwrap();
+        // The SQL transaction has committed, but this caller still owns the store writer mutex.
+        // The checkpoint must complete on its separate connection without waiting for that mutex.
+        wait_for_checkpoint(&db, |frames, copied| frames >= 1000 && copied == frames);
+        // Copy only the database file, without WAL or SQLite backup: seeing the committed payload
+        // in this copy proves the recorded progress corresponds to actual backfilled pages.
+        std::fs::copy(
+            dir.path().join("library.db"),
+            dir.path().join("backfilled.db"),
+        )
+        .unwrap();
+        let backfilled = Connection::open(dir.path().join("backfilled.db")).unwrap();
+        let size: i64 = backfilled
+            .query_row("SELECT length(v) FROM t", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(size, 6291456);
+        let sync: i32 = held
+            .pragma_query_value(None, "synchronous", |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            sync, 1,
+            "moving checkpoints must retain NORMAL durability policy"
+        );
+    }
+
+    #[test]
+    fn checkpoint_respects_maintenance_and_resumes_after_the_gate_opens() {
+        let (_dir, db) = file_db();
+        let exclusive = db.exclusive();
+        exclusive
+            .execute("INSERT INTO t(v) VALUES(zeroblob(6291456))", [])
+            .unwrap();
+        std::thread::sleep(SETTLE);
+        assert_eq!(
+            checkpoint_progress(&db),
+            None,
+            "checkpoint bypassed exclusive maintenance"
+        );
+        drop(exclusive);
+        wait_for_checkpoint(&db, |frames, copied| frames >= 1000 && copied == frames);
+    }
+
+    #[test]
+    fn a_pinned_external_snapshot_is_preserved_and_checkpoint_retries_without_new_writes() {
+        let (dir, db) = file_db();
+        let observer = Connection::open(dir.path().join("library.db")).unwrap();
+        let pinned = Connection::open(dir.path().join("library.db")).unwrap();
+        pinned.execute_batch("BEGIN DEFERRED").unwrap();
+        let count: i64 = pinned
+            .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+        {
+            let writer = db.write();
+            writer
+                .execute("INSERT INTO t(v) VALUES(zeroblob(6291456))", [])
+                .unwrap();
+        }
+        wait_for_checkpoint(&db, |frames, copied| {
+            frames >= 1000 && copied > 0 && copied < frames
+        });
+        let old_count: i64 = pinned
+            .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            old_count, 0,
+            "a passive checkpoint changed a pinned reader's snapshot"
+        );
+        pinned.execute_batch("ROLLBACK").unwrap();
+        // No subsequent writer notification: the worker's bounded incomplete-work retry must
+        // finish the backlog after this other connection releases its old WAL read mark.
+        wait_for_checkpoint(&db, |frames, copied| frames >= 1000 && copied == frames);
+        let current: i64 = observer
+            .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(current, 1);
+    }
+
+    #[test]
+    fn checkpointer_setup_failure_preserves_the_original_automatic_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = Connection::open(dir.path().join("library.db")).unwrap();
+        configure(&writer, Role::Writer).unwrap();
+        writer
+            .pragma_update(None, "wal_autocheckpoint", 32)
+            .unwrap();
+        assert!(Checkpointer::start(
+            &writer,
+            &dir.path().join("missing.db"),
+            Arc::new(RwLock::new(()))
+        )
+        .is_err());
+        let automatic: i32 = writer
+            .pragma_query_value(None, "wal_autocheckpoint", |row| row.get(0))
+            .unwrap();
+        assert_eq!(automatic, 32);
+        writer
+            .execute_batch("CREATE TABLE recovered(id INTEGER)")
+            .unwrap();
+    }
+
+    #[test]
+    fn a_disconnected_worker_restores_automatic_checkpoints_without_failing_the_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = Connection::open(dir.path().join("library.db")).unwrap();
+        configure(&writer, Role::Writer).unwrap();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let mut notifier = Box::new(CheckpointNotifier {
+            sender,
+            latest_frames: Arc::new(AtomicI32::new(0)),
+            auto_pages: 1,
+        });
+        drop(receiver);
+        // Safety: install the production hook with a live boxed context. Its first commit notices
+        // the disconnected worker, replaces the hook, and performs the overdue checkpoint.
+        unsafe {
+            rusqlite::ffi::sqlite3_wal_hook(
+                writer.handle(),
+                Some(checkpoint_hook),
+                (&mut *notifier as *mut CheckpointNotifier).cast(),
+            );
+        }
+        writer
+            .execute_batch("CREATE TABLE recovered(id INTEGER); INSERT INTO recovered VALUES(1)")
+            .unwrap();
+        let automatic: i32 = writer
+            .pragma_query_value(None, "wal_autocheckpoint", |row| row.get(0))
+            .unwrap();
+        assert_eq!(automatic, 1);
+        std::fs::copy(
+            dir.path().join("library.db"),
+            dir.path().join("backfilled.db"),
+        )
+        .unwrap();
+        let backfilled = Connection::open(dir.path().join("backfilled.db")).unwrap();
+        let copied_value: i64 = backfilled
+            .query_row("SELECT id FROM recovered", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            copied_value, 1,
+            "fallback did not backfill the committed row to the main database"
+        );
+        let value: i64 = writer
+            .query_row("SELECT id FROM recovered", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, 1);
+        writer.wal_hook(None);
+    }
+
+    #[test]
+    fn dropping_the_catalog_drains_the_worker_and_closes_its_connection() {
+        let (dir, db) = file_db();
+        {
+            let writer = db.write();
+            writer
+                .execute("INSERT INTO t(v) VALUES(zeroblob(65536))", [])
+                .unwrap();
+        }
+        drop(db);
+        assert!(
+            !dir.path().join("library.db-wal").exists(),
+            "a checkpoint connection survived catalog shutdown"
+        );
+        let reopened = Connection::open(dir.path().join("library.db")).unwrap();
+        let size: i64 = reopened
+            .query_row("SELECT length(v) FROM t", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(size, 65536);
+    }
+
+    #[test]
+    fn catalog_shutdown_does_not_wait_for_a_pinned_external_reader() {
+        let (dir, db) = file_db();
+        let pinned = Connection::open(dir.path().join("library.db")).unwrap();
+        pinned.execute_batch("BEGIN DEFERRED").unwrap();
+        let _: i64 = pinned
+            .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+            .unwrap();
+        {
+            let writer = db.write();
+            writer
+                .execute("INSERT INTO t(v) VALUES(zeroblob(6291456))", [])
+                .unwrap();
+        }
+        let observer = Connection::open(dir.path().join("library.db")).unwrap();
+        wait_for_checkpoint(&db, |frames, copied| {
+            frames >= 1000 && copied > 0 && copied < frames
+        });
+        let (finished, completion) = mpsc::channel();
+        let shutdown = std::thread::spawn(move || {
+            drop(db);
+            finished.send(()).unwrap();
+        });
+        assert_eq!(
+            completion.recv_timeout(PATIENCE),
+            Ok(()),
+            "shutdown kept retrying a pinned checkpoint"
+        );
+        shutdown.join().unwrap();
+        let old_count: i64 = pinned
+            .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(old_count, 0);
+        pinned.execute_batch("ROLLBACK").unwrap();
+        let current: i64 = observer
+            .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(current, 1);
+    }
+
+    #[test]
+    fn catalog_shutdown_unregisters_the_hook_even_after_writer_mutex_poisoning() {
+        let (_dir, db) = file_db();
+        let db = Arc::new(db);
+        let poison = db.clone();
+        assert!(std::thread::spawn(move || {
+            let _held = poison.write();
+            panic!("simulate a writer panic");
+        })
+        .join()
+        .is_err());
+        let (finished, completion) = mpsc::channel();
+        let shutdown = std::thread::spawn(move || {
+            drop(db);
+            finished.send(()).unwrap();
+        });
+        assert_eq!(
+            completion.recv_timeout(PATIENCE),
+            Ok(()),
+            "poisoned writer prevented safe hook cleanup"
+        );
+        shutdown.join().unwrap();
     }
 
     /// A pooled reader sees committed writer rows and hands its connection back on drop, so the

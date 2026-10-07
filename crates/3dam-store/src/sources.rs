@@ -683,10 +683,18 @@ mod tests {
                 .unwrap();
         }
         let generation = store.begin_source_scan(&source).unwrap();
-        store
-            .write()
-            .execute_batch("PRAGMA main.wal_checkpoint(TRUNCATE)")
+        // Drain background checkpoints before establishing the empty-WAL baseline. Ordinary
+        // writer locking intentionally no longer excludes the independent PASSIVE worker.
+        let (busy, _, _): (i64, i64, i64) = store
+            .exclusive()
+            .query_row("PRAGMA main.wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
             .unwrap();
+        assert_eq!(
+            busy, 0,
+            "the fixture WAL baseline must actually be truncated"
+        );
         for chunk in (0..1024).collect::<Vec<_>>().chunks(128) {
             let paths = chunk.iter().map(|n| format!("{n}.png")).collect::<Vec<_>>();
             assert_eq!(
