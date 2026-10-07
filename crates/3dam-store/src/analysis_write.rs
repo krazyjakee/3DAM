@@ -17,7 +17,9 @@ impl Store {
     ) -> Result<bool, LibError> {
         let conn = self.write();
         conn.execute(
-            "UPDATE asset SET derivative_version=?2 WHERE id=?1 AND content_hash IS ?3",
+            "UPDATE asset SET derivative_version=?2 WHERE id=?1 AND content_hash IS ?3
+                AND NOT EXISTS (SELECT 1 FROM pending_ingest p
+                    WHERE p.source_id=asset.source_id AND p.path=asset.path)",
             params![
                 id.as_bytes().to_vec(),
                 derivative_version,

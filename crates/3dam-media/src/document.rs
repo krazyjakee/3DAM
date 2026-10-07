@@ -46,7 +46,9 @@ impl crate::MediaHandler for Handler {
     }
 
     fn extract_metadata(&self, path: &Path, format: &str) -> MediaAttributes {
-        MediaAttributes::Document(metadata(path, format))
+        let budget = crate::MetadataBudget::default();
+        let mut session = crate::ingest::Session::new(&budget);
+        MediaAttributes::Document(ingest_metadata(path, format, &mut session))
     }
 
     fn extract_text(&self, path: &Path, format: &str) -> Option<String> {
@@ -64,6 +66,9 @@ const EXCERPT_CHARS: usize = 280;
 /// Page ceiling for PDF body extraction. [`MAX_TEXT_BYTES`] is the real bound, but a generated PDF
 /// of a hundred thousand near-empty pages would reach it slowly if at all; this caps the work.
 const MAX_TEXT_PAGES: usize = 2_000;
+
+/// Deferred PDF/ZIP parsers still reject source containers above this ceiling.
+const DEEP_CONTAINER_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Bytes of a plaintext file read for the cheap tier. Word count on a huge log file is not worth a
 /// full read at ingest; the analyse pass gets the whole thing (up to [`MAX_TEXT_BYTES`]).
@@ -193,15 +198,24 @@ fn strip_rtf(src: &str) -> String {
 /// replacement char, not the whole document's text, word count and excerpt. (OOXML/ODF parts are
 /// always UTF-8 by specification, so there is no encoding to sniff — only a truncation to survive.)
 fn zip_entry(path: &Path, name: &str) -> Option<String> {
+    zip_entry_status(path, name).map(|(text, _)| text)
+}
+
+fn zip_entry_status(path: &Path, name: &str) -> Option<(String, bool)> {
     let f = std::fs::File::open(path).ok()?;
+    if f.metadata().ok()?.len() > DEEP_CONTAINER_BYTES {
+        return None;
+    }
     let mut zip = zip::ZipArchive::new(f).ok()?;
     let entry = zip.by_name(name).ok()?;
+    let declared = entry.size();
     let mut buf = Vec::new();
     entry
         .take(MAX_TEXT_BYTES as u64)
         .read_to_end(&mut buf)
         .ok()?;
-    Some(String::from_utf8_lossy(&buf).into_owned())
+    let complete = declared <= MAX_TEXT_BYTES as u64 && buf.len() as u64 == declared;
+    Some((String::from_utf8_lossy(&buf).into_owned(), complete))
 }
 
 /// Concatenate every text node in an XML document, inserting breaks at the elements that mean
@@ -338,12 +352,112 @@ fn count_words(text: &str) -> i64 {
 
 // ── entry points ───────────────────────────────────────────────────────────
 
-/// CHEAP tier: describe the document without reading more of it than necessary.
+/// Ingest never loads a PDF page tree. Plaintext snapshots retain useful titles
+/// and excerpts, but a prefix word count is unknown rather than an exact total.
+pub(crate) fn ingest_metadata(
+    path: &Path,
+    format: &str,
+    session: &mut crate::ingest::Session<'_, '_>,
+) -> DocumentAttributes {
+    let mut attrs = DocumentAttributes::default();
+    if format == "pdf" {
+        session.deferred = true;
+        return attrs;
+    }
+    if format == "docx" || format == "odt" {
+        let Some(bytes) = session.complete_file(path) else {
+            return attrs;
+        };
+        let Ok(mut archive) = zip::ZipArchive::new(std::io::Cursor::new(bytes)) else {
+            return attrs;
+        };
+        let (properties, body) = if format == "docx" {
+            ("docProps/core.xml", "word/document.xml")
+        } else {
+            ("meta.xml", "content.xml")
+        };
+        let mut inflated_remaining = session.remaining().min(CHEAP_READ_BYTES);
+        if let Some((xml, _)) =
+            ingest_zip_entry(&mut archive, properties, &mut inflated_remaining, session)
+        {
+            attrs.title = xml_field(&xml, "title");
+            attrs.author = xml_field(&xml, "creator");
+        }
+        if let Some((xml, complete)) =
+            ingest_zip_entry(&mut archive, body, &mut inflated_remaining, session)
+        {
+            let text = normalise(&xml_text(&xml));
+            attrs.word_count = complete.then(|| count_words(&text));
+            attrs.excerpt = excerpt(&text);
+        }
+        return attrs;
+    }
+    let Some((bytes, complete)) = session.prefix(path, CHEAP_READ_BYTES) else {
+        return attrs;
+    };
+    let (raw, encoding) = decode_text(&bytes);
+    attrs.encoding = Some(encoding.to_ascii_lowercase());
+    let body = if format == "rtf" {
+        strip_rtf(&raw)
+    } else {
+        raw
+    };
+    if format == "md" {
+        attrs.title = markdown_title(&body);
+    }
+    let text = normalise(&body);
+    attrs.word_count = complete.then(|| count_words(&text));
+    attrs.excerpt = excerpt(&text);
+    attrs
+}
+
+fn ingest_zip_entry(
+    archive: &mut zip::ZipArchive<std::io::Cursor<Vec<u8>>>,
+    name: &str,
+    remaining: &mut usize,
+    session: &mut crate::ingest::Session<'_, '_>,
+) -> Option<(String, bool)> {
+    let mut entry = archive.by_name(name).ok()?;
+    let declared = entry.size();
+    let limit = usize::try_from(declared)
+        .unwrap_or(usize::MAX)
+        .min(*remaining);
+    let complete = limit as u64 == declared;
+    if !complete {
+        session.deferred = true;
+    }
+    let mut bytes = Vec::with_capacity(limit);
+    let mut chunk = [0u8; 8192];
+    while bytes.len() < limit {
+        if !session.active() {
+            session.deferred = true;
+            return None;
+        }
+        let n = (limit - bytes.len()).min(chunk.len());
+        let n = entry.read(&mut chunk[..n]).ok()?;
+        if n == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..n]);
+    }
+    *remaining = remaining.saturating_sub(bytes.len());
+    // The complete flag includes a short/corrupt inflated stream.
+    let complete = complete && bytes.len() as u64 == declared;
+    Some((String::from_utf8_lossy(&bytes).into_owned(), complete))
+}
+
+/// Deferred tier: describe a document, including its PDF page tree.
 pub fn metadata(path: &Path, format: &str) -> DocumentAttributes {
     let mut attrs = DocumentAttributes::default();
 
     match format {
         "pdf" => {
+            if std::fs::metadata(path)
+                .map(|meta| meta.len() > DEEP_CONTAINER_BYTES)
+                .unwrap_or(true)
+            {
+                return attrs;
+            }
             let Ok(doc) = lopdf::Document::load(path) else {
                 // Encrypted or malformed: we still catalogue it, we just can't describe it.
                 return attrs;
@@ -352,11 +466,8 @@ pub fn metadata(path: &Path, format: &str) -> DocumentAttributes {
             attrs.page_count = Some(pages.len() as i64);
             attrs.title = pdf_info(&doc, b"Title");
             attrs.author = pdf_info(&doc, b"Author");
-            // Honest about the one cost this arm can't avoid: `Document::load` parses the whole
-            // file, so a PDF is the one cheap-tier extraction proportional to file size rather than
-            // to header size. lopdf has no partial-parse entry point that still yields the page
-            // tree and `/Info`. Only the *text* is bounded — the first few pages, enough for an
-            // excerpt without paying to lay out a 400-page manual. The analyse pass reads the rest.
+            // PDF page trees require a full parse, restricted to the deferred analysis
+            // lane and the source-container ceiling. Ingest leaves these fields unknown.
             let first: Vec<u32> = pages.keys().take(3).copied().collect();
             if let Ok(text) = doc.extract_text(&first) {
                 let text = normalise(&text);
@@ -369,12 +480,9 @@ pub fn metadata(path: &Path, format: &str) -> DocumentAttributes {
                 attrs.title = xml_field(&core, "title");
                 attrs.author = xml_field(&core, "creator");
             }
-            if let Some(text) = zip_entry(path, "word/document.xml")
-                .as_deref()
-                .map(xml_text)
-            {
-                let text = normalise(&text);
-                attrs.word_count = Some(count_words(&text));
+            if let Some((xml, complete)) = zip_entry_status(path, "word/document.xml") {
+                let text = normalise(&xml_text(&xml));
+                attrs.word_count = complete.then(|| count_words(&text));
                 attrs.excerpt = excerpt(&text);
             }
         }
@@ -383,15 +491,15 @@ pub fn metadata(path: &Path, format: &str) -> DocumentAttributes {
                 attrs.title = xml_field(&meta, "title");
                 attrs.author = xml_field(&meta, "creator");
             }
-            if let Some(text) = zip_entry(path, "content.xml").as_deref().map(xml_text) {
-                let text = normalise(&text);
-                attrs.word_count = Some(count_words(&text));
+            if let Some((xml, complete)) = zip_entry_status(path, "content.xml") {
+                let text = normalise(&xml_text(&xml));
+                attrs.word_count = complete.then(|| count_words(&text));
                 attrs.excerpt = excerpt(&text);
             }
         }
         // Plaintext family: md, txt, rtf.
         _ => {
-            let Some((raw, encoding)) = read_text_capped(path, CHEAP_READ_BYTES) else {
+            let Some((raw, encoding)) = read_text_capped(path, MAX_TEXT_BYTES) else {
                 return attrs;
             };
             attrs.encoding = Some(encoding.to_ascii_lowercase());
@@ -404,7 +512,10 @@ pub fn metadata(path: &Path, format: &str) -> DocumentAttributes {
                 attrs.title = markdown_title(&body);
             }
             let text = normalise(&body);
-            attrs.word_count = Some(count_words(&text));
+            attrs.word_count = std::fs::metadata(path)
+                .ok()
+                .filter(|meta| meta.len() <= MAX_TEXT_BYTES as u64)
+                .map(|_| count_words(&text));
             attrs.excerpt = excerpt(&text);
         }
     }
@@ -420,6 +531,9 @@ pub fn metadata(path: &Path, format: &str) -> DocumentAttributes {
 pub fn extract_text(path: &Path, format: &str) -> Option<String> {
     let raw = match format {
         "pdf" => {
+            if std::fs::metadata(path).ok()?.len() > DEEP_CONTAINER_BYTES {
+                return None;
+            }
             let doc = lopdf::Document::load(path).ok()?;
             // Page at a time, stopping at the cap. Extracting every page first and truncating
             // afterwards would materialise the whole of a 2000-page manual (several times over,

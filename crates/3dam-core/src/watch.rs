@@ -9,15 +9,15 @@
 //! A watch scan reuses [`crate::scan::run_scan`] directly (store + event bus), so the manager needs
 //! no back-reference to the full engine. Overlapping scans of one source are suppressed.
 
-use crate::scan;
+use crate::scan::ScanOutcome;
+use dam_api::dto::JobKind;
 use dam_api::dto::SourceKind;
-use dam_api::dto::{JobKind, ScanMode};
 use dam_api::event::LibraryEvent;
 use dam_api::id::SourceId;
 use dam_store::Store;
 use notify::event::ModifyKind;
 use notify::{EventKind, RecursiveMode, Watcher};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
@@ -26,14 +26,101 @@ use tokio::sync::{broadcast, watch};
 
 /// Quiet window a burst of local FS events must settle for before a re-scan fires.
 const DEBOUNCE: Duration = Duration::from_millis(600);
-/// Poll cadence for remote sources with no push channel (SFTP/SMB).
-const POLL_INTERVAL: Duration = Duration::from_secs(60);
+const MAX_DIRTY_PATHS: usize = 512;
+
+#[derive(Default)]
+struct DirtyPaths {
+    full: bool,
+    trusted: bool,
+    paths: BTreeSet<String>,
+}
+impl DirtyPaths {
+    fn fallback(&mut self) {
+        self.full = true;
+        self.trusted = false;
+        self.paths.clear();
+    }
+    fn add(&mut self, root: &Path, path: &Path) {
+        if self.full {
+            return;
+        }
+        let Ok(relative) = path.strip_prefix(root) else {
+            self.fallback();
+            return;
+        };
+        if relative.as_os_str().is_empty()
+            || relative
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            self.fallback();
+            return;
+        }
+        self.paths
+            .insert(relative.to_string_lossy().replace('\\', "/"));
+        if self.paths.len() > MAX_DIRTY_PATHS {
+            self.fallback();
+        }
+    }
+    fn take(&mut self) -> Vec<String> {
+        if self.full {
+            self.full = false;
+            self.paths.clear();
+            Vec::new()
+        } else {
+            std::mem::take(&mut self.paths).into_iter().collect()
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PollPolicy {
+    base: Duration,
+    max: Duration,
+}
+impl PollPolicy {
+    fn from_env() -> Self {
+        let seconds = |name: &str, default: u64| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(default)
+        };
+        let base = seconds("DAM_SOURCE_POLL_SECONDS", 60).clamp(1, 86400);
+        let max = seconds("DAM_SOURCE_POLL_MAX_SECONDS", 900).clamp(base, 86400);
+        Self {
+            base: Duration::from_secs(base),
+            max: Duration::from_secs(max),
+        }
+    }
+    fn next(self, previous: Duration, outcome: ScanOutcome) -> Duration {
+        if outcome.healthy && outcome.changed {
+            self.base
+        } else {
+            previous.saturating_mul(2).min(self.max)
+        }
+    }
+    // Stable per-source jitter, below 10%; never exceed the configured freshness bound.
+    fn delay(self, interval: Duration, id: SourceId) -> Duration {
+        let seed = id
+            .as_bytes()
+            .iter()
+            .fold(0u64, |n, b| n.wrapping_mul(31).wrapping_add(*b as u64));
+        interval
+            .saturating_add(Duration::from_millis(
+                interval.as_millis() as u64 * (seed % 100) / 1000,
+            ))
+            .min(self.max)
+    }
+}
 
 enum WatchEntry {
     /// The live OS watcher. Never read — held purely so its `Drop` (which stops notifications)
     /// doesn't run until the source is unwatched or the engine closes.
     Local {
         _watcher: notify::RecommendedWatcher,
+        dirty: Arc<Mutex<DirtyPaths>>,
     },
     /// A detached poll task marks its source watched here (nothing to keep alive).
     Poll,
@@ -54,6 +141,7 @@ pub(crate) struct WatchManager {
     governor: Arc<crate::resources::Governor>,
     /// Scratch dir the triggered scans hand to remote sources (issue #87).
     scratch: Arc<std::path::PathBuf>,
+    coordinator: Arc<crate::scan_admission::Coordinator>,
 }
 
 impl WatchManager {
@@ -64,6 +152,7 @@ impl WatchManager {
         rt: tokio::runtime::Handle,
         governor: Arc<crate::resources::Governor>,
         scratch: std::path::PathBuf,
+        coordinator: Arc<crate::scan_admission::Coordinator>,
     ) -> WatchManager {
         WatchManager {
             store,
@@ -74,6 +163,23 @@ impl WatchManager {
             in_flight: Arc::new(Mutex::new(HashSet::new())),
             governor,
             scratch: Arc::new(scratch),
+            coordinator,
+        }
+    }
+
+    /// A watcher becomes a trusted discovery journal only after a successful reconciliation.
+    /// Pending/failed registration, dirty revisions and active scans all require enumeration.
+    pub(crate) fn trusted_clean(&self, id: SourceId) -> bool {
+        if self.in_flight.lock().unwrap().contains(&id) {
+            return false;
+        }
+        let live = self.live.lock().unwrap();
+        match live.get(&id) {
+            Some(WatchEntry::Local { dirty, .. }) => {
+                let dirty = dirty.lock().unwrap();
+                dirty.trusted && !dirty.full && dirty.paths.is_empty()
+            }
+            _ => false,
         }
     }
 
@@ -129,52 +235,133 @@ impl WatchManager {
         let rt = self.rt.clone();
         let governor = self.governor.clone();
         let scratch = self.scratch.clone();
+        let coordinator = self.coordinator.clone();
         self.rt.spawn_blocking(move || {
             // A watch channel retains one revision, not one item per callback. A 100k-file copy can
             // therefore make this counter race ahead, but it can never allocate a 100k-entry queue.
             let (tx, mut rx) = watch::channel(0_u64);
             let initial_scan = tx.clone();
+            let dirty = Arc::new(Mutex::new(DirtyPaths::default()));
+            let callback_dirty = dirty.clone();
+            let callback_root = std::path::PathBuf::from(&root);
             let mut watcher =
                 match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
                     // Only a genuine content mutation may trigger a re-scan. The inotify backend also
                     // reports opens/reads/atime bumps (`OPEN`, `CLOSE_NOWRITE`, `ATTRIB`), and the scan
                     // opens+reads every file — so firing on those would make the scan re-trigger the
                     // very scan that produced them: an endless rescan-from-zero loop. Filter it out.
-                    if let Ok(ev) = res {
-                        if is_content_change(&ev.kind) {
+                    match res {
+                        Ok(ev)
+                            if ev.need_rescan()
+                                || matches!(ev.kind, EventKind::Any | EventKind::Other) =>
+                        {
+                            callback_dirty.lock().unwrap().fallback();
                             mark_dirty(&tx);
                         }
+                        Ok(ev) if is_content_change(&ev.kind) => {
+                            let mut pending = callback_dirty.lock().unwrap();
+                            if ev.paths.is_empty() {
+                                pending.fallback();
+                            }
+                            for path in &ev.paths {
+                                pending.add(&callback_root, path);
+                            }
+                            drop(pending);
+                            mark_dirty(&tx);
+                        }
+                        Err(_) => {
+                            callback_dirty.lock().unwrap().fallback();
+                            mark_dirty(&tx);
+                        }
+                        _ => {}
                     }
                 }) {
                     Ok(w) => w,
                     Err(e) => {
                         tracing::warn!(source = %id, error = %e, "could not create local watcher");
-                        live.lock().unwrap().remove(&id);
+                        spawn_poll_task(
+                            &rt,
+                            id,
+                            store,
+                            secrets,
+                            events,
+                            in_flight,
+                            governor,
+                            scratch,
+                            coordinator,
+                        );
+                        live.lock().unwrap().insert(id, WatchEntry::Poll);
                         return;
                     }
                 };
             if let Err(e) = watcher.watch(Path::new(&root), RecursiveMode::Recursive) {
                 tracing::warn!(source = %id, error = %e, "could not start local watcher");
-                live.lock().unwrap().remove(&id);
+                spawn_poll_task(
+                    &rt,
+                    id,
+                    store,
+                    secrets,
+                    events,
+                    in_flight,
+                    governor,
+                    scratch,
+                    coordinator,
+                );
+                live.lock().unwrap().insert(id, WatchEntry::Poll);
                 return;
             }
 
             // Reconcile once after registration. A file can be created after `add_source` returns
             // but before the off-thread OS watch is live; that event cannot be replayed by notify.
             // The initial delta is idempotent and closes that otherwise permanent missed-event gap.
+            dirty.lock().unwrap().fallback();
             mark_dirty(&initial_scan);
 
+            let task_live = live.clone();
+            let task_dirty = dirty.clone();
             rt.spawn(async move {
-                while wait_for_quiet(&mut rx, DEBOUNCE).await {
-                    trigger_delta(
-                        &store, &secrets, &events, &in_flight, &governor, &scratch, id,
-                    );
+                let fallback = PollPolicy::from_env().max;
+                loop {
+                    if !matches!(store.get_source(&id),Ok(Some(info)) if info.watch) {
+                        task_live.lock().unwrap().remove(&id);
+                        break;
+                    }
+                    let scopes = tokio::select! {
+                        changed=wait_for_quiet(&mut rx,DEBOUNCE) => {
+                            if !changed { break; }
+                            task_dirty.lock().unwrap().take()
+                        },
+                        _=tokio::time::sleep(fallback) => Vec::new(),
+                    };
+                    if let Some(task) = trigger_delta(
+                        &store,
+                        &secrets,
+                        &events,
+                        &in_flight,
+                        &governor,
+                        &scratch,
+                        &coordinator,
+                        id,
+                        scopes,
+                    ) {
+                        let outcome = task.await.unwrap_or_default();
+                        let mut pending = task_dirty.lock().unwrap();
+                        if outcome.healthy && !pending.full {
+                            pending.trusted = true;
+                        } else if !outcome.healthy {
+                            pending.fallback();
+                        }
+                    }
                 }
             });
             // Publish the live watcher, replacing the `Pending` reservation.
-            live.lock()
-                .unwrap()
-                .insert(id, WatchEntry::Local { _watcher: watcher });
+            live.lock().unwrap().insert(
+                id,
+                WatchEntry::Local {
+                    _watcher: watcher,
+                    dirty,
+                },
+            );
         });
     }
 
@@ -185,15 +372,56 @@ impl WatchManager {
         let in_flight = self.in_flight.clone();
         let governor = self.governor.clone();
         let scratch = self.scratch.clone();
-        self.rt.spawn(async move {
-            loop {
-                tokio::time::sleep(POLL_INTERVAL).await;
-                trigger_delta(
-                    &store, &secrets, &events, &in_flight, &governor, &scratch, id,
-                );
-            }
-        });
+        let coordinator = self.coordinator.clone();
+        spawn_poll_task(
+            &self.rt,
+            id,
+            store,
+            secrets,
+            events,
+            in_flight,
+            governor,
+            scratch,
+            coordinator,
+        );
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_poll_task(
+    rt: &tokio::runtime::Handle,
+    id: SourceId,
+    store: Arc<Store>,
+    secrets: crate::credentials::SecretVault,
+    events: broadcast::Sender<LibraryEvent>,
+    in_flight: Arc<Mutex<HashSet<SourceId>>>,
+    governor: Arc<crate::resources::Governor>,
+    scratch: Arc<std::path::PathBuf>,
+    coordinator: Arc<crate::scan_admission::Coordinator>,
+) {
+    rt.spawn(async move {
+        let policy = PollPolicy::from_env();
+        let mut interval = policy.base;
+        loop {
+            tokio::time::sleep(policy.delay(interval, id)).await;
+            if !matches!(store.get_source(&id),Ok(Some(info)) if info.watch) {
+                break;
+            }
+            if let Some(task) = trigger_delta(
+                &store,
+                &secrets,
+                &events,
+                &in_flight,
+                &governor,
+                &scratch,
+                &coordinator,
+                id,
+                Vec::new(),
+            ) {
+                interval = policy.next(interval, task.await.unwrap_or_default());
+            }
+        }
+    });
 }
 
 /// Mark a watched source dirty without queueing one allocation per filesystem event.
@@ -234,6 +462,7 @@ fn is_content_change(kind: &EventKind) -> bool {
 }
 
 /// Submit a background delta scan for one source, unless one is already running for it.
+#[allow(clippy::too_many_arguments)]
 fn trigger_delta(
     store: &Arc<Store>,
     secrets: &crate::credentials::SecretVault,
@@ -241,31 +470,33 @@ fn trigger_delta(
     in_flight: &Arc<Mutex<HashSet<SourceId>>>,
     governor: &Arc<crate::resources::Governor>,
     scratch: &Arc<std::path::PathBuf>,
+    coordinator: &Arc<crate::scan_admission::Coordinator>,
     id: SourceId,
-) {
+    scopes: Vec<String>,
+) -> Option<tokio::task::JoinHandle<ScanOutcome>> {
     {
         let mut f = in_flight.lock().unwrap();
         if !f.insert(id) {
-            return; // a scan for this source is already running
+            return None; // a scan for this source is already running
         }
     }
     let clear = || {
         in_flight.lock().unwrap().remove(&id);
     };
     let info = match store.get_source(&id) {
-        Ok(Some(i)) => i,
+        Ok(Some(i)) if i.watch => i,
         _ => {
             clear();
-            return;
+            return None;
         }
     };
-    let params = r#"{"mode":"delta","watch":true}"#;
+    let params = r#"{"mode":"quick","watch":true}"#;
     // An auto-rescan touches exactly the one watched source (issue #42).
     let job = match store.create_job(JobKind::Scan, params, None, &[id]) {
         Ok(j) => j,
         Err(_) => {
             clear();
-            return;
+            return None;
         }
     };
     let store = store.clone();
@@ -274,23 +505,48 @@ fn trigger_delta(
     let in_flight = in_flight.clone();
     let governor = governor.clone();
     let scratch = scratch.clone();
-    tokio::task::spawn_blocking(move || {
-        let cancel = Arc::new(AtomicBool::new(false));
-        if let Err(error) = scan::run_scan(
-            store,
+    let coordinator = coordinator.clone();
+    let cancel = Arc::new(AtomicBool::new(false));
+    coordinator
+        .cancels
+        .lock()
+        .unwrap()
+        .insert(job, cancel.clone());
+    Some(tokio::task::spawn_blocking(move || {
+        let outcome = match crate::quick_scan::run_quick_scan(
+            store.clone(),
             secrets,
-            events,
+            events.clone(),
             job,
             vec![info],
-            ScanMode::Delta,
             cancel,
             &governor,
             &scratch,
+            &coordinator,
+            false,
+            &scopes,
+            None,
         ) {
-            crate::reliability::background_job_failed(&job, "run watched scan", &error);
-        }
+            Ok(outcome) => outcome,
+            Err(error) => {
+                crate::reliability::background_job_failed(&job, "run watched scan", &error);
+                crate::reliability::required_background_write(
+                    store.set_job_state(
+                        &job,
+                        dam_api::dto::JobState::Failed,
+                        Some(&error.to_string()),
+                    ),
+                    "persist watched scan failure",
+                    &job,
+                );
+                crate::emit_progress(&store, &events, &job);
+                ScanOutcome::default()
+            }
+        };
+        coordinator.cancels.lock().unwrap().remove(&job);
         in_flight.lock().unwrap().remove(&id);
-    });
+        outcome
+    }))
 }
 
 #[cfg(test)]
@@ -303,6 +559,73 @@ mod tests {
     use notify::EventKind;
     use std::time::Duration;
     use tokio::sync::watch;
+
+    #[test]
+    fn dirty_paths_are_bounded_and_rename_keeps_both_sides() {
+        let mut paths = super::DirtyPaths::default();
+        let root = std::path::Path::new("/root");
+        paths.add(root, &root.join("old/subtree"));
+        paths.add(root, &root.join("new/subtree"));
+        assert_eq!(paths.take(), vec!["new/subtree", "old/subtree"]);
+        for n in 0..100_000 {
+            paths.add(root, &root.join(format!("{n}.png")));
+        }
+        assert!(paths.full);
+        assert!(paths.paths.is_empty());
+        assert!(paths.take().is_empty());
+        paths.add(root, &root.join("during-scan.png"));
+        assert_eq!(paths.take(), vec!["during-scan.png"]);
+        paths.add(root, std::path::Path::new("/outside"));
+        assert!(paths.full);
+    }
+
+    #[test]
+    fn unknown_watcher_state_never_claims_an_unchanged_source() {
+        let mut pending = super::DirtyPaths::default();
+        assert!(!pending.trusted);
+        pending.trusted = true;
+        pending.add(
+            std::path::Path::new("/root"),
+            std::path::Path::new("/root/new.png"),
+        );
+        assert!(!pending.paths.is_empty());
+        pending.fallback();
+        assert!(!pending.trusted);
+        assert!(pending.take().is_empty());
+        assert!(
+            !pending.trusted,
+            "taking a dirty snapshot is not successful reconciliation"
+        );
+    }
+
+    #[test]
+    fn remote_polling_backs_off_and_obeys_freshness_bound() {
+        let policy = super::PollPolicy {
+            base: Duration::from_secs(60),
+            max: Duration::from_secs(900),
+        };
+        let mut interval = policy.base;
+        for _ in 0..20 {
+            interval = policy.next(
+                interval,
+                super::ScanOutcome {
+                    changed: false,
+                    healthy: true,
+                },
+            );
+        }
+        assert_eq!(interval, policy.max);
+        let changed = super::ScanOutcome {
+            changed: true,
+            healthy: true,
+        };
+        assert_eq!(policy.next(interval, changed), policy.base);
+        assert!(policy.delay(interval, dam_api::id::SourceId::new()) <= policy.max);
+        assert_eq!(
+            policy.next(policy.base, super::ScanOutcome::default()),
+            Duration::from_secs(120)
+        );
+    }
 
     #[tokio::test]
     async fn hundred_thousand_dirty_events_coalesce_in_one_slot() {

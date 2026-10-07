@@ -95,6 +95,10 @@ fn is_ktx1(path: &Path) -> bool {
 
 fn dds_metadata(path: &Path) -> Option<ImageAttributes> {
     let file = std::fs::File::open(path).ok()?;
+    dds_metadata_reader(file)
+}
+
+fn dds_metadata_reader(file: impl std::io::Read) -> Option<ImageAttributes> {
     // `Decoder::new` reads the header and stops; it does not touch surface data.
     let decoder = dds::Decoder::new(std::io::BufReader::new(file)).ok()?;
     let header = decoder.header();
@@ -168,7 +172,10 @@ fn ktx2_header(path: &Path) -> Option<ktx2::Header> {
 }
 
 fn ktx2_metadata(path: &Path) -> Option<ImageAttributes> {
-    let h = ktx2_header(path)?;
+    ktx2_metadata_header(ktx2_header(path)?)
+}
+
+fn ktx2_metadata_header(h: ktx2::Header) -> Option<ImageAttributes> {
     let mut attrs = ImageAttributes {
         width: Some(h.pixel_width as i64),
         height: Some(h.pixel_height.max(1) as i64),
@@ -420,6 +427,18 @@ fn astc_2d_block_dims(name: &str) -> Option<(usize, usize)> {
 /// Ceiling on a single decoded surface (256 MB of RGBA ≈ 8192×8192). Dimensions come from a header
 /// in a scanned folder, so the allocation they imply is untrusted input.
 const MAX_DECODE_BYTES: u64 = 256 * 1024 * 1024;
+
+pub(crate) fn metadata_from_bytes(bytes: &[u8], format: &str) -> Option<ImageAttributes> {
+    match format {
+        "dds" => dds_metadata_reader(bytes),
+        "ktx" | "ktx2" => {
+            let header: [u8; ktx2::Header::LENGTH] =
+                bytes.get(..ktx2::Header::LENGTH)?.try_into().ok()?;
+            ktx2_metadata_header(ktx2::Header::from_bytes(&header).ok()?)
+        }
+        _ => None,
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -36,6 +36,9 @@ pub(crate) enum Cmd {
         /// Delta re-scan: only re-open files whose size/mtime changed; mark vanished files absent.
         #[arg(long)]
         delta: bool,
+        /// Finish discovery without reading changed payloads; verification continues as a durable job.
+        #[arg(long, conflicts_with = "delta")]
+        quick: bool,
         /// Wait for the scan to finish and print a summary.
         #[arg(long)]
         wait: bool,

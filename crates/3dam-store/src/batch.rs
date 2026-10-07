@@ -122,6 +122,9 @@ pub struct TagSuggestion {
 /// every field is independently optional, and an empty `AnalysisWrite` writes nothing at all.
 pub struct AnalysisWrite {
     pub id: AssetId,
+    /// The revision analysed by a background worker. Outer None preserves explicit legacy
+    /// writes; Some(None) still guards a hashless row against a subsequently verified revision.
+    pub expected_content_hash: Option<Option<ContentHash>>,
     /// Cheap-tier attributes refined by the deep pass (a model's exact counts, a document's page
     /// and word counts).
     pub attrs: Option<MediaAttributes>,
@@ -146,6 +149,7 @@ impl AnalysisWrite {
     pub fn new(id: AssetId) -> AnalysisWrite {
         AnalysisWrite {
             id,
+            expected_content_hash: None,
             attrs: None,
             image: None,
             class: None,
@@ -185,16 +189,39 @@ impl Store {
         generation: i64,
         paths: &[String],
     ) -> Result<Vec<Option<SourceChangeToken>>, LibError> {
+        Ok(self
+            .probe_scan_chunk_current(source, generation, paths)?
+            .unwrap_or_else(|| vec![None; paths.len()]))
+    }
+
+    /// A superseded generation is distinct from a path absent from the catalog. In particular,
+    /// callers must never turn a superseded delta scan into a full byte reread.
+    pub fn probe_scan_chunk_current(
+        &self,
+        source: &SourceId,
+        generation: i64,
+        paths: &[String],
+    ) -> Result<Option<Vec<Option<SourceChangeToken>>>, LibError> {
         let mut conn = self.write();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(internal)?;
+        let current: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM source WHERE id=?1 AND scan_generation=?2)",
+                params![source.as_bytes().to_vec(), generation],
+                |row| row.get(0),
+            )
+            .map_err(internal)?;
+        if !current {
+            return Ok(None);
+        }
         let mut out = Vec::with_capacity(paths.len());
         for path in paths {
             out.push(Self::observe_source_path_in(&tx, source, path, generation)?);
         }
         tx.commit().map_err(internal)?;
-        Ok(out)
+        Ok(Some(out))
     }
 
     /// Persist a slice of scanned assets — catalog row, cheap-tier attributes, generation stamp —
@@ -258,6 +285,18 @@ impl Store {
         ctx: &ScanBatchContext,
         item: &ScanWrite,
     ) -> Result<(ScanItemOutcome, bool), LibError> {
+        let generation_current: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM source WHERE id=?1 AND scan_generation=?2)",
+                params![item.asset.source_id.as_bytes().to_vec(), ctx.generation],
+                |row| row.get(0),
+            )
+            .map_err(internal)?;
+        if !generation_current {
+            return Err(LibError::Conflict(
+                "scan generation was superseded before persistence".into(),
+            ));
+        }
         if let Some(hash) = &item.asset.content_hash {
             if Self::is_blocked_in(conn, hash)? {
                 return Ok((ScanItemOutcome::Blocked, false));
@@ -278,6 +317,20 @@ impl Store {
             true
         };
         Self::set_media_attrs_in(conn, &up.id, &item.attrs)?;
+        if item.asset.content_hash.is_some() {
+            conn.execute(
+                "DELETE FROM pending_ingest WHERE source_id=?1 AND path=?2 AND size_bytes IS ?3
+                    AND source_modified_at IS ?4 AND seen_generation=?5",
+                params![
+                    item.asset.source_id.as_bytes().to_vec(),
+                    item.asset.path,
+                    item.asset.size_bytes,
+                    item.asset.source_modified_at,
+                    ctx.generation
+                ],
+            )
+            .map_err(internal)?;
+        }
         Ok((
             ScanItemOutcome::Written {
                 id: up.id,
@@ -354,6 +407,7 @@ impl Store {
         item: &AnalysisWrite,
         tags: &HashMap<String, Vec<u8>>,
     ) -> Result<(AnalysisItemOutcome, bool), LibError> {
+        Self::ensure_content_ready_in(conn, &item.id, item.expected_content_hash)?;
         if let Some(attrs) = &item.attrs {
             Self::set_media_attrs_in(conn, &item.id, attrs)?;
         }
@@ -463,6 +517,110 @@ mod tests {
             current: None,
             generation: 0,
         }
+    }
+
+    fn queue_fixture(store: &Store, source: SourceId, path: &str, size: i64, generation: i64) {
+        store.write().execute(
+            "INSERT INTO pending_ingest(source_id,path,size_bytes,source_modified_at,media_type,format,revision,seen_generation,queued_at)
+                VALUES(?1,?2,?3,1,'image','png',1,?4,0)",
+            params![source.as_bytes().to_vec(), path, size, generation],
+        ).unwrap();
+    }
+
+    #[test]
+    fn in_flight_analysis_cannot_write_pending_or_a_newly_verified_revision() {
+        let (store, source) = store_with_source();
+        let job = job_for(&store, source);
+        let initial = image_write(source, 1, 12);
+        store
+            .apply_scan_batch(&scan_ctx(job, 1), &[initial])
+            .unwrap();
+        let id = asset_ids(&store)[0];
+        let mut stale = AnalysisWrite::new(id);
+        stale.expected_content_hash = Some(Some(ContentHash([1; 32])));
+        stale.attrs = Some(MediaAttributes::Image(ImageAttributes {
+            width: Some(77),
+            ..Default::default()
+        }));
+        stale.embeddings.push(EmbeddingWrite {
+            space_id: "image-stats-v1".into(),
+            media: MediaType::Image,
+            vector: vec![1.0, 0.0],
+            extractor: "stale-worker".into(),
+        });
+        stale.analysed_version = Some(99);
+        queue_fixture(&store, source, "pack/1/tex1.png", 64, 0);
+        assert!(store
+            .apply_analysis_batch(&analysis_ctx(job, 1), &[stale])
+            .unwrap()
+            .items[0]
+            .is_err());
+        assert_eq!(count(&store, "SELECT width FROM image_attr"), 12);
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM embedding"), 0);
+        assert_eq!(count(&store, "SELECT analysis_version FROM asset"), 0);
+
+        let mut verified = image_write(source, 1, 24);
+        verified.asset.content_hash = Some(ContentHash([2; 32]));
+        store
+            .apply_scan_batch(&scan_ctx(job, 2), &[verified])
+            .unwrap();
+        let mut stale = AnalysisWrite::new(id);
+        stale.expected_content_hash = Some(Some(ContentHash([1; 32])));
+        stale.attrs = Some(MediaAttributes::Image(ImageAttributes {
+            width: Some(77),
+            ..Default::default()
+        }));
+        stale.analysed_version = Some(99);
+        assert!(store
+            .apply_analysis_batch(&analysis_ctx(job, 2), &[stale])
+            .unwrap()
+            .items[0]
+            .is_err());
+        assert_eq!(count(&store, "SELECT width FROM image_attr"), 24);
+        assert_eq!(count(&store, "SELECT analysis_version FROM asset"), 0);
+    }
+
+    #[test]
+    fn verified_scan_clears_only_the_matching_pending_token_and_generation() {
+        let (store, source) = store_with_source();
+        let job = job_for(&store, source);
+        let initial = image_write(source, 1, 12);
+        queue_fixture(&store, source, &initial.asset.path, 65, 0);
+        store
+            .apply_scan_batch(&scan_ctx(job, 1), &[initial])
+            .unwrap();
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM pending_ingest"), 1);
+        let mut verified = image_write(source, 1, 24);
+        verified.asset.size_bytes = Some(65);
+        store
+            .apply_scan_batch(&scan_ctx(job, 2), &[verified])
+            .unwrap();
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM pending_ingest"), 0);
+    }
+
+    #[test]
+    fn superseded_scan_cannot_overwrite_the_current_catalog_or_clear_pending_work() {
+        let (store, source) = store_with_source();
+        let job = job_for(&store, source);
+        let initial = image_write(source, 1, 12);
+        store
+            .apply_scan_batch(&scan_ctx(job, 1), &[initial])
+            .unwrap();
+        let generation = store.begin_source_scan(&source).unwrap();
+        queue_fixture(&store, source, "pack/1/tex1.png", 64, generation);
+        let mut stale = image_write(source, 1, 77);
+        stale.asset.content_hash = Some(ContentHash([7; 32]));
+        assert!(store
+            .apply_scan_batch(&scan_ctx(job, 2), &[stale])
+            .unwrap()
+            .items[0]
+            .is_err());
+        assert_eq!(count(&store, "SELECT width FROM image_attr"), 12);
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM pending_ingest"), 1);
+        assert_eq!(
+            store.get_asset(&asset_ids(&store)[0]).unwrap().hash,
+            Some(ContentHash([1; 32]))
+        );
     }
 
     fn analysis_ctx(job: JobId, done: u64) -> AnalysisBatchContext {

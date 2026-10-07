@@ -276,7 +276,7 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
         <button
           className="btn px-1.5 py-1 disabled:opacity-40 coarse:min-h-11 coarse:min-w-11 coarse:justify-center"
           aria-label="Quick rescan all sources (changed files only)"
-          onClick={() => scan.mutate({ mode: "delta" })}
+          onClick={() => scan.mutate({ mode: "quick" })}
           {...gate({
             disabled: scan.isPending,
             title: "Quick rescan — changed files only (all sources)",
@@ -413,7 +413,7 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
                   })
               : undefined
           }
-          onRescan={() => scan.mutate({ sources: [s.id], mode: "delta" })}
+          onRescan={() => scan.mutate({ sources: [s.id], mode: "quick" })}
           onRemove={async () => {
             const n = s.stats.asset_count;
             if (

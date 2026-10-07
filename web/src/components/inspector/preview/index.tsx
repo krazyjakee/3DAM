@@ -28,15 +28,24 @@ import { TilePreview } from "../../TilePreview";
  *  file-03 content endpoint), or the server-rendered thumbnail for images and as the fallback. */
 export function Preview({ asset }: { asset: Asset }) {
   const { summary } = asset;
+  const pending = summary.key_attrs.ingest_status === "pending_verification";
   const [tiling, setTiling] = useState(false);
   const mediaPath =
     summary.media === "model" && hasInteractive3D(summary.format)
       ? api.assetPreviewMeshUrl(summary.id, asset.source_id)
       : api.assetContentUrl(summary.id, asset.source_id);
   const streaming = summary.media === "audio" || summary.media === "video";
-  const blob = useMediaBlob(mediaPath, !streaming);
-  const ticket = useMediaTicket(mediaPath, streaming);
+  const blob = useMediaBlob(mediaPath, !streaming && !pending);
+  const ticket = useMediaTicket(mediaPath, streaming && !pending);
   const media = streaming ? ticket : blob;
+  if (pending) {
+    return (
+      <div className="flex aspect-square flex-col items-center justify-center gap-2 border-b border-border px-4 text-center text-xs text-fg-dim">
+        <span>Awaiting verification</span>
+        <span>The current file is queued for hashing and metadata extraction.</span>
+      </div>
+    );
+  }
   if (media.status === "loading" || media.status === "idle") {
     return (
       <div className="flex aspect-square items-center justify-center border-b border-border text-xs text-fg-dim">

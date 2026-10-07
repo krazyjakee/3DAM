@@ -260,6 +260,8 @@ pub struct ImageAnalysis {
 pub struct Store {
     /// Connection ownership: one writer, a lazy read pool, and the maintenance gate (see [`db`]).
     db: Db,
+    // Private, disposable scan observations: bounded SQLite page cache, never catalog WAL.
+    _scan_spool: Option<tempfile::NamedTempFile>,
     /// Query-expansion vocabulary for text search (semantic-search M3). Built-in defaults plus any
     /// user `synonyms.txt`; loaded once at open so a query never touches the filesystem.
     synonyms: search::SynonymMap,
@@ -270,6 +272,11 @@ pub struct Store {
 }
 
 impl Store {
+    /// Catalog backing path for device admission; in-memory catalogs have no backing device.
+    pub fn storage_path(&self) -> Option<&Path> {
+        self.db.path()
+    }
+
     /// Open (creating if needed) `library.db` in `data_dir`, applying pending migrations.
     pub fn open(data_dir: &Path) -> Result<Store, LibError> {
         std::fs::create_dir_all(data_dir).map_err(internal)?;
@@ -296,8 +303,37 @@ impl Store {
     }
 
     fn build(db: Db, synonyms: search::SynonymMap) -> Result<Store, LibError> {
+        let scan_spool = if let Some(path) = db.path() {
+            Some(
+                tempfile::Builder::new()
+                    .prefix("scan-observations-")
+                    .suffix(".sqlite")
+                    .tempfile_in(path.parent().unwrap_or_else(|| Path::new(".")))
+                    .map_err(internal)?,
+            )
+        } else {
+            None
+        };
+        {
+            let conn = db.write();
+            let spool_path = scan_spool
+                .as_ref()
+                .map(|file| file.path().to_string_lossy().into_owned())
+                .unwrap_or_else(|| ":memory:".to_string());
+            conn.execute("ATTACH DATABASE ?1 AS scan_spool", [&spool_path])
+                .map_err(internal)?;
+            conn.execute_batch("PRAGMA scan_spool.journal_mode=OFF;
+                PRAGMA scan_spool.synchronous=OFF; PRAGMA scan_spool.cache_size=-1024;
+                CREATE TABLE scan_spool.active(source_id BLOB PRIMARY KEY,generation INTEGER NOT NULL) WITHOUT ROWID;
+                CREATE TABLE scan_spool.observed(source_id BLOB NOT NULL,generation INTEGER NOT NULL,
+                    asset_rowid INTEGER NOT NULL,PRIMARY KEY(source_id,generation,asset_rowid)) WITHOUT ROWID;
+                CREATE TABLE scan_spool.scope(source_id BLOB NOT NULL,generation INTEGER NOT NULL,
+                    path TEXT NOT NULL,PRIMARY KEY(source_id,generation,path)) WITHOUT ROWID;")
+                .map_err(internal)?;
+        }
         let store = Store {
             db,
+            _scan_spool: scan_spool,
             synonyms,
             #[cfg(feature = "ann")]
             ann: None,
@@ -399,15 +435,22 @@ mod assets;
 mod batch;
 mod blocklist;
 mod collections;
+mod content_guard;
 mod duplicates;
 mod export;
 mod helpers;
 mod jobs;
 mod maintenance;
+mod pending_ingest;
 mod query;
+mod scan_metrics;
 pub mod search;
 mod similarity;
 mod sources;
+pub use pending_ingest::{
+    PendingCommitOutcome, PendingDiscovery, PendingIngest, QuickDiscoveryOutcome,
+};
+pub use scan_metrics::ScanSqlMetrics;
 mod tags;
 
 pub use batch::{

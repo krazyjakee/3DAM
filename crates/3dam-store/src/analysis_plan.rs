@@ -53,6 +53,7 @@ struct PlanRow {
 
 fn plan_where(kind: PlanKind, ids: &[AssetId]) -> (String, Vec<Value>) {
     let mut sql = String::from("WHERE s.kind <> 'federated'");
+    sql.push_str(" AND NOT EXISTS (SELECT 1 FROM pending_ingest p WHERE p.source_id=a.source_id AND p.path=a.path)");
     match kind {
         PlanKind::Analysis {
             current_version,
@@ -662,6 +663,38 @@ mod tests {
             1,
             "cache-wide reset did not reopen work"
         );
+    }
+
+    #[test]
+    fn pending_paths_are_excluded_from_force_analysis_and_derivative_watermarks() {
+        let (store, id) = store_with_asset_on(
+            &SourceConnection::LocalFs {
+                root: "/pending-planner".into(),
+            },
+            "pending",
+        );
+        let asset = store.get_asset(&id).unwrap();
+        {
+            let conn = store.write();
+            conn.execute("INSERT INTO pending_ingest(source_id,path,size_bytes,source_modified_at,media_type,format,revision,seen_generation,queued_at)
+                VALUES(?1,?2,2,1,'image','png',1,0,0)",
+                params![asset.source_id.as_bytes().to_vec(), asset.path]).unwrap();
+        }
+        assert!(store
+            .list_analysis_targets(1, false, &[])
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .list_analysis_targets(1, true, &[id])
+            .unwrap()
+            .is_empty());
+        assert_eq!(store.analysis_plan_summary(1, true, &[]).unwrap().total, 0);
+        assert!(store
+            .derivative_target_batch(1, None, 10)
+            .unwrap()
+            .targets
+            .is_empty());
+        assert!(!store.mark_derivative_ready(&id, 1, None).unwrap());
     }
 
     /// The one exclusion that must survive: a federated peer yields catalog rows, not bytes. There

@@ -21,7 +21,7 @@
 
 use dam_api::dto::ModelAttributes;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
 /// The 21-byte signature every binary FBX opens with (note the two trailing spaces).
@@ -47,8 +47,12 @@ const ASCII_SCAN_CAP: u64 = 64 * 1024 * 1024;
 
 /// Cheap FBX attributes, or `None` when the file is not readable as an FBX at all.
 pub(super) fn metadata(path: &Path) -> Option<ModelAttributes> {
-    let mut f = File::open(path).ok()?;
+    let f = File::open(path).ok()?;
     let len = f.metadata().ok()?.len();
+    from_reader(f, len)
+}
+
+pub(super) fn from_reader<R: Read + Seek>(mut f: R, len: u64) -> Option<ModelAttributes> {
     let mut magic = [0u8; 21];
     if len >= HEADER_LEN && f.read_exact(&mut magic).is_ok() && &magic == BINARY_MAGIC {
         let mut version = [0u8; 6]; // [0x1A, 0x00] then the u32 version
@@ -56,7 +60,8 @@ pub(super) fn metadata(path: &Path) -> Option<ModelAttributes> {
         let version = u32::from_le_bytes([version[2], version[3], version[4], version[5]]);
         binary(f, len, version >= WIDE_OFFSETS_FROM)
     } else {
-        ascii(path)
+        f.seek(SeekFrom::Start(0)).ok()?;
+        ascii_reader(f)
     }
 }
 
@@ -109,8 +114,8 @@ struct Array {
     payload: u64,
 }
 
-struct Fbx {
-    r: BufReader<File>,
+struct Fbx<R: Read + Seek> {
+    r: BufReader<R>,
     /// Tracked by hand so skipping is a `seek_relative` (which keeps the buffer for short hops)
     /// rather than a `stream_position` round trip per record.
     pos: u64,
@@ -121,7 +126,7 @@ struct Fbx {
 /// `f`'s cursor is already past the 27-byte file header (its magic and version were what selected
 /// this path), so the tracked position starts there rather than at zero — a `BufReader` wraps the
 /// handle where it stands, and re-seeking would land 27 bytes into the first record.
-fn binary(f: File, len: u64, wide: bool) -> Option<ModelAttributes> {
+fn binary<R: Read + Seek>(f: R, len: u64, wide: bool) -> Option<ModelAttributes> {
     let mut fbx = Fbx {
         r: BufReader::new(f),
         pos: HEADER_LEN,
@@ -133,7 +138,7 @@ fn binary(f: File, len: u64, wide: bool) -> Option<ModelAttributes> {
     Some(counts.into_attrs())
 }
 
-impl Fbx {
+impl<R: Read + Seek> Fbx<R> {
     fn take(&mut self, buf: &mut [u8]) -> Option<()> {
         self.r.read_exact(buf).ok()?;
         self.pos += buf.len() as u64;
@@ -319,8 +324,7 @@ impl Fbx {
 
 /// The text form of the same tree. A line scan is enough because the element counts are declared
 /// inline (`Vertices: *72 {`) — the numbers that follow never have to be read.
-fn ascii(path: &Path) -> Option<ModelAttributes> {
-    let f = File::open(path).ok()?;
+fn ascii_reader(f: impl Read) -> Option<ModelAttributes> {
     let mut c = Counts::default();
     let mut indices: i64 = 0;
     let mut looks_like_fbx = false;

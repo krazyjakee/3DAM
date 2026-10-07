@@ -955,7 +955,7 @@ impl Store {
         where_sql.push_str(&format!(" AND asset.id IN ({placeholders})"));
         binds.extend(ids.iter().map(|id| Value::Blob(id.as_bytes().to_vec())));
         let sql = format!(
-            "{GRID_SELECT}, asset.path, source.name, asset.source_modified_at, asset.analysed_at
+            "{GRID_SELECT}, asset.path, source.name, asset.source_modified_at, asset.analysed_at{GRID_PENDING_SELECT}
                FROM asset JOIN source ON source.id = asset.source_id {ATTR_JOINS} {where_sql}"
         );
         let mut stmt = conn.prepare(&sql).map_err(internal)?;
@@ -1002,7 +1002,7 @@ impl Store {
         for id in ids {
             binds.push(Value::Blob(id.as_bytes().to_vec()));
         }
-        let sql = format!("{GRID_SELECT} FROM asset {ATTR_JOINS} {where_sql}");
+        let sql = format!("{GRID_SELECT}{GRID_PENDING_SELECT} FROM asset {ATTR_JOINS} {where_sql}");
         let mut stmt = conn.prepare(&sql).map_err(internal)?;
         let rows = stmt
             .query_map(rusqlite::params_from_iter(binds.iter()), row_to_summary)
@@ -1628,6 +1628,51 @@ mod tests {
             after: None,
             review: DupReviewFilter::Pending,
         }
+    }
+
+    #[test]
+    fn pending_member_projection_preserves_duplicate_metadata_columns() {
+        let store = duplicate_store(1, 2);
+        let page = store
+            .query_assets_semantic(&QueryRequest::default(), None, &Visibility::Full)
+            .unwrap();
+        let pending_id = page.items[0].id;
+        let before = store.get_asset(&pending_id).unwrap();
+        let generation = store.begin_source_scan(&before.source_id).unwrap();
+        store
+            .apply_quick_discovery(
+                &before.source_id,
+                generation,
+                &[crate::PendingDiscovery {
+                    path: before.path.clone(),
+                    size: 30,
+                    modified_ms: Some(2),
+                    media: Some(MediaType::Image),
+                    format: Some("png".into()),
+                }],
+            )
+            .unwrap();
+        let current = store.get_asset(&pending_id).unwrap();
+        let ids: Vec<_> = page.items.iter().map(|summary| summary.id).collect();
+        let conn = store.read().unwrap();
+        let members = Store::duplicate_members_for_ids(&conn, &ids, &Visibility::Full).unwrap();
+        let member = &members[&pending_id];
+        assert_eq!(member.path, before.path);
+        assert_eq!(member.source, "duplicates");
+        assert_eq!(member.modified_at, current.timestamps.modified);
+        assert_eq!(member.analyzed_at, current.timestamps.analyzed);
+        assert_eq!(
+            member
+                .asset
+                .key_attrs
+                .get("ingest_status")
+                .map(String::as_str),
+            Some("pending_verification")
+        );
+        assert!(!members[&page.items[1].id]
+            .asset
+            .key_attrs
+            .contains_key("ingest_status"));
     }
 
     fn insert_test_asset(

@@ -404,8 +404,55 @@ impl Store {
                 |row| row.get(0),
             )
             .map_err(internal)?;
+        tx.execute(
+            "DELETE FROM scan_spool.scope WHERE source_id=?1",
+            params![source_id.as_bytes().to_vec()],
+        )
+        .map_err(internal)?;
+        tx.execute(
+            "DELETE FROM scan_spool.observed WHERE source_id=?1",
+            params![source_id.as_bytes().to_vec()],
+        )
+        .map_err(internal)?;
+        tx.execute(
+            "INSERT INTO scan_spool.active(source_id,generation) VALUES(?1,?2)
+            ON CONFLICT(source_id) DO UPDATE SET generation=excluded.generation",
+            params![source_id.as_bytes().to_vec(), generation],
+        )
+        .map_err(internal)?;
         tx.commit().map_err(internal)?;
         Ok(generation)
+    }
+
+    /// Install a bounded set of exact paths/subtree prefixes before scoped enumeration. Empty
+    /// scopes mean an exhaustive walk. The private spool never changes catalog asset pages.
+    pub fn set_source_scan_scope(
+        &self,
+        source_id: &SourceId,
+        generation: i64,
+        scopes: &[String],
+    ) -> Result<(), LibError> {
+        let mut conn = self.write();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(internal)?;
+        for scope in scopes {
+            tx.execute("INSERT OR IGNORE INTO scan_spool.scope(source_id,generation,path) VALUES(?1,?2,?3)",
+                params![source_id.as_bytes().to_vec(),generation,scope.trim_end_matches('/')]).map_err(internal)?;
+        }
+        tx.commit().map_err(internal)
+    }
+
+    /// Used only for paths rejected by extension: catalogued paths still need an observation.
+    pub fn source_path_exists(&self, source_id: &SourceId, path: &str) -> Result<bool, LibError> {
+        self.read()?
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM asset WHERE source_id=?1 AND path=?2)
+                OR EXISTS(SELECT 1 FROM pending_ingest WHERE source_id=?1 AND path=?2)",
+                params![source_id.as_bytes().to_vec(), path],
+                |row| row.get(0),
+            )
+            .map_err(internal)
     }
 
     /// Stamp one enumerated path and return its prior delta change token. The unique
@@ -430,17 +477,26 @@ impl Store {
         path: &str,
         generation: i64,
     ) -> Result<Option<SourceChangeToken>, LibError> {
-        conn.query_row(
-            "UPDATE asset
-                SET seen_generation = max(seen_generation, ?3), flags = flags & -2
-              WHERE source_id = ?1 AND path = ?2
-                AND ?3 = (SELECT scan_generation FROM source WHERE id = ?1)
-              RETURNING size_bytes, source_modified_at",
-            params![source_id.as_bytes().to_vec(), path, generation],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+        let row: Option<(i64,Option<i64>,Option<i64>,i64)> = conn.prepare_cached(
+            "SELECT rowid,size_bytes,source_modified_at,flags FROM asset
+             WHERE source_id=?1 AND path=?2 AND ?3=(SELECT scan_generation FROM source WHERE id=?1)"
+        ).map_err(internal)?.query_row(params![source_id.as_bytes().to_vec(),path,generation],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).optional().map_err(internal)?;
+        let Some((rowid, size, modified, flags)) = row else {
+            return Ok(None);
+        };
+        conn.prepare_cached(
+            "INSERT OR IGNORE INTO scan_spool.observed(source_id,generation,asset_rowid)
+            VALUES(?1,?2,?3)",
         )
-        .optional()
-        .map_err(internal)
+        .map_err(internal)?
+        .execute(params![source_id.as_bytes().to_vec(), generation, rowid])
+        .map_err(internal)?;
+        if flags & 1 != 0 {
+            conn.execute("UPDATE asset SET flags=flags & -2 WHERE rowid=?1", [rowid])
+                .map_err(internal)?;
+        }
+        Ok(Some((size, modified)))
     }
 
     /// Finish an exhaustively enumerated generation. The missing transition and source-success
@@ -466,14 +522,20 @@ impl Store {
             .optional()
             .map_err(internal)?
             .ok_or_else(|| LibError::NotFound(format!("source {source_id}")))?;
-        if current != generation {
+        let observed: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM scan_spool.active WHERE source_id=?1 AND generation=?2)",
+            params![source_id.as_bytes().to_vec(),generation], |row| row.get(0)).map_err(internal)?;
+        if current != generation || !observed {
             tx.commit().map_err(internal)?;
             return Ok(None);
         }
         let missing = tx
             .execute(
                 "UPDATE asset SET flags = flags | 1, updated_at = ?3
-                  WHERE source_id = ?1 AND seen_generation <> ?2 AND (flags & 1) = 0",
+                  WHERE source_id = ?1 AND seen_generation <> ?2 AND (flags & 1) = 0
+                    AND rowid NOT IN (SELECT asset_rowid FROM scan_spool.observed WHERE source_id=?1 AND generation=?2)
+                    AND (NOT EXISTS(SELECT 1 FROM scan_spool.scope WHERE source_id=?1 AND generation=?2)
+                         OR EXISTS(SELECT 1 FROM scan_spool.scope AS scope WHERE scope.source_id=?1 AND scope.generation=?2
+                            AND (asset.path=scope.path OR (asset.path>=scope.path||'/' AND asset.path<scope.path||'0'))))",
                 params![source_id.as_bytes().to_vec(), generation, scanned_at],
             )
             .map_err(internal)? as u64;
@@ -567,6 +629,108 @@ mod tests {
     }
 
     #[test]
+    fn scoped_reconciliation_preserves_rows_outside_removed_subtree() {
+        let (store, source) = fixture();
+        for path in ["folder/a.png", "folder/b.png", "folder-other/c.png"] {
+            store.upsert_asset(&scanned(source, path)).unwrap();
+        }
+        let generation = store.begin_source_scan(&source).unwrap();
+        store
+            .set_source_scan_scope(&source, generation, &["folder".into()])
+            .unwrap();
+        store
+            .observe_source_path(&source, "folder/a.png", generation)
+            .unwrap();
+        assert_eq!(
+            store
+                .finish_source_scan(&source, generation, now_ms())
+                .unwrap(),
+            Some(1)
+        );
+        assert!(missing(&store, source, "folder/b.png"));
+        for path in [
+            "a.png",
+            "b.png",
+            "c.png",
+            "folder/a.png",
+            "folder-other/c.png",
+        ] {
+            assert!(!missing(&store, source, path), "{path}");
+        }
+    }
+
+    #[test]
+    fn unchanged_observations_do_not_write_catalog_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let source = store
+            .add_source(
+                &SourceConnection::LocalFs {
+                    root: "/wal-scan".into(),
+                },
+                "wal-scan",
+                false,
+            )
+            .unwrap();
+        for n in 0..1024 {
+            store
+                .upsert_asset(&scanned(source, &format!("{n}.png")))
+                .unwrap();
+        }
+        let generation = store.begin_source_scan(&source).unwrap();
+        store
+            .write()
+            .execute_batch("PRAGMA main.wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        for chunk in (0..1024).collect::<Vec<_>>().chunks(128) {
+            let paths = chunk.iter().map(|n| format!("{n}.png")).collect::<Vec<_>>();
+            assert_eq!(
+                store
+                    .probe_scan_chunk_current(&source, generation, &paths)
+                    .unwrap()
+                    .unwrap()
+                    .len(),
+                paths.len()
+            );
+        }
+        let wal = dir.path().join("library.db-wal");
+        assert_eq!(std::fs::metadata(wal).map(|m| m.len()).unwrap_or(0), 0);
+        assert_eq!(
+            store
+                .finish_source_scan(&source, generation, now_ms())
+                .unwrap(),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn reopened_store_cannot_finalize_lost_observations() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source, generation) = {
+            let store = Store::open(dir.path()).unwrap();
+            let source = store
+                .add_source(
+                    &SourceConnection::LocalFs {
+                        root: "/restart-scan".into(),
+                    },
+                    "restart",
+                    false,
+                )
+                .unwrap();
+            store.upsert_asset(&scanned(source, "a.png")).unwrap();
+            (source, store.begin_source_scan(&source).unwrap())
+        };
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(
+            store
+                .finish_source_scan(&source, generation, now_ms())
+                .unwrap(),
+            None
+        );
+        assert!(!missing(&store, source, "a.png"));
+    }
+
+    #[test]
     fn scan_generation_marks_only_unseen_rows_after_successful_finish() {
         let (store, source) = fixture();
         let generation = store.begin_source_scan(&source).unwrap();
@@ -609,10 +773,9 @@ mod tests {
             None
         );
         let b_seen: i64 = store
-            .read()
-            .unwrap()
+            .write()
             .query_row(
-                "SELECT seen_generation FROM asset WHERE source_id = ?1 AND path = 'b.png'",
+                "SELECT generation FROM scan_spool.observed WHERE source_id=?1 AND asset_rowid=(SELECT rowid FROM asset WHERE source_id=?1 AND path='b.png')",
                 params![source.as_bytes().to_vec()],
                 |row| row.get(0),
             )
@@ -648,6 +811,24 @@ mod tests {
         assert!(missing(&store, source, "a.png"));
         assert!(!missing(&store, source, "b.png"));
         assert!(missing(&store, source, "c.png"));
+    }
+
+    #[test]
+    fn a_superseded_probe_is_not_a_batch_of_uncatalogued_paths() {
+        let (store, source) = fixture();
+        let older = store.begin_source_scan(&source).unwrap();
+        let newer = store.begin_source_scan(&source).unwrap();
+        let paths = vec!["a.png".to_string(), "new.png".to_string()];
+        assert!(store
+            .probe_scan_chunk_current(&source, older, &paths)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store
+                .probe_scan_chunk_current(&source, newer, &paths)
+                .unwrap(),
+            Some(vec![Some((Some(10), Some(20))), None])
+        );
     }
 
     #[test]

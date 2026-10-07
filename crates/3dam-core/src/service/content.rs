@@ -112,9 +112,11 @@ impl EmbeddedLibrary {
         let local = if self.asset_visible(ctx, &id).await? {
             self.db(move |store| {
                 let asset = store.get_asset(&id)?;
+                store.ensure_content_ready(&asset)?;
                 let connection = secrets.resolve(store.get_source_connection(&asset.source_id)?)?;
                 let source = dam_sources::open_source(&connection, &scratch)?;
                 let stat = source.content_stat(&asset.path)?;
+                store.ensure_content_ready(&asset)?;
                 Ok(content_metadata(&asset, stat))
             })
             .await
@@ -153,6 +155,7 @@ impl EmbeddedLibrary {
         let local = if self.asset_visible(ctx, &id).await? {
             self.db(move |store| {
                 let asset = store.get_asset(&id)?;
+                store.ensure_content_ready(&asset)?;
                 let connection = secrets.resolve(store.get_source_connection(&asset.source_id)?)?;
                 let source = dam_sources::open_source(&connection, &scratch)?;
                 let stat = source.content_stat(&asset.path)?;
@@ -162,16 +165,21 @@ impl EmbeddedLibrary {
                     ));
                 }
                 let metadata = content_metadata(&asset, stat);
-                Ok((source, asset.path, metadata))
+                store.ensure_content_ready(&asset)?;
+                Ok((source, asset, metadata))
             })
             .await
         } else {
             Err(LibError::NotFound(format!("asset {id}")))
         };
         match local {
-            Ok((source, path, metadata)) => {
-                Ok(source_content_stream(source, path, metadata, range))
-            }
+            Ok((source, asset, metadata)) => Ok(source_content_stream(
+                self.store.clone(),
+                asset,
+                source,
+                metadata,
+                range,
+            )),
             Err(LibError::NotFound(_)) if Self::may_proxy_peer(ctx, source) => {
                 federation::proxy_stream_content(self, &id, range, source, ctx.visibility.is_full())
                     .await
@@ -249,17 +257,17 @@ impl EmbeddedLibrary {
             self.db(move |s| {
                 let asset = s.get_asset(&id)?;
                 Ok((
-                    thumb_cache_lookup(&cache, &probe_dir, &asset, edge),
-                    asset.summary.media == MediaType::Model,
+                    thumb_cache_lookup(&cache, &probe_dir, s, &asset, edge)?,
+                    asset,
                 ))
             })
             .await
         } else {
             Err(LibError::NotFound(format!("asset {id}")))
         };
-        let is_model = match probe {
+        let expected_asset = match probe {
             Ok((Some(hit), _)) => return Ok(hit),
-            Ok((None, is_model)) => is_model,
+            Ok((None, asset)) => asset,
             // Peer-owned asset: fetch its remote-owned preview — the one sanctioned federated byte
             // transfer (tech-spec 07 §4) — through the 7-day local peer cache. Full-visibility only.
             Err(LibError::NotFound(_)) if Self::may_proxy_peer(ctx, source) => {
@@ -275,6 +283,7 @@ impl EmbeddedLibrary {
             }
             Err(e) => return Err(e),
         };
+        let is_model = expected_asset.summary.media == MediaType::Model;
         // Cache miss: the expensive render/decode runs on the bounded background pool so a grid
         // burst can't starve an interactive inspector read (preview / waveform / detail).
         let key = if is_model {
@@ -283,10 +292,12 @@ impl EmbeddedLibrary {
             format!("thumbnail:{id}:{edge}")
         };
         let cache = self.cache.clone();
-        self.cache
+        let retained_asset = expected_asset.clone();
+        let content = self
+            .cache
             .singleflight(key, || async move {
                 self.run_interactive(move |s| {
-                    let asset = s.get_asset(&id)?;
+                    let asset = retained_asset;
                     if is_model {
                         let derivatives =
                             gen_model_derivatives(&cache, &data_dir, s, &secrets, &asset, edge)?;
@@ -299,7 +310,10 @@ impl EmbeddedLibrary {
                 })
                 .await
             })
-            .await
+            .await?;
+        self.db(move |store| store.ensure_content_ready(&expected_asset))
+            .await?;
+        Ok(content)
     }
 
     pub(crate) async fn read_model_preview_impl(
@@ -329,15 +343,18 @@ impl EmbeddedLibrary {
                         "3D preview is only available for model assets".into(),
                     ));
                 }
-                Ok(model_preview_cache_lookup(&cache, &probe_dir, &asset))
+                Ok((
+                    model_preview_cache_lookup(&cache, &probe_dir, s, &asset)?,
+                    asset,
+                ))
             })
             .await
         } else {
             Err(LibError::NotFound(format!("asset {id}")))
         };
-        match probe {
-            Ok(Some(hit)) => return Ok(hit),
-            Ok(None) => {}
+        let expected_asset = match probe {
+            Ok((Some(hit), _)) => return Ok(hit),
+            Ok((None, asset)) => asset,
             Err(LibError::NotFound(_)) if Self::may_proxy_peer(ctx, source) => {
                 return federation::proxy_model_preview(
                     self,
@@ -349,21 +366,26 @@ impl EmbeddedLibrary {
                 .ok_or_else(|| LibError::NotFound(format!("asset {id}")));
             }
             Err(error) => return Err(error),
-        }
+        };
         let edge = background::PREGEN_THUMB_EDGE;
         let key = format!("model-derivatives:{id}:{edge}");
         let cache = self.cache.clone();
-        self.cache
+        let retained_asset = expected_asset.clone();
+        let content = self
+            .cache
             .singleflight(key, || async move {
                 self.run_interactive(move |store| {
-                    let asset = store.get_asset(&id)?;
+                    let asset = retained_asset;
                     let derivatives =
                         gen_model_derivatives(&cache, &data_dir, store, &secrets, &asset, edge)?;
                     Ok(preview_content(derivatives.preview))
                 })
                 .await
             })
-            .await
+            .await?;
+        self.db(move |store| store.ensure_content_ready(&expected_asset))
+            .await?;
+        Ok(content)
     }
 
     pub(crate) async fn prefetch_impl(
@@ -437,6 +459,9 @@ impl EmbeddedLibrary {
                     let Ok(asset) = store.get_asset(&id) else {
                         continue; // vanished (or peer-owned) — fail-soft
                     };
+                    if store.ensure_content_ready(&asset).is_err() {
+                        continue;
+                    }
                     let key = if asset.summary.media == MediaType::Model {
                         format!("model-derivatives:{id}:{edge}")
                     } else {

@@ -12,9 +12,11 @@ mod derivatives;
 mod export;
 mod federation;
 mod paths;
+mod quick_scan;
 mod reliability;
 mod resources;
 mod scan;
+mod scan_admission;
 pub mod semantic;
 mod service;
 mod upload;
@@ -98,7 +100,8 @@ pub struct EmbeddedLibrary {
     secrets: credentials::SecretVault,
     events: broadcast::Sender<LibraryEvent>,
     data_dir: PathBuf,
-    cancels: Mutex<HashMap<JobId, Arc<AtomicBool>>>,
+    cancels: scan_admission::JobCancels,
+    scan_coordinator: Arc<scan_admission::Coordinator>,
     /// Auto-rescan watchers for `watch`-enabled sources (tech-spec 07 §3.1).
     watchers: watch::WatchManager,
     /// Bounded pool for heavy *background* CPU work (thumbnail generation + the analysis pass),
@@ -192,11 +195,15 @@ impl EmbeddedLibrary {
         let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         // Built before the watch manager: watch-triggered delta scans are bulk readers too and
         // pace against the same governor as everything else (tech-spec 14 §3.4).
-        let governor = Arc::new(resources::Governor::with_io(
+        let mut governor = resources::Governor::with_io(
             resources.min_free_memory_mb,
             resources.max_io_stall_pct,
             resources.io,
-        ));
+        );
+        governor.set_load_limit(resources.max_load_per_cpu);
+        let governor = Arc::new(governor);
+        let cancels = Arc::new(Mutex::new(HashMap::new()));
+        let scan_coordinator = Arc::new(scan_admission::Coordinator::new(cancels.clone()));
         let watchers = watch::WatchManager::new(
             store.clone(),
             secrets.clone(),
@@ -204,6 +211,7 @@ impl EmbeddedLibrary {
             tokio::runtime::Handle::current(),
             governor.clone(),
             scratch.clone(),
+            scan_coordinator.clone(),
         );
         // NB: watchers are *not* started here. Auto-rescan only makes sense for long-running roles
         // (serve/mcp), which call `start_watchers()` explicitly. A run-and-exit CLI command must not
@@ -245,12 +253,23 @@ impl EmbeddedLibrary {
             inventory_cache.initialize_now();
             inventory_wake.notify_one();
         });
+        if !resources.defer_ingest {
+            background::start_pending_worker(
+                store.clone(),
+                secrets.clone(),
+                events.clone(),
+                governor.clone(),
+                scratch.clone(),
+                scan_coordinator.clone(),
+            );
+        }
         Ok(EmbeddedLibrary {
             store,
             secrets,
             events,
             data_dir: data_dir.to_path_buf(),
-            cancels: Mutex::new(HashMap::new()),
+            cancels,
+            scan_coordinator,
             watchers,
             bg_pool: Arc::new(bg_pool),
             interactive_pool: Arc::new(interactive_pool),

@@ -1208,6 +1208,139 @@ pub const MIGRATIONS: &[&str] = &[
             generation = excluded.generation, operation = excluded.operation;
     END;
     "#,
+    // ── V28: suppress unchanged scan index and aggregate maintenance (issue #203) ────────
+    // UPDATE OF observes the SET list, not value changes. Guard actual index inputs and count
+    // transitions, including NULL analysis timestamps; an analysed timestamp changing to another
+    // non-NULL timestamp does not change the unanalyzed backlog. No index rebuild or data rewrite.
+    r#"
+    DROP TRIGGER asset_fts_au;
+    CREATE TRIGGER asset_fts_au AFTER UPDATE OF filename ON asset
+    WHEN old.filename IS NOT new.filename BEGIN
+        UPDATE asset_fts SET filename = new.filename WHERE rowid = new.rowid;
+    END;
+    DROP TRIGGER asset_filename_trigram_au;
+    CREATE TRIGGER asset_filename_trigram_au AFTER UPDATE OF filename ON asset
+    WHEN old.filename IS NOT new.filename BEGIN
+        UPDATE asset_filename_trigram SET filename = new.filename WHERE rowid = new.rowid;
+    END;
+
+    DROP TRIGGER asset_browse_size_au;
+    CREATE TRIGGER asset_browse_size_au AFTER UPDATE OF size_bytes ON asset
+    WHEN old.size_bytes IS NOT new.size_bytes BEGIN
+        UPDATE asset
+           SET browse_size_bytes = new.size_bytes + COALESCE(
+               (SELECT dependency_bytes FROM model_attr WHERE asset_id = new.id), 0
+           )
+         WHERE rowid = new.rowid;
+    END;
+    DROP TRIGGER model_browse_size_au;
+    CREATE TRIGGER model_browse_size_au AFTER UPDATE OF dependency_bytes ON model_attr
+    WHEN old.dependency_bytes IS NOT new.dependency_bytes BEGIN
+        UPDATE asset
+           SET browse_size_bytes = size_bytes + COALESCE(new.dependency_bytes, 0)
+         WHERE id = new.asset_id;
+    END;
+
+    DROP TRIGGER aggregate_asset_au;
+    CREATE TRIGGER aggregate_asset_au
+    AFTER UPDATE OF source_id, media_type, analysed_at ON asset
+    WHEN old.source_id IS NOT new.source_id OR old.media_type IS NOT new.media_type
+      OR (old.analysed_at IS NULL) <> (new.analysed_at IS NULL) BEGIN
+        UPDATE library_stat SET
+            unanalyzed_count = unanalyzed_count - (old.analysed_at IS NULL)
+                               + (new.analysed_at IS NULL)
+         WHERE singleton = 1 AND (old.analysed_at IS NULL) <> (new.analysed_at IS NULL);
+        UPDATE media_stat SET asset_count = asset_count - 1
+         WHERE media_type = old.media_type AND old.media_type <> new.media_type;
+        DELETE FROM media_stat WHERE media_type = old.media_type AND asset_count = 0
+           AND old.media_type <> new.media_type;
+        INSERT INTO media_stat(media_type, asset_count)
+        SELECT new.media_type, 1 WHERE old.media_type <> new.media_type
+            ON CONFLICT(media_type) DO UPDATE SET asset_count = asset_count + 1;
+        UPDATE source_stat SET asset_count = asset_count - 1,
+            unanalyzed_count = unanalyzed_count - (old.analysed_at IS NULL)
+         WHERE source_id = old.source_id AND old.source_id <> new.source_id;
+        UPDATE source_stat SET asset_count = asset_count + 1,
+            unanalyzed_count = unanalyzed_count + (new.analysed_at IS NULL)
+         WHERE source_id = new.source_id AND old.source_id <> new.source_id;
+        UPDATE source_stat SET unanalyzed_count = unanalyzed_count
+            - (old.analysed_at IS NULL) + (new.analysed_at IS NULL)
+         WHERE source_id = new.source_id AND old.source_id = new.source_id
+           AND (old.analysed_at IS NULL) <> (new.analysed_at IS NULL);
+        UPDATE source_media_stat SET asset_count = asset_count - 1
+         WHERE source_id = old.source_id AND media_type = old.media_type
+           AND (old.source_id <> new.source_id OR old.media_type <> new.media_type);
+        DELETE FROM source_media_stat WHERE source_id = old.source_id
+           AND media_type = old.media_type AND asset_count = 0
+           AND (old.source_id <> new.source_id OR old.media_type <> new.media_type);
+        INSERT INTO source_media_stat(source_id, media_type, asset_count)
+        SELECT new.source_id, new.media_type, 1
+         WHERE old.source_id <> new.source_id OR old.media_type <> new.media_type
+            ON CONFLICT(source_id, media_type) DO UPDATE SET asset_count = asset_count + 1;
+        UPDATE source_tag_stat SET asset_count = asset_count - 1,
+            manual_count = manual_count - EXISTS(
+                SELECT 1 FROM asset_tag at WHERE at.asset_id = old.id
+                 AND at.tag_id = source_tag_stat.tag_id AND at.state = 'confirmed'
+                 AND at.source = 'user')
+         WHERE source_id = old.source_id AND old.source_id <> new.source_id
+           AND tag_id IN (SELECT tag_id FROM asset_tag WHERE asset_id = old.id AND state = 'confirmed');
+        DELETE FROM source_tag_stat WHERE source_id = old.source_id AND asset_count = 0
+           AND old.source_id <> new.source_id;
+        INSERT INTO source_tag_stat(source_id, tag_id, asset_count, manual_count)
+        SELECT new.source_id, at.tag_id, 1, (at.source = 'user')
+          FROM asset_tag at WHERE at.asset_id = new.id AND at.state = 'confirmed'
+           AND old.source_id <> new.source_id
+        ON CONFLICT(source_id, tag_id) DO UPDATE SET
+            asset_count = asset_count + 1, manual_count = manual_count + excluded.manual_count;
+    END;
+
+    DROP TRIGGER aggregate_asset_tag_au;
+    CREATE TRIGGER aggregate_asset_tag_au
+    AFTER UPDATE OF asset_id, tag_id, state, source ON asset_tag
+    WHEN old.asset_id IS NOT new.asset_id OR old.tag_id IS NOT new.tag_id
+      OR (old.state = 'confirmed') <> (new.state = 'confirmed')
+      OR (old.state = 'confirmed' AND old.source = 'user')
+         <> (new.state = 'confirmed' AND new.source = 'user') BEGIN
+        UPDATE tag_stat SET asset_count = asset_count - 1,
+            manual_count = manual_count - (old.source = 'user')
+         WHERE tag_id = old.tag_id AND old.state = 'confirmed';
+        UPDATE source_tag_stat SET asset_count = asset_count - 1,
+            manual_count = manual_count - (old.source = 'user')
+         WHERE tag_id = old.tag_id AND old.state = 'confirmed' AND source_id =
+             (SELECT source_id FROM asset WHERE id = old.asset_id);
+        DELETE FROM source_tag_stat WHERE tag_id = old.tag_id AND asset_count = 0
+           AND old.state = 'confirmed';
+        UPDATE tag_stat SET asset_count = asset_count + 1,
+            manual_count = manual_count + (new.source = 'user')
+         WHERE tag_id = new.tag_id AND new.state = 'confirmed';
+        INSERT INTO source_tag_stat(source_id, tag_id, asset_count, manual_count)
+        SELECT source_id, new.tag_id, 1, (new.source = 'user')
+          FROM asset WHERE id = new.asset_id AND new.state = 'confirmed'
+        ON CONFLICT(source_id, tag_id) DO UPDATE SET
+            asset_count = asset_count + excluded.asset_count,
+            manual_count = manual_count + excluded.manual_count;
+    END;
+    "#,
+    // ── V29: durable discovery revisions, outside the verified catalog (issue #188) ──────
+    r#"
+    ALTER TABLE source ADD COLUMN ingest_revision INTEGER NOT NULL DEFAULT 0;
+    CREATE TABLE pending_ingest (
+        source_id BLOB NOT NULL REFERENCES source(id) ON DELETE CASCADE,
+        path TEXT NOT NULL,
+        size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0),
+        source_modified_at INTEGER,
+        media_type TEXT NOT NULL,
+        format TEXT NOT NULL,
+        revision INTEGER NOT NULL DEFAULT 1,
+        seen_generation INTEGER NOT NULL,
+        queued_at INTEGER NOT NULL,
+        retry_after INTEGER NOT NULL DEFAULT 0,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        PRIMARY KEY(source_id, path)
+    ) STRICT, WITHOUT ROWID;
+    CREATE INDEX idx_pending_ingest_ready ON pending_ingest(source_id, retry_after, path);
+    "#,
 ];
 
 #[cfg(test)]
@@ -1332,6 +1465,125 @@ mod tests {
             conn.execute_batch(step).unwrap();
         }
         conn
+    }
+
+    #[test]
+    fn unchanged_index_migration_preserves_search_and_skips_noop_trigger_bodies() {
+        let conn = db_at(27);
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        conn.execute_batch(
+            "INSERT INTO source(id,name,kind,connection,created_at,updated_at)
+             VALUES(x'01','one','local_fs','{}',0,0), (x'02','two','local_fs','{}',0,0);
+             INSERT INTO tag(id,name) VALUES(x'11','approved');
+             INSERT INTO asset(id,source_id,path,filename,size_bytes,scanned_at,analysed_at,
+                               media_type,format,created_at,updated_at)
+             VALUES(x'21',x'01','Art/ak47.glb','ak47.glb',10,0,10,'model','glb',0,0);
+             INSERT INTO model_attr(asset_id,dependency_bytes) VALUES(x'21',5);
+             INSERT INTO asset_tag(asset_id,tag_id,state,source,created_at)
+             VALUES(x'21',x'11','confirmed','user',0);
+             UPDATE asset_fts SET tokens='ak47 ak 47 glb', folder='art', tags='approved',
+                                  note='retain note', text='retain extracted body';",
+        )
+        .unwrap();
+        let before_migration = conn.total_changes();
+        conn.execute_batch(MIGRATIONS[27]).unwrap();
+        assert_eq!(
+            conn.total_changes(),
+            before_migration,
+            "migration rewrote indexed data"
+        );
+
+        // Count actual rows affected, including FTS shadow-table and aggregate trigger effects.
+        // Every statement here should write exactly its base row, despite naming watched columns.
+        for sql in [
+            "UPDATE asset SET filename=filename, path=path, source_id=source_id,
+                 media_type=media_type, analysed_at=analysed_at, size_bytes=size_bytes WHERE id=x'21'",
+            "UPDATE asset SET analysed_at=20 WHERE id=x'21'",
+            "UPDATE model_attr SET dependency_bytes=dependency_bytes WHERE asset_id=x'21'",
+            "UPDATE asset_tag SET asset_id=asset_id, tag_id=tag_id, state=state, source=source",
+        ] {
+            let before = conn.total_changes();
+            conn.execute(sql, []).unwrap();
+            assert_eq!(conn.total_changes() - before, 1, "redundant maintenance for {sql}");
+            assert_aggregate_integrity(&conn);
+        }
+        let indexed: (String, String, String, String, String) = conn
+            .query_row(
+                "SELECT tokens,folder,tags,note,text FROM asset_fts",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            indexed,
+            (
+                "ak47 ak 47 glb".into(),
+                "art".into(),
+                "approved".into(),
+                "retain note".into(),
+                "retain extracted body".into()
+            )
+        );
+        assert_eq!(conn.query_row(
+            "SELECT count(*) FROM asset_filename_trigram WHERE asset_filename_trigram MATCH 'k47'",
+            [], |row| row.get::<_, i64>(0),
+        ).unwrap(), 1);
+
+        for sql in [
+            "UPDATE asset SET analysed_at=NULL WHERE id=x'21'",
+            "UPDATE asset SET analysed_at=30 WHERE id=x'21'",
+            "UPDATE asset SET source_id=x'02', media_type='image', filename='renamed.png',
+                 path='Moved/renamed.png', size_bytes=20 WHERE id=x'21'",
+            "UPDATE asset_tag SET source='auto'",
+            "UPDATE asset_tag SET state='rejected'",
+            "UPDATE asset_tag SET state='suggested'",
+            "UPDATE asset_tag SET state='confirmed', source='user'",
+        ] {
+            conn.execute(sql, []).unwrap();
+            assert_aggregate_integrity(&conn);
+        }
+        assert_eq!(
+            conn.query_row("SELECT filename FROM asset_fts", [], |row| row
+                .get::<_, String>(0),)
+                .unwrap(),
+            "renamed.png"
+        );
+        assert_eq!(conn.query_row(
+            "SELECT count(*) FROM asset_filename_trigram WHERE asset_filename_trigram MATCH 'name'",
+            [], |row| row.get::<_, i64>(0),
+        ).unwrap(), 1);
+        assert_eq!(
+            conn.query_row(
+                "SELECT descendant_asset_count FROM folder WHERE source_id=x'02' AND path='Moved/'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        conn.execute("DELETE FROM asset WHERE id=x'21'", [])
+            .unwrap();
+        assert_aggregate_integrity(&conn);
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM asset_fts", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM asset_filename_trigram", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
     }
 
     /// An FTS5 rebuild has to carry the index-only columns across, and the only way to know it does

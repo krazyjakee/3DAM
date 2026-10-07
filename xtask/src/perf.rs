@@ -1226,6 +1226,7 @@ fn benchmark_analysis_under_browse(
                 background_threads: Some(requested_workers),
                 min_free_memory_mb: Some(0),
                 max_io_stall_pct: Some(f64::INFINITY),
+                ..ResourceOptions::ungoverned()
             },
         ))
         .map_err(|error| format!("open fixture for analysis: {error}"))?;

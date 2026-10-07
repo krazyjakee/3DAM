@@ -70,11 +70,69 @@ fn reconciliation_is_authoritative(
 
 /// The one and only source enumeration call for a scan pass. Kept as a narrow seam so remote
 /// backends have a regression test proving progress planning never adds a second network walk.
+#[cfg(test)]
 fn enumerate_source(
     source: &dyn dam_sources::FileSource,
     sink: &mut dyn FnMut(Result<FileEntry, LibError>) -> bool,
 ) -> Result<(), LibError> {
     source.walk(sink)
+}
+
+struct ScanHeartbeat<'a> {
+    store: &'a Store,
+    events: &'a broadcast::Sender<LibraryEvent>,
+    job: JobId,
+    cancel: &'a AtomicBool,
+    phase: String,
+    last: std::sync::Mutex<Instant>,
+}
+impl<'a> ScanHeartbeat<'a> {
+    fn new(
+        store: &'a Store,
+        events: &'a broadcast::Sender<LibraryEvent>,
+        job: JobId,
+        cancel: &'a AtomicBool,
+        phase: String,
+    ) -> Self {
+        Self {
+            store,
+            events,
+            job,
+            cancel,
+            phase,
+            last: std::sync::Mutex::new(Instant::now()),
+        }
+    }
+}
+impl crate::resources::Cancellation for ScanHeartbeat<'_> {
+    fn cancelled(&self) -> bool {
+        if self.cancel.load(Ordering::Relaxed) {
+            return true;
+        }
+        let mut last = self.last.lock().unwrap();
+        if last.elapsed() >= FLUSH_INTERVAL {
+            *last = Instant::now();
+            if let Ok(mut status) = self.store.get_job_summary(&self.job) {
+                if status.state == JobState::Cancelled {
+                    self.cancel.store(true, Ordering::Relaxed);
+                    return true;
+                }
+                status.progress.current = Some(self.phase.clone());
+                reliability::publish_event(
+                    self.events,
+                    LibraryEvent::JobProgress(status),
+                    "scan file phase progress",
+                );
+            }
+        }
+        false
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ScanOutcome {
+    pub changed: bool,
+    pub healthy: bool,
 }
 
 /// Counters and warnings for one whole scan job, across every source it touches.
@@ -119,6 +177,7 @@ struct Staged {
 /// probe → per-entry work → one write transaction → post-commit events (steps A–D of issue #138).
 struct ScanChunker<'a> {
     scratch: &'a Path,
+    manual: bool,
     store: &'a Store,
     events: &'a broadcast::Sender<LibraryEvent>,
     job: JobId,
@@ -133,6 +192,7 @@ struct ScanChunker<'a> {
     scanned_at: i64,
     pending: Vec<FileEntry>,
     last_flush: Instant,
+    last_progress: Instant,
     tally: &'a mut ScanTally,
     reconciliation_safe: bool,
     listing_incomplete: bool,
@@ -192,11 +252,32 @@ impl ScanChunker<'_> {
     /// of the walk would mark it missing while it sits right there on disk.
     fn stamp(&mut self, entries: &[FileEntry]) -> Vec<Option<SourceChangeToken>> {
         let paths: Vec<String> = entries.iter().map(|e| e.rel_path.clone()).collect();
+        if self
+            .governor
+            .io
+            .acquire_metadata(
+                self.governor,
+                &[self.store.storage_path()],
+                self.cancel,
+                self.manual,
+            )
+            .and_then(|work| work.pace((paths.len() as u64 * 256).max(4096)))
+            .is_err()
+        {
+            self.tally.cancelled = true;
+            return vec![None; entries.len()];
+        }
         match self
             .store
-            .probe_scan_chunk(&self.sid, self.generation, &paths)
+            .probe_scan_chunk_current(&self.sid, self.generation, &paths)
         {
-            Ok(tokens) => tokens,
+            Ok(Some(tokens)) => tokens,
+            Ok(None) => {
+                self.reconciliation_safe = false;
+                self.tally.cancelled = true;
+                self.warn("This scan was superseded by a newer source scan".into());
+                vec![None; entries.len()]
+            }
             Err(error) => {
                 // Unstamped paths cannot be told apart from vanished ones, so this walk gives up
                 // its right to finalise missing rows — and, with no tokens, re-opens every entry.
@@ -226,6 +307,7 @@ impl ScanChunker<'_> {
         let mut items = Vec::with_capacity(entries.len());
         let mut staged = Vec::with_capacity(entries.len());
         let mut current = None;
+        let mut processing_started = Instant::now();
         for (fe, token) in entries.into_iter().zip(tokens) {
             // Cancellation stops the walk, but whatever this chunk has already computed is still
             // committed below: those rows are legitimately ingested, and their events would
@@ -254,34 +336,63 @@ impl ScanChunker<'_> {
                 break;
             }
             // Materialise bytes locally from the backend's pinned/opened source handle.
-            let (fetched, fetch_work) =
-                match self
-                    .governor
-                    .fetch(self.fs, &fe.rel_path, self.scratch, self.cancel)
-                {
-                    Ok(f) => f,
-                    Err(error) => {
-                        if self.cancelled() {
-                            break;
-                        }
-                        self.tally.settled += 1;
-                        self.warn(format!(
-                            "“{}” could not be read from source “{}”",
-                            fe.rel_path, self.source_label
-                        ));
-                        tracing::warn!(path = %fe.rel_path, error = %error, "fetch failed");
-                        continue;
+            let mut heartbeat = ScanHeartbeat::new(
+                self.store,
+                self.events,
+                self.job,
+                self.cancel,
+                format!("Reading and hashing {}", fe.rel_path),
+            );
+            let governor = self.governor;
+            let fs = self.fs;
+            let scratch = self.scratch;
+            let mut flush_ready = |_: u64| {
+                if !items.is_empty() && processing_started.elapsed() >= FLUSH_INTERVAL {
+                    self.commit(&items, std::mem::take(&mut staged), current.clone());
+                    items.clear();
+                    processing_started = Instant::now();
+                }
+            };
+            let (fetched, fetch_work) = match governor.fetch_with_progress(
+                fs,
+                &fe.rel_path,
+                scratch,
+                &heartbeat,
+                &mut flush_ready,
+            ) {
+                Ok(f) => f,
+                Err(error) => {
+                    if self.cancelled() {
+                        break;
                     }
-                };
+                    self.tally.settled += 1;
+                    self.warn(format!(
+                        "“{}” could not be read from source “{}”",
+                        fe.rel_path, self.source_label
+                    ));
+                    tracing::warn!(path = %fe.rel_path, error = %error, "fetch failed");
+                    continue;
+                }
+            };
+            if fetched
+                .source_stat()
+                .is_some_and(|stat| stat.len != fe.size || stat.modified_ms != fe.modified_ms)
+            {
+                self.tally.settled += 1;
+                self.warn(format!(
+                    "“{}” changed since discovery; scan again to verify it",
+                    fe.rel_path
+                ));
+                continue;
+            }
             let abs = fetched.path();
-            // Now that real bytes exist locally, settle the container extensions whose media type
-            // the path alone can't determine (`.mp4`/`.mov`/`.m4v` — audio-only or video?). This is
-            // the only point in the scan where that question is answerable, and it's asked once per
-            // asset, before the row is written.
-            let det = dam_media::refine_with_content(&det, abs).unwrap_or(det);
             // Reacquire for scratch-only hashing after releasing the source/copy permits.
             drop(fetch_work);
-            let Some(hash) = hash_file_paced(abs, self.governor, self.cancel) else {
+            let hash = fetched
+                .content_hash()
+                .and_then(dam_api::id::ContentHash::from_hex)
+                .or_else(|| hash_file_paced(abs, self.governor, &heartbeat));
+            let Some(hash) = hash else {
                 if self.cancelled() {
                     break;
                 }
@@ -296,7 +407,39 @@ impl ScanChunker<'_> {
             // after the upsert because the bytes are open now and the batch takes no file I/O.
             // (A blocklisted hash therefore pays for its own header read — the block itself is
             // decided inside the transaction, issue #21.)
-            let attrs = dam_media::extract_metadata(abs, &det);
+            heartbeat.phase = format!("Inspecting metadata for {}", fe.rel_path);
+            let ingested = {
+                let work = match self
+                    .governor
+                    .io
+                    .acquire(self.governor, &[Some(abs)], &heartbeat)
+                {
+                    Ok(work) => work,
+                    Err(_) => break,
+                };
+                let cancelled = || self.cancelled();
+                let before_read = |bytes: usize| work.pace(bytes as u64).is_ok();
+                let budget = dam_media::MetadataBudget {
+                    cancelled: &cancelled,
+                    before_read: &before_read,
+                    ..dam_media::MetadataBudget::default()
+                };
+                dam_media::extract_ingest_metadata(abs, &det, &budget)
+            };
+            if self.cancelled() {
+                break;
+            }
+            if let Err(error) = fetched.verify_unchanged() {
+                self.warn(format!(
+                    "“{}” changed during ingest; scan again to verify it",
+                    fe.rel_path
+                ));
+                self.tally.settled += 1;
+                tracing::warn!(error=%error,path=%fe.rel_path,"source changed during ingest");
+                continue;
+            }
+            let det = ingested.detected;
+            let attrs = ingested.attributes;
             let filename = file_name(&fe.rel_path);
             staged.push(Staged {
                 path: fe.rel_path.clone(),
@@ -322,6 +465,11 @@ impl ScanChunker<'_> {
                 },
                 attrs,
             });
+            if processing_started.elapsed() >= FLUSH_INTERVAL {
+                self.commit(&items, std::mem::take(&mut staged), current.clone());
+                items.clear();
+                processing_started = Instant::now();
+            }
         }
         (items, staged, current)
     }
@@ -333,6 +481,12 @@ impl ScanChunker<'_> {
     /// update that keeps a mostly-unchanged delta re-scan's bar moving, and its read-back of the
     /// job row is how a cancellation that landed mid-batch is noticed.
     fn commit(&mut self, items: &[ScanWrite], staged: Vec<Staged>, current: Option<String>) {
+        // Empty quick-scan chunks need no durable asset write. Persist progress by time, rather
+        // than opening another catalog transaction for every 128 unchanged paths.
+        if items.is_empty() && self.last_progress.elapsed() < FLUSH_INTERVAL {
+            return;
+        }
+        self.last_progress = Instant::now();
         let ctx = ScanBatchContext {
             job: self.job,
             state: JobState::Running,
@@ -341,6 +495,24 @@ impl ScanChunker<'_> {
             current,
             generation: self.generation,
         };
+        if self
+            .governor
+            .io
+            .acquire_metadata(
+                self.governor,
+                &[self.store.storage_path()],
+                self.cancel,
+                self.manual,
+            )
+            .and_then(|work| work.pace((items.len() as u64 * 4096).max(4096)))
+            .is_err()
+        {
+            // Cancellation still permits already computed rows to commit; admission itself never
+            // waits with a database lock held.
+            if !self.cancelled() {
+                return;
+            }
+        }
         let outcome = match self.store.apply_scan_batch(&ctx, items) {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -400,6 +572,7 @@ impl ScanChunker<'_> {
                     self.tally.settled += 1;
                 }
                 Err(error) => {
+                    self.reconciliation_safe = false;
                     self.tally.failed += 1;
                     self.warn(format!("“{}” could not be added to the catalog", item.path));
                     tracing::warn!(path = %item.path, error = %error, "skipped asset");
@@ -439,7 +612,11 @@ pub(crate) fn run_scan(
     cancel: Arc<AtomicBool>,
     governor: &crate::resources::Governor,
     scratch: &Path,
-) -> Result<(), LibError> {
+    coordinator: &crate::scan_admission::Coordinator,
+    manual: bool,
+    scopes: &[String],
+    source_override: Option<Arc<dyn dam_sources::FileSource>>,
+) -> Result<ScanOutcome, LibError> {
     // Use the catalog size as an estimate for either mode. A new/empty source is indeterminate.
     // Walking just to discover an exact denominator doubled local directory work and, worse, every
     // SFTP/SMB listing call. The final update replaces this estimate with the examined count.
@@ -453,6 +630,10 @@ pub(crate) fn run_scan(
             continue; // federated peers yield catalog rows, not bytes — not scanned here (phase 6)
         }
         let sid = src.id;
+        let Some(_lease) = coordinator.acquire(sid, manual, &cancel) else {
+            tally.cancelled = true;
+            break;
+        };
         let source_label = src.name.clone();
 
         // Rebuild from the persisted non-secret connection + its resolved host credential. An
@@ -477,7 +658,11 @@ pub(crate) fn run_scan(
                 continue;
             }
         };
-        let fs = match open_source(&conn, scratch) {
+        let fs: Arc<dyn dam_sources::FileSource> = match source_override
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(|| open_source(&conn, scratch).map(Arc::from))
+        {
             Ok(fs) => fs,
             Err(e) => {
                 reliability::retryable_store_write(
@@ -499,6 +684,10 @@ pub(crate) fn run_scan(
         // The database owns reconciliation state. Each streamed path is an indexed point lookup +
         // generation stamp; only an exhaustively completed walk finalises unseen rows as missing.
         // No catalog-sized path map/set exists in this process.
+        governor
+            .io
+            .acquire_metadata(governor, &[store.storage_path()], &*cancel, manual)?
+            .pace_metadata()?;
         let generation = match store.begin_source_scan(&sid) {
             Ok(generation) => generation,
             Err(error) => {
@@ -516,8 +705,10 @@ pub(crate) fn run_scan(
                 continue;
             }
         };
+        store.set_source_scan_scope(&sid, generation, scopes)?;
         let mut chunker = ScanChunker {
             scratch,
+            manual,
             store: &store,
             events: &events,
             job,
@@ -532,12 +723,25 @@ pub(crate) fn run_scan(
             scanned_at: dam_store::now_ms(),
             pending: Vec::with_capacity(SCAN_CHUNK),
             last_flush: Instant::now(),
+            last_progress: Instant::now(),
             tally: &mut tally,
             reconciliation_safe: true,
             listing_incomplete: false,
         };
 
-        let walk_result = enumerate_source(fs.as_ref(), &mut |entry| {
+        let mut eligible = |path: &str| -> Result<bool, LibError> {
+            if dam_media::detect_for_ingest(Path::new(path)).is_some() {
+                return Ok(true);
+            }
+            store.source_path_exists(&sid, path)
+        };
+        let mut pace = || {
+            governor
+                .io
+                .acquire_metadata(governor, &[fs.storage_path()], &*cancel, manual)
+                .and_then(|work| work.pace_metadata())
+        };
+        let walk_result = fs.walk_scoped(scopes, &mut eligible, &mut pace, &mut |entry| {
             if chunker.cancelled() {
                 return false;
             }
@@ -653,7 +857,10 @@ pub(crate) fn run_scan(
         warnings = tally.warnings,
         "scan finished"
     );
-    terminal_result
+    terminal_result.map(|()| ScanOutcome {
+        changed: tally.committed > 0 || tally.removed_total > 0,
+        healthy: tally.warnings == 0 && !tally.cancelled && !cancel.load(Ordering::Relaxed),
+    })
 }
 
 /// A delta entry is unchanged when its size and mtime both match the stored change token.
@@ -726,7 +933,7 @@ pub(crate) fn hash_file(path: &Path) -> Option<dam_api::id::ContentHash> {
 fn hash_file_paced(
     path: &Path,
     governor: &crate::resources::Governor,
-    cancel: &AtomicBool,
+    cancel: &dyn crate::resources::Cancellation,
 ) -> Option<dam_api::id::ContentHash> {
     use std::io::Read;
     let work = governor.io.acquire(governor, &[Some(path)], cancel).ok()?;
@@ -739,6 +946,9 @@ fn hash_file_paced(
         let wanted = length.saturating_sub(read).clamp(1, buffer.len() as u64) as usize;
         work.pace(wanted as u64).ok()?;
         let n = file.read(&mut buffer[..wanted]).ok()?;
+        if n < wanted {
+            work.refund((wanted - n) as u64);
+        }
         if n == 0 {
             break;
         }

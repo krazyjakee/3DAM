@@ -48,11 +48,15 @@ function TypedTile({ asset, size }: { asset: AssetSummary; size: number }) {
       <span className="text-[10px] font-medium tracking-wide text-fg-dim uppercase">
         {asset.format}
       </span>
+      {asset.key_attrs.ingest_status === "pending_verification" && (
+        <span className="text-center text-[10px] text-fg-dim">Awaiting verification</span>
+      )}
     </div>
   );
 }
 
 export function Thumbnail({ asset, size = 28 }: { asset: AssetSummary; size?: number }) {
+  const pending = asset.key_attrs.ingest_status === "pending_verification";
   const [status, setStatus] = useState<"loading" | "loaded" | "failed">("loading");
   // Regeneration epoch: bumped when the user forces a rebuild, so the <img> re-fetches past the cache.
   const version = useThumbnailVersion(asset.id);
@@ -64,18 +68,18 @@ export function Thumbnail({ asset, size = 28 }: { asset: AssetSummary; size?: nu
       version,
       typeof asset.origin === "object" ? asset.source_id : null,
     ),
-    hasServerThumbnail(asset.media),
+    hasServerThumbnail(asset.media) && !pending,
   );
 
   // A virtualised cell may be reused for a different asset without remounting — reset when the id
   // (or regeneration epoch) changes so the placeholder/spinner tracks the new image.
-  useEffect(() => setStatus("loading"), [asset.id, version]);
+  useEffect(() => setStatus("loading"), [asset.id, version, pending]);
   useEffect(() => {
     if (media.status === "error") setStatus("failed");
   }, [media.status]);
 
   // Media with no server thumbnail (audio), or a preview that failed to load, shows the typed tile.
-  if (!hasServerThumbnail(asset.media) || status === "failed") {
+  if (pending || !hasServerThumbnail(asset.media) || status === "failed") {
     return <TypedTile asset={asset} size={size} />;
   }
 

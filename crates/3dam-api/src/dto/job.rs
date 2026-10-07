@@ -20,12 +20,16 @@ pub enum ScanMode {
     #[default]
     Full,
     Delta,
+    /// Persist discovery first; verify bytes through a resumable enrichment job.
+    Quick,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobKind {
     Scan,
+    /// Hash and inspect durable pending source revisions after quick discovery.
+    Enrich,
     Analyze,
     Convert,
     Export,

@@ -179,7 +179,6 @@ impl std::fmt::Debug for Db {
 }
 
 impl Db {
-    #[cfg(feature = "ann")]
     pub(crate) fn path(&self) -> Option<&Path> {
         match self {
             Db::File { path, .. } => Some(path),

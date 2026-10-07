@@ -61,6 +61,151 @@ fn the_sftp_source_walks_and_fetches_real_files() {
 }
 
 #[test]
+fn listing_delivers_progress_before_the_last_page_and_closes_once() {
+    use std::sync::atomic::Ordering;
+
+    let root = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    for index in 0..100 {
+        std::fs::write(root.path().join(format!("file-{index}.png")), b"texture").unwrap();
+    }
+    let server = TestSftpServer::start(root.path());
+    let source = server.connect(scratch.path()).unwrap();
+    let mut count = 0;
+    source
+        .walk(&mut |entry| {
+            entry.unwrap();
+            count += 1;
+            if count == 1 {
+                assert_eq!(server.listing.reads.load(Ordering::Relaxed), 1);
+                assert_eq!(server.listing.closes.load(Ordering::Relaxed), 0);
+            }
+            true
+        })
+        .unwrap();
+    assert_eq!(count, 100);
+    assert_eq!(server.listing.opens.load(Ordering::Relaxed), 1);
+    assert_eq!(server.listing.reads.load(Ordering::Relaxed), 5);
+    assert_eq!(server.listing.closes.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn listing_cancellation_stops_pages_even_when_every_path_is_filtered() {
+    use std::cell::Cell;
+    use std::sync::atomic::Ordering;
+
+    let root = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    for index in 0..100 {
+        std::fs::write(root.path().join(format!("file-{index}.csv")), b"ignored").unwrap();
+    }
+    let server = TestSftpServer::start(root.path());
+    let source = server.connect(scratch.path()).unwrap();
+    let cancelled = Cell::new(false);
+    let result = source.walk_filtered(
+        &mut |_| {
+            cancelled.set(true);
+            Ok(false)
+        },
+        &mut || {
+            if cancelled.get() {
+                Err(dam_api::LibError::Internal("cancelled fixture".into()))
+            } else {
+                Ok(())
+            }
+        },
+        &mut |_| panic!("filtered paths must not reach the sink"),
+    );
+    assert!(result.is_err());
+    assert_eq!(server.listing.reads.load(Ordering::Relaxed), 1);
+    assert_eq!(server.listing.closes.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        walk_all(source.as_ref()).len(),
+        100,
+        "session remains usable"
+    );
+}
+
+#[test]
+fn listing_sink_stop_and_partial_page_errors_close_the_directory() {
+    use std::sync::atomic::Ordering;
+
+    let root = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    for index in 0..100 {
+        std::fs::write(root.path().join(format!("file-{index}.png")), b"texture").unwrap();
+    }
+    let server = TestSftpServer::start(root.path());
+    let source = server.connect(scratch.path()).unwrap();
+    source.walk(&mut |_| false).unwrap();
+    assert_eq!(server.listing.reads.load(Ordering::Relaxed), 1);
+    assert_eq!(server.listing.closes.load(Ordering::Relaxed), 1);
+
+    server.listing.fail_read.store(3, Ordering::Relaxed);
+    let mut successes = 0;
+    let mut warnings = 0;
+    source
+        .walk(&mut |entry| {
+            match entry {
+                Ok(_) => successes += 1,
+                Err(_) => warnings += 1,
+            }
+            true
+        })
+        .unwrap();
+    assert_eq!(successes, 32);
+    assert_eq!(warnings, 1);
+    assert_eq!(server.listing.closes.load(Ordering::Relaxed), 2);
+}
+
+#[test]
+fn fetch_hash_matches_materialized_bytes_with_empty_files_and_short_remote_reads() {
+    use std::sync::atomic::Ordering;
+
+    let root = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let server = TestSftpServer::start(root.path());
+    server
+        .listing
+        .content_read_limit
+        .store(7, Ordering::Relaxed);
+    let source = server.connect(scratch.path()).unwrap();
+    for bytes in [Vec::new(), (0..200).map(|index| index as u8).collect()] {
+        std::fs::write(root.path().join("asset.png"), &bytes).unwrap();
+        let fetched = source.fetch("asset.png").unwrap();
+        let expected = blake3::hash(&bytes).to_hex().to_string();
+        assert_eq!(fetched.content_hash(), Some(expected.as_str()));
+        assert_eq!(fetched.source_stat().unwrap().len, bytes.len() as u64);
+        assert_eq!(std::fs::read(fetched.path()).unwrap(), bytes);
+        drop(fetched);
+        assert_eq!(std::fs::read_dir(scratch.path()).unwrap().count(), 0);
+    }
+}
+
+#[test]
+fn cancelled_remote_hash_fetch_removes_its_partial_materialization() {
+    let root = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("asset.png"), vec![0x5a; 1024 * 1024]).unwrap();
+    let server = TestSftpServer::start(root.path());
+    let source = server.connect(scratch.path()).unwrap();
+    let mut calls = 0;
+    let outcome = source.fetch_paced("asset.png", &mut |_| {
+        calls += 1;
+        if calls == 2 {
+            Err(dam_api::LibError::Internal("cancelled fixture".into()))
+        } else {
+            Ok(())
+        }
+    });
+    assert!(outcome.is_err());
+    assert_eq!(calls, 2);
+    assert_eq!(std::fs::read_dir(scratch.path()).unwrap().count(), 0);
+    let fetched = source.fetch("asset.png").unwrap();
+    assert_eq!(fetched.source_stat().unwrap().len, 1024 * 1024);
+}
+
+#[test]
 fn an_ipv6_sftp_url_connects_when_ipv6_loopback_is_available() {
     let root = tempfile::tempdir().expect("root");
     let scratch = tempfile::tempdir().expect("scratch");

@@ -29,6 +29,10 @@ const SCAN_CAP: u64 = 128 * 1024 * 1024;
 
 pub(super) fn metadata(path: &Path) -> Option<ModelAttributes> {
     let f = File::open(path).ok()?;
+    from_reader(f)
+}
+
+pub(super) fn from_reader(f: impl Read) -> Option<ModelAttributes> {
     let mut reader = quick_xml::Reader::from_reader(BufReader::new(f.take(SCAN_CAP)));
     reader.config_mut().trim_text(true);
 
@@ -164,5 +168,9 @@ fn attr(e: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> Option<String> {
 }
 
 fn int_attr(e: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> Option<i64> {
-    attr(e, key)?.trim().parse().ok()
+    attr(e, key)?
+        .trim()
+        .parse::<i64>()
+        .ok()
+        .filter(|n| (0..=u32::MAX as i64).contains(n))
 }

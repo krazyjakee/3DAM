@@ -72,12 +72,22 @@ impl crate::MediaHandler for Handler {
     }
 
     fn extract_metadata(&self, path: &Path, format: &str) -> MediaAttributes {
-        MediaAttributes::Model(metadata(path, format))
+        let budget = crate::MetadataBudget::default();
+        let mut session = crate::ingest::Session::new(&budget);
+        MediaAttributes::Model(ingest_metadata(path, format, &mut session))
     }
 }
 
 /// Extract cheap model attributes; best-effort, fail-soft (a parse fault yields whatever was read).
 pub fn metadata(path: &Path, format: &str) -> ModelAttributes {
+    // Full textual/container scans belong to analysis, and still have a source
+    // ceiling. Larger assets can use the separately scheduled Assimp deep probe.
+    if std::fs::metadata(path)
+        .map(|metadata| metadata.len() > 64 * 1024 * 1024)
+        .unwrap_or(true)
+    {
+        return ModelAttributes::default();
+    }
     let attrs = match format {
         "glb" => gltf::glb(path),
         "gltf" => gltf::gltf(path),
@@ -96,6 +106,73 @@ pub fn metadata(path: &Path, format: &str) -> ModelAttributes {
     // The reported size of a model should reflect the whole asset — its external textures and
     // buffers, not just the mesh container — so a 130 KB `.fbx` with 14 MB of maps reads honestly.
     attrs.dependency_bytes = dependency_bytes(path, format);
+    attrs
+}
+
+/// Scan-lane metadata: large complete scans are deferred, and partial totals are
+/// never presented as exact counts. Small primary documents are parsed once.
+pub(crate) fn ingest_metadata(
+    path: &Path,
+    format: &str,
+    session: &mut crate::ingest::Session<'_, '_>,
+) -> ModelAttributes {
+    if format == "glb" {
+        return session
+            .glb_json(path)
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .map(|root| gltf::from_gltf_json(&root))
+            .unwrap_or_default();
+    }
+    if format == "stl" {
+        if let Some((header, len)) = session.header(path, 84) {
+            if header.len() == 84 {
+                let count = u32::from_le_bytes(header[80..84].try_into().unwrap()) as u64;
+                if 84 + count * 50 == len {
+                    return stl::model_from_tris(count as i64);
+                }
+            }
+        }
+    }
+    if format == "ply" {
+        if let Some((bytes, _)) = session.prefix(path, 16 * 1024) {
+            if bytes.windows(10).any(|window| window == b"end_header") {
+                return ply::from_reader(bytes.as_slice()).unwrap_or_default();
+            }
+        }
+        session.deferred = true;
+        return ModelAttributes::default();
+    }
+    if !["gltf", "obj", "stl", "fbx", "dae", "3ds"].contains(&format) {
+        session.deferred = true;
+        return ModelAttributes::default();
+    }
+    let Some(bytes) = session.complete_file(path) else {
+        return ModelAttributes::default();
+    };
+    let mut attrs = match format {
+        "gltf" => {
+            let Ok(root) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                return ModelAttributes::default();
+            };
+            let mut attrs = gltf::from_gltf_json(&root);
+            attrs.dependency_bytes = deps::ingest_gltf_deps(path, &root, session);
+            return attrs;
+        }
+        "obj" => {
+            let mut attrs = obj::from_bytes(&bytes);
+            attrs.dependency_bytes = deps::ingest_obj_deps(path, &bytes, session);
+            return attrs;
+        }
+        "stl" => stl::from_bytes(&bytes),
+        "dae" => dae::from_reader(bytes.as_slice()),
+        "fbx" => fbx::from_reader(std::io::Cursor::new(&bytes), bytes.len() as u64),
+        "3ds" => tds::from_reader(std::io::Cursor::new(&bytes), bytes.len() as u64),
+        _ => None,
+    }
+    .unwrap_or_default();
+    if format == "fbx" {
+        attrs.dependency_bytes = deps::ingest_fbx_deps(path, &bytes, session);
+    }
     attrs
 }
 

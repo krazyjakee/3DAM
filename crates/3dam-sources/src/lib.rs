@@ -7,10 +7,10 @@
 //! (catalog rows, not bytes) is a separate surface that lands with phase 6.
 //!
 //! **Byte access is uniform.** The media handlers ([`dam_media`]) are path-based, so every source
-//! resolves an entry to a private local path via [`FileSource::fetch`]. Remote sources download to
-//! it; local sources copy from a capability-relative, already-open handle. That copy is intentional:
-//! path-based handlers would otherwise reopen an attacker-swappable source pathname after fetch
-//! returned. The temp suffix preserves the logical extension for extension-keyed detection.
+//! resolves an entry to a confined local path via [`FileSource::fetch`]. Remote sources download;
+//! legacy local fetches copy from an already-open capability. Paced Linux ingest can instead hold
+//! the file descriptor and reopen it through procfs, retaining confinement without scratch writes.
+//! All built-in copy/read loops return their BLAKE3 hash without a second full-file read.
 
 use dam_api::LibError;
 use serde::{Deserialize, Serialize};
@@ -45,19 +45,74 @@ pub struct ContentStat {
     pub modified_ms: Option<i64>,
 }
 
-/// A locally-readable handle to an entry's bytes. Every backend materialises a private temp file,
-/// removed on drop, so path-based media handlers never reopen an attacker-swappable source path.
+/// A locally-readable representation whose path stays confined for its lifetime. Legacy fetches
+/// materialise scratch; paced local ingest can retain a source descriptor on supported platforms.
 pub enum Fetched {
     /// A pinned/materialised copy, deleted when this drops. Suffixed with the logical extension so
     /// extension-keyed detection (tech-spec 04 §7) still works.
     Temp(tempfile::NamedTempFile),
+    /// The hash was computed while writing this private, immutable-for-the-caller scratch copy.
+    HashedTemp {
+        file: tempfile::NamedTempFile,
+        content_hash: String,
+        source_stat: Option<ContentStat>,
+    },
+    /// Linux ingest handlers reopen this process's held descriptor through procfs. The parent PID
+    /// keeps the path usable by subprocess probes even when they close inherited descriptors.
+    #[cfg(target_os = "linux")]
+    Pinned {
+        file: cap_std::fs::File,
+        path: PathBuf,
+        content_hash: String,
+        source_stat: ContentStat,
+        original_metadata: Box<cap_std::fs::Metadata>,
+    },
 }
 
 impl Fetched {
     pub fn path(&self) -> &Path {
         match self {
             Fetched::Temp(f) => f.path(),
+            Fetched::HashedTemp { file, .. } => file.path(),
+            #[cfg(target_os = "linux")]
+            Fetched::Pinned { path, .. } => path,
         }
+    }
+
+    pub fn content_hash(&self) -> Option<&str> {
+        match self {
+            Fetched::Temp(_) => None,
+            Fetched::HashedTemp { content_hash, .. } => Some(content_hash),
+            #[cfg(target_os = "linux")]
+            Fetched::Pinned { content_hash, .. } => Some(content_hash),
+        }
+    }
+
+    pub fn source_stat(&self) -> Option<ContentStat> {
+        match self {
+            Fetched::Temp(_) => None,
+            Fetched::HashedTemp { source_stat, .. } => *source_stat,
+            #[cfg(target_os = "linux")]
+            Fetched::Pinned { source_stat, .. } => Some(*source_stat),
+        }
+    }
+
+    /// Revalidate after probing a pinned representation, before storing metadata against its
+    /// hash. A scratch representation has already detached from subsequent source writes.
+    pub fn verify_unchanged(&self) -> Result<(), LibError> {
+        #[cfg(target_os = "linux")]
+        if let Fetched::Pinned {
+            file,
+            original_metadata,
+            ..
+        } = self
+        {
+            let current = file.metadata().map_err(|_| source_changed())?;
+            if !same_local_token(original_metadata, &current) {
+                return Err(source_changed());
+            }
+        }
+        Ok(())
     }
 }
 
@@ -71,6 +126,61 @@ pub trait FileSource: Send + Sync {
         sink: &mut dyn FnMut(Result<FileEntry, LibError>) -> bool,
     ) -> Result<(), LibError>;
 
+    /// Admit paths before acquiring their change tokens. Built-in sources invoke `eligible`
+    /// before file-token metadata requests; directory traversal is never pruned by this predicate.
+    /// Filesystems lacking directory-entry types can require metadata to classify an entry first.
+    /// `pace` is called before advancing listing I/O, including remote directory pages. An error
+    /// stops enumeration and must prevent authoritative missing reconciliation. Existing external
+    /// backends remain compatible, though their `walk` may acquire metadata before filtering.
+    fn walk_filtered(
+        &self,
+        eligible: &mut dyn FnMut(&str) -> Result<bool, LibError>,
+        pace: &mut dyn FnMut() -> Result<(), LibError>,
+        sink: &mut dyn FnMut(Result<FileEntry, LibError>) -> bool,
+    ) -> Result<(), LibError> {
+        let mut stopped = None;
+        pace()?;
+        self.walk(&mut |entry| {
+            let decision = pace().and_then(|()| match &entry {
+                Ok(entry) => eligible(&entry.rel_path),
+                Err(_) => Ok(true),
+            });
+            match decision {
+                Ok(true) => sink(entry),
+                Ok(false) => true,
+                Err(error) => {
+                    stopped = Some(error);
+                    false
+                }
+            }
+        })?;
+        stopped.map_or(Ok(()), Err)
+    }
+
+    /// Enumerate exact files or directory subtrees. Missing scopes yield no entries. An empty
+    /// scope list selects the entire source; paths are root-relative and overlapping scopes are
+    /// collapsed. The default filters a full walk, while local sources restrict directory I/O.
+    fn walk_scoped(
+        &self,
+        scopes: &[String],
+        eligible: &mut dyn FnMut(&str) -> Result<bool, LibError>,
+        pace: &mut dyn FnMut() -> Result<(), LibError>,
+        sink: &mut dyn FnMut(Result<FileEntry, LibError>) -> bool,
+    ) -> Result<(), LibError> {
+        let scopes = walk_scopes(scopes)?;
+        self.walk_filtered(
+            &mut |path| {
+                if scopes.iter().any(|scope| path_in_scope(path, scope)) {
+                    eligible(path)
+                } else {
+                    Ok(false)
+                }
+            },
+            pace,
+            sink,
+        )
+    }
+
     /// Resolve an entry's bytes to a private local path for the media handlers. Guards all rooted,
     /// prefixed, URL, and traversal shapes and pins local reads to the registered root capability.
     fn fetch(&self, rel_path: &str) -> Result<Fetched, LibError>;
@@ -79,6 +189,12 @@ pub trait FileSource: Send + Sync {
     /// fallback. The engine also budgets the scratch device, independently when appropriate.
     fn storage_path(&self) -> Option<&Path> {
         None
+    }
+
+    /// Whether a paced fetch writes a source-sized scratch representation. Callers use this to
+    /// budget source reads and scratch writes separately. Legacy `fetch` keeps its copy semantics.
+    fn fetch_uses_scratch(&self, _rel_path: &str) -> bool {
+        true
     }
 
     /// Background materialisation with a cancellable pace point before each bounded read/write.
@@ -998,14 +1114,113 @@ fn open_registered_root(root: &Path) -> Option<cap_std::fs::Dir> {
     Some(cap_std::fs::Dir::from_std_file(current))
 }
 
+fn path_in_scope(path: &str, scope: &str) -> bool {
+    scope.is_empty()
+        || path == scope
+        || path
+            .strip_prefix(scope)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn walk_scopes(scopes: &[String]) -> Result<Vec<String>, LibError> {
+    if scopes.is_empty() || scopes.iter().any(|scope| scope.is_empty() || scope == ".") {
+        return Ok(vec![String::new()]);
+    }
+    let mut normalized = scopes
+        .iter()
+        .map(|scope| guard_rel_path(scope.trim_end_matches('/')))
+        .collect::<Result<Vec<_>, _>>()?;
+    normalized.sort();
+    let mut result: Vec<String> = Vec::new();
+    for scope in normalized {
+        if !result.iter().any(|parent| path_in_scope(&scope, parent)) {
+            result.push(scope);
+        }
+    }
+    Ok(result)
+}
+
+fn local_file_entry(rel_path: String, metadata: cap_std::fs::Metadata) -> FileEntry {
+    FileEntry {
+        rel_path,
+        size: metadata.len(),
+        modified_ms: metadata
+            .modified()
+            .ok()
+            .and_then(|time| system_time_ms(time.into_std())),
+    }
+}
+
+#[cfg(unix)]
+fn local_entry_metadata(
+    _root: &cap_std::fs::Dir,
+    entry: &cap_std::fs::DirEntry,
+    _child: &Path,
+) -> std::io::Result<cap_std::fs::Metadata> {
+    entry.metadata()
+}
+
+#[cfg(not(unix))]
+fn local_entry_metadata(
+    root: &cap_std::fs::Dir,
+    _entry: &cap_std::fs::DirEntry,
+    child: &Path,
+) -> std::io::Result<cap_std::fs::Metadata> {
+    root.open(child)?.metadata()
+}
+
 impl FileSource for LocalFsSource {
     fn walk(
         &self,
         sink: &mut dyn FnMut(Result<FileEntry, LibError>) -> bool,
     ) -> Result<(), LibError> {
+        self.walk_filtered(&mut |_| Ok(true), &mut || Ok(()), sink)
+    }
+
+    fn walk_filtered(
+        &self,
+        eligible: &mut dyn FnMut(&str) -> Result<bool, LibError>,
+        pace: &mut dyn FnMut() -> Result<(), LibError>,
+        sink: &mut dyn FnMut(Result<FileEntry, LibError>) -> bool,
+    ) -> Result<(), LibError> {
+        self.walk_scoped(&[], eligible, pace, sink)
+    }
+
+    fn walk_scoped(
+        &self,
+        scopes: &[String],
+        eligible: &mut dyn FnMut(&str) -> Result<bool, LibError>,
+        pace: &mut dyn FnMut() -> Result<(), LibError>,
+        sink: &mut dyn FnMut(Result<FileEntry, LibError>) -> bool,
+    ) -> Result<(), LibError> {
         let root = self.cap_root()?;
-        let mut stack = vec![PathBuf::new()];
+        let mut stack = Vec::new();
+        for scope in walk_scopes(scopes)? {
+            if scope.is_empty() {
+                stack.push(PathBuf::new());
+                continue;
+            }
+            pace()?;
+            match root.symlink_metadata(&scope) {
+                Ok(meta) if meta.is_dir() => stack.push(PathBuf::from(scope)),
+                Ok(meta) if meta.is_file() => {
+                    if eligible(&scope)? && !sink(Ok(local_file_entry(scope, meta))) {
+                        return Ok(());
+                    }
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => {
+                    if !sink(Err(LibError::SourceUnavailable(
+                        "local source scope is unavailable".into(),
+                    ))) {
+                        return Ok(());
+                    }
+                }
+            }
+        }
         while let Some(rel_dir) = stack.pop() {
+            pace()?;
             // `cap_std` treats an empty relative path as ENOENT; `.` names the already-pinned root
             // without changing the catalog paths yielded below.
             let read_dir = if rel_dir.as_os_str().is_empty() {
@@ -1013,10 +1228,20 @@ impl FileSource for LocalFsSource {
             } else {
                 &rel_dir
             };
-            let entries = root.read_dir(read_dir).map_err(|_| {
-                LibError::SourceUnavailable("registered local source root is unavailable".into())
-            })?;
-            for entry in entries {
+            let mut entries = match root.read_dir(read_dir) {
+                Ok(entries) => entries,
+                Err(_) => {
+                    if !sink(Err(LibError::SourceUnavailable(
+                        "local source directory is unavailable".into(),
+                    ))) {
+                        return Ok(());
+                    }
+                    continue;
+                }
+            };
+            loop {
+                pace()?;
+                let Some(entry) = entries.next() else { break };
                 let entry = match entry {
                     Ok(entry) => entry,
                     Err(_) => {
@@ -1031,29 +1256,69 @@ impl FileSource for LocalFsSource {
                 let child = rel_dir.join(entry.file_name());
                 let kind = match entry.file_type() {
                     Ok(kind) => kind,
-                    Err(_) => continue,
+                    Err(_) => {
+                        if !sink(Err(LibError::SourceUnavailable(
+                            "local source entry type is unavailable".into(),
+                        ))) {
+                            return Ok(());
+                        }
+                        continue;
+                    }
                 };
+                // Some mounted/FUSE filesystems return DT_UNKNOWN. A no-follow metadata lookup
+                // is then necessary to classify directories; reuse it for the file token below.
+                let listing_metadata = if kind == cap_std::fs::FileType::unknown() {
+                    match local_entry_metadata(root, &entry, &child) {
+                        Ok(metadata) => Some(metadata),
+                        Err(_) => {
+                            if !sink(Err(LibError::SourceUnavailable(
+                                "local source entry type is unavailable".into(),
+                            ))) {
+                                return Ok(());
+                            }
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
+                let kind = listing_metadata
+                    .as_ref()
+                    .map_or(kind, cap_std::fs::Metadata::file_type);
                 if kind.is_dir() {
                     stack.push(child);
                 } else if kind.is_file() {
                     let rel_path = child.to_string_lossy().replace('\\', "/");
-                    // Reopen through the entry capability before reading metadata. A path-based
-                    // metadata call after `file_type` would be another swap window (and could
-                    // disclose an external target's size/mtime even though fetch later refused it).
-                    let (size, modified_ms) = match entry.open().and_then(|file| file.metadata()) {
-                        Ok(meta) => (
-                            meta.len(),
-                            meta.modified()
-                                .ok()
-                                .and_then(|time| system_time_ms(time.into_std())),
-                        ),
-                        Err(_) => (0, None),
+                    if !eligible(&rel_path)? {
+                        continue;
+                    }
+                    // Unix entry metadata is fstatat(parent capability, basename, NOFOLLOW).
+                    // Check its type again: a link swapped in after file_type must not disclose
+                    // its target's change token. Windows conservatively opens through the root
+                    // capability because its DirEntry implementation uses ambient paths.
+                    let metadata = match listing_metadata
+                        .map(Ok)
+                        .unwrap_or_else(|| local_entry_metadata(root, &entry, &child))
+                    {
+                        Ok(meta) if meta.is_file() => meta,
+                        Ok(_) => {
+                            if !sink(Err(LibError::SourceUnavailable(
+                                "local source entry changed during enumeration".into(),
+                            ))) {
+                                return Ok(());
+                            }
+                            continue;
+                        }
+                        Err(_) => {
+                            if !sink(Err(LibError::SourceUnavailable(
+                                "local source entry metadata is unavailable".into(),
+                            ))) {
+                                return Ok(());
+                            }
+                            continue;
+                        }
                     };
-                    if !sink(Ok(FileEntry {
-                        rel_path,
-                        size,
-                        modified_ms,
-                    })) {
+                    if !sink(Ok(local_file_entry(rel_path, metadata))) {
                         return Ok(());
                     }
                 }
@@ -1071,13 +1336,17 @@ impl FileSource for LocalFsSource {
         Some(&self.root)
     }
 
+    fn fetch_uses_scratch(&self, rel_path: &str) -> bool {
+        !can_pin_local(rel_path)
+    }
+
     fn fetch_paced(
         &self,
         rel_path: &str,
         pace: &mut dyn FnMut(u64) -> Result<(), LibError>,
     ) -> Result<Fetched, LibError> {
         let rel = guard_rel_path(rel_path)?;
-        self.fetch_copy(&rel, || {}, pace)
+        self.fetch_copy(&rel, || {}, pace, true)
     }
 
     fn content_stat(&self, rel_path: &str) -> Result<ContentStat, LibError> {
@@ -1285,15 +1554,14 @@ impl LocalFsSource {
         Ok(file)
     }
 
-    /// Open from the pinned root capability, then copy from that already-open handle to a private
-    /// temp file. Existing media handlers are path-based; returning the original path would make
-    /// them reopen it and reintroduce a symlink-swap race after this method returned.
+    /// Legacy fetch keeps an extension-suffixed scratch path for path-based consumers. Paced
+    /// ingest can hold the descriptor instead; neither representation exposes the ambient source.
     fn fetch_after_validation(
         &self,
         rel: &str,
         before_open: impl FnOnce(),
     ) -> Result<Fetched, LibError> {
-        self.fetch_copy(rel, before_open, &mut |_| Ok(()))
+        self.fetch_copy(rel, before_open, &mut |_| Ok(()), false)
     }
 
     fn fetch_copy(
@@ -1301,16 +1569,26 @@ impl LocalFsSource {
         rel: &str,
         before_open: impl FnOnce(),
         pace: &mut dyn FnMut(u64) -> Result<(), LibError>,
+        allow_pin: bool,
     ) -> Result<Fetched, LibError> {
         use std::io::{Read, Write};
         before_open();
         let mut source = self.open_content_file(rel)?;
-        let mut length = source.metadata().map(|m| m.len()).unwrap_or(0);
-        let mut copied = 0u64;
-        let scratch = self.scratch.as_deref().ok_or_else(|| {
-            LibError::Internal("local source fetch has no configured scratch directory".into())
+        let original_metadata = source.metadata().map_err(|_| {
+            LibError::SourceUnavailable("local fetch metadata is unavailable".into())
         })?;
-        let mut sink = temp_sink(rel, scratch)?;
+        let mut length = original_metadata.len();
+        let mut copied = 0u64;
+        let pin = allow_pin && can_pin_local(rel);
+        let mut sink = if pin {
+            None
+        } else {
+            let scratch = self.scratch.as_deref().ok_or_else(|| {
+                LibError::Internal("local source fetch has no configured scratch directory".into())
+            })?;
+            Some(temp_sink(rel, scratch)?)
+        };
+        let mut hasher = blake3::Hasher::new();
         let mut buffer = vec![0; FETCH_CHUNK];
         loop {
             if copied >= length {
@@ -1325,12 +1603,152 @@ impl LocalFsSource {
             if n == 0 {
                 break;
             }
-            sink.write_all(&buffer[..n])
-                .map_err(|e| LibError::Internal(format!("local fetch write: {e}")))?;
+            if let Some(sink) = &mut sink {
+                sink.write_all(&buffer[..n])
+                    .map_err(|e| LibError::Internal(format!("local fetch write: {e}")))?;
+            }
+            hasher.update(&buffer[..n]);
             copied = copied.saturating_add(n as u64);
         }
-        Ok(Fetched::Temp(sink))
+        let final_metadata = source.metadata().map_err(|_| source_changed())?;
+        if copied != final_metadata.len() || !same_local_token(&original_metadata, &final_metadata)
+        {
+            return Err(source_changed());
+        }
+        let content_hash = hasher.finalize().to_hex().to_string();
+        let source_stat = local_content_stat(&final_metadata);
+        if let Some(file) = sink {
+            return Ok(Fetched::HashedTemp {
+                file,
+                content_hash,
+                source_stat: Some(source_stat),
+            });
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+
+            let path = PathBuf::from(format!(
+                "/proc/{}/fd/{}",
+                std::process::id(),
+                source.as_raw_fd()
+            ));
+            Ok(Fetched::Pinned {
+                file: source,
+                path,
+                content_hash,
+                source_stat,
+                original_metadata: Box::new(final_metadata),
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        Err(LibError::Internal(
+            "pinned local fetch is unavailable".into(),
+        ))
     }
+}
+
+fn local_content_stat(metadata: &cap_std::fs::Metadata) -> ContentStat {
+    ContentStat {
+        len: metadata.len(),
+        modified_ms: metadata
+            .modified()
+            .ok()
+            .and_then(|time| system_time_ms(time.into_std())),
+    }
+}
+
+fn source_changed() -> LibError {
+    LibError::SourceUnavailable(
+        "source changed while its bytes were being fetched; retry scan".into(),
+    )
+}
+
+fn same_local_token(before: &cap_std::fs::Metadata, after: &cap_std::fs::Metadata) -> bool {
+    if before.len() != after.len() || before.modified().ok() != after.modified().ok() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use cap_std::fs::MetadataExt;
+        if before.dev() != after.dev()
+            || before.ino() != after.ino()
+            || before.ctime() != after.ctime()
+            || before.ctime_nsec() != after.ctime_nsec()
+        {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(target_os = "linux")]
+fn can_pin_local(rel_path: &str) -> bool {
+    use std::sync::OnceLock;
+
+    static PROCFS: OnceLock<bool> = OnceLock::new();
+    let extension = Path::new(rel_path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let supported = matches!(
+        extension.as_str(),
+        // These raster readers sniff their format from bytes. GPU/container textures, TGA,
+        // SVG and formats whose legacy consumers require a filename hint retain scratch paths.
+        "png"
+            | "jpg"
+            | "jpeg"
+            | "gif"
+            | "bmp"
+            | "tiff"
+            | "tif"
+            | "webp"
+            | "wav"
+            | "flac"
+            | "mp3"
+            | "ogg"
+            | "oga"
+            | "opus"
+            | "aiff"
+            | "aif"
+            | "m4a"
+            | "aac"
+            | "wma"
+            | "it"
+            | "xm"
+            | "mod"
+            | "s3m"
+            | "mp4"
+            | "mov"
+            | "mkv"
+            | "webm"
+            | "avi"
+            | "m4v"
+            | "mpeg"
+            | "mpg"
+            | "txt"
+            | "md"
+            | "markdown"
+            | "pdf"
+            | "rtf"
+    );
+    supported
+        && *PROCFS.get_or_init(|| {
+            let path = std::ffi::CString::new(format!("/proc/{}/fd", std::process::id())).unwrap();
+            let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::uninit();
+            // Safety: the CString is NUL-terminated and statfs initializes this correctly sized
+            // output on success. Require genuine procfs, rather than an arbitrary ambient directory.
+            unsafe {
+                libc::statfs(path.as_ptr(), filesystem.as_mut_ptr()) == 0
+                    && filesystem.assume_init().f_type == libc::PROC_SUPER_MAGIC
+            }
+        })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn can_pin_local(_rel_path: &str) -> bool {
+    false
 }
 
 pub(crate) fn system_time_ms(t: std::time::SystemTime) -> Option<i64> {
@@ -1342,6 +1760,164 @@ pub(crate) fn system_time_ms(t: std::time::SystemTime) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_filter_rejects_paths_before_acquiring_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("ignored.csv"), b"uncatalogued").unwrap();
+        std::fs::create_dir(root.path().join("vendor")).unwrap();
+        std::fs::write(root.path().join("vendor/texture.png"), b"texture").unwrap();
+        let source = LocalFsSource::without_scratch(root.path());
+        let mut found = Vec::new();
+        source
+            .walk_filtered(
+                &mut |path| {
+                    if path == "ignored.csv" {
+                        // A rejected, vanished file cannot cause a metadata warning: no metadata
+                        // operation should have been attempted after path eligibility.
+                        std::fs::remove_file(root.path().join(path)).unwrap();
+                        Ok(false)
+                    } else {
+                        Ok(true)
+                    }
+                },
+                &mut || Ok(()),
+                &mut |entry| {
+                    found.push(entry.unwrap());
+                    true
+                },
+            )
+            .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].rel_path, "vendor/texture.png");
+        assert_eq!(found[0].size, 7);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_metadata_rejects_a_file_swapped_for_an_external_link() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("asset.png"), b"asset").unwrap();
+        std::fs::write(outside.path().join("secret"), b"private external bytes").unwrap();
+        let source = LocalFsSource::without_scratch(root.path());
+        let mut warnings = 0;
+        source
+            .walk_filtered(
+                &mut |path| {
+                    std::fs::remove_file(root.path().join(path)).unwrap();
+                    std::os::unix::fs::symlink(
+                        outside.path().join("secret"),
+                        root.path().join(path),
+                    )
+                    .unwrap();
+                    Ok(true)
+                },
+                &mut || Ok(()),
+                &mut |entry| {
+                    assert!(
+                        entry.is_err(),
+                        "external change tokens must never be yielded"
+                    );
+                    warnings += 1;
+                    true
+                },
+            )
+            .unwrap();
+        assert_eq!(warnings, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_metadata_stays_with_the_pinned_root_after_path_replacement() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("source");
+        let moved = parent.path().join("original");
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("asset.png"), b"asset").unwrap();
+        std::fs::write(outside.path().join("asset.png"), b"external secret bytes").unwrap();
+        let source = LocalFsSource::without_scratch(&root);
+        let mut sizes = Vec::new();
+        source
+            .walk_filtered(
+                &mut |_| {
+                    std::fs::rename(&root, &moved).unwrap();
+                    std::os::unix::fs::symlink(outside.path(), &root).unwrap();
+                    Ok(true)
+                },
+                &mut || Ok(()),
+                &mut |entry| {
+                    sizes.push(entry.unwrap().size);
+                    true
+                },
+            )
+            .unwrap();
+        assert_eq!(sizes, vec![5]);
+    }
+
+    #[test]
+    fn scoped_local_walk_visits_only_selected_files_and_subtrees_once() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["models", "textures", "unrelated"] {
+            std::fs::create_dir(root.path().join(name)).unwrap();
+        }
+        for path in [
+            "models/item.obj",
+            "textures/brick.png",
+            "unrelated/other.wav",
+        ] {
+            std::fs::write(root.path().join(path), b"data").unwrap();
+        }
+        let source = LocalFsSource::without_scratch(root.path());
+        let mut paths = Vec::new();
+        source
+            .walk_scoped(
+                &[
+                    "models".into(),
+                    "models/item.obj".into(),
+                    "textures/brick.png".into(),
+                    "removed.png".into(),
+                ],
+                &mut |_| Ok(true),
+                &mut || Ok(()),
+                &mut |entry| {
+                    paths.push(entry.unwrap().rel_path);
+                    true
+                },
+            )
+            .unwrap();
+        paths.sort();
+        assert_eq!(paths, ["models/item.obj", "textures/brick.png"]);
+    }
+
+    #[test]
+    fn local_listing_checks_cancellation_when_all_files_are_filtered() {
+        use std::cell::Cell;
+
+        let root = tempfile::tempdir().unwrap();
+        for index in 0..10 {
+            std::fs::write(root.path().join(format!("ignored-{index}.csv")), b"data").unwrap();
+        }
+        let source = LocalFsSource::without_scratch(root.path());
+        let count = Cell::new(0);
+        let result = source.walk_filtered(
+            &mut |_| {
+                count.set(count.get() + 1);
+                Ok(false)
+            },
+            &mut || {
+                if count.get() == 1 {
+                    Err(LibError::Internal("cancelled fixture".into()))
+                } else {
+                    Ok(())
+                }
+            },
+            &mut |_| panic!("rejected paths must not acquire metadata"),
+        );
+        assert!(result.is_err());
+        assert_eq!(count.get(), 1);
+    }
 
     #[test]
     fn parses_sftp_uri_with_userinfo_and_port() {
@@ -1625,6 +2201,158 @@ mod tests {
         let fetched = source.fetch("asset.bin").unwrap();
         assert_eq!(std::fs::read(fetched.path()).unwrap(), b"inside");
         assert_eq!(fetched.path().parent(), Some(scratch.path()));
+        assert_eq!(
+            fetched.content_hash(),
+            Some(blake3::hash(b"inside").to_hex().as_str())
+        );
+    }
+
+    #[test]
+    fn local_fetch_hashes_empty_and_chunk_boundary_files_during_copy() {
+        let root = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let source = fetched_local(root.path(), scratch.path());
+        for size in [0, 1, FETCH_CHUNK - 1, FETCH_CHUNK, FETCH_CHUNK + 17] {
+            let bytes = vec![0x5a; size];
+            std::fs::write(root.path().join("asset.bin"), &bytes).unwrap();
+            let fetched = source.fetch_paced("asset.bin", &mut |_| Ok(())).unwrap();
+            let expected = blake3::hash(&bytes).to_hex().to_string();
+            assert_eq!(fetched.content_hash(), Some(expected.as_str()));
+            assert_eq!(fetched.source_stat().unwrap().len, size as u64);
+            assert_eq!(std::fs::read(fetched.path()).unwrap(), bytes);
+            assert!(fetched.path().starts_with(scratch.path()));
+            fetched.verify_unchanged().unwrap();
+            drop(fetched);
+            assert_eq!(std::fs::read_dir(scratch.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn formats_requiring_a_physical_extension_keep_the_paced_scratch_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let source = fetched_local(root.path(), scratch.path());
+        for path in [
+            "texture.dds",
+            "texture.ktx2",
+            "texture.tga",
+            "vector.svg",
+            "mesh.gltf",
+        ] {
+            assert!(source.fetch_uses_scratch(path));
+            std::fs::write(root.path().join(path), b"fixture").unwrap();
+            let fetched = source.fetch_paced(path, &mut |_| Ok(())).unwrap();
+            assert!(fetched.path().starts_with(scratch.path()));
+            assert_eq!(fetched.path().extension(), Path::new(path).extension());
+        }
+    }
+
+    #[test]
+    fn local_hash_fetch_rejects_a_source_mutated_during_read_and_cleans_scratch() {
+        let root = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let source = fetched_local(root.path(), scratch.path());
+        let path = root.path().join("asset.bin");
+        std::fs::write(&path, vec![0x5a; FETCH_CHUNK + 17]).unwrap();
+        let mut calls = 0;
+        let outcome = source.fetch_paced("asset.bin", &mut |_| {
+            calls += 1;
+            if calls == 2 {
+                use std::io::Write;
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap()
+                    .write_all(b"source grew")
+                    .unwrap();
+            }
+            Ok(())
+        });
+        assert!(matches!(outcome, Err(LibError::SourceUnavailable(_))));
+        assert_eq!(std::fs::read_dir(scratch.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn paced_image_fetch_holds_a_proc_descriptor_without_scratch_or_a_hash_reread() {
+        let root = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let source = fetched_local(root.path(), scratch.path());
+        if source.fetch_uses_scratch("asset.png") {
+            return; // procfs may be unavailable in a restricted Linux execution environment
+        }
+        let bytes = vec![0x5a; FETCH_CHUNK * 2 + 17];
+        std::fs::write(root.path().join("asset.png"), &bytes).unwrap();
+        let mut charged = 0;
+        let fetched = source
+            .fetch_paced("asset.png", &mut |size| {
+                charged += size;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(charged, bytes.len() as u64 + 1);
+        assert_eq!(
+            fetched.content_hash(),
+            Some(blake3::hash(&bytes).to_hex().as_str())
+        );
+        assert_eq!(fetched.source_stat().unwrap().len, bytes.len() as u64);
+        assert_eq!(std::fs::read_dir(scratch.path()).unwrap().count(), 0);
+        assert_eq!(std::fs::read(fetched.path()).unwrap(), bytes);
+        let subprocess = std::process::Command::new("cat")
+            .arg(fetched.path())
+            .output()
+            .unwrap();
+        assert!(subprocess.status.success());
+        assert_eq!(
+            subprocess.stdout, bytes,
+            "subprocess opens the parent's descriptor"
+        );
+        fetched.verify_unchanged().unwrap();
+        let descriptor_path = fetched.path().to_path_buf();
+        drop(fetched);
+        assert!(
+            !descriptor_path.exists(),
+            "dropping the result closes its descriptor"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pinned_fetch_cannot_reopen_a_replacement_external_target() {
+        let root = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let source = fetched_local(root.path(), scratch.path());
+        if source.fetch_uses_scratch("asset.png") {
+            return;
+        }
+        let path = root.path().join("asset.png");
+        std::fs::write(&path, b"original asset").unwrap();
+        std::fs::write(outside.path().join("secret"), b"external secret").unwrap();
+        let fetched = source.fetch_paced("asset.png", &mut |_| Ok(())).unwrap();
+        std::fs::rename(&path, root.path().join("original.png")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret"), &path).unwrap();
+        assert_eq!(std::fs::read(fetched.path()).unwrap(), b"original asset");
+        assert_eq!(
+            fetched.content_hash(),
+            Some(blake3::hash(b"original asset").to_hex().as_str())
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pinned_fetch_revalidation_rejects_subsequent_content_writes() {
+        let root = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let source = fetched_local(root.path(), scratch.path());
+        if source.fetch_uses_scratch("asset.png") {
+            return;
+        }
+        let path = root.path().join("asset.png");
+        std::fs::write(&path, b"asset").unwrap();
+        let fetched = source.fetch_paced("asset.png", &mut |_| Ok(())).unwrap();
+        std::fs::write(&path, b"changed asset").unwrap();
+        assert!(fetched.verify_unchanged().is_err());
     }
 
     #[test]

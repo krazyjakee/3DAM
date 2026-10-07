@@ -192,12 +192,13 @@ fn tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "scan",
-            description: "Scan sources for new/changed assets. Returns a job id.",
+            description: "Scan sources for new/changed assets. Quick mode finishes discovery while verification continues; full mode verifies every file. Returns a job id.",
             write: true,
             schema: || {
                 json!({
                     "type": "object",
-                    "properties": {"sources": {"type": "array", "items": {"type": "string"}}}
+                    "properties": {"sources": {"type": "array", "items": {"type": "string"}},
+                        "mode": {"type":"string","enum":["quick","delta","full"],"default":"full"}}
                 })
             },
         },
@@ -474,7 +475,7 @@ impl McpAdapter {
                         ctx,
                         ScanRequest {
                             sources,
-                            mode: ScanMode::Full,
+                            mode: a.mode.unwrap_or_default(),
                         },
                     )
                     .await?;
@@ -625,6 +626,7 @@ struct TagArgs {
 #[derive(serde::Deserialize)]
 struct ScanArgs {
     sources: Option<Vec<String>>,
+    mode: Option<ScanMode>,
 }
 
 fn parse_args<T: serde::de::DeserializeOwned>(v: Value) -> Result<T, LibError> {

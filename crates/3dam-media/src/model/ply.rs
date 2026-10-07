@@ -2,13 +2,17 @@
 
 use dam_api::dto::ModelAttributes;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
 /// PLY carries element counts in its ASCII header (`element vertex N` / `element face N`) — cheap
 /// to read without touching the body (tech-spec 04 §7.3).
 pub(super) fn metadata(path: &Path) -> Option<ModelAttributes> {
     let f = File::open(path).ok()?;
+    from_reader(f)
+}
+
+pub(super) fn from_reader(f: impl Read) -> Option<ModelAttributes> {
     let mut reader = BufReader::new(f);
     let mut first = String::new();
     reader.read_line(&mut first).ok()?;

@@ -539,6 +539,11 @@ fn analyze_one(
     let (fetched, work) = governor
         .fetch(fs, &t.path, scratch, cancel)
         .map_err(|e| e.to_string())?;
+    if let (Some(expected), Some(actual)) = (t.content_hash, fetched.content_hash()) {
+        if expected.to_hex() != actual {
+            return Err("source bytes differ from the planned content revision".into());
+        }
+    }
     // Opaque decoders are protected by device concurrency; their entry read is budgeted before
     // execution. The fetched copy itself yields and cancels between every 256 KiB chunk.
     work.pace(
@@ -553,6 +558,7 @@ fn analyze_one(
         format: t.format.clone(),
     };
     let mut write = AnalysisWrite::new(t.id);
+    write.expected_content_hash = Some(t.content_hash);
     match t.media {
         MediaType::Image => analyze_image(&mut write, &abs)?,
         MediaType::Audio => analyze_audio(&mut write, t, &abs, &det)?,
@@ -593,6 +599,9 @@ fn analyze_one(
     // Written last by the store, after everything above (see `apply_analysis_batch`), so this asset
     // can never claim to be analysed at a version it only half reached.
     write.analysed_version = Some(PIPELINE_VERSION);
+    fetched
+        .verify_unchanged()
+        .map_err(|error| error.to_string())?;
     Ok(write)
 }
 
@@ -747,7 +756,7 @@ fn analyze_model(
     abs: &Path,
     det: &dam_media::Detected,
 ) -> Result<(), String> {
-    let MediaAttributes::Model(m) = dam_media::extract_metadata(abs, det) else {
+    let MediaAttributes::Model(m) = dam_media::extract_metadata_deep(abs, det) else {
         return Err("model metadata unavailable".into());
     };
     // Refine the scan's cheap counts with exact ones where this build can (issue #49). The cheap
@@ -759,6 +768,7 @@ fn analyze_model(
     // Fail-soft in both directions: a build without `model-convert`, or a file Assimp cannot read,
     // simply leaves the cheap answer in place. The refined attributes are written back before the
     // embedding is computed so the stored row and the vector agree.
+    w.attrs = Some(MediaAttributes::Model(m.clone()));
     let m = match dam_media::extract_model_metadata_deep(abs, &det.format) {
         Ok(exact) => {
             w.attrs = Some(MediaAttributes::Model(exact.clone()));
@@ -899,7 +909,7 @@ fn analyze_document(
     abs: &Path,
     det: &dam_media::Detected,
 ) -> Result<(), String> {
-    let MediaAttributes::Document(d) = dam_media::extract_metadata(abs, det) else {
+    let MediaAttributes::Document(d) = dam_media::extract_metadata_deep(abs, det) else {
         return Err("document metadata unavailable".into());
     };
     // Re-persist the cheap tier: word/page counts and the excerpt for a document scanned before

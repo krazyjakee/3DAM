@@ -25,7 +25,13 @@ pub(super) fn glb(path: &Path) -> Option<ModelAttributes> {
         u32::from_le_bytes([chunk_head[0], chunk_head[1], chunk_head[2], chunk_head[3]]) as usize;
     let chunk_type =
         u32::from_le_bytes([chunk_head[4], chunk_head[5], chunk_head[6], chunk_head[7]]);
-    if chunk_type != GLB_CHUNK_JSON {
+    let declared_len = u32::from_le_bytes(header[8..12].try_into().ok()?) as u64;
+    if u32::from_le_bytes(header[4..8].try_into().ok()?) != 2
+        || declared_len > f.metadata().ok()?.len()
+        || 20u64.checked_add(chunk_len as u64)? > declared_len
+        || chunk_len > 16 * 1024 * 1024
+        || chunk_type != GLB_CHUNK_JSON
+    {
         return None;
     }
     // Bound the JSON read defensively; the BIN chunk after it is deliberately never touched.
@@ -36,20 +42,26 @@ pub(super) fn glb(path: &Path) -> Option<ModelAttributes> {
 }
 
 pub(super) fn gltf(path: &Path) -> Option<ModelAttributes> {
-    let bytes = std::fs::read(path).ok()?;
+    let file = File::open(path).ok()?;
+    if file.metadata().ok()?.len() > 16 * 1024 * 1024 {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(16 * 1024 * 1024).read_to_end(&mut bytes).ok()?;
     let root: Value = serde_json::from_slice(&bytes).ok()?;
     Some(from_gltf_json(&root))
 }
 
 /// Derive counts from a parsed glTF document. Vertex/triangle totals sum per primitive from the
 /// accessor `count` fields — exact, no BIN decode (`../3d-handler-notes.md` §1).
-fn from_gltf_json(root: &Value) -> ModelAttributes {
+pub(super) fn from_gltf_json(root: &Value) -> ModelAttributes {
     let accessors = root.get("accessors").and_then(Value::as_array);
     let meshes = root.get("meshes").and_then(Value::as_array);
 
     let mut vertex_count: i64 = 0;
     let mut triangle_count: i64 = 0;
     let mut has_uvs = false;
+    let mut counts_valid = true;
 
     if let Some(meshes) = meshes {
         for mesh in meshes {
@@ -64,7 +76,10 @@ fn from_gltf_json(root: &Value) -> ModelAttributes {
                 let pos_count = pos_idx
                     .and_then(|i| accessor_count(accessors, i))
                     .unwrap_or(0);
-                vertex_count += pos_count;
+                match vertex_count.checked_add(pos_count) {
+                    Some(count) => vertex_count = count,
+                    None => counts_valid = false,
+                }
                 if attributes
                     .and_then(|a| a.get("TEXCOORD_0"))
                     .and_then(Value::as_u64)
@@ -78,7 +93,10 @@ fn from_gltf_json(root: &Value) -> ModelAttributes {
                     .and_then(Value::as_u64)
                     .and_then(|i| accessor_count(accessors, i));
                 let elems = index_count.unwrap_or(pos_count);
-                triangle_count += triangles_for(mode, elems);
+                match triangle_count.checked_add(triangles_for(mode, elems)) {
+                    Some(count) => triangle_count = count,
+                    None => counts_valid = false,
+                }
             }
         }
     }
@@ -98,8 +116,8 @@ fn from_gltf_json(root: &Value) -> ModelAttributes {
         .map(|a| !a.is_empty());
 
     ModelAttributes {
-        vertex_count: nonzero(vertex_count),
-        triangle_count: nonzero(triangle_count),
+        vertex_count: counts_valid.then(|| nonzero(vertex_count)).flatten(),
+        triangle_count: counts_valid.then(|| nonzero(triangle_count)).flatten(),
         mesh_count: count_of("meshes"),
         material_count: count_of("materials"),
         texture_count: count_of("textures").or_else(|| count_of("images")),
@@ -113,9 +131,10 @@ fn from_gltf_json(root: &Value) -> ModelAttributes {
 
 fn accessor_count(accessors: Option<&Vec<Value>>, idx: u64) -> Option<i64> {
     accessors?
-        .get(idx as usize)?
+        .get(usize::try_from(idx).ok()?)?
         .get("count")
         .and_then(Value::as_i64)
+        .filter(|count| *count >= 0)
 }
 
 /// Triangle count for a glTF primitive `mode` given the element (index/vertex) count.

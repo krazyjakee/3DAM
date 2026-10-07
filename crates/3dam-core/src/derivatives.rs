@@ -1,5 +1,9 @@
 use crate::resources::Cancellation;
-use crate::{cache, content::fetch_asset, credentials, paths, reliability};
+use crate::{
+    cache,
+    content::{ensure_fetched_revision, fetch_asset},
+    credentials, paths, reliability,
+};
 use dam_api::dto::{Asset, AssetContent, ConvertReport, JobState, MediaType};
 use dam_api::event::LibraryEvent;
 use dam_api::id::{AssetId, ContentHash, JobId};
@@ -58,15 +62,19 @@ pub(crate) fn thumbnail_cache_path(
 pub(super) fn thumb_cache_lookup(
     cache: &cache::Controller,
     data_dir: &Path,
+    store: &Store,
     asset: &Asset,
     max_edge: u32,
-) -> Option<AssetContent> {
-    cache
+) -> Result<Option<AssetContent>, LibError> {
+    store.ensure_content_ready(asset)?;
+    let hit = cache
         .read(
             &thumb_cache_path(data_dir, asset, max_edge),
             cache::Tier::Thumbnail,
         )
-        .map(png_content)
+        .map(png_content);
+    store.ensure_content_ready(asset)?;
+    Ok(hit)
 }
 
 /// Render (or read from cache) a downscaled PNG thumbnail for an asset — a raster downscale for
@@ -93,7 +101,7 @@ fn gen_thumbnail_with_io(
     max_edge: u32,
     io: Option<(&crate::resources::Governor, &dyn Cancellation)>,
 ) -> Result<AssetContent, LibError> {
-    if let Some(hit) = thumb_cache_lookup(cache, data_dir, asset, max_edge) {
+    if let Some(hit) = thumb_cache_lookup(cache, data_dir, store, asset, max_edge)? {
         return Ok(hit); // cache hit → no source access at all
     }
     let cache_path = thumb_cache_path(data_dir, asset, max_edge);
@@ -107,8 +115,10 @@ fn gen_thumbnail_with_io(
     };
     let bytes = render_thumbnail_bytes(fetched.path(), &det, max_edge)?;
     drop(work);
+    ensure_fetched_revision(store, asset, &fetched)?;
 
     publish_derivative(cache, &cache_path, &bytes, cache::Tier::Thumbnail, io);
+    store.ensure_content_ready(asset)?;
     Ok(png_content(bytes))
 }
 
@@ -208,23 +218,29 @@ fn model_preview_cache_path(data_dir: &Path, asset: &Asset) -> PathBuf {
 pub(super) fn model_preview_cache_lookup(
     cache: &cache::Controller,
     data_dir: &Path,
+    store: &Store,
     asset: &Asset,
-) -> Option<AssetContent> {
-    cache
+) -> Result<Option<AssetContent>, LibError> {
+    store.ensure_content_ready(asset)?;
+    let hit = cache
         .read(
             &model_preview_cache_path(data_dir, asset),
             cache::Tier::Preview,
         )
-        .map(preview_content)
+        .map(preview_content);
+    store.ensure_content_ready(asset)?;
+    Ok(hit)
 }
 
 #[cfg(not(feature = "render"))]
 pub(super) fn model_preview_cache_lookup(
     _cache: &cache::Controller,
     _data_dir: &Path,
-    _asset: &Asset,
-) -> Option<AssetContent> {
-    None
+    store: &Store,
+    asset: &Asset,
+) -> Result<Option<AssetContent>, LibError> {
+    store.ensure_content_ready(asset)?;
+    Ok(None)
 }
 
 /// Generate both model derivatives from one fetch + Assimp decode. Interactive requests,
@@ -252,6 +268,7 @@ fn gen_model_derivatives_with_io(
     edge: u32,
     io: Option<(&crate::resources::Governor, &dyn Cancellation)>,
 ) -> Result<ModelDerivativeContent, LibError> {
+    store.ensure_content_ready(asset)?;
     let thumbnail_path = thumb_cache_path(data_dir, asset, edge);
     let preview_path = model_preview_cache_path(data_dir, asset);
     // Background callers discard the result: even a partial cache hit only needs metadata.
@@ -270,6 +287,7 @@ fn gen_model_derivatives_with_io(
         cache.read(&preview_path, cache::Tier::Preview)
     };
     if let (Some(thumbnail), Some(preview)) = (thumbnail_hit.as_ref(), preview_hit.as_ref()) {
+        store.ensure_content_ready(asset)?;
         return Ok(ModelDerivativeContent {
             thumbnail: Some(thumbnail.clone()),
             preview: preview.clone(),
@@ -280,6 +298,7 @@ fn gen_model_derivatives_with_io(
     let derivatives = dam_render::model_derivatives(fetched.path(), &asset.summary.format, edge)
         .map_err(|error| LibError::Unsupported(error.to_string()))?;
     drop(work);
+    ensure_fetched_revision(store, asset, &fetched)?;
     if preview_hit.is_none() {
         publish_derivative(
             cache,
@@ -301,6 +320,7 @@ fn gen_model_derivatives_with_io(
             None
         }
     };
+    store.ensure_content_ready(asset)?;
     Ok(ModelDerivativeContent {
         thumbnail: thumbnail_hit.or(generated_thumbnail),
         preview: preview_hit.unwrap_or(derivatives.preview),
@@ -337,6 +357,7 @@ fn fetch_derivative<'a>(
     data_dir: &Path,
     io: Option<(&'a crate::resources::Governor, &'a dyn Cancellation)>,
 ) -> Result<(dam_sources::Fetched, Option<crate::resources::io::Work<'a>>), LibError> {
+    store.ensure_content_ready(asset)?;
     let scratch = paths::scratch_dir(data_dir);
     if let Some((governor, cancel)) = io {
         let conn = secrets.resolve(store.get_source_connection(&asset.source_id)?)?;
@@ -350,6 +371,7 @@ fn fetch_derivative<'a>(
         if cancel.cancelled() {
             return Err(LibError::Internal("background derivative deferred".into()));
         }
+        ensure_fetched_revision(store, asset, &fetched)?;
         Ok((fetched, Some(work)))
     } else {
         Ok((fetch_asset(store, secrets, asset, &scratch)?, None))
@@ -390,6 +412,7 @@ pub(super) fn warm_derivatives(
     governor: &crate::resources::Governor,
     cancel: &dyn Cancellation,
 ) -> Result<(), LibError> {
+    store.ensure_content_ready(asset)?;
     let thumbnail_ready = warm_cache_probe(
         cache,
         &thumb_cache_path(data_dir, asset, edge),
@@ -408,6 +431,7 @@ pub(super) fn warm_derivatives(
                 cancel,
             )?;
             if thumbnail_ready && preview_ready {
+                store.ensure_content_ready(asset)?;
                 return Ok(());
             }
             gen_model_derivatives_with_io(
@@ -426,6 +450,7 @@ pub(super) fn warm_derivatives(
                 &model_preview_cache_path(data_dir, asset),
                 cache::Tier::Preview,
             ) {
+                store.ensure_content_ready(asset)?;
                 return Ok(());
             }
             return Err(LibError::Internal(
@@ -438,6 +463,7 @@ pub(super) fn warm_derivatives(
         ));
     }
     if thumbnail_ready {
+        store.ensure_content_ready(asset)?;
         return Ok(());
     }
     gen_thumbnail_with_io(
@@ -453,7 +479,7 @@ pub(super) fn warm_derivatives(
         &thumb_cache_path(data_dir, asset, edge),
         cache::Tier::Thumbnail,
     ) {
-        Ok(())
+        store.ensure_content_ready(asset)
     } else {
         Err(LibError::Internal(
             "thumbnail deferred until cache publication succeeds".into(),
@@ -549,6 +575,78 @@ pub(super) fn convert_summary(report: &ConvertReport, state: JobState) -> String
 #[cfg(test)]
 mod priority_tests {
     use super::*;
+
+    #[test]
+    fn an_old_cached_thumbnail_cannot_bypass_pending_revision_guards() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let source = store
+            .add_source(
+                &dam_sources::SourceConnection::LocalFs {
+                    root: "/pending-cache".into(),
+                },
+                "test",
+                false,
+            )
+            .unwrap();
+        let (id, _) = store
+            .upsert_asset(&dam_store::NewAsset {
+                source_id: source,
+                path: "asset.png".into(),
+                filename: "asset.png".into(),
+                content_hash: Some(ContentHash([1; 32])),
+                size_bytes: Some(1),
+                source_modified_at: Some(1),
+                scanned_at: 1,
+                media_type: MediaType::Image,
+                format: "png".into(),
+            })
+            .unwrap();
+        let asset = store.get_asset(&id).unwrap();
+        let cache = cache::Controller::new(
+            data.path(),
+            cache::CacheOptions {
+                local_bytes: Some(1024),
+                peer_bytes: Some(1024),
+            },
+        );
+        cache.publish(
+            &thumb_cache_path(data.path(), &asset, 128),
+            b"old thumbnail",
+            cache::Tier::Thumbnail,
+        );
+        assert!(thumb_cache_lookup(&cache, data.path(), &store, &asset, 128)
+            .unwrap()
+            .is_some());
+        let generation = store.begin_source_scan(&source).unwrap();
+        store
+            .apply_quick_discovery(
+                &source,
+                generation,
+                &[dam_store::PendingDiscovery {
+                    path: "asset.png".into(),
+                    size: 2,
+                    modified_ms: Some(2),
+                    media: Some(MediaType::Image),
+                    format: Some("png".into()),
+                }],
+            )
+            .unwrap();
+        assert!(matches!(
+            thumb_cache_lookup(&cache, data.path(), &store, &asset, 128),
+            Err(LibError::Conflict(_))
+        ));
+        let pending = store.get_asset(&id).unwrap();
+        cache.publish(
+            &thumb_cache_path(data.path(), &pending, 128),
+            b"old id fallback",
+            cache::Tier::Thumbnail,
+        );
+        assert!(matches!(
+            thumb_cache_lookup(&cache, data.path(), &store, &pending, 128),
+            Err(LibError::Conflict(_))
+        ));
+    }
 
     struct ForegroundClaim;
     impl Cancellation for ForegroundClaim {

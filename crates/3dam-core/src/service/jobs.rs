@@ -169,6 +169,36 @@ impl EmbeddedLibrary {
         ctx: &AuthContext,
         req: ScanRequest,
     ) -> Result<JobId, LibError> {
+        self.submit_scan_inner(ctx, req, None).await
+    }
+
+    /// Optional writer-only SQL metrics for the manual single-catalog harness.
+    #[doc(hidden)]
+    pub fn enable_scan_sql_metrics(&self) {
+        self.store.enable_scan_sql_metrics();
+    }
+    #[doc(hidden)]
+    pub fn scan_sql_metrics(&self) -> dam_store::ScanSqlMetrics {
+        self.store.scan_sql_metrics()
+    }
+
+    /// Exercise the production scan with a measured backend (manual performance harness).
+    #[doc(hidden)]
+    pub async fn submit_scan_with_source(
+        &self,
+        ctx: &AuthContext,
+        req: ScanRequest,
+        source: Arc<dyn dam_sources::FileSource>,
+    ) -> Result<JobId, LibError> {
+        self.submit_scan_inner(ctx, req, Some(source)).await
+    }
+
+    async fn submit_scan_inner(
+        &self,
+        ctx: &AuthContext,
+        req: ScanRequest,
+        source_override: Option<Arc<dyn dam_sources::FileSource>>,
+    ) -> Result<JobId, LibError> {
         Self::require_full_visibility(ctx, "scanning")?;
         // Resolve target sources (all file sources when none specified; federated peers excluded).
         let all = self.db(|s| s.list_sources()).await?;
@@ -187,10 +217,23 @@ impl EmbeddedLibrary {
             ));
         }
 
+        if source_override.is_some() && sources.len() != 1 {
+            return Err(LibError::BadRequest(
+                "measured scans require exactly one source".into(),
+            ));
+        }
         let mode = req.mode;
         let params = serde_json::to_string(&req).unwrap_or_else(|_| "{}".into());
         // The resolved source set *is* the job's attribution (issue #42).
         let touched: Vec<SourceId> = sources.iter().map(|s| s.id).collect();
+        let sources = if mode == ScanMode::Quick && source_override.is_none() {
+            sources
+                .into_iter()
+                .filter(|source| !self.watchers.trusted_clean(source.id))
+                .collect()
+        } else {
+            sources
+        };
         let job = self
             .db(move |s| s.create_job(JobKind::Scan, &params, None, &touched))
             .await?;
@@ -203,12 +246,50 @@ impl EmbeddedLibrary {
         let events = self.events.clone();
         let governor = self.governor.clone();
         let scratch = self.scratch();
+        let coordinator = self.scan_coordinator.clone();
         tokio::task::spawn_blocking(move || {
-            if let Err(error) = scan::run_scan(
-                store, secrets, events, job, sources, mode, cancel, &governor, &scratch,
-            ) {
+            let outcome = if mode == ScanMode::Quick {
+                quick_scan::run_quick_scan(
+                    store.clone(),
+                    secrets,
+                    events.clone(),
+                    job,
+                    sources,
+                    cancel,
+                    &governor,
+                    &scratch,
+                    &coordinator,
+                    true,
+                    &[],
+                    source_override,
+                )
+            } else {
+                scan::run_scan(
+                    store.clone(),
+                    secrets,
+                    events.clone(),
+                    job,
+                    sources,
+                    mode,
+                    cancel,
+                    &governor,
+                    &scratch,
+                    &coordinator,
+                    true,
+                    &[],
+                    source_override,
+                )
+            };
+            if let Err(error) = outcome {
                 reliability::background_job_failed(&job, "run scan", &error);
+                reliability::required_background_write(
+                    store.set_job_state(&job, JobState::Failed, Some(&error.to_string())),
+                    "persist scan failure",
+                    &job,
+                );
+                emit_progress(&store, &events, &job);
             }
+            coordinator.cancels.lock().unwrap().remove(&job);
         });
 
         Ok(job)

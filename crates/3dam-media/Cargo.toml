@@ -31,6 +31,9 @@ zip.workspace = true
 quick-xml.workspace = true
 encoding_rs.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 base64.workspace = true
 tempfile.workspace = true

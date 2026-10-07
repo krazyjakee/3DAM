@@ -101,6 +101,7 @@ pub async fn serve(cfg: ServeConfig) -> anyhow::Result<()> {
         background_threads: file.resources.background_threads,
         min_free_memory_mb: file.resources.min_free_memory_mb,
         max_io_stall_pct: file.resources.max_io_stall_pct,
+        ..dam_core::ResourceOptions::default()
     };
     let cache_options = dam_core::CacheOptions::from_mebibytes(
         file.resources.derivative_cache_mb,

@@ -34,6 +34,9 @@ pub struct SftpSource {
     cfg: SftpConfig,
     rt: Runtime,
     session: Mutex<russh_sftp::client::SftpSession>,
+    /// Raw listing protocol uses one server page at a time; high-level read_dir collects all
+    /// pages. Reuse a second subsystem on the same authenticated SSH connection.
+    listing_session: Mutex<russh_sftp::client::RawSftpSession>,
     /// Where downloads are materialised (issue #87) — under the data dir, not the OS temp dir.
     scratch: std::path::PathBuf,
     /// Keeps the SSH connection alive for as long as the source exists.
@@ -46,11 +49,12 @@ impl SftpSource {
             .enable_all()
             .build()
             .map_err(|e| LibError::Internal(format!("sftp runtime: {e}")))?;
-        let (handle, session) = rt.block_on(connect_inner(&cfg))?;
+        let (handle, session, listing_session) = rt.block_on(connect_inner(&cfg))?;
         Ok(SftpSource {
             cfg,
             rt,
             session: Mutex::new(session),
+            listing_session: Mutex::new(listing_session),
             scratch,
             _handle: Mutex::new(handle),
         })
@@ -68,6 +72,7 @@ async fn connect_inner(
     (
         russh::client::Handle<Client>,
         russh_sftp::client::SftpSession,
+        russh_sftp::client::RawSftpSession,
     ),
     LibError,
 > {
@@ -112,7 +117,20 @@ async fn connect_inner(
     let session = russh_sftp::client::SftpSession::new(channel.into_stream())
         .await
         .map_err(|e| LibError::SourceUnavailable(format!("sftp session: {e}")))?;
-    Ok((handle, session))
+    let channel = handle
+        .channel_open_session()
+        .await
+        .map_err(|e| LibError::SourceUnavailable(format!("sftp listing channel: {e}")))?;
+    channel
+        .request_subsystem(true, "sftp")
+        .await
+        .map_err(|e| LibError::SourceUnavailable(format!("sftp listing subsystem: {e}")))?;
+    let listing_session = russh_sftp::client::RawSftpSession::new(channel.into_stream());
+    listing_session
+        .init()
+        .await
+        .map_err(|e| LibError::SourceUnavailable(format!("sftp listing session: {e}")))?;
+    Ok((handle, session, listing_session))
 }
 
 impl FileSource for SftpSource {
@@ -120,49 +138,86 @@ impl FileSource for SftpSource {
         &self,
         sink: &mut dyn FnMut(Result<FileEntry, LibError>) -> bool,
     ) -> Result<(), LibError> {
+        self.walk_filtered(&mut |_| Ok(true), &mut || Ok(()), sink)
+    }
+
+    fn walk_filtered(
+        &self,
+        eligible: &mut dyn FnMut(&str) -> Result<bool, LibError>,
+        pace: &mut dyn FnMut() -> Result<(), LibError>,
+        sink: &mut dyn FnMut(Result<FileEntry, LibError>) -> bool,
+    ) -> Result<(), LibError> {
+        use russh_sftp::client::error::Error;
+        use russh_sftp::protocol::StatusCode;
+
         // Iterative DFS over remote directories (out-of-core; no full tree in RAM at once).
         let mut stack: Vec<String> = vec![String::new()];
         while let Some(rel_dir) = stack.pop() {
             let abs_dir = self.remote_path(&rel_dir);
-            let listing = self.rt.block_on(async {
-                let session = self.session.lock().await;
-                session
-                    .read_dir(abs_dir.clone())
-                    .await
-                    .map_err(|e| LibError::SourceUnavailable(format!("read_dir {abs_dir}: {e}")))
-            });
-            let listing = match listing {
-                Ok(l) => l,
-                Err(e) => {
-                    if !sink(Err(e)) {
-                        return Ok(());
+            let keep_going = self.rt.block_on(async {
+                let session = self.listing_session.lock().await;
+                pace()?;
+                let handle = match session.opendir(abs_dir.clone()).await {
+                    Ok(handle) => handle.handle,
+                    Err(error) => {
+                        return Ok(sink(Err(LibError::SourceUnavailable(format!(
+                            "sftp open directory {abs_dir}: {error}"
+                        )))));
                     }
-                    continue;
-                }
-            };
-            for entry in listing {
-                let name = entry.file_name();
-                if name == "." || name == ".." {
-                    continue;
-                }
-                let meta = entry.metadata();
-                let child_rel = if rel_dir.is_empty() {
-                    name.clone()
-                } else {
-                    format!("{rel_dir}/{name}")
                 };
-                if meta.is_dir() {
-                    stack.push(child_rel);
-                    continue;
+                // Keep cleanup outside the fallible loop: pace, predicate, server errors and
+                // sink cancellation all close the directory before returning to the caller.
+                let outcome: Result<bool, LibError> = async {
+                    loop {
+                        pace()?;
+                        let page = match session.readdir(handle.as_str()).await {
+                            Ok(page) => page,
+                            Err(Error::Status(status)) if status.status_code == StatusCode::Eof => {
+                                return Ok(true)
+                            }
+                            Err(error) => {
+                                return Ok(sink(Err(LibError::SourceUnavailable(format!(
+                                    "sftp read directory {abs_dir}: {error}"
+                                )))));
+                            }
+                        };
+                        for entry in page.files {
+                            pace()?;
+                            let name = entry.filename;
+                            if name == "." || name == ".." {
+                                continue;
+                            }
+                            let child_rel = if rel_dir.is_empty() {
+                                name
+                            } else {
+                                format!("{rel_dir}/{name}")
+                            };
+                            if entry.attrs.is_dir() {
+                                stack.push(child_rel);
+                            } else if eligible(&child_rel)?
+                                && !sink(Ok(FileEntry {
+                                    rel_path: child_rel,
+                                    size: entry.attrs.size.unwrap_or(0),
+                                    modified_ms: entry.attrs.mtime.map(|s| s as i64 * 1000),
+                                }))
+                            {
+                                return Ok(false);
+                            }
+                        }
+                    }
                 }
-                let fe = FileEntry {
-                    rel_path: child_rel,
-                    size: meta.size.unwrap_or(0),
-                    modified_ms: meta.mtime.map(|s| s as i64 * 1000),
-                };
-                if !sink(Ok(fe)) {
-                    return Ok(());
+                .await;
+                let closed = session.close(handle).await;
+                let keep_going = outcome?;
+                if let Err(error) = closed {
+                    return Err(LibError::SourceUnavailable(format!(
+                        "sftp close directory {abs_dir}: {error}"
+                    )));
                 }
+                Ok::<bool, LibError>(keep_going)
+            })?;
+            if !keep_going {
+                return Ok(());
             }
         }
         Ok(())
@@ -186,32 +241,63 @@ impl FileSource for SftpSource {
         let rel_path = guard_rel_path(rel_path)?;
         let abs = self.remote_path(&rel_path);
         let mut sink = crate::temp_sink(&rel_path, &self.scratch)?;
-        self.rt.block_on(async {
-            use tokio::io::AsyncReadExt;
+        let (content_hash, source_stat) = self.rt.block_on(async {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let session = self.session.lock().await;
             let mut remote = session
                 .open(abs.clone())
                 .await
                 .map_err(|e| LibError::SourceUnavailable(format!("open {abs}: {e}")))?;
-            let mut buf = vec![0u8; crate::FETCH_CHUNK];
-            loop {
-                pace(crate::FETCH_CHUNK as u64)?;
-                let n = remote
-                    .read(&mut buf)
-                    .await
-                    .map_err(|e| LibError::SourceUnavailable(format!("read {abs}: {e}")))?;
-                if n == 0 {
-                    break;
+            let outcome = async {
+                let before = remote.metadata().await.map_err(|e| {
+                    LibError::SourceUnavailable(format!("sftp fetch stat {abs}: {e}"))
+                })?;
+                let mut hasher = blake3::Hasher::new();
+                let mut copied = 0u64;
+                let mut buf = vec![0u8; crate::FETCH_CHUNK];
+                loop {
+                    pace(crate::FETCH_CHUNK as u64)?;
+                    let n = remote
+                        .read(&mut buf)
+                        .await
+                        .map_err(|e| LibError::SourceUnavailable(format!("read {abs}: {e}")))?;
+                    if n == 0 {
+                        break;
+                    }
+                    // This private current-thread runtime already runs on spawn_blocking.
+                    std::io::Write::write_all(&mut sink, &buf[..n])
+                        .map_err(|e| LibError::Internal(format!("scratch write: {e}")))?;
+                    hasher.update(&buf[..n]);
+                    copied = copied.saturating_add(n as u64);
                 }
-                // A blocking write inside `block_on` is fine here: this runtime is current-thread
-                // and private to the source, and the caller already handed off via `spawn_blocking`.
-                std::io::Write::write_all(&mut sink, &buf[..n])
-                    .map_err(|e| LibError::Internal(format!("scratch write: {e}")))?;
+                let after = remote.metadata().await.map_err(|e| {
+                    LibError::SourceUnavailable(format!("sftp fetch stat {abs}: {e}"))
+                })?;
+                if copied != after.len()
+                    || before.len() != after.len()
+                    || before.modified().ok() != after.modified().ok()
+                {
+                    return Err(crate::source_changed());
+                }
+                Ok::<_, LibError>((
+                    hasher.finalize().to_hex().to_string(),
+                    ContentStat {
+                        len: after.len(),
+                        modified_ms: after.modified().ok().and_then(crate::system_time_ms),
+                    },
+                ))
             }
-            Ok::<(), LibError>(())
+            .await;
+            let closed = remote.shutdown().await;
+            let fetched = outcome?;
+            closed.map_err(|e| LibError::SourceUnavailable(format!("sftp close {abs}: {e}")))?;
+            Ok::<_, LibError>(fetched)
         })?;
-        std::io::Write::flush(&mut sink).ok();
-        Ok(Fetched::Temp(sink))
+        Ok(Fetched::HashedTemp {
+            file: sink,
+            content_hash,
+            source_stat: Some(source_stat),
+        })
     }
 
     fn content_stat(&self, rel_path: &str) -> Result<ContentStat, LibError> {

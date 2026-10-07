@@ -779,7 +779,7 @@ export interface BlockEntry {
 
 // ── jobs ───────────────────────────────────────────────────────────────────
 
-export type ScanMode = "full" | "delta";
+export type ScanMode = "full" | "delta" | "quick";
 export interface ScanRequest {
   sources?: SourceId[];
   mode?: ScanMode;
@@ -798,7 +798,7 @@ export interface ThumbnailRegenReport {
   assets: number;
   files_deleted: number;
 }
-export type JobKind = "scan" | "analyze" | "convert" | "export";
+export type JobKind = "scan" | "enrich" | "analyze" | "convert" | "export";
 export type JobState =
   | "queued"
   | "running"

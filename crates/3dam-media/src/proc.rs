@@ -91,6 +91,17 @@ impl Tool {
             .as_deref()
     }
 
+    #[cfg(test)]
+    pub(crate) fn at_path(path: PathBuf) -> Self {
+        let cell = OnceLock::new();
+        let _ = cell.set(Some(path));
+        Self {
+            bin: "fake ffprobe",
+            env_override: "unused",
+            cell,
+        }
+    }
+
     pub fn available(&self) -> bool {
         self.path().is_some()
     }
@@ -102,6 +113,23 @@ impl Tool {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
+        self.run_cancellable(args, TOOL_TIMEOUT, MAX_STDOUT, &|| false)
+    }
+
+    pub(crate) fn run_cancellable<I, S>(
+        &self,
+        args: I,
+        timeout: Duration,
+        max_stdout: u64,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Option<Vec<u8>>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        if cancelled() || timeout.is_zero() {
+            return None;
+        }
         let exe = self.path()?;
         let mut cmd = Command::new(exe);
         cmd.args(args)
@@ -109,7 +137,7 @@ impl Tool {
             .stdout(Stdio::piped())
             // stderr is where ffmpeg narrates; we don't parse it and don't want it on our console.
             .stderr(Stdio::null());
-        run_bounded(cmd, TOOL_TIMEOUT, MAX_STDOUT, self.bin)
+        run_bounded(cmd, timeout, max_stdout, self.bin, cancelled)
     }
 }
 
@@ -119,53 +147,167 @@ fn run_bounded(
     timeout: Duration,
     max_stdout: u64,
     label: &str,
+    cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Option<Vec<u8>> {
+    if cancelled() || timeout.is_zero() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Wrappers may launch descendants which inherit the stdout pipe. Killing
+        // only the wrapper would leave the reader blocked on that inherited fd.
+        cmd.process_group(0);
+    }
     let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!("failed to spawn {label}: {e}");
+        Ok(child) => child,
+        Err(error) => {
+            tracing::warn!("failed to spawn {label}: {error}");
             return None;
         }
     };
-    // Take the pipe out before sharing the child, so reading never contends with the watchdog's
-    // lock — otherwise the killer could block behind a read that only a kill would unblock.
     let stdout = child.stdout.take()?;
     let child = Arc::new(Mutex::new(child));
-    let finished = Arc::new(AtomicBool::new(false));
-
-    let watchdog = {
-        let child = Arc::clone(&child);
-        let finished = Arc::clone(&finished);
-        let label = label.to_string();
-        std::thread::spawn(move || {
+    let finished = AtomicBool::new(false);
+    let aborted = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let watchdog = scope.spawn(|| {
             let deadline = Instant::now() + timeout;
-            while Instant::now() < deadline {
-                if finished.load(Ordering::Relaxed) {
+            loop {
+                if finished.load(Ordering::Acquire) {
                     return;
                 }
-                std::thread::sleep(Duration::from_millis(25));
+                if cancelled() || Instant::now() >= deadline {
+                    if let Ok(mut child) = child.lock() {
+                        if finished.load(Ordering::Acquire) {
+                            return;
+                        }
+                        aborted.store(true, Ordering::Release);
+                        terminate(&mut child);
+                    }
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
             }
-            if !finished.load(Ordering::Relaxed) {
-                tracing::warn!("{label} exceeded {timeout:?}; killing it");
-                if let Ok(mut c) = child.lock() {
-                    let _ = c.kill();
+        });
+        // One extra byte distinguishes a complete response from truncated JSON.
+        let mut bytes = Vec::new();
+        let read = stdout
+            .take(max_stdout.saturating_add(1))
+            .read_to_end(&mut bytes);
+        if bytes.len() as u64 > max_stdout || read.is_err() {
+            aborted.store(true, Ordering::Release);
+            if let Ok(mut child) = child.lock() {
+                terminate(&mut child);
+            }
+        }
+        // Keep the watchdog armed while the process finishes even if stdout closed.
+        // Waiting under the mutex would prevent the watchdog from killing it.
+        let status = loop {
+            let status = child.lock().ok().and_then(|mut child| {
+                let status = child.try_wait().ok();
+                if matches!(status, Some(Some(_))) {
+                    // Publish completion before releasing the process lock, so
+                    // the watchdog cannot signal a group after its leader was
+                    // reaped and the pid became eligible for reuse.
+                    finished.store(true, Ordering::Release);
+                }
+                status
+            });
+            match status {
+                Some(Some(status)) => break Some(status),
+                Some(None) => std::thread::sleep(Duration::from_millis(10)),
+                None => {
+                    if let Ok(mut child) = child.lock() {
+                        terminate(&mut child);
+                        let _ = child.wait();
+                    }
+                    break None;
                 }
             }
-        })
-    };
+        };
+        finished.store(true, Ordering::Release);
+        let _ = watchdog.join();
+        if aborted.load(Ordering::Acquire) || cancelled() {
+            return None;
+        }
+        status.filter(|status| status.success()).map(|_| bytes)
+    })
+}
 
-    let mut buf = Vec::new();
-    let read = stdout.take(max_stdout).read_to_end(&mut buf);
-    finished.store(true, Ordering::Relaxed);
-
-    let status = child.lock().ok().and_then(|mut c| c.wait().ok());
-    let _ = watchdog.join();
-
-    if read.is_err() {
-        return None;
+fn terminate(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        // SAFETY: run_bounded created a dedicated process group whose leader is
+        // this still-owned, unreaped child. A negative pid targets that group.
+        unsafe {
+            libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+        }
     }
-    match status {
-        Some(s) if s.success() => Some(buf),
-        _ => None,
+    let _ = child.kill();
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn shell_tool(dir: &Path, body: &str) -> Tool {
+        let path = dir.join("probe.sh");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        Tool::at_path(path)
+    }
+
+    #[test]
+    fn timeout_kills_descendants_holding_inherited_stdout() {
+        let dir = tempfile::tempdir().unwrap();
+        // The wrapper exits immediately; its child alone keeps stdout open.
+        let tool = shell_tool(dir.path(), "sleep 3 &\nprintf '{}'\nexit 0");
+        let start = Instant::now();
+        let output = tool.run_cancellable(
+            std::iter::empty::<&str>(),
+            Duration::from_millis(100),
+            4096,
+            &|| false,
+        );
+        assert!(output.is_none());
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "inherited stdout outlived the watchdog"
+        );
+    }
+
+    #[test]
+    fn cancellation_kills_descendants_holding_inherited_stdout() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = shell_tool(dir.path(), "sleep 3 &\nprintf '{}'\nwait");
+        let start = Instant::now();
+        let output = tool.run_cancellable(
+            std::iter::empty::<&str>(),
+            Duration::from_secs(10),
+            4096,
+            &|| start.elapsed() >= Duration::from_millis(100),
+        );
+        assert!(output.is_none());
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "cancellation left inherited stdout open"
+        );
+    }
+
+    #[test]
+    fn normal_short_tool_still_returns_complete_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = shell_tool(dir.path(), "printf '{\"streams\":[]}'");
+        assert_eq!(
+            tool.run_cancellable(
+                std::iter::empty::<&str>(),
+                Duration::from_secs(2),
+                4096,
+                &|| false,
+            ),
+            Some(br#"{"streams":[]}"#.to_vec())
+        );
     }
 }

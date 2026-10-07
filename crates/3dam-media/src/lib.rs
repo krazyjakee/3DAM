@@ -12,6 +12,7 @@ mod audio_features;
 mod document;
 mod features;
 mod image;
+mod ingest;
 mod mel;
 mod model;
 mod proc;
@@ -27,8 +28,10 @@ pub use audio_features::{
 };
 pub use document::{text_descriptor, MAX_TEXT_BYTES, TEXT_DIM};
 pub use features::{extract_image_features, l2_normalise, ImageFeatures};
+pub use ingest::{extract_ingest_metadata, IngestMetadata, MetadataBudget};
 pub use mel::{log_mel, mel_from_samples, MelConfig, MelSpectrogram};
 pub use video::probe_available as video_probe_available;
+pub use video::VideoProbe;
 
 use dam_api::dto::{MediaAttributes, MediaType};
 use std::path::Path;
@@ -325,6 +328,18 @@ pub fn refine_with_content(det: &Detected, abs: &Path) -> Option<Detected> {
 /// asset at ingest. Best-effort and fail-soft: a partial or empty struct is returned on fault,
 /// never an error that would sink the scan.
 pub fn extract_metadata(path: &Path, det: &Detected) -> MediaAttributes {
+    extract_ingest_metadata(path, det, &MetadataBudget::default()).attributes
+}
+
+/// Deferred metadata extraction for the analysis lane. Never call during ingest.
+pub fn extract_metadata_deep(path: &Path, det: &Detected) -> MediaAttributes {
+    match det.media {
+        MediaType::Document => {
+            return MediaAttributes::Document(document::metadata(path, &det.format))
+        }
+        MediaType::Model => return MediaAttributes::Model(model::metadata(path, &det.format)),
+        _ => {}
+    }
     HandlerRegistry::builtin()
         .for_media(det.media)
         .expect("every MediaType has a built-in handler")

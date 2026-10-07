@@ -13,7 +13,7 @@
 //! Playback never comes through here: the browser plays the original bytes via `<video>` off the
 //! asset-content route, so we decode exactly one frame, exactly once, for the grid tile.
 
-use dam_api::dto::{MediaAttributes, MediaType, VideoAttributes};
+use dam_api::dto::{AudioAttributes, MediaAttributes, MediaType, VideoAttributes};
 use serde_json::Value;
 use std::path::Path;
 
@@ -141,29 +141,120 @@ fn parse_rational(s: &str) -> Option<f32> {
 /// A cover-art JPEG inside an audio file appears as a video stream, so an image-ish codec carrying
 /// a single frame is not counted as video.
 pub fn has_video_stream(path: &Path) -> Option<bool> {
-    let v = probe(path)?;
-    let Some(s) = stream_of(&v, "video") else {
-        return Some(false);
-    };
-    let codec = s.get("codec_name").and_then(|c| c.as_str()).unwrap_or("");
-    if matches!(codec, "mjpeg" | "png" | "bmp" | "gif" | "webp") {
-        // Attached-picture disposition is ffprobe's explicit "this is cover art" marker.
-        let cover = s
-            .get("disposition")
-            .and_then(|d| d.get("attached_pic"))
-            .and_then(|a| a.as_i64())
-            .unwrap_or(0);
-        // `nb_frames` is absent for fragmented/streamed containers, and "unknown" is not "one":
-        // defaulting it to zero would demote a real MJPEG track to audio. Only an explicitly
-        // single-frame (or empty) track is cover art. The disposition check above doesn't cover
-        // this on its own — art muxed with `-disposition:v 0` reports `nb_frames="1"` and
-        // `attached_pic=0` — so the frame count is still load-bearing, just no longer guessed.
-        let frames = as_i64(s.get("nb_frames"));
-        if cover == 1 || matches!(frames, Some(n) if n <= 1) {
-            return Some(false);
-        }
+    Some(VideoProbe::probe(path, &crate::MetadataBudget::default())?.has_video_stream())
+}
+
+fn is_real_video(stream: &Value) -> bool {
+    if stream.get("codec_type").and_then(Value::as_str) != Some("video") {
+        return false;
     }
-    Some(true)
+    if stream
+        .get("disposition")
+        .and_then(|d| d.get("attached_pic"))
+        .and_then(Value::as_i64)
+        == Some(1)
+    {
+        return false;
+    }
+    let codec = stream
+        .get("codec_name")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    !(matches!(codec, "mjpeg" | "png" | "bmp" | "gif" | "webp")
+        && matches!(as_i64(stream.get("nb_frames")), Some(n) if n <= 1))
+}
+
+/// One parsed ffprobe response, reusable for classification and stream attributes.
+#[derive(Clone, Debug)]
+pub struct VideoProbe {
+    document: Value,
+}
+
+impl VideoProbe {
+    /// Probe once under a metadata budget, then reuse this value's classification
+    /// and audio/video attributes. The combined ingest API also exposes I/O stats.
+    pub fn probe(path: &Path, budget: &crate::MetadataBudget<'_>) -> Option<Self> {
+        let mut session = crate::ingest::Session::new(budget);
+        Self::ingest(path, &mut session).0
+    }
+
+    pub fn has_video_stream(&self) -> bool {
+        streams(&self.document).iter().any(is_real_video)
+    }
+
+    pub fn video_attributes(&self) -> VideoAttributes {
+        metadata_from_probe(&self.document)
+    }
+
+    pub fn audio_attributes(&self) -> AudioAttributes {
+        let mut attrs = AudioAttributes::default();
+        let format = self.document.get("format");
+        attrs.duration_ms =
+            as_f64(format.and_then(|f| f.get("duration"))).map(|s| (s * 1000.0).round() as i64);
+        attrs.container = format
+            .and_then(|f| f.get("format_name"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if let Some(stream) = stream_of(&self.document, "audio") {
+            attrs.sample_rate = as_i64(stream.get("sample_rate"));
+            attrs.channels = as_i64(stream.get("channels"));
+            attrs.bit_depth = as_i64(stream.get("bits_per_raw_sample"))
+                .filter(|n| *n > 0)
+                .or_else(|| as_i64(stream.get("bits_per_sample")).filter(|n| *n > 0));
+            attrs.codec = stream
+                .get("codec_name")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if attrs.duration_ms.is_none() {
+                attrs.duration_ms =
+                    as_f64(stream.get("duration")).map(|s| (s * 1000.0).round() as i64);
+            }
+        }
+        attrs
+    }
+
+    pub(crate) fn ingest(
+        path: &Path,
+        session: &mut crate::ingest::Session<'_, '_>,
+    ) -> (Option<Self>, u32) {
+        Self::ingest_with_tool(path, session, &FFPROBE)
+    }
+
+    fn ingest_with_tool(
+        path: &Path,
+        session: &mut crate::ingest::Session<'_, '_>,
+        tool: &Tool,
+    ) -> (Option<Self>, u32) {
+        if !tool.available() || !session.active() || session.budget.max_bytes < 32 {
+            return (None, 0);
+        }
+        let limit = session.remaining();
+        // Reserve demuxer probe work in the same device pacing lane. The number is
+        // a requested demuxer limit, never a measured physical read total.
+        if limit < 32 || !(session.budget.before_read)(limit) || !session.active() {
+            return (None, 0);
+        }
+        let args: [std::ffi::OsString; 11] = [
+            "-v".into(), "error".into(), "-print_format".into(), "json".into(),
+            "-probesize".into(), limit.to_string().into(),
+            "-analyzeduration".into(), session.remaining_time().as_micros().to_string().into(),
+            "-show_entries".into(),
+            "format=duration,bit_rate,format_name:stream=codec_type,codec_name,width,height,avg_frame_rate,r_frame_rate,duration,nb_frames,sample_rate,channels,bits_per_sample,bits_per_raw_sample:stream_disposition=attached_pic".into(),
+            path.as_os_str().to_os_string(),
+        ];
+        let output = tool.run_cancellable(
+            args,
+            session.remaining_time(),
+            limit.min(256 * 1024) as u64,
+            session.budget.cancelled,
+        );
+        (
+            output
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                .map(|document| Self { document }),
+            1,
+        )
+    }
 }
 
 /// CHEAP tier: container/stream headers only, via one `ffprobe` invocation.
@@ -171,10 +262,13 @@ pub fn has_video_stream(path: &Path) -> Option<bool> {
 /// Returns a default (all-`None`) struct when ffprobe is absent. That is the designed floor, not a
 /// failure: the asset is still catalogued, searchable by name, and playable.
 pub fn metadata(path: &Path, _format: &str) -> VideoAttributes {
+    probe(path)
+        .map(|value| metadata_from_probe(&value))
+        .unwrap_or_default()
+}
+
+fn metadata_from_probe(v: &Value) -> VideoAttributes {
     let mut attrs = VideoAttributes::default();
-    let Some(v) = probe(path) else {
-        return attrs;
-    };
 
     if let Some(fmt) = v.get("format") {
         // Duration lives on the container; fall back to the video stream for formats (some MKV,
@@ -187,7 +281,7 @@ pub fn metadata(path: &Path, _format: &str) -> VideoAttributes {
             .map(str::to_string);
     }
 
-    if let Some(s) = stream_of(&v, "video") {
+    if let Some(s) = streams(v).iter().find(|stream| is_real_video(stream)) {
         attrs.width = as_i64(s.get("width"));
         attrs.height = as_i64(s.get("height"));
         attrs.codec = s
@@ -210,7 +304,7 @@ pub fn metadata(path: &Path, _format: &str) -> VideoAttributes {
         }
     }
 
-    attrs.has_audio = Some(stream_of(&v, "audio").is_some());
+    attrs.has_audio = Some(stream_of(v, "audio").is_some());
     attrs
 }
 
@@ -311,5 +405,129 @@ mod tests {
         // Whatever the environment, a non-video file must yield a default struct and never panic.
         let attrs = metadata(Path::new("/nonexistent/nope.mp4"), "mp4");
         assert!(attrs.width.is_none() && attrs.duration_ms.is_none());
+    }
+    #[test]
+    fn classification_ignores_cover_art_but_keeps_real_mjpeg_and_later_video() {
+        for (streams, expected) in [
+            (serde_json::json!([{"codec_type":"audio"}]), false),
+            (
+                serde_json::json!([{"codec_type":"video","codec_name":"mjpeg","nb_frames":"1"}]),
+                false,
+            ),
+            (
+                serde_json::json!([{"codec_type":"video","codec_name":"mjpeg","disposition":{"attached_pic":1}}]),
+                false,
+            ),
+            (
+                serde_json::json!([{"codec_type":"video","codec_name":"mjpeg"}]),
+                true,
+            ),
+            (
+                serde_json::json!([{"codec_type":"video","codec_name":"mjpeg","nb_frames":"100"}]),
+                true,
+            ),
+            (
+                serde_json::json!([{"codec_type":"video","codec_name":"mjpeg","nb_frames":"1"},{"codec_type":"video","codec_name":"h264","width":1920}]),
+                true,
+            ),
+        ] {
+            let probe = VideoProbe {
+                document: serde_json::json!({"streams":streams}),
+            };
+            assert_eq!(probe.has_video_stream(), expected);
+        }
+    }
+
+    #[cfg(unix)]
+    fn fake_tool(dir: &Path, body: &str) -> Tool {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("ffprobe");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        Tool::at_path(path)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn one_probe_supplies_classification_and_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let count = dir.path().join("calls");
+        let tool = fake_tool(dir.path(), &format!(
+            "echo call >> '{}'\nprintf '%s' '{{\"streams\":[{{\"codec_type\":\"video\",\"codec_name\":\"h264\",\"width\":1920,\"height\":1080,\"avg_frame_rate\":\"30/1\"}},{{\"codec_type\":\"audio\",\"sample_rate\":\"48000\",\"channels\":2}}],\"format\":{{\"duration\":\"2.5\"}}}}'", count.display()
+        ));
+        let budget = crate::MetadataBudget::default();
+        let mut session = crate::ingest::Session::new(&budget);
+        let (probe, invocations) =
+            VideoProbe::ingest_with_tool(Path::new("container.mp4"), &mut session, &tool);
+        let probe = probe.unwrap();
+        assert!(probe.has_video_stream());
+        assert_eq!(probe.video_attributes().width, Some(1920));
+        assert_eq!(probe.video_attributes().duration_ms, Some(2500));
+        assert_eq!(probe.audio_attributes().sample_rate, Some(48000));
+        assert_eq!(invocations, 1);
+        assert_eq!(std::fs::read_to_string(count).unwrap().lines().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_probe_is_not_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let count = dir.path().join("calls");
+        let tool = fake_tool(
+            dir.path(),
+            &format!("echo call >> '{}'\nprintf '%s' 'not json'", count.display()),
+        );
+        let budget = crate::MetadataBudget::default();
+        let mut session = crate::ingest::Session::new(&budget);
+        let (probe, invocations) =
+            VideoProbe::ingest_with_tool(Path::new("bad.mp4"), &mut session, &tool);
+        assert!(probe.is_none());
+        assert_eq!(invocations, 1);
+        assert_eq!(std::fs::read_to_string(count).unwrap().lines().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_kills_a_running_probe_promptly() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let tool = fake_tool(dir.path(), "while :; do :; done");
+        let cancelled = AtomicBool::new(false);
+        let is_cancelled = || cancelled.load(Ordering::Relaxed);
+        let budget = crate::MetadataBudget {
+            timeout: std::time::Duration::from_secs(5),
+            cancelled: &is_cancelled,
+            ..crate::MetadataBudget::default()
+        };
+        let start = std::time::Instant::now();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                cancelled.store(true, Ordering::Relaxed);
+            });
+            let mut session = crate::ingest::Session::new(&budget);
+            let (probe, invocations) =
+                VideoProbe::ingest_with_tool(Path::new("hanging.mp4"), &mut session, &tool);
+            assert!(probe.is_none());
+            assert_eq!(invocations, 1);
+        });
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn closed_stdout_does_not_disarm_the_probe_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = fake_tool(dir.path(), "exec 1>&-\nwhile :; do :; done");
+        let budget = crate::MetadataBudget {
+            timeout: std::time::Duration::from_millis(100),
+            ..crate::MetadataBudget::default()
+        };
+        let start = std::time::Instant::now();
+        let mut session = crate::ingest::Session::new(&budget);
+        let (probe, _) =
+            VideoProbe::ingest_with_tool(Path::new("hanging.mp4"), &mut session, &tool);
+        assert!(probe.is_none());
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
     }
 }

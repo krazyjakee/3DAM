@@ -37,13 +37,16 @@ pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Cmd::Scan {
             source,
             delta,
+            quick,
             wait,
         } => {
             let sources = match source {
                 Some(s) => vec![parse_source_id(&s)?],
                 None => Vec::new(),
             };
-            let mode = if delta {
+            let mode = if quick {
+                ScanMode::Quick
+            } else if delta {
                 ScanMode::Delta
             } else {
                 ScanMode::Full

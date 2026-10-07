@@ -18,6 +18,102 @@
 
 use super::*;
 
+/// Hash verification runs independently of the quick discovery job, even when optional analysis
+/// and thumbnail generation are disabled. A startup pass resumes durable work after a crash.
+pub(crate) fn start_pending_worker(
+    store: Arc<Store>,
+    secrets: credentials::SecretVault,
+    events: broadcast::Sender<LibraryEvent>,
+    governor: Arc<resources::Governor>,
+    scratch: std::path::PathBuf,
+    coordinator: Arc<scan_admission::Coordinator>,
+) {
+    let mut receiver = events.subscribe();
+    tokio::spawn(async move {
+        loop {
+            let sources = match store.list_sources() {
+                Ok(sources) => sources
+                    .into_iter()
+                    .filter(|source| {
+                        source.kind != SourceKind::Federated
+                            && store
+                                .list_pending_ingest(&source.id, 1)
+                                .map(|work| !work.is_empty())
+                                .unwrap_or(false)
+                    })
+                    .collect::<Vec<_>>(),
+                Err(error) => {
+                    tracing::warn!(%error,"pending ingest planning failed");
+                    Vec::new()
+                }
+            };
+            if !sources.is_empty() {
+                let touched = sources.iter().map(|source| source.id).collect::<Vec<_>>();
+                if let Ok(job) =
+                    store.create_job(JobKind::Enrich, "{\"auto\":true}", None, &touched)
+                {
+                    let cancel = Arc::new(AtomicBool::new(false));
+                    coordinator
+                        .cancels
+                        .lock()
+                        .unwrap()
+                        .insert(job, cancel.clone());
+                    let worker_store = store.clone();
+                    let worker_events = events.clone();
+                    let worker_secrets = secrets.clone();
+                    let worker_governor = governor.clone();
+                    let worker_scratch = scratch.clone();
+                    let worker_coordinator = coordinator.clone();
+                    let outcome = tokio::task::spawn_blocking(move || {
+                        quick_scan::run_pending_ingest(
+                            worker_store,
+                            worker_secrets,
+                            worker_events,
+                            job,
+                            sources,
+                            cancel,
+                            &worker_governor,
+                            &worker_scratch,
+                            &worker_coordinator,
+                            false,
+                            &[],
+                        )
+                    })
+                    .await;
+                    coordinator.cancels.lock().unwrap().remove(&job);
+                    if let Err(error) = outcome
+                        .map_err(|e| LibError::Internal(e.to_string()))
+                        .and_then(|r| r)
+                    {
+                        reliability::required_background_write(
+                            store.set_job_state(&job, JobState::Failed, Some(&error.to_string())),
+                            "persist pending ingest failure",
+                            &job,
+                        );
+                        emit_progress(&store, &events, &job);
+                    }
+                }
+            }
+            // Coalesce scan completions received during enrichment into a follow-up pass. Retry
+            // unavailable sources on a bounded cadence; durable per-item retry dates avoid spins.
+            loop {
+                match tokio::time::timeout(std::time::Duration::from_secs(60), receiver.recv())
+                    .await
+                {
+                    Ok(Ok(LibraryEvent::JobProgress(job)))
+                        if job.kind == JobKind::Scan && job.state == JobState::Done =>
+                    {
+                        break
+                    }
+                    Ok(Err(broadcast::error::RecvError::Lagged(_))) | Err(_) => break,
+                    Ok(Err(broadcast::error::RecvError::Closed)) => return,
+                    _ => {}
+                }
+            }
+        }
+    });
+}
+
 /// The runtime policy a long-running server supplies so the pipeline honours the `auto_thumbnail` /
 /// `auto_analyze` feature flags — read fresh on every drain, so a live admin toggle takes effect on
 /// the next scan without a restart. Kept as a trait so dam-core needn't link the server's flag store.
@@ -55,7 +151,8 @@ impl EmbeddedLibrary {
             loop {
                 match rx.recv().await {
                     Ok(LibraryEvent::JobProgress(js))
-                        if js.kind == JobKind::Scan && js.state == JobState::Done =>
+                        if matches!(js.kind, JobKind::Scan | JobKind::Enrich)
+                            && js.state == JobState::Done =>
                     {
                         listener_notify.notify_one();
                     }

@@ -130,8 +130,8 @@ fn fieldless_enums_match_the_committed_wire_vocabulary() {
     assert_wire_enum!("sort_field", SortField, SortField::Name => "name", SortField::Size => "size", SortField::Scanned => "scanned", SortField::Relevance => "relevance");
     assert_wire_enum!("sort_dir", SortDir, SortDir::Asc => "asc", SortDir::Desc => "desc");
     assert_wire_enum!("source_kind", SourceKind, SourceKind::LocalFs => "local_fs", SourceKind::Sftp => "sftp", SourceKind::Smb => "smb", SourceKind::Federated => "federated");
-    assert_wire_enum!("scan_mode", ScanMode, ScanMode::Full => "full", ScanMode::Delta => "delta");
-    assert_wire_enum!("job_kind", JobKind, JobKind::Scan => "scan", JobKind::Analyze => "analyze", JobKind::Convert => "convert", JobKind::Export => "export");
+    assert_wire_enum!("scan_mode", ScanMode, ScanMode::Full => "full", ScanMode::Delta => "delta", ScanMode::Quick => "quick");
+    assert_wire_enum!("job_kind", JobKind, JobKind::Scan => "scan", JobKind::Enrich => "enrich", JobKind::Analyze => "analyze", JobKind::Convert => "convert", JobKind::Export => "export");
     assert_wire_enum!("job_state", JobState, JobState::Queued => "queued", JobState::Running => "running", JobState::Paused => "paused", JobState::Done => "done", JobState::Failed => "failed", JobState::Cancelled => "cancelled");
     assert_wire_enum!("collision_rule", CollisionRule, CollisionRule::Fail => "fail", CollisionRule::Suffix => "suffix", CollisionRule::Skip => "skip", CollisionRule::Overwrite => "overwrite");
     assert_wire_enum!("disposition", Disposition, Disposition::Write => "write", Disposition::Collision => "collision", Disposition::Skipped => "skipped", Disposition::Unsupported => "unsupported", Disposition::Done => "done", Disposition::Failed => "failed");

@@ -420,6 +420,7 @@ fn decode_job_collections(raw: Option<&str>) -> Vec<CollectionId> {
 fn job_kind_str(k: JobKind) -> &'static str {
     match k {
         JobKind::Scan => "scan",
+        JobKind::Enrich => "enrich",
         JobKind::Analyze => "analyse",
         JobKind::Convert => "convert",
         JobKind::Export => "export",
@@ -427,6 +428,7 @@ fn job_kind_str(k: JobKind) -> &'static str {
 }
 fn parse_job_kind(s: &str) -> JobKind {
     match s {
+        "enrich" => JobKind::Enrich,
         "analyse" => JobKind::Analyze,
         "convert" => JobKind::Convert,
         "export" => JobKind::Export,

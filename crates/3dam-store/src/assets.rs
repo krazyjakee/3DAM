@@ -44,13 +44,15 @@ impl Store {
         tx: &Connection,
         a: &NewAsset,
     ) -> Result<UpsertOutcome, LibError> {
-        // The previous hash and media type come back with the id: both decide whether the derived
-        // layer this row already carries is still about the same file (see below).
-        let existing: Option<(Vec<u8>, Option<Vec<u8>>, String)> = tx
+        // Previous hash/media decide whether derivations remain valid; the filename decides
+        // whether searchable name tokens need refreshing. The lookup already fixes the path.
+        type ExistingAsset = (Vec<u8>, Option<Vec<u8>>, String, String);
+        let existing: Option<ExistingAsset> = tx
             .query_row(
-                "SELECT id, content_hash, media_type FROM asset WHERE source_id = ?1 AND path = ?2",
+                "SELECT id, content_hash, media_type, filename
+                 FROM asset WHERE source_id = ?1 AND path = ?2",
                 params![a.source_id.as_bytes().to_vec(), a.path],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()
             .map_err(internal)?;
@@ -59,7 +61,8 @@ impl Store {
         // Set when this upsert deletes the row's embeddings, so the ANN cache generation can be
         // bumped once the transaction has actually committed.
         let mut dropped_embeddings = false;
-        let (id, is_new) = if let Some((id_blob, prev_hash, prev_media)) = existing {
+        let refresh_name_tokens = existing.as_ref().is_none_or(|row| row.3 != a.filename);
+        let (id, is_new) = if let Some((id_blob, prev_hash, prev_media, prev_filename)) = existing {
             // Same path, different bytes: everything the analyse pass derived (embedding, class,
             // indexed document text) describes the *old* file. Only a Some→Some change counts —
             // a row that simply had no hash before is not evidence the file was edited, and
@@ -72,18 +75,19 @@ impl Store {
             // becoming available between scans) is the same problem plus one: the derived rows are
             // in the wrong tables entirely.
             let media_changed = prev_media != a.media_type.as_str();
-            // One UPDATE, not three. The two gate resets below used to be separate statements
-            // against the same row, and both `analysed_at` and `media_type` are watched by
-            // `aggregate_asset_au` (V26) — so a plain re-scan fired the aggregate triggers twice
-            // for one logical change. Folding them in makes the trigger fire once with the same
-            // net arithmetic (the triggers reason on old→new transitions, so `-old + new` over one
-            // step equals the sum over two), and `derivative_version` rides along because it is
-            // free once the statement exists.
+            // Keep the gate resets in this UPDATE and omit unchanged searchable columns. V28
+            // also guards old→new trigger inputs, including writes through other store seams.
             let mut sets = String::from(
-                "content_hash = ?2, filename = ?3, size_bytes = ?4,
-                 source_modified_at = ?5, scanned_at = ?6, media_type = ?7, format = ?8,
+                "content_hash = ?2, size_bytes = ?4,
+                 source_modified_at = ?5, scanned_at = ?6, format = ?8,
                  updated_at = ?9, flags = flags & -2",
             );
+            if prev_filename != a.filename {
+                sets.push_str(", filename = ?3");
+            }
+            if media_changed {
+                sets.push_str(", media_type = ?7");
+            }
             if content_changed || media_changed {
                 // Re-open the analyse gate (`analysis_version < PIPELINE_VERSION`, §7.2). The scan
                 // has already refreshed the cheap tier; without this the expensive tier would keep
@@ -129,8 +133,13 @@ impl Store {
                 // The ANN cache generation is bumped after the commit, not here: a bump for a
                 // write that then rolls back would discard a still-valid cached index for nothing.
                 dropped_embeddings = true;
+            }
+            if content_changed || media_changed {
+                // Old extracted body text describes the previous bytes/classification. Preserve
+                // filename, folder, tags and notes; avoid rebuilding FTS if text is already empty.
                 tx.execute(
-                    "UPDATE asset_fts SET text = '' WHERE rowid = (SELECT rowid FROM asset WHERE id = ?1)",
+                    "UPDATE asset_fts SET text = ''
+                     WHERE rowid = (SELECT rowid FROM asset WHERE id = ?1) AND text IS NOT ''",
                     params![id_blob],
                 )
                 .map_err(internal)?;
@@ -167,13 +176,16 @@ impl Store {
         // row already carries, so this is the right place: a moved file is a new `(source_id, path)`
         // and comes back through here with its new folder. Best-effort: a token failure never sinks
         // the ingest.
-        let tokens = crate::search::tokenize_name(&a.filename).join(" ");
-        let folder = crate::search::folder_terms(&a.path);
-        let _ = tx.execute(
-            "UPDATE asset_fts SET tokens = ?2, folder = ?3
-             WHERE rowid = (SELECT rowid FROM asset WHERE id = ?1)",
-            params![id.as_bytes().to_vec(), tokens, folder],
-        );
+        if refresh_name_tokens {
+            let tokens = crate::search::tokenize_name(&a.filename).join(" ");
+            let folder = crate::search::folder_terms(&a.path);
+            let _ = tx.execute(
+                "UPDATE asset_fts SET tokens = ?2, folder = ?3
+                 WHERE rowid = (SELECT rowid FROM asset WHERE id = ?1)
+                   AND (tokens IS NOT ?2 OR folder IS NOT ?3)",
+                params![id.as_bytes().to_vec(), tokens, folder],
+            );
+        }
         Ok(UpsertOutcome {
             id,
             inserted: is_new,
@@ -808,7 +820,9 @@ impl Store {
                         source_created_at, source_modified_at, scanned_at, analysed_at,
                         media_type, format, license_id, license_status, license_provenance,
                         rights_commercial, rights_modify, rights_redistribute, rights_attribution,
-                        attribution_holder, attribution_credit, license_url, created_at, flags
+                        attribution_holder, attribution_credit, license_url, created_at, flags,
+                        EXISTS(SELECT 1 FROM pending_ingest p WHERE p.source_id=asset.source_id
+                            AND p.path=asset.path) AS ingest_pending
                  FROM asset WHERE id = ?1",
                 params![id.as_bytes().to_vec()],
                 Self::row_to_asset,
@@ -874,6 +888,8 @@ impl Store {
 
         let media = MediaType::parse(&media_s).unwrap_or(MediaType::Image);
         let status = LicenseStatus::parse(&license_status);
+        let mut key_attrs = SmallMap::new();
+        crate::helpers::mark_pending_summary(&mut key_attrs, r.get("ingest_pending")?);
         let summary = AssetSummary {
             id,
             name: filename,
@@ -886,7 +902,7 @@ impl Store {
             },
             top_tags: Vec::new(),
             origin: Origin::Local,
-            key_attrs: SmallMap::new(),
+            key_attrs,
             favorite: flags & crate::helpers::FAVORITE_FLAG != 0,
             source_id: Some(source_id),
         };
@@ -1077,7 +1093,42 @@ fn row_to_comment(r: &rusqlite::Row) -> rusqlite::Result<Comment> {
 mod tests {
     use super::*;
     use dam_sources::SourceConnection;
+    use rusqlite::trace::{TraceEvent, TraceEventCodes};
+    use std::cell::RefCell;
     use LicenseStatus::{Attribution, Permissive, Restricted, Unknown};
+
+    thread_local! {
+        static MAINTENANCE_SQL: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    fn record_maintenance(event: TraceEvent<'_>) {
+        if let TraceEvent::Stmt(_, sql) = event {
+            if [
+                "UPDATE asset_fts",
+                "UPDATE asset_filename_trigram",
+                "UPDATE library_stat",
+                "UPDATE media_stat",
+                "UPDATE source_stat",
+                "UPDATE source_media_stat",
+                "UPDATE source_tag_stat",
+            ]
+            .iter()
+            .any(|prefix| sql.contains(prefix))
+            {
+                MAINTENANCE_SQL.with(|statements| statements.borrow_mut().push(sql.into()));
+            }
+        }
+    }
+
+    fn trace_maintenance(store: &Store, write: impl FnOnce()) -> Vec<String> {
+        MAINTENANCE_SQL.with(|statements| statements.borrow_mut().clear());
+        store
+            .write()
+            .trace_v2(TraceEventCodes::SQLITE_TRACE_STMT, Some(record_maintenance));
+        write();
+        store.write().trace_v2(TraceEventCodes::empty(), None);
+        MAINTENANCE_SQL.with(|statements| statements.borrow().clone())
+    }
 
     fn scanned(src: SourceId, path: &str, media: MediaType, hash: u8) -> NewAsset {
         NewAsset {
@@ -1113,6 +1164,136 @@ mod tests {
             .unwrap()
             .query_row(sql, [], |r| r.get(0))
             .unwrap()
+    }
+
+    #[test]
+    fn verification_and_same_path_edits_skip_unchanged_search_and_aggregate_maintenance() {
+        let (store, src) = store_and_source();
+        let mut asset = scanned(src, "Docs/spec_note.md", MediaType::Document, 1);
+        let (id, _) = store.upsert_asset(&asset).unwrap();
+        let unchanged = trace_maintenance(&store, || {
+            store.upsert_asset(&asset).unwrap();
+        });
+        assert!(
+            unchanged.is_empty(),
+            "unchanged scan executed maintenance: {unchanged:?}"
+        );
+
+        asset.content_hash = Some(ContentHash([2; 32]));
+        let edited = trace_maintenance(&store, || {
+            store.upsert_asset(&asset).unwrap();
+        });
+        // Empty-body invalidation is allowed to check its predicate, but filename, folder,
+        // trigram and aggregates must not be maintained just because the hash changed.
+        assert!(
+            edited
+                .iter()
+                .all(|sql| sql.contains("UPDATE asset_fts SET text")),
+            "same-path byte change executed unrelated maintenance: {edited:?}"
+        );
+        crate::schema::assert_aggregate_integrity(&store.read().unwrap());
+
+        asset.filename = "updated_brief.md".into();
+        let renamed = trace_maintenance(&store, || {
+            store.upsert_asset(&asset).unwrap();
+        });
+        for required in [
+            "UPDATE asset_fts SET filename",
+            "UPDATE asset_fts SET tokens",
+            "UPDATE asset_filename_trigram SET filename",
+        ] {
+            assert!(
+                renamed.iter().any(|sql| sql.contains(required)),
+                "rename did not execute {required}: {renamed:?}"
+            );
+        }
+        let (filename, tokens, folder): (String, String, String) = store
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT filename,tokens,folder FROM asset_fts
+             WHERE rowid=(SELECT rowid FROM asset WHERE id=?1)",
+                params![id.as_bytes().to_vec()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(filename, "updated_brief.md");
+        assert_eq!(
+            tokens,
+            crate::search::tokenize_name(&asset.filename).join(" ")
+        );
+        assert_eq!(folder, crate::search::folder_terms(&asset.path));
+        crate::schema::assert_aggregate_integrity(&store.read().unwrap());
+    }
+
+    #[test]
+    fn body_invalidation_preserves_notes_tags_and_folder_search_through_reclassification() {
+        let (store, src) = store_and_source();
+        let mut asset = scanned(src, "Docs/spec.md", MediaType::Document, 1);
+        let (id, _) = store.upsert_asset(&asset).unwrap();
+        store.write().execute(
+            "UPDATE asset_fts SET text='obsolete extracted body', note='keep note', tags='keep tag'
+             WHERE rowid=(SELECT rowid FROM asset WHERE id=?1)",
+            params![id.as_bytes().to_vec()],
+        ).unwrap();
+        store.mark_analysed(&id, 3).unwrap();
+        let indexed = || {
+            store
+                .read()
+                .unwrap()
+                .query_row(
+                    "SELECT text,note,tags,folder FROM asset_fts
+             WHERE rowid=(SELECT rowid FROM asset WHERE id=?1)",
+                    params![id.as_bytes().to_vec()],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    },
+                )
+                .unwrap()
+        };
+        store.upsert_asset(&asset).unwrap();
+        assert_eq!(indexed().0, "obsolete extracted body");
+        asset.content_hash = Some(ContentHash([2; 32]));
+        store.upsert_asset(&asset).unwrap();
+        assert_eq!(
+            indexed(),
+            (
+                "".into(),
+                "keep note".into(),
+                "keep tag".into(),
+                crate::search::folder_terms(&asset.path)
+            )
+        );
+        store
+            .write()
+            .execute("UPDATE asset_fts SET text='document only body'", [])
+            .unwrap();
+        asset.media_type = MediaType::Image;
+        store.upsert_asset(&asset).unwrap();
+        assert_eq!(
+            indexed(),
+            (
+                "".into(),
+                "keep note".into(),
+                "keep tag".into(),
+                crate::search::folder_terms(&asset.path)
+            )
+        );
+        crate::schema::assert_aggregate_integrity(&store.read().unwrap());
+
+        let moved = scanned(src, "Other/spec.md", MediaType::Document, 2);
+        store.upsert_asset(&moved).unwrap();
+        let folder_hits = count(
+            &store,
+            "SELECT count(*) FROM asset_fts WHERE asset_fts MATCH 'folder:other'",
+        );
+        assert_eq!(folder_hits, 1);
+        crate::schema::assert_aggregate_integrity(&store.read().unwrap());
     }
 
     /// The analyse gate is `analysis_version < PIPELINE_VERSION`, and a re-scan of an edited file

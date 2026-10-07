@@ -352,6 +352,12 @@ struct GovState {
 }
 
 impl Governor {
+    pub(crate) fn set_load_limit(&mut self, limit: Option<f64>) {
+        if let Some(limit) = limit.filter(|n| *n > 0.0) {
+            self.max_load_per_cpu = limit;
+        }
+    }
+
     pub(crate) fn fetch<'a>(
         &'a self,
         source: &dyn dam_sources::FileSource,
@@ -359,11 +365,33 @@ impl Governor {
         scratch: &Path,
         cancel: &'a dyn Cancellation,
     ) -> Result<(dam_sources::Fetched, io::Work<'a>), dam_api::LibError> {
+        self.fetch_with_progress(source, rel, scratch, cancel, &mut |_| {})
+    }
+
+    pub(crate) fn fetch_with_progress<'a>(
+        &'a self,
+        source: &dyn dam_sources::FileSource,
+        rel: &str,
+        scratch: &Path,
+        cancel: &'a dyn Cancellation,
+        progress: &mut dyn FnMut(u64),
+    ) -> Result<(dam_sources::Fetched, io::Work<'a>), dam_api::LibError> {
         let source_path = source.storage_path().map(|root| root.join(rel));
-        let work = self
-            .io
-            .acquire(self, &[source_path.as_deref(), Some(scratch)], cancel)?;
-        let fetched = source.fetch_paced(rel, &mut |bytes| work.pace(bytes.saturating_mul(2)))?;
+        let copy = source.fetch_uses_scratch(rel);
+        let paths = if copy {
+            vec![source_path.as_deref(), Some(scratch)]
+        } else {
+            vec![source_path.as_deref()]
+        };
+        let work = self.io.acquire(self, &paths, cancel)?;
+        let fetched = source.fetch_paced(rel, &mut |bytes| {
+            progress(bytes);
+            if copy {
+                work.pace_resources(&[bytes, bytes])
+            } else {
+                work.pace_resources(&[bytes])
+            }
+        })?;
         Ok((fetched, work))
     }
     /// `min_free_memory_mb = None` picks the default floor: 10% of the memory ceiling, clamped to
@@ -553,12 +581,17 @@ pub fn deprioritize_current_thread() {
 #[derive(Default, Clone)]
 pub struct ResourceOptions {
     pub io: IoOptions,
+    /// Leave durable discovery queued for separately measured verification (manual tooling).
+    #[doc(hidden)]
+    pub defer_ingest: bool,
     /// Background pool size override (clamped to the effective CPU budget).
     pub background_threads: Option<usize>,
     /// Pause background work when host available memory dips below this (MiB).
     pub min_free_memory_mb: Option<u64>,
     /// Pause bulk reads/grind when I/O full-stall (PSI `avg10`) exceeds this (%). ≥ 100 disables.
     pub max_io_stall_pct: Option<f64>,
+    /// CPU load gate; positive infinity disables it for deterministic tests/tooling.
+    pub max_load_per_cpu: Option<f64>,
 }
 
 impl ResourceOptions {
@@ -572,13 +605,15 @@ impl ResourceOptions {
                 concurrency: parse("3DAM_IO_CONCURRENCY"),
                 storage: Vec::new(),
             },
+            defer_ingest: false,
             background_threads: parse("3DAM_BG_THREADS"),
             min_free_memory_mb: parse("3DAM_MIN_FREE_MEMORY_MB"),
             max_io_stall_pct: parse("3DAM_MAX_IO_STALL_PCT"),
+            max_load_per_cpu: parse("3DAM_MAX_LOAD_PER_CPU"),
         }
     }
 
-    /// Options that render the pressure governor inert: no memory floor, no I/O-stall gate.
+    /// Options that disable memory, CPU-load, and I/O-stall gates for deterministic tooling.
     /// For hermetic tests (and one-shot tooling) on busy dev/CI boxes — there, a scan parking
     /// because the *build itself* is hammering the disk is flake, not good-neighbourliness.
     /// Every knob is `Some`, so `or_env()` leaves these as-is.
@@ -589,9 +624,11 @@ impl ResourceOptions {
                 concurrency: Some(DEFAULT_BG_THREAD_CAP),
                 storage: Vec::new(),
             },
+            defer_ingest: false,
             background_threads: None,
             min_free_memory_mb: Some(0),
             max_io_stall_pct: Some(f64::INFINITY),
+            max_load_per_cpu: Some(f64::INFINITY),
         }
     }
 
@@ -604,9 +641,11 @@ impl ResourceOptions {
                 concurrency: self.io.concurrency.or(env.io.concurrency),
                 storage: self.io.storage,
             },
+            defer_ingest: self.defer_ingest,
             background_threads: self.background_threads.or(env.background_threads),
             min_free_memory_mb: self.min_free_memory_mb.or(env.min_free_memory_mb),
             max_io_stall_pct: self.max_io_stall_pct.or(env.max_io_stall_pct),
+            max_load_per_cpu: self.max_load_per_cpu.or(env.max_load_per_cpu),
         }
     }
 }

@@ -11,7 +11,8 @@ pub(crate) fn parse_connection(blob: &str) -> Result<SourceConnection, LibError>
 }
 
 /// The SELECT column list every grid/summary query shares — sixteen columns in the exact order
-/// `row_to_summary` reads them. Callers append their own `FROM …`, `{ATTR_JOINS}`, WHERE and ORDER.
+/// `row_to_summary` reads them. Callers append their extra cursor/member columns, then
+/// [`GRID_PENDING_SELECT`], their own `FROM …`, `{ATTR_JOINS}`, WHERE and ORDER.
 ///
 /// Video reuses the dimension and duration slots via `COALESCE` rather than claiming its own
 /// columns: a video's `1920×1080` and `1:30` mean exactly what an image's and an audio clip's do,
@@ -23,6 +24,17 @@ pub(crate) const GRID_SELECT: &str = "SELECT asset.id, filename, media_type, for
         COALESCE(audio_attr.duration_ms, video_attr.duration_ms),
         model_attr.triangle_count, audio_attr.class, asset.flags,
         document_attr.page_count, document_attr.word_count, asset.source_id";
+
+/// Append after a caller's additional projection columns so cursor/duplicate offsets remain
+/// unchanged. The queue's composite primary key makes this one indexed lookup per returned row.
+pub(crate) const GRID_PENDING_SELECT: &str = ", EXISTS(SELECT 1 FROM pending_ingest
+        WHERE pending_ingest.source_id=asset.source_id AND pending_ingest.path=asset.path) AS ingest_pending";
+
+pub(crate) fn mark_pending_summary(attrs: &mut SmallMap, pending: bool) {
+    if pending {
+        attrs.insert("ingest_status".into(), "pending_verification".into());
+    }
+}
 
 /// The attribute table a media type owns. The tables are exclusive — an asset has a row in exactly
 /// one of them — which is the invariant [`GRID_SELECT`] `COALESCE`s on, so anything that changes an
@@ -59,6 +71,16 @@ pub(crate) fn row_to_summary(r: &rusqlite::Row) -> rusqlite::Result<AssetSummary
     let flags: i64 = r.get(12)?;
     let page_count: Option<i64> = r.get(13)?;
     let word_count: Option<i64> = r.get(14)?;
+    let mut key_attrs = grid_key_attrs(GridKeyAttrs {
+        media,
+        width,
+        height,
+        duration_ms,
+        tri_count,
+        page_count,
+        word_count,
+    });
+    mark_pending_summary(&mut key_attrs, r.get("ingest_pending")?);
     Ok(AssetSummary {
         id,
         name: r.get(1)?,
@@ -71,15 +93,7 @@ pub(crate) fn row_to_summary(r: &rusqlite::Row) -> rusqlite::Result<AssetSummary
         },
         top_tags: Vec::new(),
         origin: Origin::Local,
-        key_attrs: grid_key_attrs(GridKeyAttrs {
-            media,
-            width,
-            height,
-            duration_ms,
-            tri_count,
-            page_count,
-            word_count,
-        }),
+        key_attrs,
         favorite: flags & FAVORITE_FLAG != 0,
         source_id: Some(blob_to_source_id(&r.get::<_, Vec<u8>>(15)?)),
     })

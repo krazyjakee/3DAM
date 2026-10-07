@@ -161,7 +161,7 @@ impl Store {
             }
         }
         let sql = format!(
-            "{cte} {GRID_SELECT}{key_select} FROM {from} {ATTR_JOINS} {page_where} \
+            "{cte} {GRID_SELECT}{key_select}{GRID_PENDING_SELECT} FROM {from} {ATTR_JOINS} {page_where} \
              ORDER BY {order_clause} LIMIT ?"
         );
         page_binds.push(Value::Integer(limit as i64 + 1));
@@ -850,6 +850,152 @@ mod tests {
             })
             .unwrap();
         store
+    }
+
+    #[test]
+    fn pending_verification_survives_query_modes_cursor_keys_and_detail() {
+        let store = Store::open_in_memory().unwrap();
+        let source = store
+            .add_source(
+                &SourceConnection::LocalFs {
+                    root: "/tmp".into(),
+                },
+                "pending",
+                false,
+            )
+            .unwrap();
+        let add = |name: &str, size, hash| {
+            store
+                .upsert_asset(&NewAsset {
+                    source_id: source,
+                    path: name.into(),
+                    filename: name.into(),
+                    content_hash: Some(ContentHash([hash; 32])),
+                    size_bytes: Some(size),
+                    source_modified_at: Some(1),
+                    scanned_at: size,
+                    media_type: MediaType::Image,
+                    format: "png".into(),
+                })
+                .unwrap()
+                .0
+        };
+        let pending_id = add("pending-one.png", 10, 1);
+        let ready_id = add("pending-two.png", 20, 2);
+        store
+            .set_media_attrs(
+                &ready_id,
+                &MediaAttributes::Image(ImageAttributes {
+                    width: Some(64),
+                    height: Some(32),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        let generation = store.begin_source_scan(&source).unwrap();
+        store
+            .apply_quick_discovery(
+                &source,
+                generation,
+                &[crate::PendingDiscovery {
+                    path: "pending-one.png".into(),
+                    size: 30,
+                    modified_ms: Some(2),
+                    media: Some(MediaType::Image),
+                    format: Some("png".into()),
+                }],
+            )
+            .unwrap();
+
+        let assert_marker = |summary: &AssetSummary| {
+            assert_eq!(
+                summary.key_attrs.get("ingest_status").map(String::as_str),
+                (summary.id == pending_id).then_some("pending_verification"),
+            );
+        };
+        for mode in [
+            SearchMode::Lexical,
+            SearchMode::Hybrid,
+            SearchMode::Semantic,
+        ] {
+            let page = query_all(
+                &store,
+                &QueryRequest {
+                    text: Some("pending".into()),
+                    mode,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(page.items.len(), 2);
+            for summary in &page.items {
+                assert_marker(summary);
+            }
+        }
+        // Each sort projects a different cursor key after the shared grid columns. The pending
+        // projection must not displace those positional keys on either page.
+        for field in [
+            SortField::Name,
+            SortField::Size,
+            SortField::Scanned,
+            SortField::Relevance,
+        ] {
+            let mut req = QueryRequest {
+                text: Some("pending".into()),
+                sort: Sort {
+                    field,
+                    dir: SortDir::Asc,
+                },
+                page: PageParams {
+                    after: None,
+                    limit: 1,
+                },
+                ..Default::default()
+            };
+            let first = query_all(&store, &req).unwrap();
+            assert_eq!(first.items.len(), 1);
+            assert_marker(&first.items[0]);
+            req.page.after = Some(first.cursor.unwrap());
+            let second = query_all(&store, &req).unwrap();
+            assert_eq!(second.items.len(), 1);
+            assert_ne!(first.items[0].id, second.items[0].id);
+            assert_marker(&second.items[0]);
+        }
+        for id in [pending_id, ready_id] {
+            assert_marker(
+                &store
+                    .get_asset_detail(&id, &Visibility::Full)
+                    .unwrap()
+                    .summary,
+            );
+        }
+        let collection = store
+            .create_collection("queued", CollectionKind::Manual, None)
+            .unwrap();
+        store
+            .modify_collection_members(&collection, &[pending_id, ready_id], &[])
+            .unwrap();
+        for summary in store
+            .collection_summaries(&collection, 10, &Visibility::Full)
+            .unwrap()
+        {
+            assert_marker(&summary);
+        }
+        let conn = store.read().unwrap();
+        let summaries =
+            Store::summaries_for_ids(&conn, &[pending_id, ready_id], &[], &Visibility::Full)
+                .unwrap();
+        assert_eq!(summaries.len(), 2);
+        for summary in summaries.values() {
+            assert_marker(summary);
+        }
+        assert_eq!(
+            summaries[&ready_id]
+                .key_attrs
+                .get("dimensions")
+                .map(String::as_str),
+            Some("64×32")
+        );
     }
 
     #[test]

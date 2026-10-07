@@ -243,6 +243,9 @@ function Body({ asset }: { asset: Asset }) {
 
         {/* core metadata */}
         <Group title="Details">
+          {summary.key_attrs.ingest_status === "pending_verification" && (
+            <Field label="Status" value="Awaiting verification" />
+          )}
           <Field label="Type" value={mediaLabel[summary.media]} />
           <Field label="Format" value={summary.format.toUpperCase()} />
           <Field label="Size" value={bytes(summary.size)} />
@@ -261,7 +264,7 @@ function Body({ asset }: { asset: Asset }) {
           {asset.hash && <Field label="Hash" value={asset.hash.slice(0, 16) + "…"} mono />}
         </Group>
 
-        <MediaFacts attrs={asset.attributes} />
+        {summary.key_attrs.ingest_status !== "pending_verification" && <MediaFacts attrs={asset.attributes} />}
 
         <Group title="Timestamps">
           <Field label="Scanned" value={relTime(asset.timestamps.scanned)} />
@@ -287,10 +290,10 @@ function Body({ asset }: { asset: Asset }) {
 
         {/* duplicates — the byte-identical copies collapsed behind one card in the grid/table live
             here (rendered only when this asset is part of an exact-duplicate group) */}
-        <DuplicatesSection asset={asset} />
+        {summary.key_attrs.ingest_status !== "pending_verification" && <DuplicatesSection asset={asset} />}
 
         {/* find similar — cosine over embeddings, ranked in this asset's media space (phase 3) */}
-        <SimilarSection asset={asset} />
+        {summary.key_attrs.ingest_status !== "pending_verification" && <SimilarSection asset={asset} />}
 
         {/* discussion (issue #82) — deliberately *below* everything derived, and visually a message
             list rather than a field, so it never reads as a second note box. Renders nothing at all
@@ -336,6 +339,7 @@ function Actions({ asset }: { asset: Asset }) {
   const regenerateThumbnail = useRegenerateThumbnail();
   const canWrite = useCan("write");
   const { summary } = asset;
+  const pending = summary.key_attrs.ingest_status === "pending_verification";
   // Peer-owned assets are read-only references (tech-spec 07 §7.4) — maintenance runs on their peer.
   const peerTitle = peerReadOnlyTitle(summary.origin);
   const analyzed = asset.timestamps.analyzed != null;
@@ -348,10 +352,10 @@ function Actions({ asset }: { asset: Asset }) {
       <button
         type="button"
         className="btn disabled:cursor-not-allowed disabled:opacity-40"
-        disabled={analyze.isPending || !canWrite || !!peerTitle}
+        disabled={pending || analyze.isPending || !canWrite || !!peerTitle}
         onClick={() => analyze.mutate({ assets: [summary.id], force: true })}
         title={
-          peerTitle ??
+          peerTitle ?? (pending ? "Awaiting verification" : undefined) ??
           (!canWrite
             ? AUTH_COPY.needsWrite
             : "Re-run analysis (embeddings, tileability, auto-tags) for this asset")
@@ -364,10 +368,10 @@ function Actions({ asset }: { asset: Asset }) {
         <button
           type="button"
           className="btn disabled:cursor-not-allowed disabled:opacity-40"
-          disabled={regenerateThumbnail.isPending || !canWrite || !!peerTitle}
+          disabled={pending || regenerateThumbnail.isPending || !canWrite || !!peerTitle}
           onClick={() => regenerateThumbnail.mutate([summary.id])}
           title={
-            peerTitle ??
+            peerTitle ?? (pending ? "Awaiting verification" : undefined) ??
             (!canWrite
               ? AUTH_COPY.needsWrite
               : "Rebuild the preview thumbnail from the current source file")

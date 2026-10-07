@@ -67,18 +67,52 @@ fn canonical_format(format: &str) -> &'static str {
 /// Probe container + default-track params. Best-effort/fail-soft: an unreadable file yields the
 /// default (all-`None`) struct rather than aborting the scan.
 pub fn metadata(path: &Path, format: &str) -> AudioAttributes {
-    let mut attrs = AudioAttributes::default();
     let Ok(file) = std::fs::File::open(path) else {
-        return attrs;
+        return AudioAttributes::default();
     };
-    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    metadata_from_source(Box::new(file), format, 128 * 1024)
+}
+
+pub(crate) fn ingest_metadata(
+    path: &Path,
+    format: &str,
+    session: &mut crate::ingest::Session<'_, '_>,
+) -> AudioAttributes {
+    if session.budget.max_allocation_bytes < 128 * 1024 {
+        session.deferred = true;
+        return AudioAttributes::default();
+    }
+    let Some((bytes, complete)) = session.prefix(path, session.remaining()) else {
+        return AudioAttributes::default();
+    };
+    let mut attrs = metadata_from_source(
+        Box::new(std::io::Cursor::new(bytes)),
+        format,
+        session.allocation_input_limit(),
+    );
+    if !complete {
+        attrs.duration_ms = None;
+    }
+    attrs
+}
+
+fn metadata_from_source(
+    source: Box<dyn symphonia::core::io::MediaSource>,
+    format: &str,
+    metadata_limit: usize,
+) -> AudioAttributes {
+    let mut attrs = AudioAttributes::default();
+    let mss = MediaSourceStream::new(source, Default::default());
     let mut hint = Hint::new();
     hint.with_extension(format);
     let probed = symphonia::default::get_probe().format(
         &hint,
         mss,
         &FormatOptions::default(),
-        &MetadataOptions::default(),
+        &MetadataOptions {
+            limit_metadata_bytes: symphonia::core::meta::Limit::Maximum(metadata_limit),
+            limit_visual_bytes: symphonia::core::meta::Limit::Maximum(metadata_limit),
+        },
     );
     let Ok(probed) = probed else {
         return attrs;

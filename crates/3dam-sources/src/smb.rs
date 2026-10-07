@@ -89,40 +89,28 @@ impl FileSource for SmbSource {
         &self,
         sink: &mut dyn FnMut(Result<FileEntry, LibError>) -> bool,
     ) -> Result<(), LibError> {
+        self.walk_filtered(&mut |_| Ok(true), &mut || Ok(()), sink)
+    }
+
+    fn walk_filtered(
+        &self,
+        eligible: &mut dyn FnMut(&str) -> Result<bool, LibError>,
+        pace: &mut dyn FnMut() -> Result<(), LibError>,
+        sink: &mut dyn FnMut(Result<FileEntry, LibError>) -> bool,
+    ) -> Result<(), LibError> {
         let mut stack: Vec<String> = vec![String::new()];
         while let Some(rel_dir) = stack.pop() {
             let unc = self.unc_for(&rel_dir);
-            let listing = self.rt.block_on(list_dir(&self.client, &unc));
-            let entries = match listing {
-                Ok(e) => e,
-                Err(e) => {
-                    if !sink(Err(e)) {
-                        return Ok(());
-                    }
-                    continue;
-                }
-            };
-            for (name, is_dir, size, mtime_ms) in entries {
-                if name == "." || name == ".." {
-                    continue;
-                }
-                let child_rel = if rel_dir.is_empty() {
-                    name
-                } else {
-                    format!("{rel_dir}/{name}")
-                };
-                if is_dir {
-                    stack.push(child_rel);
-                    continue;
-                }
-                let fe = FileEntry {
-                    rel_path: child_rel,
-                    size,
-                    modified_ms: mtime_ms,
-                };
-                if !sink(Ok(fe)) {
-                    return Ok(());
-                }
+            if !self.rt.block_on(list_dir(
+                &self.client,
+                &unc,
+                &rel_dir,
+                &mut stack,
+                eligible,
+                pace,
+                sink,
+            ))? {
+                return Ok(());
             }
         }
         Ok(())
@@ -143,10 +131,14 @@ impl FileSource for SmbSource {
         let rel_path = guard_rel_path(rel_path)?;
         let unc = self.unc_for(&rel_path);
         let mut sink = crate::temp_sink(&rel_path, &self.scratch)?;
-        self.rt
-            .block_on(read_file_into(&self.client, &unc, &mut sink, pace))?;
-        std::io::Write::flush(&mut sink).ok();
-        Ok(Fetched::Temp(sink))
+        let (content_hash, source_stat) =
+            self.rt
+                .block_on(read_file_into(&self.client, &unc, &mut sink, pace))?;
+        Ok(Fetched::HashedTemp {
+            file: sink,
+            content_hash,
+            source_stat: Some(source_stat),
+        })
     }
 
     fn content_stat(&self, rel_path: &str) -> Result<ContentStat, LibError> {
@@ -403,40 +395,97 @@ async fn close_resource(resource: Resource) {
     }
 }
 
-/// List a directory's immediate children: `(name, is_dir, size, modified_ms)`.
+/// Deliver children as the bounded query stream produces them. No directory-width Vec is kept.
 async fn list_dir(
     client: &Client,
     unc: &UncPath,
-) -> Result<Vec<(String, bool, u64, Option<i64>)>, LibError> {
+    rel_dir: &str,
+    stack: &mut Vec<String>,
+    eligible: &mut dyn FnMut(&str) -> Result<bool, LibError>,
+    pace: &mut dyn FnMut() -> Result<(), LibError>,
+    sink: &mut dyn FnMut(Result<FileEntry, LibError>) -> bool,
+) -> Result<bool, LibError> {
+    pace()?;
     let args = FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_read(true));
-    let resource = client
-        .create_file(unc, &args)
-        .await
-        .map_err(|e| LibError::SourceUnavailable(format!("smb open dir: {e}")))?;
-    let dir = match resource {
-        Resource::Directory(d) => Arc::new(d),
-        _ => {
-            return Err(LibError::SourceUnavailable(
-                "smb path is not a directory".into(),
-            ))
+    let resource = match client.create_file(unc, &args).await {
+        Ok(resource) => resource,
+        Err(error) => {
+            return Ok(sink(Err(LibError::SourceUnavailable(format!(
+                "smb open dir: {error}"
+            )))));
         }
     };
-    let mut stream = Directory::query::<FileDirectoryInformation>(&dir, "*")
-        .await
-        .map_err(|e| LibError::SourceUnavailable(format!("smb query dir: {e}")))?;
-    let mut out = Vec::new();
-    while let Some(item) = stream.next().await {
-        let info = item.map_err(|e| LibError::SourceUnavailable(format!("smb dir entry: {e}")))?;
-        let name = info.file_name.to_string();
-        let is_dir = info.file_attributes.directory();
-        let mtime = if info.last_write_time.is_zero() {
-            None
-        } else {
-            crate::system_time_ms(SystemTime::from(info.last_write_time))
-        };
-        out.push((name, is_dir, info.end_of_file, mtime));
+    let dir = match resource {
+        Resource::Directory(d) => Arc::new(d),
+        other => {
+            close_resource(other).await;
+            return Ok(sink(Err(LibError::SourceUnavailable(
+                "smb path is not a directory".into(),
+            ))));
+        }
+    };
+    let outcome: Result<bool, LibError> = async {
+        pace()?;
+        let mut stream =
+            match Directory::query_with_options::<FileDirectoryInformation>(&dir, "*", 64 * 1024)
+                .await
+            {
+                Ok(stream) => stream,
+                Err(error) => {
+                    return Ok(sink(Err(LibError::SourceUnavailable(format!(
+                        "smb query dir: {error}"
+                    )))));
+                }
+            };
+        loop {
+            // The source runtime is current-thread. Keep this synchronous admission and the
+            // sink ahead of the next await; a notified page-fetch task cannot race cancellation.
+            pace()?;
+            let Some(item) = stream.next().await else {
+                return Ok(true);
+            };
+            let info = match item {
+                Ok(info) => info,
+                Err(error) => {
+                    return Ok(sink(Err(LibError::SourceUnavailable(format!(
+                        "smb dir entry: {error}"
+                    )))));
+                }
+            };
+            let name = info.file_name.to_string();
+            if name == "." || name == ".." {
+                continue;
+            }
+            let child_rel = if rel_dir.is_empty() {
+                name
+            } else {
+                format!("{rel_dir}/{name}")
+            };
+            if info.file_attributes.directory() {
+                stack.push(child_rel);
+            } else if eligible(&child_rel)? {
+                let modified_ms = if info.last_write_time.is_zero() {
+                    None
+                } else {
+                    crate::system_time_ms(SystemTime::from(info.last_write_time))
+                };
+                if !sink(Ok(FileEntry {
+                    rel_path: child_rel,
+                    size: info.end_of_file,
+                    modified_ms,
+                })) {
+                    return Ok(false);
+                }
+            }
+        }
     }
-    Ok(out)
+    .await;
+    // The stream drops before close. close marks the handle closed synchronously, so a notified
+    // background fetch cannot issue another page while the CLOSE response is awaited.
+    let closed = dir.close().await;
+    let keep_going = outcome?;
+    closed.map_err(|error| LibError::SourceUnavailable(format!("smb close dir: {error}")))?;
+    Ok(keep_going)
 }
 
 /// Copy a remote file block-by-block into `out`, never holding more than one block in memory.
@@ -445,7 +494,7 @@ async fn read_file_into<W: std::io::Write>(
     unc: &UncPath,
     out: &mut W,
     pace: &mut dyn FnMut(u64) -> Result<(), LibError>,
-) -> Result<(), LibError> {
+) -> Result<(String, ContentStat), LibError> {
     let args = FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_read(true));
     let resource = client
         .create_file(unc, &args)
@@ -453,25 +502,59 @@ async fn read_file_into<W: std::io::Write>(
         .map_err(|e| LibError::SourceUnavailable(format!("smb open file: {e}")))?;
     let file = match resource {
         Resource::File(f) => f,
-        _ => return Err(LibError::SourceUnavailable("smb path is not a file".into())),
-    };
-    let mut buf = vec![0u8; crate::FETCH_CHUNK];
-    let mut pos: u64 = 0;
-    loop {
-        pace(crate::FETCH_CHUNK as u64)?;
-        let n = file
-            .read_block(&mut buf, pos, None, false)
-            .await
-            .map_err(|e| LibError::SourceUnavailable(format!("smb read: {e}")))?;
-        if n == 0 {
-            break;
+        other => {
+            close_resource(other).await;
+            return Err(LibError::SourceUnavailable("smb path is not a file".into()));
         }
-        out.write_all(&buf[..n])
-            .map_err(|e| LibError::Internal(format!("scratch write: {e}")))?;
-        pos += n as u64;
+    };
+    let outcome = async {
+        let before = file
+            .query_info::<smb::FileAllInformation>()
+            .await
+            .map_err(|e| LibError::SourceUnavailable(format!("smb fetch stat: {e}")))?;
+        let mut hasher = blake3::Hasher::new();
+        let mut buf = vec![0u8; crate::FETCH_CHUNK];
+        let mut pos: u64 = 0;
+        loop {
+            pace(crate::FETCH_CHUNK as u64)?;
+            let n = file
+                .read_block(&mut buf, pos, None, false)
+                .await
+                .map_err(|e| LibError::SourceUnavailable(format!("smb read: {e}")))?;
+            if n == 0 {
+                break;
+            }
+            out.write_all(&buf[..n])
+                .map_err(|e| LibError::Internal(format!("scratch write: {e}")))?;
+            hasher.update(&buf[..n]);
+            pos = pos.saturating_add(n as u64);
+        }
+        let after = file
+            .query_info::<smb::FileAllInformation>()
+            .await
+            .map_err(|e| LibError::SourceUnavailable(format!("smb fetch stat: {e}")))?;
+        if pos != after.standard.end_of_file
+            || before.standard.end_of_file != after.standard.end_of_file
+            || before.basic.last_write_time != after.basic.last_write_time
+            || before.basic.change_time != after.basic.change_time
+        {
+            return Err(crate::source_changed());
+        }
+        let source_stat = ContentStat {
+            len: after.standard.end_of_file,
+            modified_ms: if after.basic.last_write_time.is_zero() {
+                None
+            } else {
+                crate::system_time_ms(SystemTime::from(after.basic.last_write_time))
+            },
+        };
+        Ok::<_, LibError>((hasher.finalize().to_hex().to_string(), source_stat))
     }
-    let _ = file.close().await;
-    Ok(())
+    .await;
+    let closed = file.close().await;
+    let fetched = outcome?;
+    closed.map_err(|e| LibError::SourceUnavailable(format!("smb close: {e}")))?;
+    Ok(fetched)
 }
 
 /// Join a base dir and a source-relative path into a `\`-separated share path.

@@ -18,6 +18,9 @@ mod scenario;
 pub(crate) const CHUNK: usize = 256 * 1024;
 const TICK: Duration = Duration::from_millis(25);
 const SAMPLE: Duration = Duration::from_millis(250);
+const NANOS_PER_SEC: u128 = 1_000_000_000;
+// Idle time buys at most one bounded request, even at very high configured rates.
+const BURST: u128 = CHUNK as u128 * NANOS_PER_SEC;
 
 #[derive(Clone, Debug, Default)]
 pub struct IoOptions {
@@ -91,8 +94,11 @@ struct Device {
 struct DeviceState {
     probe_checked: Option<Instant>,
     active: usize,
+    metadata_active: usize,
+    manual_metadata_waiters: usize,
     deferred: usize,
-    next: Instant,
+    replenished_at: Instant,
+    credit: u128,
     rate: u64,
     bytes: u64,
     sample: Option<(Instant, DiskStats)>,
@@ -141,8 +147,11 @@ impl Device {
             state: Mutex::new(DeviceState {
                 probe_checked: None,
                 active: 0,
+                metadata_active: 0,
+                manual_metadata_waiters: 0,
                 deferred: 0,
-                next: Instant::now(),
+                replenished_at: Instant::now(),
+                credit: 0,
                 rate: limit,
                 bytes: 0,
                 sample: None,
@@ -320,20 +329,72 @@ impl Scheduler {
         paths: &[Option<&Path>],
         cancel: &'a dyn Cancellation,
     ) -> Result<Work<'a>, LibError> {
+        self.acquire_inner(governor, paths, cancel, false, false)
+    }
+
+    /// Short listing/stat/SQLite admission shares the device's byte budget, with one separate
+    /// bounded operation slot. It can proceed between bulk reads without waiting for a whole
+    /// multi-gigabyte file to release its bulk permit. Manual discovery has priority over watches.
+    pub(crate) fn acquire_metadata<'a>(
+        &self,
+        governor: &'a Governor,
+        paths: &[Option<&Path>],
+        cancel: &'a dyn Cancellation,
+        manual: bool,
+    ) -> Result<Work<'a>, LibError> {
+        self.acquire_inner(governor, paths, cancel, true, manual)
+    }
+
+    fn acquire_inner<'a>(
+        &self,
+        governor: &'a Governor,
+        paths: &[Option<&Path>],
+        cancel: &'a dyn Cancellation,
+        metadata: bool,
+        manual: bool,
+    ) -> Result<Work<'a>, LibError> {
         let mut unique = BTreeMap::new();
+        let mut resources = Vec::with_capacity(paths.len());
         for path in paths {
-            for device in self.resolve(*path) {
+            let devices = self.resolve(*path);
+            resources.push(
+                devices
+                    .iter()
+                    .map(|device| device.id.clone())
+                    .collect::<Vec<_>>(),
+            );
+            for device in devices {
                 unique.insert(device.id.clone(), device);
             }
         }
         let devices: Vec<_> = unique.into_values().collect();
+        let resources = resources
+            .into_iter()
+            .map(|ids| {
+                ids.into_iter()
+                    .map(|id| {
+                        devices
+                            .binary_search_by(|device| device.id.cmp(&id))
+                            .unwrap()
+                    })
+                    .collect()
+            })
+            .collect();
         for device in &devices {
-            device.state.lock().unwrap().deferred += 1;
+            let mut state = device.state.lock().unwrap();
+            state.deferred += 1;
+            if metadata && manual {
+                state.manual_metadata_waiters += 1;
+            }
         }
         loop {
             if cancel.cancelled() {
                 for device in &devices {
-                    device.state.lock().unwrap().deferred -= 1;
+                    let mut state = device.state.lock().unwrap();
+                    state.deferred -= 1;
+                    if metadata && manual {
+                        state.manual_metadata_waiters -= 1;
+                    }
                 }
                 return Err(cancelled());
             }
@@ -347,25 +408,44 @@ impl Scheduler {
             let mut acquired = 0;
             for device in &devices {
                 let mut state = device.state.lock().unwrap();
-                if state.active >= device.concurrency {
+                if if metadata {
+                    state.metadata_active >= 1 || (!manual && state.manual_metadata_waiters > 0)
+                } else {
+                    state.active >= device.concurrency
+                } {
                     state.reason = "concurrency";
                     break;
                 }
-                state.active += 1;
+                if metadata {
+                    state.metadata_active += 1;
+                } else {
+                    state.active += 1;
+                }
                 acquired += 1;
             }
             if acquired == devices.len() {
                 for device in &devices {
-                    device.state.lock().unwrap().deferred -= 1;
+                    let mut state = device.state.lock().unwrap();
+                    state.deferred -= 1;
+                    if metadata && manual {
+                        state.manual_metadata_waiters -= 1;
+                    }
                 }
                 return Ok(Work {
                     devices,
+                    resources,
                     governor,
                     cancel,
+                    metadata,
                 });
             }
             for device in &devices[..acquired] {
-                device.state.lock().unwrap().active -= 1;
+                let mut state = device.state.lock().unwrap();
+                if metadata {
+                    state.metadata_active -= 1;
+                } else {
+                    state.active -= 1;
+                }
             }
             std::thread::sleep(TICK);
         }
@@ -384,7 +464,7 @@ impl Scheduler {
                     limit_bytes_per_sec: device.limit,
                     current_bytes_per_sec: state.rate,
                     concurrency: device.concurrency,
-                    active: state.active,
+                    active: state.active + state.metadata_active,
                     deferred: state.deferred,
                     accounted_bytes: state.bytes,
                     observed_bytes_per_sec: state.throughput,
@@ -400,54 +480,162 @@ impl Scheduler {
 
 pub(crate) struct Work<'a> {
     devices: Vec<Arc<Device>>,
+    // Each input path retains its backing leaves; permits themselves remain deduplicated.
+    resources: Vec<Vec<usize>>,
     governor: &'a Governor,
     cancel: &'a dyn Cancellation,
+    metadata: bool,
 }
 
 impl Work<'_> {
-    /// No future reservation is queued: cancellation never leaves bandwidth debt behind.
-    /// Charging reads and writes separately means a same-disk source→scratch copy pays twice.
+    /// Charge each acquired device equally (single-resource reads/writes).
     pub(crate) fn pace(&self, bytes: u64) -> Result<(), LibError> {
-        let mut remaining = bytes;
-        while remaining > 0 {
-            let chunk = remaining.min(CHUNK as u64);
+        self.pace_with(
+            vec![bytes; self.devices.len()],
+            Instant::now,
+            || self.governor.pressure_reason(),
+            std::thread::sleep,
+        )
+    }
+
+    /// Charge input paths independently while holding their jointly acquired permits. A copy
+    /// pays one read on its source and one write on scratch, summing only overlapping leaves.
+    pub(crate) fn pace_resources(&self, bytes: &[u64]) -> Result<(), LibError> {
+        let charges = self.resource_charges(bytes)?;
+        self.pace_with(
+            charges,
+            Instant::now,
+            || self.governor.pressure_reason(),
+            std::thread::sleep,
+        )
+    }
+
+    /// Admission for a bounded metadata operation; the charge is an operation budget estimate.
+    pub(crate) fn pace_metadata(&self) -> Result<(), LibError> {
+        self.pace(4096)
+    }
+
+    /// Return the unused portion of an admitted read (short final reads and EOF). Credit remains
+    /// burst-bounded, and diagnostics retain only the bytes actually read or written.
+    pub(crate) fn refund(&self, bytes: u64) {
+        self.refund_charges(&vec![bytes; self.devices.len()]);
+    }
+
+    fn refund_charges(&self, bytes: &[u64]) {
+        for (device, bytes) in self.devices.iter().zip(bytes) {
+            let mut state = device.state.lock().unwrap();
+            state.credit = state
+                .credit
+                .saturating_add(*bytes as u128 * NANOS_PER_SEC)
+                .min(BURST);
+            state.bytes = state.bytes.saturating_sub(*bytes);
+        }
+    }
+
+    fn resource_charges(&self, bytes: &[u64]) -> Result<Vec<u64>, LibError> {
+        if bytes.len() != self.resources.len() {
+            return Err(LibError::Internal(
+                "background I/O resource charge mismatch".into(),
+            ));
+        }
+        let mut charges = vec![0u64; self.devices.len()];
+        for (resources, bytes) in self.resources.iter().zip(bytes) {
+            for &index in resources {
+                charges[index] = charges[index].saturating_add(*bytes);
+            }
+        }
+        Ok(charges)
+    }
+
+    /// No tokens are consumed until every involved device is ready. Waiting or cancellation
+    /// therefore creates no future reservation debt. Injected time drives the production loop
+    /// in tests, including pressure polls and fractional-request bandwidth deadlines.
+    fn pace_with(
+        &self,
+        mut remaining: Vec<u64>,
+        now: impl Fn() -> Instant,
+        pressure: impl Fn() -> Option<&'static str>,
+        mut sleep: impl FnMut(Duration),
+    ) -> Result<(), LibError> {
+        if self.cancel.cancelled() {
+            return Err(cancelled());
+        }
+        let original = remaining.clone();
+        while remaining.iter().any(|bytes| *bytes > 0) {
+            let largest = remaining.iter().copied().max().unwrap();
+            // Advance all directions in proportion. A shared fast leaf receiving twice the
+            // bytes must not defer half its charge until after a slower independent leaf ends.
+            let chunks: Vec<_> = remaining
+                .iter()
+                .map(|bytes| {
+                    if largest <= CHUNK as u64 {
+                        *bytes
+                    } else {
+                        (*bytes as u128 * CHUNK as u128).div_ceil(largest as u128) as u64
+                    }
+                })
+                .collect();
             loop {
                 if self.cancel.cancelled() {
+                    let admitted: Vec<_> = original
+                        .iter()
+                        .zip(&remaining)
+                        .map(|(original, remaining)| original - remaining)
+                        .collect();
+                    self.refund_charges(&admitted);
                     return Err(cancelled());
                 }
-                let pressure = self.governor.pressure_reason();
-                let now = Instant::now();
+                let pressure = pressure();
+                let now = now();
                 let mut states: Vec<_> = self
                     .devices
                     .iter()
                     .map(|d| d.state.lock().unwrap())
                     .collect();
-                let mut wait = false;
-                for (device, state) in self.devices.iter().zip(&mut states) {
+                let mut wait = Duration::ZERO;
+                for ((device, state), bytes) in self.devices.iter().zip(&mut states).zip(&chunks) {
+                    // Refill at the previous rate before observing a possible rate change.
+                    state.credit = state
+                        .credit
+                        .saturating_add(
+                            now.saturating_duration_since(state.replenished_at)
+                                .as_nanos()
+                                .saturating_mul(state.rate as u128),
+                        )
+                        .min(BURST);
+                    state.replenished_at = now;
                     device.observe(state, now);
+                    let needed = *bytes as u128 * NANOS_PER_SEC;
+                    let deficit = needed.saturating_sub(state.credit);
                     state.reason = if let Some(reason) = pressure {
                         reason
-                    } else if now < state.next {
+                    } else if deficit > 0 {
                         "bandwidth"
                     } else if state.rate < device.limit {
                         "device_latency_or_queue"
                     } else {
                         "ready"
                     };
-                    wait |= pressure.is_some() || now < state.next;
+                    let nanos = deficit.div_ceil(state.rate as u128);
+                    wait = wait.max(Duration::from_nanos(nanos as u64));
                 }
-                if !wait {
-                    for state in &mut states {
-                        state.next =
-                            now + Duration::from_secs_f64(chunk as f64 / state.rate as f64);
-                        state.bytes = state.bytes.saturating_add(chunk);
+                if pressure.is_none() && wait.is_zero() {
+                    for ((state, bytes), chunk) in
+                        states.iter_mut().zip(&mut remaining).zip(&chunks)
+                    {
+                        state.credit -= *chunk as u128 * NANOS_PER_SEC;
+                        state.bytes = state.bytes.saturating_add(*chunk);
+                        *bytes -= *chunk;
                     }
                     break;
                 }
                 drop(states);
-                std::thread::sleep(TICK);
+                sleep(if pressure.is_some() {
+                    TICK
+                } else {
+                    wait.min(TICK)
+                });
             }
-            remaining -= chunk;
         }
         Ok(())
     }
@@ -457,8 +645,12 @@ impl Drop for Work<'_> {
     fn drop(&mut self) {
         for device in &self.devices {
             let mut state = device.state.lock().unwrap();
-            state.active -= 1;
-            if state.active == 0 && state.deferred == 0 {
+            if self.metadata {
+                state.metadata_active -= 1;
+            } else {
+                state.active -= 1;
+            }
+            if state.active == 0 && state.metadata_active == 0 && state.deferred == 0 {
                 state.reason = "ready";
             }
         }
@@ -542,6 +734,441 @@ fn physical_devices(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    struct FakeClock {
+        now: Cell<Instant>,
+        slept: Cell<Duration>,
+        largest_sleep: Cell<Duration>,
+    }
+
+    impl FakeClock {
+        fn new(work: &Work<'_>) -> Self {
+            let now = Instant::now();
+            for device in &work.devices {
+                let mut state = device.state.lock().unwrap();
+                state.replenished_at = now;
+                state.credit = 0;
+            }
+            Self {
+                now: Cell::new(now),
+                slept: Cell::new(Duration::ZERO),
+                largest_sleep: Cell::new(Duration::ZERO),
+            }
+        }
+
+        fn sleep(&self, duration: Duration) {
+            assert!(!duration.is_zero());
+            assert!(duration <= TICK);
+            self.now.set(self.now.get() + duration);
+            self.slept.set(self.slept.get() + duration);
+            self.largest_sleep
+                .set(self.largest_sleep.get().max(duration));
+        }
+
+        fn pace(&self, work: &Work<'_>, bytes: u64) {
+            work.pace_with(
+                vec![bytes; work.devices.len()],
+                || self.now.get(),
+                || None,
+                |duration| self.sleep(duration),
+            )
+            .unwrap();
+        }
+
+        fn copy(&self, work: &Work<'_>, bytes: u64) {
+            work.pace_with(
+                work.resource_charges(&[bytes, bytes]).unwrap(),
+                || self.now.get(),
+                || None,
+                |duration| self.sleep(duration),
+            )
+            .unwrap();
+        }
+    }
+
+    fn healthy_governor(options: IoOptions) -> Governor {
+        let mut governor = Governor::with_io(Some(0), Some(100.0), options);
+        governor.max_load_per_cpu = f64::INFINITY;
+        governor
+    }
+
+    #[test]
+    fn quick_metadata_can_run_while_a_bulk_file_holds_the_device() {
+        let governor = healthy_governor(IoOptions {
+            concurrency: Some(1),
+            ..Default::default()
+        });
+        let cancel = AtomicBool::new(false);
+        let bulk = governor.io.acquire(&governor, &[None], &cancel).unwrap();
+        let metadata = governor
+            .io
+            .acquire_metadata(&governor, &[None], &cancel, true)
+            .unwrap();
+        assert_eq!(metadata.devices[0].state.lock().unwrap().active, 1);
+        assert_eq!(metadata.devices[0].state.lock().unwrap().metadata_active, 1);
+        let clock = FakeClock::new(&metadata);
+        clock.pace(&metadata, 4096);
+        assert_eq!(bulk.devices[0].state.lock().unwrap().bytes, 4096);
+        drop(metadata);
+        assert_eq!(bulk.devices[0].state.lock().unwrap().metadata_active, 0);
+        assert_eq!(bulk.devices[0].state.lock().unwrap().active, 1);
+        let cancelled = AtomicBool::new(true);
+        assert!(governor
+            .io
+            .acquire_metadata(&governor, &[None], &cancelled, true)
+            .is_err());
+        assert_eq!(
+            bulk.devices[0]
+                .state
+                .lock()
+                .unwrap()
+                .manual_metadata_waiters,
+            0
+        );
+    }
+
+    #[test]
+    fn healthy_pacing_matches_caps_for_tiny_and_large_requests() {
+        for mib_per_sec in [4, 8, 128, 1024] {
+            for (bytes, requests) in [(1024, 64), (CHUNK as u64, 32)] {
+                let governor = healthy_governor(IoOptions {
+                    max_mib_per_sec: Some(mib_per_sec),
+                    ..Default::default()
+                });
+                let cancel = AtomicBool::new(false);
+                let work = governor.io.acquire(&governor, &[None], &cancel).unwrap();
+                let clock = FakeClock::new(&work);
+                for _ in 0..requests {
+                    clock.pace(&work, bytes);
+                }
+                let rate = mib_per_sec * 1024 * 1024;
+                let expected = Duration::from_secs_f64((bytes * requests) as f64 / rate as f64);
+                let elapsed = clock.slept.get();
+                assert!(
+                    elapsed >= expected,
+                    "{bytes}-byte requests at {mib_per_sec} MiB/s"
+                );
+                assert!(elapsed <= expected + Duration::from_nanos(requests));
+                assert_eq!(
+                    work.devices[0].state.lock().unwrap().bytes,
+                    bytes * requests
+                );
+                if bytes == 1024 {
+                    assert!(clock.largest_sleep.get() < Duration::from_millis(1));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tiny_requests_preserve_capacity_when_sleep_overshoots_deadlines() {
+        for mib_per_sec in [4, 8, 128, 1024] {
+            let governor = healthy_governor(IoOptions {
+                max_mib_per_sec: Some(mib_per_sec),
+                ..Default::default()
+            });
+            let cancel = AtomicBool::new(false);
+            let work = governor.io.acquire(&governor, &[None], &cancel).unwrap();
+            let clock = FakeClock::new(&work);
+            let timer_resolution = Duration::from_micros(100);
+            for _ in 0..64 {
+                work.pace_with(
+                    vec![1024],
+                    || clock.now.get(),
+                    || None,
+                    |duration| clock.sleep(duration.max(timer_resolution)),
+                )
+                .unwrap();
+            }
+            let expected =
+                Duration::from_secs_f64(64.0 * 1024.0 / (mib_per_sec * 1024 * 1024) as f64);
+            assert!(clock.slept.get() >= expected);
+            assert!(clock.slept.get() <= expected + timer_resolution);
+        }
+    }
+
+    #[test]
+    fn idle_credit_is_bounded_and_short_reads_refund_unused_admission() {
+        let governor = healthy_governor(IoOptions::default());
+        let cancel = AtomicBool::new(false);
+        let work = governor.io.acquire(&governor, &[None], &cancel).unwrap();
+        let clock = FakeClock::new(&work);
+        clock.now.set(clock.now.get() + Duration::from_secs(3600));
+        clock.pace(&work, CHUNK as u64);
+        assert_eq!(clock.slept.get(), Duration::ZERO);
+        clock.pace(&work, 1024);
+        assert_eq!(
+            clock.slept.get(),
+            Duration::from_secs_f64(1024.0 / (4 * 1024 * 1024) as f64)
+        );
+        clock.pace(&work, CHUNK as u64);
+        work.refund(CHUNK as u64 - 7);
+        assert_eq!(
+            work.devices[0].state.lock().unwrap().bytes,
+            CHUNK as u64 + 1024 + 7
+        );
+        let before_eof = clock.slept.get();
+        clock.pace(&work, 0);
+        assert_eq!(clock.slept.get(), before_eof);
+        // The unused admission carries forward instead of charging another final-read interval.
+        clock.pace(&work, 1024);
+        assert_eq!(clock.slept.get(), before_eof);
+    }
+
+    #[test]
+    fn shared_workers_share_one_aggregate_budget_and_idle_burst() {
+        let governor = healthy_governor(IoOptions {
+            max_mib_per_sec: Some(8),
+            concurrency: Some(4),
+            ..Default::default()
+        });
+        let cancel = AtomicBool::new(false);
+        let workers: Vec<_> = (0..4)
+            .map(|_| governor.io.acquire(&governor, &[None], &cancel).unwrap())
+            .collect();
+        let clock = FakeClock::new(&workers[0]);
+        for _ in 0..32 {
+            for worker in &workers {
+                clock.pace(worker, 1024);
+            }
+        }
+        assert_eq!(
+            clock.slept.get(),
+            Duration::from_millis(15) + Duration::from_micros(625)
+        );
+        assert_eq!(
+            workers[0].devices[0].state.lock().unwrap().bytes,
+            128 * 1024
+        );
+        clock.now.set(clock.now.get() + Duration::from_secs(60));
+        let before = clock.slept.get();
+        for worker in &workers {
+            clock.pace(worker, CHUNK as u64);
+        }
+        assert_eq!(
+            clock.slept.get() - before,
+            Duration::from_millis(93) + Duration::from_micros(750)
+        );
+    }
+
+    #[test]
+    fn cancelled_wait_rolls_back_partial_admission_and_releases_joint_permits() {
+        let governor = healthy_governor(IoOptions::default());
+        let cancel = AtomicBool::new(false);
+        let work = governor
+            .io
+            .acquire(&governor, &[None, None], &cancel)
+            .unwrap();
+        let clock = FakeClock::new(&work);
+        clock.now.set(clock.now.get() + Duration::from_secs(1));
+        assert!(work
+            .pace_with(
+                vec![(CHUNK * 2) as u64],
+                || clock.now.get(),
+                || None,
+                |duration| {
+                    clock.sleep(duration);
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            )
+            .is_err());
+        assert_eq!(work.devices[0].state.lock().unwrap().bytes, 0);
+        assert_eq!(work.devices[0].state.lock().unwrap().credit, BURST);
+        drop(work);
+        assert_eq!(governor.io.diagnostics()[0].active, 0);
+        assert_eq!(governor.io.diagnostics()[0].deferred, 0);
+        cancel.store(false, Ordering::Relaxed);
+        let work = governor.io.acquire(&governor, &[None], &cancel).unwrap();
+        let before = clock.slept.get();
+        clock.pace(&work, CHUNK as u64);
+        assert_eq!(clock.slept.get(), before);
+    }
+
+    #[test]
+    fn pressure_polls_promptly_without_consuming_tokens() {
+        let governor = healthy_governor(IoOptions::default());
+        let cancel = AtomicBool::new(false);
+        let work = governor.io.acquire(&governor, &[None], &cancel).unwrap();
+        let clock = FakeClock::new(&work);
+        let polls = Cell::new(0);
+        work.pace_with(
+            vec![1024],
+            || clock.now.get(),
+            || {
+                let poll = polls.get();
+                polls.set(poll + 1);
+                (poll < 3).then_some("io_stall")
+            },
+            |duration| {
+                assert_eq!(duration, TICK);
+                assert_eq!(work.devices[0].state.lock().unwrap().bytes, 0);
+                clock.sleep(duration);
+            },
+        )
+        .unwrap();
+        assert_eq!(clock.slept.get(), TICK * 3);
+        assert_eq!(work.devices[0].state.lock().unwrap().bytes, 1024);
+    }
+
+    #[test]
+    fn copy_charges_independent_and_grouped_storage_without_halving_source_allowance() {
+        for shared in [false, true] {
+            let governor = healthy_governor(IoOptions {
+                storage: vec![
+                    StorageOverride {
+                        path: "/source".into(),
+                        resource: "source".into(),
+                        kind: StorageKind::Rotational,
+                        max_mib_per_sec: Some(8),
+                        concurrency: Some(1),
+                    },
+                    StorageOverride {
+                        path: "/scratch".into(),
+                        resource: if shared { "source" } else { "scratch" }.into(),
+                        kind: StorageKind::SolidState,
+                        max_mib_per_sec: Some(128),
+                        concurrency: Some(2),
+                    },
+                ],
+                ..Default::default()
+            });
+            let cancel = AtomicBool::new(false);
+            let work = governor
+                .io
+                .acquire(
+                    &governor,
+                    &[Some(Path::new("/source/a")), Some(Path::new("/scratch/b"))],
+                    &cancel,
+                )
+                .unwrap();
+            let clock = FakeClock::new(&work);
+            clock.copy(&work, 1024 * 1024);
+            let diagnostics = governor.io.diagnostics();
+            assert_eq!(diagnostics.len(), if shared { 1 } else { 2 });
+            for budget in diagnostics {
+                assert_eq!(
+                    budget.accounted_bytes,
+                    if shared { 2 * 1024 * 1024 } else { 1024 * 1024 }
+                );
+                assert_eq!(budget.active, 1);
+            }
+            assert_eq!(
+                clock.slept.get(),
+                Duration::from_millis(if shared { 250 } else { 125 })
+            );
+        }
+    }
+
+    #[test]
+    fn remote_and_overlapping_mapper_leaves_keep_directional_accounting() {
+        let governor = healthy_governor(IoOptions::default());
+        let a = governor.io.resolve(None)[0].clone();
+        let b = Arc::new(Device::new(
+            "local".into(),
+            Kind::SolidState,
+            None,
+            IoOptions::default(),
+        ));
+        let c = Arc::new(Device::new(
+            "other".into(),
+            Kind::Rotational,
+            None,
+            IoOptions::default(),
+        ));
+        {
+            let mut paths = governor.io.paths.lock().unwrap();
+            paths.insert("remote-local".into(), vec![b.clone()]);
+            // Simulate mapper leaf sets sharing a physical disk. Resolve already deduplicates
+            // partitions and mapper slave aliases; the common leaf must receive both directions.
+            paths.insert("mapper-source".into(), vec![a.clone(), b.clone()]);
+            paths.insert("mapper-scratch".into(), vec![b.clone(), c.clone()]);
+        }
+        let cancel = AtomicBool::new(false);
+        let remote = governor
+            .io
+            .acquire(&governor, &[None, Some(Path::new("remote-local"))], &cancel)
+            .unwrap();
+        let clock = FakeClock::new(&remote);
+        clock.copy(&remote, 1024 * 1024);
+        assert_eq!(a.state.lock().unwrap().bytes, 1024 * 1024);
+        assert_eq!(b.state.lock().unwrap().bytes, 1024 * 1024);
+        assert_eq!(clock.slept.get(), Duration::from_millis(250));
+        drop(remote);
+        let mixed = governor
+            .io
+            .acquire(
+                &governor,
+                &[
+                    Some(Path::new("mapper-source")),
+                    Some(Path::new("mapper-scratch")),
+                ],
+                &cancel,
+            )
+            .unwrap();
+        let clock = FakeClock::new(&mixed);
+        clock.copy(&mixed, 1024 * 1024);
+        assert_eq!(mixed.devices.len(), 3);
+        assert_eq!(a.state.lock().unwrap().bytes, 2 * 1024 * 1024);
+        assert_eq!(b.state.lock().unwrap().bytes, 3 * 1024 * 1024);
+        assert_eq!(c.state.lock().unwrap().bytes, 1024 * 1024);
+        assert_eq!(clock.slept.get(), Duration::from_millis(250));
+    }
+
+    #[test]
+    fn cancelled_joint_admission_preserves_ready_devices_credit() {
+        let governor = healthy_governor(IoOptions {
+            storage: vec![
+                StorageOverride {
+                    path: "/ready".into(),
+                    resource: "ready".into(),
+                    kind: StorageKind::SolidState,
+                    max_mib_per_sec: Some(128),
+                    concurrency: Some(1),
+                },
+                StorageOverride {
+                    path: "/waiting".into(),
+                    resource: "waiting".into(),
+                    kind: StorageKind::Rotational,
+                    max_mib_per_sec: Some(4),
+                    concurrency: Some(1),
+                },
+            ],
+            ..Default::default()
+        });
+        let cancel = AtomicBool::new(false);
+        let work = governor
+            .io
+            .acquire(
+                &governor,
+                &[Some(Path::new("/ready")), Some(Path::new("/waiting"))],
+                &cancel,
+            )
+            .unwrap();
+        let clock = FakeClock::new(&work);
+        work.devices[0].state.lock().unwrap().credit = BURST;
+        let charges = work
+            .resource_charges(&[CHUNK as u64, CHUNK as u64])
+            .unwrap();
+        assert!(work
+            .pace_with(
+                charges,
+                || clock.now.get(),
+                || None,
+                |duration| {
+                    clock.sleep(duration);
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            )
+            .is_err());
+        assert_eq!(work.devices[0].state.lock().unwrap().credit, BURST);
+        drop(work);
+        for budget in governor.io.diagnostics() {
+            assert_eq!(budget.accounted_bytes, 0);
+            assert_eq!(budget.active, 0);
+            assert_eq!(budget.deferred, 0);
+        }
+    }
 
     #[test]
     fn stats_include_reads_and_writes() {

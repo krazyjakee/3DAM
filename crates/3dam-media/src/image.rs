@@ -114,6 +114,46 @@ pub fn metadata(path: &Path, format: &str) -> ImageAttributes {
     attrs
 }
 
+/// Parse a bounded header snapshot; the source is never reopened for the PNG sniff.
+pub(crate) fn ingest_metadata(
+    path: &Path,
+    format: &str,
+    session: &mut crate::ingest::Session<'_, '_>,
+) -> ImageAttributes {
+    let limit = if crate::texture::is_texture(format) {
+        148
+    } else {
+        session.remaining()
+    };
+    let Some((bytes, _)) = session.prefix(path, limit) else {
+        return ImageAttributes::default();
+    };
+    if crate::texture::is_texture(format) {
+        return crate::texture::metadata_from_bytes(&bytes, format).unwrap_or_default();
+    }
+    let mut attrs = ImageAttributes::default();
+    if let Ok(mut reader) = ImageReader::new(Cursor::new(&bytes)).with_guessed_format() {
+        let mut limits = image::Limits::default();
+        limits.max_alloc = Some(
+            session
+                .budget
+                .max_allocation_bytes
+                .saturating_sub(bytes.capacity() + 8192) as u64,
+        );
+        reader.limits(limits);
+        if let Ok((width, height)) = reader.into_dimensions() {
+            attrs.width = Some(width as i64);
+            attrs.height = Some(height as i64);
+        }
+    }
+    if format == "png" && bytes.len() >= 26 && bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        attrs.color_depth = Some(bytes[24] as i64);
+        attrs.has_alpha = Some(matches!(bytes[25], 4 | 6));
+    }
+    attrs.color_space = Some("srgb".to_string());
+    attrs
+}
+
 /// Read PNG bit-depth and alpha from the IHDR chunk without decoding pixels. Colour types 4/6
 /// (grey+alpha / RGBA) and any `tRNS` chunk imply alpha; we detect the former cheaply here.
 fn png_ihdr(path: &Path) -> Option<(u8, bool)> {

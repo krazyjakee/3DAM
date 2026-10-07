@@ -292,7 +292,7 @@ impl Store {
         let mut vis_binds: Vec<Value> = Vec::new();
         push_visibility(vis, "asset", &mut vis_sql, &mut vis_binds);
         let sql = format!(
-            "{GRID_SELECT} FROM collection_member cm JOIN asset ON asset.id = cm.asset_id {ATTR_JOINS} \
+            "{GRID_SELECT}{GRID_PENDING_SELECT} FROM collection_member cm JOIN asset ON asset.id = cm.asset_id {ATTR_JOINS} \
              WHERE cm.collection_id = ?{vis_sql} ORDER BY cm.added_at DESC, asset.id ASC LIMIT ?"
         );
         let mut binds: Vec<Value> = vec![Value::Blob(id.as_bytes().to_vec())];

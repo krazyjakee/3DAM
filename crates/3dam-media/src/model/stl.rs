@@ -49,7 +49,7 @@ fn stl_ascii(path: &Path) -> Option<ModelAttributes> {
     (declares_solid || tris > 0).then(|| model_from_tris(tris))
 }
 
-fn model_from_tris(tris: i64) -> ModelAttributes {
+pub(super) fn model_from_tris(tris: i64) -> ModelAttributes {
     ModelAttributes {
         vertex_count: nonzero(tris * 3),
         triangle_count: nonzero(tris),
@@ -62,4 +62,24 @@ fn model_from_tris(tris: i64) -> ModelAttributes {
         has_uvs: Some(false),
         class: None,
     }
+}
+
+/// Parse a complete bounded text snapshot; binary headers are handled separately.
+pub(super) fn from_bytes(bytes: &[u8]) -> Option<ModelAttributes> {
+    let mut tris = 0;
+    let mut solid = false;
+    for (n, line) in BufReader::new(bytes)
+        .lines()
+        .map_while(Result::ok)
+        .enumerate()
+    {
+        let line = line.trim_start();
+        if n == 0 {
+            solid = line.starts_with("solid");
+        }
+        if line.starts_with("facet normal") {
+            tris += 1;
+        }
+    }
+    (solid || tris > 0).then(|| model_from_tris(tris))
 }

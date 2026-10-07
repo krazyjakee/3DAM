@@ -10,7 +10,7 @@
 
 use dam_api::dto::ModelAttributes;
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Read, Seek};
 use std::path::Path;
 
 const MAIN: u16 = 0x4D4D;
@@ -35,6 +35,10 @@ const MAX_DEPTH: u32 = 16;
 pub(super) fn metadata(path: &Path) -> Option<ModelAttributes> {
     let f = File::open(path).ok()?;
     let len = f.metadata().ok()?.len();
+    from_reader(f, len)
+}
+
+pub(super) fn from_reader<R: Read + Seek>(f: R, len: u64) -> Option<ModelAttributes> {
     let mut r = Tds {
         r: BufReader::new(f),
         pos: 0,
@@ -72,13 +76,13 @@ struct Counts {
     has_animation: bool,
 }
 
-struct Tds {
-    r: BufReader<File>,
+struct Tds<R: Read + Seek> {
+    r: BufReader<R>,
     pos: u64,
     len: u64,
 }
 
-impl Tds {
+impl<R: Read + Seek> Tds<R> {
     fn take(&mut self, buf: &mut [u8]) -> Option<()> {
         self.r.read_exact(buf).ok()?;
         self.pos += buf.len() as u64;

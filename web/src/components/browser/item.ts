@@ -14,7 +14,8 @@ export function mods(e: React.MouseEvent): ClickMods {
  *  selected item is announced by more than colour (issue #27). */
 export function itemAriaLabel(asset: AssetSummary, dupCount?: number): string {
   const dup = dupCount != null && dupCount > 0 ? `, ${dupCount} duplicate${dupCount === 1 ? "" : "s"}` : "";
-  return `${asset.name}, ${asset.media}${dup}`;
+  const pending = asset.key_attrs.ingest_status === "pending_verification" ? ", awaiting verification" : "";
+  return `${asset.name}, ${asset.media}${pending}${dup}`;
 }
 
 /** The media-specific "detail" from the store's `key_attrs` — image dimensions, audio duration
@@ -23,6 +24,7 @@ export function itemAriaLabel(asset: AssetSummary, dupCount?: number): string {
  *  grid/table has a single meaningful column. */
 export function detailAttr(asset: AssetSummary): string | null {
   const k = asset.key_attrs;
+  if (k.ingest_status === "pending_verification") return "Awaiting verification";
   if (asset.media === "image") return k.dimensions ?? null;
   if (asset.media === "audio")
     return k.duration ? (k.type ? `${k.duration} · ${k.type}` : k.duration) : (k.type ?? null);

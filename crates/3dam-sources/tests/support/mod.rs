@@ -19,6 +19,7 @@ use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -42,8 +43,21 @@ pub struct TestSftpServer {
     root: PathBuf,
     username: String,
     password: String,
+    pub listing: Arc<ListingStats>,
     /// Owns the server task; dropped last, which tears the listener down.
     _rt: Runtime,
+}
+
+/// Wire-level listing counters and fault injection, shared across SSH subsystem channels.
+#[derive(Default)]
+pub struct ListingStats {
+    pub opens: AtomicUsize,
+    pub reads: AtomicUsize,
+    pub closes: AtomicUsize,
+    /// Fail this numbered READDIR request; zero disables injection.
+    pub fail_read: AtomicUsize,
+    /// Force content READ replies to contain at most this many bytes; zero keeps requested size.
+    pub content_read_limit: AtomicUsize,
 }
 
 impl TestSftpServer {
@@ -102,10 +116,12 @@ impl TestSftpServer {
             ..Default::default()
         });
 
+        let listing = Arc::new(ListingStats::default());
         let mut server = SshServer {
             root: root.clone(),
             username: username.to_string(),
             password: password.to_string(),
+            listing: listing.clone(),
         };
         rt.spawn(async move {
             let _ = server.run_on_socket(config, &listener).await;
@@ -117,6 +133,7 @@ impl TestSftpServer {
             root,
             username: username.to_string(),
             password: password.to_string(),
+            listing,
             _rt: rt,
         })
     }
@@ -180,6 +197,7 @@ struct SshServer {
     root: PathBuf,
     username: String,
     password: String,
+    listing: Arc<ListingStats>,
 }
 
 impl russh::server::Server for SshServer {
@@ -191,6 +209,7 @@ impl russh::server::Server for SshServer {
             root: self.root.clone(),
             username: self.username.clone(),
             password: self.password.clone(),
+            listing: self.listing.clone(),
         }
     }
 }
@@ -200,6 +219,7 @@ struct SshSession {
     root: PathBuf,
     username: String,
     password: String,
+    listing: Arc<ListingStats>,
 }
 
 impl russh::server::Handler for SshSession {
@@ -249,7 +269,11 @@ impl russh::server::Handler for SshSession {
             }
         };
         session.channel_success(channel_id)?;
-        russh_sftp::server::run(channel.into_stream(), FsSftpHandler::new(self.root.clone())).await;
+        russh_sftp::server::run(
+            channel.into_stream(),
+            FsSftpHandler::new(self.root.clone(), self.listing.clone()),
+        )
+        .await;
         Ok(())
     }
 }
@@ -260,7 +284,7 @@ impl russh::server::Handler for SshSession {
 
 enum OpenHandle {
     Dir {
-        /// Remaining entries; drained by the first `readdir`, then EOF.
+        /// Remaining entries; returned in bounded pages, then EOF.
         pending: Vec<File>,
     },
     File(fs::File),
@@ -270,14 +294,16 @@ struct FsSftpHandler {
     root: PathBuf,
     handles: HashMap<String, OpenHandle>,
     next_handle: u64,
+    listing: Arc<ListingStats>,
 }
 
 impl FsSftpHandler {
-    fn new(root: PathBuf) -> Self {
+    fn new(root: PathBuf, listing: Arc<ListingStats>) -> Self {
         FsSftpHandler {
             root,
             handles: HashMap::new(),
             next_handle: 0,
+            listing,
         }
     }
 
@@ -374,6 +400,7 @@ impl russh_sftp::server::Handler for FsSftpHandler {
     }
 
     async fn opendir(&mut self, id: u32, path: String) -> Result<Handle, Self::Error> {
+        self.listing.opens.fetch_add(1, Ordering::Relaxed);
         let dir = self.resolve(&path)?;
         let mut files = Vec::new();
         for entry in fs::read_dir(&dir).map_err(|e| io_status(&e))? {
@@ -395,10 +422,14 @@ impl russh_sftp::server::Handler for FsSftpHandler {
     }
 
     async fn readdir(&mut self, id: u32, handle: String) -> Result<Name, Self::Error> {
+        let request = self.listing.reads.fetch_add(1, Ordering::Relaxed) + 1;
+        if self.listing.fail_read.load(Ordering::Relaxed) == request {
+            return Err(StatusCode::Failure);
+        }
         match self.handles.get_mut(&handle) {
             Some(OpenHandle::Dir { pending }) if !pending.is_empty() => Ok(Name {
                 id,
-                files: std::mem::take(pending),
+                files: pending.drain(..pending.len().min(32)).collect(),
             }),
             // Empty dir, or everything already sent: the spec says signal EOF.
             Some(OpenHandle::Dir { .. }) => Err(StatusCode::Eof),
@@ -429,7 +460,9 @@ impl russh_sftp::server::Handler for FsSftpHandler {
     async fn close(&mut self, id: u32, handle: String) -> Result<Status, Self::Error> {
         // A close for an unknown handle is not worth an error: the client drops handles
         // fire-and-forget (`close_nowait`), so races are normal.
-        self.handles.remove(&handle);
+        if matches!(self.handles.remove(&handle), Some(OpenHandle::Dir { .. })) {
+            self.listing.closes.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(Self::ok(id))
     }
 
@@ -440,10 +473,16 @@ impl russh_sftp::server::Handler for FsSftpHandler {
         offset: u64,
         len: u32,
     ) -> Result<Data, Self::Error> {
+        let read_limit = self.listing.content_read_limit.load(Ordering::Relaxed);
+        let len = if read_limit == 0 {
+            len as usize
+        } else {
+            (len as usize).min(read_limit)
+        };
         let file = self.file_mut(&handle)?;
         file.seek(SeekFrom::Start(offset))
             .map_err(|e| io_status(&e))?;
-        let mut buf = vec![0u8; len as usize];
+        let mut buf = vec![0u8; len];
         let mut filled = 0usize;
         while filled < buf.len() {
             match file.read(&mut buf[filled..]) {
