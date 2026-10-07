@@ -1,0 +1,95 @@
+{
+  "revision": "9b43439226d6e89ab06b9bd2c1ec24a6d4305a0b",
+  "sqlite_version": "3.45.1",
+  "scope": "Production observation SQL replay; 20k verified rows copied from the 100k production fixture under current schema V29. Excludes scan walking, progress and final missing reconciliation. Legacy SQL is the old asset marker, current SQL is the private observation spool. Warm NVMe-backed /tmp, WAL/NORMAL, default 1000-page autocheckpoint, chunks128, shuffled seed42. Not physical HDD.",
+  "profiles": [
+    {
+      "strategy": "legacy_marker",
+      "order": "insertion",
+      "rows": 20000,
+      "explicit_commits": 157,
+      "asset_rows_updated": 20000,
+      "elapsed_ms": 221.19472292251885,
+      "sql_total_changes": 20000,
+      "process_io": {
+        "rchar": 21794955,
+        "wchar": 20907556,
+        "syscr": 5478,
+        "syscw": 8514,
+        "read_bytes": 4096,
+        "write_bytes": 20930560,
+        "cancelled_write_bytes": 0
+      },
+      "main_wal_end_bytes": 4202432,
+      "main_checkpoint_frames": 370,
+      "main_checkpoint_logical_bytes": 1515520,
+      "spool_file_bytes": 8192
+    },
+    {
+      "strategy": "legacy_marker",
+      "order": "shuffled_seed_42",
+      "rows": 20000,
+      "explicit_commits": 157,
+      "asset_rows_updated": 20000,
+      "elapsed_ms": 1039.5064479671419,
+      "sql_total_changes": 20000,
+      "process_io": {
+        "rchar": 315538007,
+        "wchar": 258832088,
+        "syscr": 77194,
+        "syscw": 102445,
+        "read_bytes": 0,
+        "write_bytes": 259067904,
+        "cancelled_write_bytes": 0
+      },
+      "main_wal_end_bytes": 5178872,
+      "main_checkpoint_frames": 296,
+      "main_checkpoint_logical_bytes": 1212416,
+      "spool_file_bytes": 8192
+    },
+    {
+      "strategy": "private_spool",
+      "order": "insertion",
+      "rows": 20000,
+      "explicit_commits": 157,
+      "asset_rows_updated": 0,
+      "elapsed_ms": 180.9871830046177,
+      "sql_total_changes": 20000,
+      "process_io": {
+        "rchar": 14289499,
+        "wchar": 3773796,
+        "syscr": 3647,
+        "syscw": 924,
+        "read_bytes": 0,
+        "write_bytes": 598016,
+        "cancelled_write_bytes": 0
+      },
+      "main_wal_end_bytes": 0,
+      "main_checkpoint_frames": 0,
+      "main_checkpoint_logical_bytes": 0,
+      "spool_file_bytes": 606208
+    },
+    {
+      "strategy": "private_spool",
+      "order": "shuffled_seed_42",
+      "rows": 20000,
+      "explicit_commits": 157,
+      "asset_rows_updated": 0,
+      "elapsed_ms": 262.84719398245215,
+      "sql_total_changes": 20000,
+      "process_io": {
+        "rchar": 170519133,
+        "wchar": 37023744,
+        "syscr": 41789,
+        "syscw": 9039,
+        "read_bytes": 0,
+        "write_bytes": 581632,
+        "cancelled_write_bytes": 0
+      },
+      "main_wal_end_bytes": 0,
+      "main_checkpoint_frames": 0,
+      "main_checkpoint_logical_bytes": 0,
+      "spool_file_bytes": 589824
+    }
+  ]
+}

@@ -1,0 +1,373 @@
+{
+  "revision": "1dd900232566bcc230258290fdb6d503727693f2",
+  "scope": "Separate-HDD production diagnostic with strace -f -ttt -T -yy -e trace=fsync,fdatasync,futex. Tracing perturbs timing; this failed profile is diagnostic, not a clean latency acceptance run. Raw trace retained outside git; summary includes every completed sync event and its observed descriptor path.",
+  "interpretation": "Slow db/WAL syncs appear on the separate connection as well as ordinary WAL recycling and explicit harness checkpoints. The nine regression tests independently prove normal checkpoints complete while the writer mutex is held. First Full traced p95=247ms and cancellation edit103ms fail the60ms budget; do not compare these timings directly with untraced runs.",
+  "events": [
+    {
+      "tid": 1247200,
+      "start_utc_epoch": 1791395584.115948,
+      "duration_ms": 93.399,
+      "syscall": "fsync(9</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace/co-tenant.bin>) = 0 <0.093399>"
+    },
+    {
+      "tid": 1247203,
+      "start_utc_epoch": 1791395584.21289,
+      "duration_ms": 71.702,
+      "syscall": "fsync(10</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace/library.db-journal>) = 0 <0.071702>"
+    },
+    {
+      "tid": 1247203,
+      "start_utc_epoch": 1791395584.28475,
+      "duration_ms": 0.02,
+      "syscall": "fsync(11</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace>) = 0 <0.000020>"
+    },
+    {
+      "tid": 1247203,
+      "start_utc_epoch": 1791395584.284937,
+      "duration_ms": 58.042,
+      "syscall": "fsync(10</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace/library.db-journal>) = 0 <0.058042>"
+    },
+    {
+      "tid": 1247203,
+      "start_utc_epoch": 1791395584.343146,
+      "duration_ms": 83.247,
+      "syscall": "fsync(9</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace/library.db>) = 0 <0.083247>"
+    },
+    {
+      "tid": 1247203,
+      "start_utc_epoch": 1791395584.436809,
+      "duration_ms": 48.18,
+      "syscall": "fsync(15</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace/library.db-wal>) = 0 <0.048180>"
+    },
+    {
+      "tid": 1247203,
+      "start_utc_epoch": 1791395584.485103,
+      "duration_ms": 0.014,
+      "syscall": "fsync(16</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace>) = 0 <0.000014>"
+    },
+    {
+      "tid": 1247200,
+      "start_utc_epoch": 1791395586.617922,
+      "duration_ms": 108.715,
+      "syscall": "fsync(21</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace/library.db-wal>) = 0 <0.108715>"
+    },
+    {
+      "tid": 1247200,
+      "start_utc_epoch": 1791395586.726769,
+      "duration_ms": 0.016,
+      "syscall": "fsync(22</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace>) = 0 <0.000016>"
+    },
+    {
+      "tid": 1247200,
+      "start_utc_epoch": 1791395586.739239,
+      "duration_ms": 79.178,
+      "syscall": "fsync(19</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace/library.db>) = 0 <0.079178>"
+    },
+    {
+      "tid": 1247210,
+      "start_utc_epoch": 1791395586.822494,
+      "duration_ms": 54.305,
+      "syscall": "fsync(15</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace/library.db-wal> <unfinished ...> <... fsync resumed>) = 0 <0.054305>"
+    },
+    {
+      "tid": 1247200,
+      "start_utc_epoch": 1791395588.889522,
+      "duration_ms": 78.893,
+      "syscall": "fsync(21</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace/library.db-wal>) = 0 <0.078893>"
+    },
+    {
+      "tid": 1247200,
+      "start_utc_epoch": 1791395588.968534,
+      "duration_ms": 0.012,
+      "syscall": "fsync(22</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace>) = 0 <0.000012>"
+    },
+    {
+      "tid": 1247200,
+      "start_utc_epoch": 1791395588.968881,
+      "duration_ms": 49.641999999999996,
+      "syscall": "fsync(19</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace/library.db>) = 0 <0.049642>"
+    },
+    {
+      "tid": 1247209,
+      "start_utc_epoch": 1791395589.02252,
+      "duration_ms": 54.355000000000004,
+      "syscall": "fsync(15</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace/library.db-wal> <unfinished ...> <... fsync resumed>) = 0 <0.054355>"
+    },
+    {
+      "tid": 1247200,
+      "start_utc_epoch": 1791395591.079895,
+      "duration_ms": 71.935,
+      "syscall": "fsync(21</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace/library.db-wal>) = 0 <0.071935>"
+    },
+    {
+      "tid": 1247200,
+      "start_utc_epoch": 1791395591.15193,
+      "duration_ms": 0.012,
+      "syscall": "fsync(22</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace>) = 0 <0.000012>"
+    },
+    {
+      "tid": 1247200,
+      "start_utc_epoch": 1791395591.152288,
+      "duration_ms": 49.635,
+      "syscall": "fsync(19</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace/library.db>) = 0 <0.049635>"
+    },
+    {
+      "tid": 1247209,
+      "start_utc_epoch": 1791395591.20556,
+      "duration_ms": 54.723,
+      "syscall": "fsync(15</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace/library.db-wal> <unfinished ...> <... fsync resumed>) = 0 <0.054723>"
+    },
+    {
+      "tid": 1247204,
+      "start_utc_epoch": 1791395596.225519,
+      "duration_ms": 126.20200000000001,
+      "syscall": "fsync(11</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace/library.db-wal> <unfinished ...> <... fsync resumed>) = 0 <0.126202>"
+    },
+    {
+      "tid": 1247204,
+      "start_utc_epoch": 1791395596.351798,
+      "duration_ms": 16.672,
+      "syscall": "fsync(22</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace> <unfinished ...> <... fsync resumed>) = 0 <0.016672>"
+    },
+    {
+      "tid": 1247204,
+      "start_utc_epoch": 1791395596.380019,
+      "duration_ms": 55.218999999999994,
+      "syscall": "fsync(11</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace/library.db-wal> <unfinished ...> <... fsync resumed>) = 0 <0.055219>"
+    },
+    {
+      "tid": 1247204,
+      "start_utc_epoch": 1791395596.435422,
+      "duration_ms": 122.945,
+      "syscall": "fsync(10</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace/library.db> <unfinished ...> <... fsync resumed>) = 0 <0.122945>"
+    },
+    {
+      "tid": 1247204,
+      "start_utc_epoch": 1791395596.558605,
+      "duration_ms": 43.526,
+      "syscall": "fsync(11</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace/library.db-wal> <unfinished ...> <... fsync resumed>) = 0 <0.043526>"
+    },
+    {
+      "tid": 1247204,
+      "start_utc_epoch": 1791395596.60231,
+      "duration_ms": 49.909,
+      "syscall": "fsync(10</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace/library.db> <unfinished ...> <... fsync resumed>) = 0 <0.049909>"
+    },
+    {
+      "tid": 1247204,
+      "start_utc_epoch": 1791395597.322825,
+      "duration_ms": 54.47,
+      "syscall": "fsync(11</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace/library.db-wal> <unfinished ...> <... fsync resumed>) = 0 <0.054470>"
+    },
+    {
+      "tid": 1247204,
+      "start_utc_epoch": 1791395597.383982,
+      "duration_ms": 135.079,
+      "syscall": "fsync(10</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace/library.db> <unfinished ...> <... fsync resumed>) = 0 <0.135079>"
+    },
+    {
+      "tid": 1247204,
+      "start_utc_epoch": 1791395597.519238,
+      "duration_ms": 59.152,
+      "syscall": "fsync(11</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace/library.db-wal> <unfinished ...> <... fsync resumed>) = 0 <0.059152>"
+    },
+    {
+      "tid": 1247204,
+      "start_utc_epoch": 1791395597.585165,
+      "duration_ms": 51.663000000000004,
+      "syscall": "fsync(11</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace/library.db-wal> <unfinished ...> <... fsync resumed>) = 0 <0.051663>"
+    },
+    {
+      "tid": 1247204,
+      "start_utc_epoch": 1791395597.637019,
+      "duration_ms": 133.28699999999998,
+      "syscall": "fsync(10</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace/library.db> <unfinished ...> <... fsync resumed>) = 0 <0.133287>"
+    },
+    {
+      "tid": 1247204,
+      "start_utc_epoch": 1791395597.770546,
+      "duration_ms": 49.835,
+      "syscall": "fsync(11</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace/library.db-wal> <unfinished ...> <... fsync resumed>) = 0 <0.049835>"
+    },
+    {
+      "tid": 1247204,
+      "start_utc_epoch": 1791395597.820759,
+      "duration_ms": 49.728,
+      "syscall": "fsync(11</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace/library.db-wal> <unfinished ...> <... fsync resumed>) = 0 <0.049728>"
+    },
+    {
+      "tid": 1247204,
+      "start_utc_epoch": 1791395597.870772,
+      "duration_ms": 58.157000000000004,
+      "syscall": "fsync(10</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace/library.db> <unfinished ...> <... fsync resumed>) = 0 <0.058157>"
+    },
+    {
+      "tid": 1247204,
+      "start_utc_epoch": 1791395597.929198,
+      "duration_ms": 49.803,
+      "syscall": "fsync(11</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace/library.db-wal> <unfinished ...> <... fsync resumed>) = 0 <0.049803>"
+    },
+    {
+      "tid": 1247204,
+      "start_utc_epoch": 1791395597.979222,
+      "duration_ms": 58.198,
+      "syscall": "fsync(10</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace/library.db> <unfinished ...> <... fsync resumed>) = 0 <0.058198>"
+    },
+    {
+      "tid": 1247203,
+      "start_utc_epoch": 1791395598.044649,
+      "duration_ms": 59.489,
+      "syscall": "fsync(15</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace/library.db-wal> <unfinished ...> <... fsync resumed>) = 0 <0.059489>"
+    },
+    {
+      "tid": 1247204,
+      "start_utc_epoch": 1791395602.044823,
+      "duration_ms": 134.138,
+      "syscall": "fsync(11</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace/library.db-wal> <unfinished ...> <... fsync resumed>) = 0 <0.134138>"
+    },
+    {
+      "tid": 1247204,
+      "start_utc_epoch": 1791395602.193175,
+      "duration_ms": 52.51,
+      "syscall": "fsync(11</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace/library.db-wal> <unfinished ...> <... fsync resumed>) = 0 <0.052510>"
+    },
+    {
+      "tid": 1247204,
+      "start_utc_epoch": 1791395602.246398,
+      "duration_ms": 49.374,
+      "syscall": "fsync(11</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace/library.db-wal> <unfinished ...> <... fsync resumed>) = 0 <0.049374>"
+    },
+    {
+      "tid": 1247204,
+      "start_utc_epoch": 1791395602.29597,
+      "duration_ms": 149.977,
+      "syscall": "fsync(10</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace/library.db> <unfinished ...> <... fsync resumed>) = 0 <0.149977>"
+    },
+    {
+      "tid": 1247204,
+      "start_utc_epoch": 1791395602.446208,
+      "duration_ms": 49.82,
+      "syscall": "fsync(11</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace/library.db-wal> <unfinished ...> <... fsync resumed>) = 0 <0.049820>"
+    },
+    {
+      "tid": 1247204,
+      "start_utc_epoch": 1791395602.496418,
+      "duration_ms": 49.681000000000004,
+      "syscall": "fsync(11</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace/library.db-wal> <unfinished ...> <... fsync resumed>) = 0 <0.049681>"
+    },
+    {
+      "tid": 1247204,
+      "start_utc_epoch": 1791395602.546289,
+      "duration_ms": 66.541,
+      "syscall": "fsync(10</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace/library.db> <unfinished ...> <... fsync resumed>) = 0 <0.066541>"
+    },
+    {
+      "tid": 1247204,
+      "start_utc_epoch": 1791395602.613105,
+      "duration_ms": 49.805,
+      "syscall": "fsync(11</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace/library.db-wal> <unfinished ...> <... fsync resumed>) = 0 <0.049805>"
+    },
+    {
+      "tid": 1247204,
+      "start_utc_epoch": 1791395602.663171,
+      "duration_ms": 58.139,
+      "syscall": "fsync(10</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace/library.db> <unfinished ...> <... fsync resumed>) = 0 <0.058139>"
+    },
+    {
+      "tid": 1247203,
+      "start_utc_epoch": 1791395602.72496,
+      "duration_ms": 54.736,
+      "syscall": "fsync(15</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace/library.db-wal> <unfinished ...> <... fsync resumed>) = 0 <0.054736>"
+    },
+    {
+      "tid": 1247200,
+      "start_utc_epoch": 1791395605.079827,
+      "duration_ms": 91.48100000000001,
+      "syscall": "fsync(21</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace/library.db-wal> <unfinished ...> <... fsync resumed>) = 0 <0.091481>"
+    },
+    {
+      "tid": 1247200,
+      "start_utc_epoch": 1791395605.171467,
+      "duration_ms": 16.537,
+      "syscall": "fsync(22</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace>) = 0 <0.016537>"
+    },
+    {
+      "tid": 1247200,
+      "start_utc_epoch": 1791395608.83364,
+      "duration_ms": 70.88,
+      "syscall": "fsync(21</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace/library.db-wal> <unfinished ...> <... fsync resumed>) = 0 <0.070880>"
+    },
+    {
+      "tid": 1247200,
+      "start_utc_epoch": 1791395608.904617,
+      "duration_ms": 0.012,
+      "syscall": "fsync(22</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace>) = 0 <0.000012>"
+    },
+    {
+      "tid": 1247200,
+      "start_utc_epoch": 1791395611.042425,
+      "duration_ms": 53.678,
+      "syscall": "fsync(21</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace/library.db-wal> <unfinished ...> <... fsync resumed>) = 0 <0.053678>"
+    },
+    {
+      "tid": 1247200,
+      "start_utc_epoch": 1791395611.096209,
+      "duration_ms": 16.617,
+      "syscall": "fsync(22</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace>) = 0 <0.016617>"
+    },
+    {
+      "tid": 1247200,
+      "start_utc_epoch": 1791395611.11319,
+      "duration_ms": 183.05599999999998,
+      "syscall": "fsync(19</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace/library.db>) = 0 <0.183056>"
+    },
+    {
+      "tid": 1247734,
+      "start_utc_epoch": 1791395611.299558,
+      "duration_ms": 55.056,
+      "syscall": "fsync(15</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace/library.db-wal> <unfinished ...> <... fsync resumed>) = 0 <0.055056>"
+    },
+    {
+      "tid": 1247200,
+      "start_utc_epoch": 1791395614.6318,
+      "duration_ms": 97.705,
+      "syscall": "fsync(21</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace/library.db-wal> <unfinished ...> <... fsync resumed>) = 0 <0.097705>"
+    },
+    {
+      "tid": 1247200,
+      "start_utc_epoch": 1791395614.729649,
+      "duration_ms": 0.017,
+      "syscall": "fsync(22</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace>) = 0 <0.000017>"
+    },
+    {
+      "tid": 1247200,
+      "start_utc_epoch": 1791395614.739984,
+      "duration_ms": 164.575,
+      "syscall": "fsync(19</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace/library.db>) = 0 <0.164575>"
+    },
+    {
+      "tid": 1247203,
+      "start_utc_epoch": 1791395614.909204,
+      "duration_ms": 103.785,
+      "syscall": "fsync(15</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace/library.db-wal> <unfinished ...> <... fsync resumed>) = 0 <0.103785>"
+    },
+    {
+      "tid": 1247200,
+      "start_utc_epoch": 1791395615.038602,
+      "duration_ms": 74.532,
+      "syscall": "fsync(21</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace/library.db-wal>) = 0 <0.074532>"
+    },
+    {
+      "tid": 1247200,
+      "start_utc_epoch": 1791395615.113314,
+      "duration_ms": 0.020999999999999998,
+      "syscall": "fsync(22</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace>) = 0 <0.000021>"
+    },
+    {
+      "tid": 1247200,
+      "start_utc_epoch": 1791395615.113841,
+      "duration_ms": 66.00200000000001,
+      "syscall": "fsync(19</mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-trace/library.db>) = 0 <0.066002>"
+    }
+  ]
+}

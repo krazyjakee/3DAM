@@ -1,0 +1,58 @@
+{
+  "revision": "1dd900232566bcc230258290fdb6d503727693f2",
+  "scope": "Serial rate/seek model on real temporary preview/asset/cache files and real Store browse query. Same current executable compares ungoverned vs governed policy; not an old-revision production scan or physically cold HDD benchmark. Cold cache means modeled preview validation reads, not dropped OS caches. Per-phase foreground and co-tenant p95 <=60ms asserted for governed; legacy control required >60ms.",
+  "phases": {
+    "cold_cache": {
+      "before": {
+        "elapsed_s": 1.146852885,
+        "progress": 4,
+        "foreground_samples": 5,
+        "foreground_p95_ms": 270.960202,
+        "competitor_samples": 5,
+        "competitor_p95_ms": 272.819712,
+        "disk_request_p95_ms": 282.90675799999997,
+        "max_queue": 3,
+        "transferred_bytes": 33595392,
+        "throughput_mib_s": 27.93650599745407
+      },
+      "after": {
+        "elapsed_s": 0.097547559,
+        "progress": 4,
+        "foreground_samples": 3,
+        "foreground_p95_ms": 24.242703000000002,
+        "competitor_samples": 3,
+        "competitor_p95_ms": 24.236271,
+        "disk_request_p95_ms": 26.271231999999998,
+        "max_queue": 3,
+        "transferred_bytes": 40960,
+        "throughput_mib_s": 0.40044569439200417
+      }
+    },
+    "sustained_copy": {
+      "before": {
+        "elapsed_s": 3.678062058,
+        "progress": 4,
+        "foreground_samples": 34,
+        "foreground_p95_ms": 102.657908,
+        "competitor_samples": 34,
+        "competitor_p95_ms": 103.162357,
+        "disk_request_p95_ms": 112.196814,
+        "max_queue": 6,
+        "transferred_bytes": 67387400,
+        "throughput_mib_s": 17.472688501710575
+      },
+      "after": {
+        "elapsed_s": 8.264891085,
+        "progress": 4,
+        "foreground_samples": 275,
+        "foreground_p95_ms": 32.671419,
+        "competitor_samples": 276,
+        "competitor_p95_ms": 33.090738,
+        "disk_request_p95_ms": 32.931539,
+        "max_queue": 3,
+        "transferred_bytes": 69365768,
+        "throughput_mib_s": 8.004019738318734
+      }
+    }
+  }
+}

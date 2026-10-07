@@ -1,0 +1,74 @@
+{
+  "implementation_revisions": [
+    "7d778ad84ac53824f1566cec34799b479ccf1c44",
+    "9b43439226d6e89ab06b9bd2c1ec24a6d4305a0b",
+    "1dd900232566bcc230258290fdb6d503727693f2"
+  ],
+  "target_branch": "main",
+  "build_output": "/mnt/Rusty/cargo-target-3dam-performance",
+  "checks": [
+    {
+      "command": "cargo test --workspace --locked",
+      "passed": 681,
+      "ignored": 8
+    },
+    {
+      "command": "cargo test -p dam-store --features ann --locked",
+      "passed": 148,
+      "ignored": 6
+    },
+    {
+      "command": "cargo test -p dam-core --example scan_performance",
+      "passed": 5
+    },
+    {
+      "command": "cargo build --workspace --locked",
+      "result": "passed"
+    },
+    {
+      "command": "cargo fmt --all --check",
+      "result": "passed"
+    },
+    {
+      "command": "cargo clippy --workspace --all-targets --all-features -- -D warnings",
+      "result": "passed"
+    },
+    {
+      "command": "cargo xtask check-deps",
+      "result": "passed"
+    },
+    {
+      "command": "canonical CI feature matrix, wasm-pack/wasm-opt, frozen web install, web tests/build/bundle budget",
+      "result": "passed component checks; affected core/binary configurations rerun after checkpoint fix"
+    },
+    {
+      "command": "pnpm lint; pnpm typecheck",
+      "result": "passed"
+    },
+    {
+      "command": "cargo test -p dam-core resources::io::scenario::shared_hdd_scenario -- --ignored --nocapture",
+      "result": "passed; governed foreground/co-tenant p95 <=60ms, legacy control >60ms, all4 progress completed"
+    },
+    {
+      "command": "python3 docs/evidence/scan-performance-20261007/validate_evidence.py",
+      "result": "passed; all12 reports checked, including explicitly retained failures"
+    }
+  ],
+  "reuse": "The checkpoint follow-up reran strict all-target/all-feature lint, core/binary configurations, full workspace/ANN tests, example tests, workspace/release builds and formatting. Web/WASM, source/media/viewer feature inputs were unchanged by the store checkpoint change; their earlier passing checks were retained.",
+  "preexisting_user_changes_preserved": [
+    ".github/workflows/performance.yml",
+    "docs/performance-harness.md",
+    "docs/tech-spec/15-observability-config-testing-packaging.md"
+  ],
+  "checkpoint_tests": "Nine tests observe actual worker completion and owned main-file-only copies, not an inspection checkpoint. Public SQLITE_CHECKPOINT_NOOP is rejected by the bundled runtime; test observer was corrected after an initial failed run. WAL fixtures drain through the exclusive maintenance gate before measuring unchanged observations.",
+  "measurement_assertions": {
+    "generated_100k_quick_budget_ms": 15000,
+    "generated_1m_quick_budget_ms": 60000,
+    "generated_scale_peak_rss_budget_bytes": 134217728,
+    "large_changed_quick_budget_ms": 5000,
+    "hdd_remote_model_quick_budget_ms": 30000,
+    "foreground_p95_budget_ms": 60,
+    "cancellation_source_quiescence_budget_ms": 30000,
+    "implementation": "validate_evidence.py plus each report assertion_failures"
+  }
+}

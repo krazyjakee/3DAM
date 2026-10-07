@@ -197,3 +197,32 @@ Idle/offline intervals double up to the ceiling, successful changes reset the in
 stable, at most 10%, and bounded by the ceiling. A poll awaits completion before scheduling the next;
 manual scans bypass that delay. Record overrides when comparing watcher/poll-triggered measurements;
 this example measures explicitly submitted scans and does not claim to measure watcher delivery.
+
+## Measured sweep on 7 October 2026
+
+The [checked-in evidence](evidence/scan-performance-20261007/README.md) contains production
+JSON, exact profile configurations, storage/cache notes, SQL replays and validation results.
+Quick phases read zero payload bytes and wrote zero scratch bytes, including discovery of a
+changed 4 GiB asset in 10.35 ms before its explicit 35.64-second verification. The 100k and
+one-million-path profiles asserted Quick completion below 15 and 60 seconds respectively and
+RSS below 128 MiB. These scale profiles use tiny virtual payloads and an NVMe catalogue;
+they are not cold physical-HDD claims.
+
+Physical shared/separate Linux ext4 HDD runs use a disposable 4000-entry fixture and retain
+production pressure gates, real analysis/warming, browsing, foreground catalogue edits and
+an evict-advised small-read co-tenant. The separate-HDD initial verification exposed a
+275 ms foreground-edit p95 checkpoint stall, retained as failed evidence for #207. Checkpoint
+offload reduced initial-verification edit p95 to 34 ms; later unchanged-source shared/separate runs
+passed all phase budgets. A 60.9 ms small-sample phase and traced failures are retained too. The
+pending-observation fix reduced matching shared-HDD unchanged queued-scan logical checkpoint
+traffic by 77.6%. Timing, physical I/O and cache limits are reported independently.
+
+The evidence validator preserves the expected failed baseline and checks the passing reports:
+
+```sh
+rtk python3 docs/evidence/scan-performance-20261007/validate_evidence.py
+```
+
+[#208](https://github.com/krazyjakee/3DAM/issues/208) retains the additional controlled
+SMB/SFTP, NTFS/FUSE, large syscall-trace and diverse-media measurements. The original
+Docker-in-LXC incident in #187 and vector-index acceptance in #43 remain separate follow-ups.

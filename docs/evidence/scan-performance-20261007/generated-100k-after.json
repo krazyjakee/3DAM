@@ -1,0 +1,1852 @@
+{
+  "schema_version": 1,
+  "revision": "9b43439226d6e89ab06b9bd2c1ec24a6d4305a0b",
+  "working_tree_dirty": true,
+  "package_version": "0.1.4",
+  "config": {
+    "paths": 100000,
+    "tiny_bytes": 32,
+    "changed": 10,
+    "removed": 10,
+    "rejected_percent": 0,
+    "absent_timestamp_percent": 0,
+    "width": 25,
+    "depth": 8,
+    "large_bytes": 0,
+    "metadata_us": 0,
+    "cold_metadata_us": 0,
+    "listing_us": 0,
+    "seek_us": 0,
+    "round_trip_us": 0,
+    "transfer_mib": 0,
+    "io_mib": 128,
+    "data_mib": 512,
+    "cancel_after_ms": 250,
+    "timeout_secs": 1800,
+    "foreground_budget_ms": 60.0,
+    "quick_budget_ms": null,
+    "placement": "separate",
+    "backend": "generated",
+    "data_dir": "/mnt/Rusty/3dam-scan-sweep-20261007/generated-100k-after",
+    "source_root": "/mnt/Rusty/3dam-scan-sweep-20261007/generated-100k-after/generated-source",
+    "output": "/tmp/3dam-issue-implementation/generated-100k-after.json",
+    "background": false,
+    "pause_before_change": false,
+    "pressure_policy": "disabled",
+    "foreground_writes": false,
+    "topology": "declared",
+    "co_tenant_cache": "cached"
+  },
+  "scope": "production LibraryService jobs, scan coordinator, source callbacks, store batches and resource scheduler",
+  "limitations": [
+    "Injected delays model request costs; wall-clock timing still depends on this host.",
+    "Cold metadata is modeled; operating-system page caches are not dropped.",
+    "Local counters describe logical source admissions and materialized bytes, not physical disk reads.",
+    "Scratch reads and read-pool SQL counts require external tracing and are null; writer SQL/commits are measured on the catalog writer.",
+    "WAL length/growth is not cumulative WAL writes; checkpoint bytes are logical pages.",
+    "Process I/O includes scan, SQLite, browsing, cache inventory and co-tenant work.",
+    "Automatic enrichment is deferred so discovery measurements do not include an unrelated verifier; Full phases measure verification explicitly.",
+    "Pressure gates follow the recorded policy; generated profiles disable host load/memory/PSI gates while retaining I/O budgets.",
+    "Local few-change phases do not mutate the real source; arrange changes externally."
+  ],
+  "profiles": [
+    {
+      "phase": "first_discovery_quick",
+      "mode": "quick",
+      "job": {
+        "id": "01a11746-9273-7353-8e8a-b5d58a7bef8c",
+        "kind": "scan",
+        "state": "done",
+        "progress": {
+          "done": 100000,
+          "total": 100000,
+          "current": null
+        },
+        "error": null,
+        "summary": "Discovered 100000 paths; queued 100000 revisions for verification; 0 missing",
+        "created_at": 1791391863411,
+        "updated_at": 1791391875668,
+        "sources": [
+          "01a11746-9273-7353-8e8a-b5c2f127a86e"
+        ],
+        "collections": []
+      },
+      "cache_state": "cold_metadata_model",
+      "elapsed_ms": 12256.966855,
+      "first_observed_committed_progress_ms": 16.726332,
+      "progress_events": 782,
+      "stream_lagged": false,
+      "source": {
+        "walk_calls": 1,
+        "listed_paths": 100000,
+        "listing_requests": 60002,
+        "metadata_requests": 100000,
+        "eligible_paths": 100000,
+        "fetch_opens": 0,
+        "source_payload_bytes": 0,
+        "scratch_written_bytes": 0,
+        "round_trips": 0
+      },
+      "scratch_read_bytes": null,
+      "sql_read_statements": null,
+      "sql_writer_statements": 703152,
+      "asset_rows_updated": 0,
+      "sql_trigger_statements": 0,
+      "sql_commit_statements": 786,
+      "sql_writer_elapsed_ms": 1513.0,
+      "wal_before_bytes": 943512,
+      "wal_peak_bytes": 4272472,
+      "wal_end_bytes": 4272472,
+      "wal_growth_bytes": 3328960,
+      "checkpoint": {
+        "elapsed_ms": 6.013432,
+        "busy": 0,
+        "wal_frames": 7,
+        "checkpointed_frames": 7,
+        "page_size": 4096,
+        "logical_checkpoint_bytes": 28672,
+        "physical_checkpoint_bytes": null
+      },
+      "checkpoint_process_io": {
+        "cancelled_write_bytes": 0,
+        "rchar": 71582,
+        "read_bytes": 0,
+        "syscr": 37,
+        "syscw": 3,
+        "wchar": 12288,
+        "write_bytes": 12288
+      },
+      "process_io": {
+        "cancelled_write_bytes": 0,
+        "rchar": 112395565,
+        "read_bytes": 8192,
+        "syscr": 46489,
+        "syscw": 73219,
+        "wchar": 173193503,
+        "write_bytes": 173326336
+      },
+      "host_before": {
+        "rss_bytes": 11104256,
+        "peak_rss_bytes": 11104256,
+        "io": {
+          "cancelled_write_bytes": 368640,
+          "rchar": 104776,
+          "read_bytes": 16384,
+          "syscr": 126,
+          "syscw": 695,
+          "wchar": 1673804,
+          "write_bytes": 1388544
+        },
+        "load": "3.30 6.67 8.18 1/4710 1086463\n",
+        "io_pressure": "some avg10=0.26 avg60=0.44 avg300=2.00 total=14292253309\nfull avg10=0.23 avg60=0.41 avg300=1.73 total=10975490241\n"
+      },
+      "host_after": {
+        "rss_bytes": 14962688,
+        "peak_rss_bytes": 14962688,
+        "io": {
+          "cancelled_write_bytes": 368640,
+          "rchar": 112500341,
+          "read_bytes": 24576,
+          "syscr": 46615,
+          "syscw": 73914,
+          "wchar": 174867307,
+          "write_bytes": 174714880
+        },
+        "load": "3.41 6.58 8.14 4/4810 1086682\n",
+        "io_pressure": "some avg10=0.91 avg60=0.59 avg300=1.96 total=14292480125\nfull avg10=0.90 avg60=0.56 avg300=1.70 total=10975710467\n"
+      },
+      "peak_rss_bytes": 14671872,
+      "browse": {
+        "samples": 1085,
+        "p95_ms": 0.358104,
+        "p99_ms": 0.418808
+      },
+      "co_tenant": {
+        "samples": 1219,
+        "p95_ms": 0.006141,
+        "p99_ms": 0.006913
+      },
+      "co_tenant_cache_mode": "cached",
+      "co_tenant_cache_limit": "cached reuses one OS page; evict requests Linux page-cache eviction before each read, without bypassing filesystem/device caches or proving physical I/O",
+      "foreground_writer": {
+        "samples": 0,
+        "p95_ms": null,
+        "p99_ms": null
+      },
+      "cancellation_requested": false,
+      "cancellation_source_quiescence_ms": null,
+      "cancellation_measured": false,
+      "yield_reasons_observed": [
+        "bandwidth",
+        "ready"
+      ],
+      "storage_usage": {
+        "io_budgets": [
+          {
+            "device": "override:sweep-data",
+            "kind": "solid_state",
+            "limit_bytes_per_sec": 536870912,
+            "current_bytes_per_sec": 536870912,
+            "concurrency": 1,
+            "active": 0,
+            "deferred": 0,
+            "accounted_bytes": 28827648,
+            "observed_bytes_per_sec": null,
+            "queue_depth": null,
+            "request_latency_ms": null,
+            "yield_reason": "ready",
+            "probes_available": false
+          },
+          {
+            "device": "override:sweep-source",
+            "kind": "rotational",
+            "limit_bytes_per_sec": 134217728,
+            "current_bytes_per_sec": 134217728,
+            "concurrency": 1,
+            "active": 0,
+            "deferred": 0,
+            "accounted_bytes": 1064968192,
+            "observed_bytes_per_sec": null,
+            "queue_depth": null,
+            "request_latency_ms": null,
+            "yield_reason": "ready",
+            "probes_available": false
+          }
+        ],
+        "io_stall_pct": 0.9,
+        "cache_inventory_ready": true,
+        "data_dir": "/mnt/Rusty/3dam-scan-sweep-20261007/generated-100k-after",
+        "library_db_bytes": 48680960,
+        "server_db_bytes": 0,
+        "thumbnails": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 10737418240,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "previews": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 10737418240,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "peer_previews": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 2147483648,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "asset_count": 0,
+        "source_count": 1
+      },
+      "assertion_failures": []
+    },
+    {
+      "phase": "unchanged_quick_cold",
+      "mode": "quick",
+      "job": {
+        "id": "01a11746-c266-7bc1-9224-d6c613836302",
+        "kind": "scan",
+        "state": "done",
+        "progress": {
+          "done": 100000,
+          "total": 100000,
+          "current": null
+        },
+        "error": null,
+        "summary": "Discovered 100000 paths; queued 0 revisions for verification; 0 missing",
+        "created_at": 1791391875686,
+        "updated_at": 1791391884612,
+        "sources": [
+          "01a11746-9273-7353-8e8a-b5c2f127a86e"
+        ],
+        "collections": []
+      },
+      "cache_state": "cold_metadata_model",
+      "elapsed_ms": 8926.068564,
+      "first_observed_committed_progress_ms": 209.85774099999998,
+      "progress_events": 44,
+      "stream_lagged": false,
+      "source": {
+        "walk_calls": 1,
+        "listed_paths": 100000,
+        "listing_requests": 60002,
+        "metadata_requests": 100000,
+        "eligible_paths": 100000,
+        "fetch_opens": 0,
+        "source_payload_bytes": 0,
+        "scratch_written_bytes": 0,
+        "round_trips": 0
+      },
+      "scratch_read_bytes": null,
+      "sql_read_statements": null,
+      "sql_writer_statements": 402413,
+      "asset_rows_updated": 0,
+      "sql_trigger_statements": 0,
+      "sql_commit_statements": 786,
+      "sql_writer_elapsed_ms": 808.0,
+      "wal_before_bytes": 4272472,
+      "wal_peak_bytes": 4272472,
+      "wal_end_bytes": 4272472,
+      "wal_growth_bytes": 0,
+      "checkpoint": {
+        "elapsed_ms": 15.941093,
+        "busy": 0,
+        "wal_frames": 97,
+        "checkpointed_frames": 97,
+        "page_size": 4096,
+        "logical_checkpoint_bytes": 397312,
+        "physical_checkpoint_bytes": null
+      },
+      "checkpoint_process_io": {
+        "cancelled_write_bytes": 0,
+        "rchar": 75678,
+        "read_bytes": 0,
+        "syscr": 38,
+        "syscw": 4,
+        "wchar": 16384,
+        "write_bytes": 16384
+      },
+      "process_io": {
+        "cancelled_write_bytes": 0,
+        "rchar": 87701468,
+        "read_bytes": 0,
+        "syscr": 32921,
+        "syscw": 14963,
+        "wchar": 52962774,
+        "write_bytes": 22671360
+      },
+      "host_before": {
+        "rss_bytes": 15327232,
+        "peak_rss_bytes": 15327232,
+        "io": {
+          "cancelled_write_bytes": 368640,
+          "rchar": 112600199,
+          "read_bytes": 24576,
+          "syscr": 46696,
+          "syscw": 73924,
+          "wchar": 174879638,
+          "write_bytes": 174731264
+        },
+        "load": "3.41 6.58 8.14 4/4810 1086682\n",
+        "io_pressure": "some avg10=0.91 avg60=0.59 avg300=1.96 total=14292481055\nfull avg10=0.90 avg60=0.56 avg300=1.70 total=10975711355\n"
+      },
+      "host_after": {
+        "rss_bytes": 17350656,
+        "peak_rss_bytes": 17350656,
+        "io": {
+          "cancelled_write_bytes": 368640,
+          "rchar": 200301667,
+          "read_bytes": 24576,
+          "syscr": 79617,
+          "syscw": 88887,
+          "wchar": 227842412,
+          "write_bytes": 197402624
+        },
+        "load": "3.11 6.41 8.06 3/4816 1086780\n",
+        "io_pressure": "some avg10=0.40 avg60=0.51 avg300=1.91 total=14292532671\nfull avg10=0.40 avg60=0.49 avg300=1.66 total=10975758983\n"
+      },
+      "peak_rss_bytes": 17346560,
+      "browse": {
+        "samples": 789,
+        "p95_ms": 0.337856,
+        "p99_ms": 0.42465899999999995
+      },
+      "co_tenant": {
+        "samples": 887,
+        "p95_ms": 0.007664,
+        "p99_ms": 0.008045
+      },
+      "co_tenant_cache_mode": "cached",
+      "co_tenant_cache_limit": "cached reuses one OS page; evict requests Linux page-cache eviction before each read, without bypassing filesystem/device caches or proving physical I/O",
+      "foreground_writer": {
+        "samples": 0,
+        "p95_ms": null,
+        "p99_ms": null
+      },
+      "cancellation_requested": false,
+      "cancellation_source_quiescence_ms": null,
+      "cancellation_measured": false,
+      "yield_reasons_observed": [
+        "bandwidth",
+        "ready"
+      ],
+      "storage_usage": {
+        "io_budgets": [
+          {
+            "device": "override:sweep-data",
+            "kind": "solid_state",
+            "limit_bytes_per_sec": 536870912,
+            "current_bytes_per_sec": 536870912,
+            "concurrency": 1,
+            "active": 0,
+            "deferred": 0,
+            "accounted_bytes": 54628352,
+            "observed_bytes_per_sec": null,
+            "queue_depth": null,
+            "request_latency_ms": null,
+            "yield_reason": "ready",
+            "probes_available": false
+          },
+          {
+            "device": "override:sweep-source",
+            "kind": "rotational",
+            "limit_bytes_per_sec": 134217728,
+            "current_bytes_per_sec": 134217728,
+            "concurrency": 1,
+            "active": 0,
+            "deferred": 0,
+            "accounted_bytes": 2129936384,
+            "observed_bytes_per_sec": null,
+            "queue_depth": null,
+            "request_latency_ms": null,
+            "yield_reason": "ready",
+            "probes_available": false
+          }
+        ],
+        "io_stall_pct": 0.786244484405821,
+        "cache_inventory_ready": true,
+        "data_dir": "/mnt/Rusty/3dam-scan-sweep-20261007/generated-100k-after",
+        "library_db_bytes": 48680960,
+        "server_db_bytes": 0,
+        "thumbnails": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 10737418240,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "previews": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 10737418240,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "peer_previews": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 2147483648,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "asset_count": 0,
+        "source_count": 1
+      },
+      "assertion_failures": []
+    },
+    {
+      "phase": "unchanged_quick_warm",
+      "mode": "quick",
+      "job": {
+        "id": "01a11746-e556-76a1-8d83-ccc438fb074f",
+        "kind": "scan",
+        "state": "done",
+        "progress": {
+          "done": 100000,
+          "total": 100000,
+          "current": null
+        },
+        "error": null,
+        "summary": "Discovered 100000 paths; queued 0 revisions for verification; 0 missing",
+        "created_at": 1791391884630,
+        "updated_at": 1791391893432,
+        "sources": [
+          "01a11746-9273-7353-8e8a-b5c2f127a86e"
+        ],
+        "collections": []
+      },
+      "cache_state": "warm_model",
+      "elapsed_ms": 8801.898209,
+      "first_observed_committed_progress_ms": 259.52250799999996,
+      "progress_events": 43,
+      "stream_lagged": false,
+      "source": {
+        "walk_calls": 1,
+        "listed_paths": 100000,
+        "listing_requests": 60002,
+        "metadata_requests": 100000,
+        "eligible_paths": 100000,
+        "fetch_opens": 0,
+        "source_payload_bytes": 0,
+        "scratch_written_bytes": 0,
+        "round_trips": 0
+      },
+      "scratch_read_bytes": null,
+      "sql_read_statements": null,
+      "sql_writer_statements": 402412,
+      "asset_rows_updated": 0,
+      "sql_trigger_statements": 0,
+      "sql_commit_statements": 786,
+      "sql_writer_elapsed_ms": 831.0,
+      "wal_before_bytes": 4272472,
+      "wal_peak_bytes": 4272472,
+      "wal_end_bytes": 4272472,
+      "wal_growth_bytes": 0,
+      "checkpoint": {
+        "elapsed_ms": 14.171491,
+        "busy": 0,
+        "wal_frames": 95,
+        "checkpointed_frames": 95,
+        "page_size": 4096,
+        "logical_checkpoint_bytes": 389120,
+        "physical_checkpoint_bytes": null
+      },
+      "checkpoint_process_io": {
+        "cancelled_write_bytes": 0,
+        "rchar": 75680,
+        "read_bytes": 0,
+        "syscr": 38,
+        "syscw": 4,
+        "wchar": 16384,
+        "write_bytes": 16384
+      },
+      "process_io": {
+        "cancelled_write_bytes": 0,
+        "rchar": 110031500,
+        "read_bytes": 0,
+        "syscr": 38188,
+        "syscw": 15716,
+        "wchar": 56181934,
+        "write_bytes": 397312
+      },
+      "host_before": {
+        "rss_bytes": 17428480,
+        "peak_rss_bytes": 17428480,
+        "io": {
+          "cancelled_write_bytes": 368640,
+          "rchar": 200405621,
+          "read_bytes": 24576,
+          "syscr": 79699,
+          "syscw": 88898,
+          "wchar": 227858837,
+          "write_bytes": 197419008
+        },
+        "load": "3.11 6.41 8.06 5/4816 1086780\n",
+        "io_pressure": "some avg10=0.40 avg60=0.51 avg300=1.91 total=14292536731\nfull avg10=0.40 avg60=0.49 avg300=1.66 total=10975762813\n"
+      },
+      "host_after": {
+        "rss_bytes": 19795968,
+        "peak_rss_bytes": 19795968,
+        "io": {
+          "cancelled_write_bytes": 368640,
+          "rchar": 310437121,
+          "read_bytes": 24576,
+          "syscr": 117887,
+          "syscw": 104614,
+          "wchar": 284040771,
+          "write_bytes": 197816320
+        },
+        "load": "2.93 6.26 8.00 3/4796 1086928\n",
+        "io_pressure": "some avg10=0.28 avg60=0.48 avg300=1.86 total=14292578217\nfull avg10=0.28 avg60=0.46 avg300=1.62 total=10975802753\n"
+      },
+      "peak_rss_bytes": 19795968,
+      "browse": {
+        "samples": 780,
+        "p95_ms": 0.36225199999999996,
+        "p99_ms": 0.412947
+      },
+      "co_tenant": {
+        "samples": 875,
+        "p95_ms": 0.0074540000000000006,
+        "p99_ms": 0.008015
+      },
+      "co_tenant_cache_mode": "cached",
+      "co_tenant_cache_limit": "cached reuses one OS page; evict requests Linux page-cache eviction before each read, without bypassing filesystem/device caches or proving physical I/O",
+      "foreground_writer": {
+        "samples": 0,
+        "p95_ms": null,
+        "p99_ms": null
+      },
+      "cancellation_requested": false,
+      "cancellation_source_quiescence_ms": null,
+      "cancellation_measured": false,
+      "yield_reasons_observed": [
+        "bandwidth",
+        "ready"
+      ],
+      "storage_usage": {
+        "io_budgets": [
+          {
+            "device": "override:sweep-data",
+            "kind": "solid_state",
+            "limit_bytes_per_sec": 536870912,
+            "current_bytes_per_sec": 536870912,
+            "concurrency": 1,
+            "active": 0,
+            "deferred": 0,
+            "accounted_bytes": 80424960,
+            "observed_bytes_per_sec": null,
+            "queue_depth": null,
+            "request_latency_ms": null,
+            "yield_reason": "ready",
+            "probes_available": false
+          },
+          {
+            "device": "override:sweep-source",
+            "kind": "rotational",
+            "limit_bytes_per_sec": 134217728,
+            "current_bytes_per_sec": 134217728,
+            "concurrency": 1,
+            "active": 0,
+            "deferred": 0,
+            "accounted_bytes": 3194904576,
+            "observed_bytes_per_sec": null,
+            "queue_depth": null,
+            "request_latency_ms": null,
+            "yield_reason": "ready",
+            "probes_available": false
+          }
+        ],
+        "io_stall_pct": 0.3427246005878707,
+        "cache_inventory_ready": true,
+        "data_dir": "/mnt/Rusty/3dam-scan-sweep-20261007/generated-100k-after",
+        "library_db_bytes": 48680960,
+        "server_db_bytes": 0,
+        "thumbnails": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 10737418240,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "previews": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 10737418240,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "peer_previews": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 2147483648,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "asset_count": 0,
+        "source_count": 1
+      },
+      "assertion_failures": []
+    },
+    {
+      "phase": "first_full_verification",
+      "mode": "full",
+      "job": {
+        "id": "01a11747-07cc-7aa1-b93d-425bf1b2a836",
+        "kind": "scan",
+        "state": "done",
+        "progress": {
+          "done": 100000,
+          "total": 100000,
+          "current": null
+        },
+        "error": null,
+        "summary": "Scanned 100000 item(s)",
+        "created_at": 1791391893452,
+        "updated_at": 1791391962028,
+        "sources": [
+          "01a11746-9273-7353-8e8a-b5c2f127a86e"
+        ],
+        "collections": []
+      },
+      "cache_state": "warm_model",
+      "elapsed_ms": 68576.20666699999,
+      "first_observed_committed_progress_ms": 206.27836299999998,
+      "progress_events": 783,
+      "stream_lagged": false,
+      "source": {
+        "walk_calls": 1,
+        "listed_paths": 100000,
+        "listing_requests": 60002,
+        "metadata_requests": 100000,
+        "eligible_paths": 100000,
+        "fetch_opens": 100000,
+        "source_payload_bytes": 3200000,
+        "scratch_written_bytes": 3200000,
+        "round_trips": 0
+      },
+      "scratch_read_bytes": null,
+      "sql_read_statements": null,
+      "sql_writer_statements": 1205496,
+      "asset_rows_updated": 200000,
+      "sql_trigger_statements": 4818537,
+      "sql_commit_statements": 1567,
+      "sql_writer_elapsed_ms": 38821.0,
+      "wal_before_bytes": 4272472,
+      "wal_peak_bytes": 8606712,
+      "wal_end_bytes": 8606712,
+      "wal_growth_bytes": 4334240,
+      "checkpoint": {
+        "elapsed_ms": 5.825428,
+        "busy": 0,
+        "wal_frames": 4,
+        "checkpointed_frames": 4,
+        "page_size": 4096,
+        "logical_checkpoint_bytes": 16384,
+        "physical_checkpoint_bytes": null
+      },
+      "checkpoint_process_io": {
+        "cancelled_write_bytes": 0,
+        "rchar": 67500,
+        "read_bytes": 0,
+        "syscr": 36,
+        "syscw": 2,
+        "wchar": 8192,
+        "write_bytes": 8192
+      },
+      "process_io": {
+        "cancelled_write_bytes": 584351744,
+        "rchar": 1675236191,
+        "read_bytes": 8192,
+        "syscr": 2441308,
+        "syscw": 8000602,
+        "wchar": 16506454041,
+        "write_bytes": 2132963328
+      },
+      "host_before": {
+        "rss_bytes": 19857408,
+        "peak_rss_bytes": 19857408,
+        "io": {
+          "cancelled_write_bytes": 368640,
+          "rchar": 310541081,
+          "read_bytes": 24576,
+          "syscr": 117969,
+          "syscw": 104625,
+          "wchar": 284057196,
+          "write_bytes": 197836800
+        },
+        "load": "2.93 6.26 8.00 4/4796 1086928\n",
+        "io_pressure": "some avg10=0.23 avg60=0.46 avg300=1.85 total=14292580185\nfull avg10=0.23 avg60=0.44 avg300=1.61 total=10975804676\n"
+      },
+      "host_after": {
+        "rss_bytes": 30461952,
+        "peak_rss_bytes": 30461952,
+        "io": {
+          "cancelled_write_bytes": 584720384,
+          "rchar": 1985777272,
+          "read_bytes": 32768,
+          "syscr": 2559277,
+          "syscw": 8105227,
+          "wchar": 16790511237,
+          "write_bytes": 2330800128
+        },
+        "load": "3.70 5.80 7.72 3/4689 1088808\n",
+        "io_pressure": "some avg10=0.40 avg60=0.73 avg300=1.65 total=14293579183\nfull avg10=0.33 avg60=0.66 avg300=1.44 total=10976766039\n"
+      },
+      "peak_rss_bytes": 31027200,
+      "browse": {
+        "samples": 5429,
+        "p95_ms": 2.661602,
+        "p99_ms": 3.5198970000000003
+      },
+      "co_tenant": {
+        "samples": 6816,
+        "p95_ms": 0.006280999999999999,
+        "p99_ms": 0.007614
+      },
+      "co_tenant_cache_mode": "cached",
+      "co_tenant_cache_limit": "cached reuses one OS page; evict requests Linux page-cache eviction before each read, without bypassing filesystem/device caches or proving physical I/O",
+      "foreground_writer": {
+        "samples": 0,
+        "p95_ms": null,
+        "p99_ms": null
+      },
+      "cancellation_requested": false,
+      "cancellation_source_quiescence_ms": null,
+      "cancellation_measured": false,
+      "yield_reasons_observed": [
+        "bandwidth",
+        "ready"
+      ],
+      "storage_usage": {
+        "io_budgets": [
+          {
+            "device": "override:sweep-data",
+            "kind": "solid_state",
+            "limit_bytes_per_sec": 536870912,
+            "current_bytes_per_sec": 536870912,
+            "concurrency": 1,
+            "active": 0,
+            "deferred": 0,
+            "accounted_bytes": 522029056,
+            "observed_bytes_per_sec": null,
+            "queue_depth": null,
+            "request_latency_ms": null,
+            "yield_reason": "ready",
+            "probes_available": false
+          },
+          {
+            "device": "override:sweep-source",
+            "kind": "rotational",
+            "limit_bytes_per_sec": 134217728,
+            "current_bytes_per_sec": 134217728,
+            "concurrency": 1,
+            "active": 0,
+            "deferred": 0,
+            "accounted_bytes": 4263072768,
+            "observed_bytes_per_sec": null,
+            "queue_depth": null,
+            "request_latency_ms": null,
+            "yield_reason": "ready",
+            "probes_available": false
+          }
+        ],
+        "io_stall_pct": 0.33,
+        "cache_inventory_ready": true,
+        "data_dir": "/mnt/Rusty/3dam-scan-sweep-20261007/generated-100k-after",
+        "library_db_bytes": 206544896,
+        "server_db_bytes": 0,
+        "thumbnails": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 10737418240,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "previews": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 10737418240,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "peer_previews": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 2147483648,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "asset_count": 100000,
+        "source_count": 1
+      },
+      "assertion_failures": []
+    },
+    {
+      "phase": "few_change_quick",
+      "mode": "quick",
+      "job": {
+        "id": "01a11748-13bb-7c10-bbd2-edd4226fd919",
+        "kind": "scan",
+        "state": "done",
+        "progress": {
+          "done": 99990,
+          "total": 99990,
+          "current": null
+        },
+        "error": null,
+        "summary": "Discovered 99990 paths; queued 10 revisions for verification; 10 missing",
+        "created_at": 1791391962043,
+        "updated_at": 1791391970854,
+        "sources": [
+          "01a11746-9273-7353-8e8a-b5c2f127a86e"
+        ],
+        "collections": []
+      },
+      "cache_state": "warm_model",
+      "elapsed_ms": 8811.263058,
+      "first_observed_committed_progress_ms": 33.605662,
+      "progress_events": 43,
+      "stream_lagged": false,
+      "source": {
+        "walk_calls": 1,
+        "listed_paths": 99990,
+        "listing_requests": 60002,
+        "metadata_requests": 99990,
+        "eligible_paths": 99990,
+        "fetch_opens": 0,
+        "source_payload_bytes": 0,
+        "scratch_written_bytes": 0,
+        "round_trips": 0
+      },
+      "scratch_read_bytes": null,
+      "sql_read_statements": null,
+      "sql_writer_statements": 502482,
+      "asset_rows_updated": 30,
+      "sql_trigger_statements": 52,
+      "sql_commit_statements": 786,
+      "sql_writer_elapsed_ms": 1039.0,
+      "wal_before_bytes": 8606712,
+      "wal_peak_bytes": 8606712,
+      "wal_end_bytes": 8606712,
+      "wal_growth_bytes": 0,
+      "checkpoint": {
+        "elapsed_ms": 14.25004,
+        "busy": 0,
+        "wal_frames": 124,
+        "checkpointed_frames": 124,
+        "page_size": 4096,
+        "logical_checkpoint_bytes": 507904,
+        "physical_checkpoint_bytes": null
+      },
+      "checkpoint_process_io": {
+        "cancelled_write_bytes": 0,
+        "rchar": 190380,
+        "read_bytes": 0,
+        "syscr": 66,
+        "syscw": 32,
+        "wchar": 131072,
+        "write_bytes": 131072
+      },
+      "process_io": {
+        "cancelled_write_bytes": 0,
+        "rchar": 222217049,
+        "read_bytes": 0,
+        "syscr": 65724,
+        "syscw": 19402,
+        "wchar": 72020178,
+        "write_bytes": 25526272
+      },
+      "host_before": {
+        "rss_bytes": 30568448,
+        "peak_rss_bytes": 30568448,
+        "io": {
+          "cancelled_write_bytes": 584720384,
+          "rchar": 1985873076,
+          "read_bytes": 32768,
+          "syscr": 2559357,
+          "syscw": 8105236,
+          "wchar": 16790519474,
+          "write_bytes": 2330812416
+        },
+        "load": "3.70 5.80 7.72 3/4689 1088808\n",
+        "io_pressure": "some avg10=0.40 avg60=0.73 avg300=1.65 total=14293580296\nfull avg10=0.33 avg60=0.66 avg300=1.44 total=10976767134\n"
+      },
+      "host_after": {
+        "rss_bytes": 30781440,
+        "peak_rss_bytes": 30781440,
+        "io": {
+          "cancelled_write_bytes": 584720384,
+          "rchar": 2208090125,
+          "read_bytes": 32768,
+          "syscr": 2625081,
+          "syscw": 8124638,
+          "wchar": 16862539652,
+          "write_bytes": 2356338688
+        },
+        "load": "3.89 5.77 7.69 4/4700 1088922\n",
+        "io_pressure": "some avg10=0.18 avg60=0.64 avg300=1.60 total=14293616294\nfull avg10=0.14 avg60=0.58 avg300=1.40 total=10976802172\n"
+      },
+      "peak_rss_bytes": 31580160,
+      "browse": {
+        "samples": 685,
+        "p95_ms": 2.407613,
+        "p99_ms": 3.076732
+      },
+      "co_tenant": {
+        "samples": 876,
+        "p95_ms": 0.007654,
+        "p99_ms": 0.009779000000000001
+      },
+      "co_tenant_cache_mode": "cached",
+      "co_tenant_cache_limit": "cached reuses one OS page; evict requests Linux page-cache eviction before each read, without bypassing filesystem/device caches or proving physical I/O",
+      "foreground_writer": {
+        "samples": 0,
+        "p95_ms": null,
+        "p99_ms": null
+      },
+      "cancellation_requested": false,
+      "cancellation_source_quiescence_ms": null,
+      "cancellation_measured": false,
+      "yield_reasons_observed": [
+        "bandwidth",
+        "ready"
+      ],
+      "storage_usage": {
+        "io_budgets": [
+          {
+            "device": "override:sweep-data",
+            "kind": "solid_state",
+            "limit_bytes_per_sec": 536870912,
+            "current_bytes_per_sec": 536870912,
+            "concurrency": 1,
+            "active": 0,
+            "deferred": 0,
+            "accounted_bytes": 547823104,
+            "observed_bytes_per_sec": null,
+            "queue_depth": null,
+            "request_latency_ms": null,
+            "yield_reason": "ready",
+            "probes_available": false
+          },
+          {
+            "device": "override:sweep-source",
+            "kind": "rotational",
+            "limit_bytes_per_sec": 134217728,
+            "current_bytes_per_sec": 134217728,
+            "concurrency": 1,
+            "active": 0,
+            "deferred": 0,
+            "accounted_bytes": 5327959040,
+            "observed_bytes_per_sec": null,
+            "queue_depth": null,
+            "request_latency_ms": null,
+            "yield_reason": "ready",
+            "probes_available": false
+          }
+        ],
+        "io_stall_pct": 0.3519605804149935,
+        "cache_inventory_ready": true,
+        "data_dir": "/mnt/Rusty/3dam-scan-sweep-20261007/generated-100k-after",
+        "library_db_bytes": 206544896,
+        "server_db_bytes": 0,
+        "thumbnails": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 10737418240,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "previews": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 10737418240,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "peer_previews": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 2147483648,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "asset_count": 100000,
+        "source_count": 1
+      },
+      "assertion_failures": []
+    },
+    {
+      "phase": "verify_changes_full",
+      "mode": "full",
+      "job": {
+        "id": "01a11748-363b-7013-bdaa-e26a5f553891",
+        "kind": "scan",
+        "state": "done",
+        "progress": {
+          "done": 99990,
+          "total": 99990,
+          "current": null
+        },
+        "error": null,
+        "summary": "Scanned 99990 item(s)",
+        "created_at": 1791391970875,
+        "updated_at": 1791391991977,
+        "sources": [
+          "01a11746-9273-7353-8e8a-b5c2f127a86e"
+        ],
+        "collections": []
+      },
+      "cache_state": "warm_model",
+      "elapsed_ms": 21101.681862999998,
+      "first_observed_committed_progress_ms": 138.198784,
+      "progress_events": 783,
+      "stream_lagged": false,
+      "source": {
+        "walk_calls": 1,
+        "listed_paths": 99990,
+        "listing_requests": 60002,
+        "metadata_requests": 99990,
+        "eligible_paths": 99990,
+        "fetch_opens": 99990,
+        "source_payload_bytes": 3199690,
+        "scratch_written_bytes": 3199690,
+        "round_trips": 0
+      },
+      "scratch_read_bytes": null,
+      "sql_read_statements": null,
+      "sql_writer_statements": 1005394,
+      "asset_rows_updated": 99990,
+      "sql_trigger_statements": 99990,
+      "sql_commit_statements": 1567,
+      "sql_writer_elapsed_ms": 2891.0,
+      "wal_before_bytes": 8606712,
+      "wal_peak_bytes": 8606712,
+      "wal_end_bytes": 8606712,
+      "wal_growth_bytes": 0,
+      "checkpoint": {
+        "elapsed_ms": 10.788902,
+        "busy": 0,
+        "wal_frames": 344,
+        "checkpointed_frames": 344,
+        "page_size": 4096,
+        "logical_checkpoint_bytes": 1409024,
+        "physical_checkpoint_bytes": null
+      },
+      "checkpoint_process_io": {
+        "cancelled_write_bytes": 0,
+        "rchar": 1296300,
+        "read_bytes": 0,
+        "syscr": 336,
+        "syscw": 302,
+        "wchar": 1236992,
+        "write_bytes": 1236992
+      },
+      "process_io": {
+        "cancelled_write_bytes": 409628672,
+        "rchar": 1676918714,
+        "read_bytes": 0,
+        "syscr": 545690,
+        "syscw": 432581,
+        "wchar": 859000139,
+        "write_bytes": 1240276992
+      },
+      "host_before": {
+        "rss_bytes": 30781440,
+        "peak_rss_bytes": 30781440,
+        "io": {
+          "cancelled_write_bytes": 584720384,
+          "rchar": 2208308809,
+          "read_bytes": 32768,
+          "syscr": 2625191,
+          "syscw": 8124677,
+          "wchar": 16862670761,
+          "write_bytes": 2356473856
+        },
+        "load": "3.89 5.77 7.69 3/4699 1088922\n",
+        "io_pressure": "some avg10=0.18 avg60=0.64 avg300=1.60 total=14293617917\nfull avg10=0.14 avg60=0.58 avg300=1.40 total=10976803764\n"
+      },
+      "host_after": {
+        "rss_bytes": 33849344,
+        "peak_rss_bytes": 33849344,
+        "io": {
+          "cancelled_write_bytes": 994349056,
+          "rchar": 3885227523,
+          "read_bytes": 32768,
+          "syscr": 3170881,
+          "syscw": 8557258,
+          "wchar": 17721670900,
+          "write_bytes": 3596750848
+        },
+        "load": "3.74 5.62 7.60 3/4702 1089426\n",
+        "io_pressure": "some avg10=1.24 avg60=0.84 avg300=1.58 total=14294028199\nfull avg10=1.12 avg60=0.77 avg300=1.38 total=10977197246\n"
+      },
+      "peak_rss_bytes": 34439168,
+      "browse": {
+        "samples": 1612,
+        "p95_ms": 2.837352,
+        "p99_ms": 3.153868
+      },
+      "co_tenant": {
+        "samples": 2098,
+        "p95_ms": 0.004428,
+        "p99_ms": 0.00513
+      },
+      "co_tenant_cache_mode": "cached",
+      "co_tenant_cache_limit": "cached reuses one OS page; evict requests Linux page-cache eviction before each read, without bypassing filesystem/device caches or proving physical I/O",
+      "foreground_writer": {
+        "samples": 0,
+        "p95_ms": null,
+        "p99_ms": null
+      },
+      "cancellation_requested": false,
+      "cancellation_source_quiescence_ms": null,
+      "cancellation_measured": false,
+      "yield_reasons_observed": [
+        "bandwidth",
+        "ready"
+      ],
+      "storage_usage": {
+        "io_budgets": [
+          {
+            "device": "override:sweep-data",
+            "kind": "solid_state",
+            "limit_bytes_per_sec": 536870912,
+            "current_bytes_per_sec": 536870912,
+            "concurrency": 1,
+            "active": 0,
+            "deferred": 0,
+            "accounted_bytes": 989383060,
+            "observed_bytes_per_sec": null,
+            "queue_depth": null,
+            "request_latency_ms": null,
+            "yield_reason": "ready",
+            "probes_available": false
+          },
+          {
+            "device": "override:sweep-source",
+            "kind": "rotational",
+            "limit_bytes_per_sec": 134217728,
+            "current_bytes_per_sec": 134217728,
+            "concurrency": 1,
+            "active": 0,
+            "deferred": 0,
+            "accounted_bytes": 6396045002,
+            "observed_bytes_per_sec": null,
+            "queue_depth": null,
+            "request_latency_ms": null,
+            "yield_reason": "ready",
+            "probes_available": false
+          }
+        ],
+        "io_stall_pct": 1.12,
+        "cache_inventory_ready": true,
+        "data_dir": "/mnt/Rusty/3dam-scan-sweep-20261007/generated-100k-after",
+        "library_db_bytes": 206557184,
+        "server_db_bytes": 0,
+        "thumbnails": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 10737418240,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "previews": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 10737418240,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "peer_previews": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 2147483648,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "asset_count": 100000,
+        "source_count": 1
+      },
+      "assertion_failures": []
+    },
+    {
+      "phase": "unchanged_delta",
+      "mode": "delta",
+      "job": {
+        "id": "01a11748-88be-7a81-aa3b-6ba8f6ff8f71",
+        "kind": "scan",
+        "state": "done",
+        "progress": {
+          "done": 99990,
+          "total": 99990,
+          "current": null
+        },
+        "error": null,
+        "summary": "Scanned 99990 item(s) (99990 unchanged)",
+        "created_at": 1791391991998,
+        "updated_at": 1791391999983,
+        "sources": [
+          "01a11746-9273-7353-8e8a-b5c2f127a86e"
+        ],
+        "collections": []
+      },
+      "cache_state": "warm_model",
+      "elapsed_ms": 7985.827267999999,
+      "first_observed_committed_progress_ms": 218.83111599999998,
+      "progress_events": 40,
+      "stream_lagged": false,
+      "source": {
+        "walk_calls": 1,
+        "listed_paths": 99990,
+        "listing_requests": 60002,
+        "metadata_requests": 99990,
+        "eligible_paths": 99990,
+        "fetch_opens": 0,
+        "source_payload_bytes": 0,
+        "scratch_written_bytes": 0,
+        "round_trips": 0
+      },
+      "scratch_read_bytes": null,
+      "sql_read_statements": null,
+      "sql_writer_statements": 202502,
+      "asset_rows_updated": 0,
+      "sql_trigger_statements": 0,
+      "sql_commit_statements": 824,
+      "sql_writer_elapsed_ms": 446.0,
+      "wal_before_bytes": 8606712,
+      "wal_peak_bytes": 8606712,
+      "wal_end_bytes": 8606712,
+      "wal_growth_bytes": 0,
+      "checkpoint": {
+        "elapsed_ms": 13.463899,
+        "busy": 0,
+        "wal_frames": 89,
+        "checkpointed_frames": 89,
+        "page_size": 4096,
+        "logical_checkpoint_bytes": 364544,
+        "physical_checkpoint_bytes": null
+      },
+      "checkpoint_process_io": {
+        "cancelled_write_bytes": 0,
+        "rchar": 75692,
+        "read_bytes": 0,
+        "syscr": 38,
+        "syscw": 4,
+        "wchar": 16384,
+        "write_bytes": 16384
+      },
+      "process_io": {
+        "cancelled_write_bytes": 0,
+        "rchar": 504267029,
+        "read_bytes": 0,
+        "syscr": 133531,
+        "syscw": 7178,
+        "wchar": 22735009,
+        "write_bytes": 2658304
+      },
+      "host_before": {
+        "rss_bytes": 33849344,
+        "peak_rss_bytes": 33849344,
+        "io": {
+          "cancelled_write_bytes": 994349056,
+          "rchar": 3886554914,
+          "read_bytes": 32768,
+          "syscr": 3171335,
+          "syscw": 8557567,
+          "wchar": 17722907933,
+          "write_bytes": 3597991936
+        },
+        "load": "3.74 5.62 7.60 2/4702 1089426\n",
+        "io_pressure": "some avg10=1.24 avg60=0.84 avg300=1.58 total=14294029625\nfull avg10=1.12 avg60=0.77 avg300=1.38 total=10977198650\n"
+      },
+      "host_after": {
+        "rss_bytes": 37728256,
+        "peak_rss_bytes": 37728256,
+        "io": {
+          "cancelled_write_bytes": 994349056,
+          "rchar": 4390821943,
+          "read_bytes": 32768,
+          "syscr": 3304866,
+          "syscw": 8564745,
+          "wchar": 17745642942,
+          "write_bytes": 3600650240
+        },
+        "load": "3.48 5.50 7.54 5/4709 1089567\n",
+        "io_pressure": "some avg10=0.56 avg60=0.74 avg300=1.54 total=14294050663\nfull avg10=0.50 avg60=0.67 avg300=1.34 total=10977218805\n"
+      },
+      "peak_rss_bytes": 38416384,
+      "browse": {
+        "samples": 620,
+        "p95_ms": 2.66635,
+        "p99_ms": 3.2436269999999996
+      },
+      "co_tenant": {
+        "samples": 794,
+        "p95_ms": 0.004618,
+        "p99_ms": 0.005801
+      },
+      "co_tenant_cache_mode": "cached",
+      "co_tenant_cache_limit": "cached reuses one OS page; evict requests Linux page-cache eviction before each read, without bypassing filesystem/device caches or proving physical I/O",
+      "foreground_writer": {
+        "samples": 0,
+        "p95_ms": null,
+        "p99_ms": null
+      },
+      "cancellation_requested": false,
+      "cancellation_source_quiescence_ms": null,
+      "cancellation_measured": false,
+      "yield_reasons_observed": [
+        "bandwidth",
+        "ready"
+      ],
+      "storage_usage": {
+        "io_budgets": [
+          {
+            "device": "override:sweep-data",
+            "kind": "solid_state",
+            "limit_bytes_per_sec": 536870912,
+            "current_bytes_per_sec": 536870912,
+            "concurrency": 1,
+            "active": 0,
+            "deferred": 0,
+            "accounted_bytes": 1015144340,
+            "observed_bytes_per_sec": null,
+            "queue_depth": null,
+            "request_latency_ms": null,
+            "yield_reason": "ready",
+            "probes_available": false
+          },
+          {
+            "device": "override:sweep-source",
+            "kind": "rotational",
+            "limit_bytes_per_sec": 134217728,
+            "current_bytes_per_sec": 134217728,
+            "concurrency": 1,
+            "active": 0,
+            "deferred": 0,
+            "accounted_bytes": 7460931274,
+            "observed_bytes_per_sec": null,
+            "queue_depth": null,
+            "request_latency_ms": null,
+            "yield_reason": "ready",
+            "probes_available": false
+          }
+        ],
+        "io_stall_pct": 0.6508313353384988,
+        "cache_inventory_ready": true,
+        "data_dir": "/mnt/Rusty/3dam-scan-sweep-20261007/generated-100k-after",
+        "library_db_bytes": 206557184,
+        "server_db_bytes": 0,
+        "thumbnails": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 10737418240,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "previews": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 10737418240,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "peer_previews": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 2147483648,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "asset_count": 100000,
+        "source_count": 1
+      },
+      "assertion_failures": []
+    },
+    {
+      "phase": "unchanged_full",
+      "mode": "full",
+      "job": {
+        "id": "01a11748-a807-70b0-9963-d8b58fe00c7e",
+        "kind": "scan",
+        "state": "done",
+        "progress": {
+          "done": 99990,
+          "total": 99990,
+          "current": null
+        },
+        "error": null,
+        "summary": "Scanned 99990 item(s)",
+        "created_at": 1791392000007,
+        "updated_at": 1791392020753,
+        "sources": [
+          "01a11746-9273-7353-8e8a-b5c2f127a86e"
+        ],
+        "collections": []
+      },
+      "cache_state": "warm_model",
+      "elapsed_ms": 20746.838459,
+      "first_observed_committed_progress_ms": 69.125066,
+      "progress_events": 783,
+      "stream_lagged": false,
+      "source": {
+        "walk_calls": 1,
+        "listed_paths": 99990,
+        "listing_requests": 60002,
+        "metadata_requests": 99990,
+        "eligible_paths": 99990,
+        "fetch_opens": 99990,
+        "source_payload_bytes": 3199690,
+        "scratch_written_bytes": 3199690,
+        "round_trips": 0
+      },
+      "scratch_read_bytes": null,
+      "sql_read_statements": null,
+      "sql_writer_statements": 1005394,
+      "asset_rows_updated": 99990,
+      "sql_trigger_statements": 99990,
+      "sql_commit_statements": 1567,
+      "sql_writer_elapsed_ms": 2808.0,
+      "wal_before_bytes": 8606712,
+      "wal_peak_bytes": 8606712,
+      "wal_end_bytes": 8606712,
+      "wal_growth_bytes": 0,
+      "checkpoint": {
+        "elapsed_ms": 9.458889,
+        "busy": 0,
+        "wal_frames": 344,
+        "checkpointed_frames": 344,
+        "page_size": 4096,
+        "logical_checkpoint_bytes": 1409024,
+        "physical_checkpoint_bytes": null
+      },
+      "checkpoint_process_io": {
+        "cancelled_write_bytes": 0,
+        "rchar": 1288109,
+        "read_bytes": 0,
+        "syscr": 334,
+        "syscw": 300,
+        "wchar": 1228800,
+        "write_bytes": 1228800
+      },
+      "process_io": {
+        "cancelled_write_bytes": 409767936,
+        "rchar": 1546883215,
+        "read_bytes": 0,
+        "syscr": 513517,
+        "syscw": 434397,
+        "wchar": 863510062,
+        "write_bytes": 1240801280
+      },
+      "host_before": {
+        "rss_bytes": 37748736,
+        "peak_rss_bytes": 37748736,
+        "io": {
+          "cancelled_write_bytes": 994349056,
+          "rchar": 4390928726,
+          "read_bytes": 32768,
+          "syscr": 3305022,
+          "syscw": 8564756,
+          "wchar": 17745659362,
+          "write_bytes": 3600670720
+        },
+        "load": "3.48 5.50 7.54 4/4709 1089567\n",
+        "io_pressure": "some avg10=0.56 avg60=0.74 avg300=1.54 total=14294051782\nfull avg10=0.50 avg60=0.67 avg300=1.34 total=10977219902\n"
+      },
+      "host_after": {
+        "rss_bytes": 37195776,
+        "peak_rss_bytes": 37195776,
+        "io": {
+          "cancelled_write_bytes": 1404116992,
+          "rchar": 5937811941,
+          "read_bytes": 32768,
+          "syscr": 3818539,
+          "syscw": 8999153,
+          "wchar": 18609169424,
+          "write_bytes": 4841472000
+        },
+        "load": "4.12 5.52 7.50 4/4702 1089887\n",
+        "io_pressure": "some avg10=0.24 avg60=0.61 avg300=1.45 total=14294239478\nfull avg10=0.23 avg60=0.56 avg300=1.27 total=10977401306\n"
+      },
+      "peak_rss_bytes": 38268928,
+      "browse": {
+        "samples": 1579,
+        "p95_ms": 2.879912,
+        "p99_ms": 3.182182
+      },
+      "co_tenant": {
+        "samples": 2063,
+        "p95_ms": 0.004629,
+        "p99_ms": 0.0063419999999999995
+      },
+      "co_tenant_cache_mode": "cached",
+      "co_tenant_cache_limit": "cached reuses one OS page; evict requests Linux page-cache eviction before each read, without bypassing filesystem/device caches or proving physical I/O",
+      "foreground_writer": {
+        "samples": 0,
+        "p95_ms": null,
+        "p99_ms": null
+      },
+      "cancellation_requested": false,
+      "cancellation_source_quiescence_ms": null,
+      "cancellation_measured": false,
+      "yield_reasons_observed": [
+        "bandwidth",
+        "ready"
+      ],
+      "storage_usage": {
+        "io_budgets": [
+          {
+            "device": "override:sweep-data",
+            "kind": "solid_state",
+            "limit_bytes_per_sec": 536870912,
+            "current_bytes_per_sec": 536870912,
+            "concurrency": 1,
+            "active": 0,
+            "deferred": 0,
+            "accounted_bytes": 1456704296,
+            "observed_bytes_per_sec": null,
+            "queue_depth": null,
+            "request_latency_ms": null,
+            "yield_reason": "ready",
+            "probes_available": false
+          },
+          {
+            "device": "override:sweep-source",
+            "kind": "rotational",
+            "limit_bytes_per_sec": 134217728,
+            "current_bytes_per_sec": 134217728,
+            "concurrency": 1,
+            "active": 0,
+            "deferred": 0,
+            "accounted_bytes": 8529017236,
+            "observed_bytes_per_sec": null,
+            "queue_depth": null,
+            "request_latency_ms": null,
+            "yield_reason": "ready",
+            "probes_available": false
+          }
+        ],
+        "io_stall_pct": 1.0931737638296681,
+        "cache_inventory_ready": true,
+        "data_dir": "/mnt/Rusty/3dam-scan-sweep-20261007/generated-100k-after",
+        "library_db_bytes": 206557184,
+        "server_db_bytes": 0,
+        "thumbnails": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 10737418240,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "previews": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 10737418240,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "peer_previews": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 2147483648,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "asset_count": 100000,
+        "source_count": 1
+      },
+      "assertion_failures": []
+    },
+    {
+      "phase": "cancel_full",
+      "mode": "full",
+      "job": {
+        "id": "01a11748-f924-7b53-b018-698fb7ee1609",
+        "kind": "scan",
+        "state": "cancelled",
+        "progress": {
+          "done": 1024,
+          "total": 100000,
+          "current": "level_0/bucket_46/level_1/bucket_46/level_2/bucket_46/level_3/bucket_46/level_4/bucket_46/level_5/bucket_46/level_6/bucket_46/level_7/bucket_46/item_000001151.txt"
+        },
+        "error": null,
+        "created_at": 1791392020772,
+        "updated_at": 1791392021033,
+        "sources": [
+          "01a11746-9273-7353-8e8a-b5c2f127a86e"
+        ],
+        "collections": []
+      },
+      "cache_state": "warm_model",
+      "elapsed_ms": 260.68729099999996,
+      "first_observed_committed_progress_ms": 73.745645,
+      "progress_events": 10,
+      "stream_lagged": false,
+      "source": {
+        "walk_calls": 1,
+        "listed_paths": 1152,
+        "listing_requests": 707,
+        "metadata_requests": 1152,
+        "eligible_paths": 1152,
+        "fetch_opens": 1152,
+        "source_payload_bytes": 36874,
+        "scratch_written_bytes": 36874,
+        "round_trips": 0
+      },
+      "scratch_read_bytes": null,
+      "sql_read_statements": null,
+      "sql_writer_statements": 11598,
+      "asset_rows_updated": 1152,
+      "sql_trigger_statements": 1152,
+      "sql_commit_statements": 20,
+      "sql_writer_elapsed_ms": 53.0,
+      "wal_before_bytes": 8606712,
+      "wal_peak_bytes": 8606712,
+      "wal_end_bytes": 8606712,
+      "wal_growth_bytes": 0,
+      "checkpoint": {
+        "elapsed_ms": 8.941665,
+        "busy": 0,
+        "wal_frames": 313,
+        "checkpointed_frames": 313,
+        "page_size": 4096,
+        "logical_checkpoint_bytes": 1282048,
+        "physical_checkpoint_bytes": null
+      },
+      "checkpoint_process_io": {
+        "cancelled_write_bytes": 0,
+        "rchar": 1197997,
+        "read_bytes": 0,
+        "syscr": 312,
+        "syscw": 278,
+        "wchar": 1138688,
+        "write_bytes": 1138688
+      },
+      "process_io": {
+        "cancelled_write_bytes": 4718592,
+        "rchar": 21380577,
+        "read_bytes": 0,
+        "syscr": 6827,
+        "syscw": 4738,
+        "wchar": 8909495,
+        "write_bytes": 13377536
+      },
+      "host_before": {
+        "rss_bytes": 37228544,
+        "peak_rss_bytes": 37228544,
+        "io": {
+          "cancelled_write_bytes": 1404116992,
+          "rchar": 5939128356,
+          "read_bytes": 32768,
+          "syscr": 3818917,
+          "syscw": 8999460,
+          "wchar": 18610398260,
+          "write_bytes": 4842704896
+        },
+        "load": "4.12 5.52 7.50 4/4702 1089887\n",
+        "io_pressure": "some avg10=0.24 avg60=0.61 avg300=1.45 total=14294240421\nfull avg10=0.23 avg60=0.56 avg300=1.27 total=10977402225\n"
+      },
+      "host_after": {
+        "rss_bytes": 37232640,
+        "peak_rss_bytes": 37232640,
+        "io": {
+          "cancelled_write_bytes": 1408835584,
+          "rchar": 5960508933,
+          "read_bytes": 32768,
+          "syscr": 3825744,
+          "syscw": 9004198,
+          "wchar": 18619307755,
+          "write_bytes": 4856082432
+        },
+        "load": "4.12 5.52 7.50 3/4698 1089887\n",
+        "io_pressure": "some avg10=0.24 avg60=0.61 avg300=1.45 total=14294242089\nfull avg10=0.23 avg60=0.56 avg300=1.27 total=10977403876\n"
+      },
+      "peak_rss_bytes": 37232640,
+      "browse": {
+        "samples": 20,
+        "p95_ms": 3.396915,
+        "p99_ms": 3.396915
+      },
+      "co_tenant": {
+        "samples": 26,
+        "p95_ms": 0.00533,
+        "p99_ms": 0.005841
+      },
+      "co_tenant_cache_mode": "cached",
+      "co_tenant_cache_limit": "cached reuses one OS page; evict requests Linux page-cache eviction before each read, without bypassing filesystem/device caches or proving physical I/O",
+      "foreground_writer": {
+        "samples": 0,
+        "p95_ms": null,
+        "p99_ms": null
+      },
+      "cancellation_requested": true,
+      "cancellation_source_quiescence_ms": 2.844085,
+      "cancellation_measured": true,
+      "yield_reasons_observed": [
+        "ready"
+      ],
+      "storage_usage": {
+        "io_budgets": [
+          {
+            "device": "override:sweep-data",
+            "kind": "solid_state",
+            "limit_bytes_per_sec": 536870912,
+            "current_bytes_per_sec": 536870912,
+            "concurrency": 1,
+            "active": 0,
+            "deferred": 0,
+            "accounted_bytes": 1461795644,
+            "observed_bytes_per_sec": null,
+            "queue_depth": null,
+            "request_latency_ms": null,
+            "yield_reason": "ready",
+            "probes_available": false
+          },
+          {
+            "device": "override:sweep-source",
+            "kind": "rotational",
+            "limit_bytes_per_sec": 134217728,
+            "current_bytes_per_sec": 134217728,
+            "concurrency": 1,
+            "active": 0,
+            "deferred": 0,
+            "accounted_bytes": 8541387166,
+            "observed_bytes_per_sec": null,
+            "queue_depth": null,
+            "request_latency_ms": null,
+            "yield_reason": "ready",
+            "probes_available": false
+          }
+        ],
+        "io_stall_pct": 0.45878164873405064,
+        "cache_inventory_ready": true,
+        "data_dir": "/mnt/Rusty/3dam-scan-sweep-20261007/generated-100k-after",
+        "library_db_bytes": 206557184,
+        "server_db_bytes": 0,
+        "thumbnails": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 10737418240,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "previews": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 10737418240,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "peer_previews": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 2147483648,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "asset_count": 100000,
+        "source_count": 1
+      },
+      "assertion_failures": []
+    }
+  ]
+}

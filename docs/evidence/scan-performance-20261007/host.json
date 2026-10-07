@@ -1,0 +1,62 @@
+{
+  "date": "2026-10-07",
+  "hostname": "krazy",
+  "storage": [
+    {
+      "command": [
+        "rtk",
+        "findmnt",
+        "-T",
+        "/mnt/Henry",
+        "-no",
+        "SOURCE,FSTYPE,OPTIONS"
+      ],
+      "output": "/dev/sda2 ext4   rw,relatime\n"
+    },
+    {
+      "command": [
+        "rtk",
+        "findmnt",
+        "-T",
+        "/mnt/Larry",
+        "-no",
+        "SOURCE,FSTYPE,OPTIONS"
+      ],
+      "output": "/dev/sdb1 ext4   rw,relatime\n"
+    },
+    {
+      "command": [
+        "rtk",
+        "findmnt",
+        "-T",
+        "/mnt/Rusty",
+        "-no",
+        "SOURCE,FSTYPE,OPTIONS"
+      ],
+      "output": "/dev/nvme0n1p1 ext4   rw,relatime\n"
+    },
+    {
+      "command": [
+        "rtk",
+        "lsblk",
+        "-d",
+        "-o",
+        "NAME,MODEL,SIZE,ROTA"
+      ],
+      "output": "NAME    MODEL                          SIZE ROTA\nloop0                                535.5M    0\nloop1                                541.9M    0\nloop2                                    4K    0\nloop3                                105.2M    0\nloop4                                 55.5M    0\nloop5                                 55.5M    0\nloop6                                 63.8M    0\nloop7                                 63.8M    0\nloop8                                   74M    0\nloop9                                   74M    0\nloop10                                66.8M    0\nloop11                                66.8M    0\nloop12                                75.5M    0\nloop13                                75.5M    0\nloop14                                41.3M    0\nloop15                               135.8M    0\nloop16                               135.8M    0\nloop17                               164.8M    0\nloop18                               349.7M    0\nloop19                               531.5M    0\nloop20                               122.7M    0\nloop21                               614.5M    0\nloop22                                91.7M    0\nloop23                                32.1M    0\nloop24                                44.7M    0\nloop25                                45.2M    0\nloop26                                 2.3M    0\nloop27                                 2.3M    0\nloop28                                 1.5G    0\nloop29                                 1.6G    0\nloop30                               264.3M    0\nloop31                               174.4M    0\nloop32                                 4.3M    0\nloop33                                 4.3M    0\nloop34                                 395M    0\nloop35                                 402M    0\nloop36                                55.3M    0\nloop37                               203.3M    0\nloop38                               310.5M    0\nloop39                               273.6M    0\nloop40                               503.6M    0\nloop41                                  74M    0\nloop42                                  74M    0\nloop43                               615.3M    0\nloop44                                50.3M    0\nloop45                                25.1M    0\nloop46                                25.1M    0\nloop47                                23.2M    0\nloop48                                46.2M    0\nloop49                               122.7M    0\nsda     ST4000DM004-2U9104             3.6T    1\nsdb     TOSHIBA HDWD130                2.7T    1\nnvme1n1 Samsung SSD 970 EVO Plus 1TB 931.5G    0\nnvme0n1 Samsung SSD 970 EVO Plus 2TB   1.8T    0\n"
+    },
+    {
+      "command": [
+        "rtk",
+        "free",
+        "-h"
+      ],
+      "output": "               total        used        free      shared  buff/cache   available\nMem:            31Gi        13Gi       386Mi        50Mi        17Gi        17Gi\nSwap:           15Gi        15Gi       301Mi\n"
+    }
+  ],
+  "fixture": "Native source: 4000 entries in 40 directories, 2000 accepted 1px PNGs plus 1024-byte padding, 2000 rejected .dat paths. PNGs initially share bytes/hash. Disposable source only; one accepted PNG appended with a revision marker and another removed between first Full and few-change Quick. Metadata is warm from creation; payloads initially fsynced and advised DONTNEED, then warmed by earlier runs. No global OS or drive cache reset.",
+  "cache_limits": "Linux fadvise DONTNEED on the co-tenant page requests eviction, but drive/filesystem caches can satisfy requests; sub-ms results must not be called cold HDD seeks.",
+  "concurrent_work": "Native reports enable real analysis/warming after initial verification plus LibraryService browsing, fixture favourite writes and evict-advised 4KiB co-tenant reads. Identical initial PNG hashes allow thumbnail-cache reuse; this is not a diverse-media decoder stress test. Host had unrelated workloads and swap populated; no other services were stopped.",
+  "generated_limits": "Generated 100k and 1M scale reports use no source request delay and small 32-byte text payloads on NVMe-backed catalogue storage, and cached co-tenant reads. They establish production DB/path scale, not cold physical-HDD timing. The HDD/remote profile separately injects request costs; SQLite commits remain actual catalogue filesystem I/O.",
+  "revision_notes": "working_tree_dirty=true includes preserved user files and later evidence documentation; executable implementations were committed before measurement. Generated scale/model reports remain at their recorded7d/9b revisions; native checkpoint follow-ups and scheduler control are1dd9002."
+}

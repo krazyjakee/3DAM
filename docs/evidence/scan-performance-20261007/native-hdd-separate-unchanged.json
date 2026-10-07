@@ -1,0 +1,1852 @@
+{
+  "schema_version": 1,
+  "revision": "1dd900232566bcc230258290fdb6d503727693f2",
+  "working_tree_dirty": true,
+  "package_version": "0.1.4",
+  "config": {
+    "paths": 4000,
+    "tiny_bytes": 1024,
+    "changed": 0,
+    "removed": 0,
+    "rejected_percent": 25,
+    "absent_timestamp_percent": 0,
+    "width": 100,
+    "depth": 3,
+    "large_bytes": 0,
+    "metadata_us": 0,
+    "cold_metadata_us": 0,
+    "listing_us": 0,
+    "seek_us": 0,
+    "round_trip_us": 0,
+    "transfer_mib": 0,
+    "io_mib": 0,
+    "data_mib": 128,
+    "cancel_after_ms": 50,
+    "timeout_secs": 600,
+    "foreground_budget_ms": 60.0,
+    "quick_budget_ms": null,
+    "placement": "separate",
+    "backend": "local",
+    "data_dir": "/mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-unchanged",
+    "source_root": "/mnt/Henry/3dam-scan-sweep-20261007/source",
+    "output": "/tmp/3dam-issue-implementation/native-hdd-separate-unchanged.json",
+    "background": true,
+    "pause_before_change": false,
+    "pressure_policy": "production",
+    "foreground_writes": true,
+    "topology": "detected",
+    "co_tenant_cache": "evict"
+  },
+  "scope": "production LibraryService jobs, scan coordinator, source callbacks, store batches and resource scheduler",
+  "limitations": [
+    "Injected delays model request costs; wall-clock timing still depends on this host.",
+    "Cold metadata is modeled; operating-system page caches are not dropped.",
+    "Local counters describe logical source admissions and materialized bytes, not physical disk reads.",
+    "Scratch reads and read-pool SQL counts require external tracing and are null; writer SQL/commits are measured on the catalog writer.",
+    "WAL length/growth is not cumulative WAL writes; checkpoint bytes are logical pages.",
+    "Process I/O includes scan, SQLite, browsing, cache inventory and co-tenant work.",
+    "Automatic enrichment is deferred so discovery measurements do not include an unrelated verifier; Full phases measure verification explicitly.",
+    "Pressure gates follow the recorded policy; generated profiles disable host load/memory/PSI gates while retaining I/O budgets.",
+    "Local few-change phases do not mutate the real source; arrange changes externally."
+  ],
+  "profiles": [
+    {
+      "phase": "first_discovery_quick",
+      "mode": "quick",
+      "job": {
+        "id": "01a11782-e3a7-79c1-b03b-431562809574",
+        "kind": "scan",
+        "state": "done",
+        "progress": {
+          "done": 2000,
+          "total": 2000,
+          "current": null
+        },
+        "error": null,
+        "summary": "Discovered 2000 paths; queued 2000 revisions for verification; 0 missing",
+        "created_at": 1791395816359,
+        "updated_at": 1791395818378,
+        "sources": [
+          "01a11782-e3a7-79c1-b03b-4302c8737482"
+        ],
+        "collections": []
+      },
+      "cache_state": "cold_metadata_model",
+      "elapsed_ms": 2019.672455,
+      "first_observed_committed_progress_ms": 152.754798,
+      "progress_events": 17,
+      "stream_lagged": false,
+      "source": {
+        "walk_calls": 1,
+        "listed_paths": 4000,
+        "listing_requests": 4122,
+        "metadata_requests": 2000,
+        "eligible_paths": 2000,
+        "fetch_opens": 0,
+        "source_payload_bytes": 0,
+        "scratch_written_bytes": 0,
+        "round_trips": 0
+      },
+      "scratch_read_bytes": null,
+      "sql_read_statements": null,
+      "sql_writer_statements": 14088,
+      "asset_rows_updated": 0,
+      "sql_trigger_statements": 0,
+      "sql_commit_statements": 20,
+      "sql_writer_elapsed_ms": 30.0,
+      "wal_before_bytes": 943512,
+      "wal_peak_bytes": 2463792,
+      "wal_end_bytes": 2480272,
+      "wal_growth_bytes": 1520280,
+      "checkpoint": {
+        "elapsed_ms": 218.858733,
+        "busy": 0,
+        "wal_frames": 602,
+        "checkpointed_frames": 602,
+        "page_size": 4096,
+        "logical_checkpoint_bytes": 2465792,
+        "physical_checkpoint_bytes": null
+      },
+      "checkpoint_process_io": {
+        "cancelled_write_bytes": 0,
+        "rchar": 788374,
+        "read_bytes": 0,
+        "syscr": 211,
+        "syscw": 178,
+        "wchar": 729088,
+        "write_bytes": 729088
+      },
+      "process_io": {
+        "cancelled_write_bytes": 0,
+        "rchar": 2544119,
+        "read_bytes": 806912,
+        "syscr": 3190,
+        "syscw": 1189,
+        "wchar": 1548487,
+        "write_bytes": 1536000
+      },
+      "host_before": {
+        "rss_bytes": 11382784,
+        "peak_rss_bytes": 11382784,
+        "io": {
+          "cancelled_write_bytes": 368640,
+          "rchar": 115578,
+          "read_bytes": 0,
+          "syscr": 149,
+          "syscw": 695,
+          "wchar": 1673804,
+          "write_bytes": 1388544
+        },
+        "load": "4.39 5.68 6.97 8/5003 1254859\n",
+        "io_pressure": "some avg10=0.90 avg60=0.39 avg300=1.42 total=14384197289\nfull avg10=0.60 avg60=0.29 avg300=1.26 total=11056424181\n"
+      },
+      "host_after": {
+        "rss_bytes": 13787136,
+        "peak_rss_bytes": 13787136,
+        "io": {
+          "cancelled_write_bytes": 368640,
+          "rchar": 2659697,
+          "read_bytes": 806912,
+          "syscr": 3339,
+          "syscw": 1884,
+          "wchar": 3222291,
+          "write_bytes": 2924544
+        },
+        "load": "4.39 5.68 6.97 7/4995 1255043\n",
+        "io_pressure": "some avg10=1.28 avg60=0.48 avg300=1.43 total=14384213352\nfull avg10=0.85 avg60=0.35 avg300=1.26 total=11056439262\n"
+      },
+      "peak_rss_bytes": 13721600,
+      "browse": {
+        "samples": 180,
+        "p95_ms": 0.287271,
+        "p99_ms": 0.388561
+      },
+      "co_tenant": {
+        "samples": 197,
+        "p95_ms": 0.078758,
+        "p99_ms": 0.09894599999999999
+      },
+      "co_tenant_cache_mode": "evict",
+      "co_tenant_cache_limit": "cached reuses one OS page; evict requests Linux page-cache eviction before each read, without bypassing filesystem/device caches or proving physical I/O",
+      "foreground_writer": {
+        "samples": 0,
+        "p95_ms": null,
+        "p99_ms": null
+      },
+      "cancellation_requested": false,
+      "cancellation_source_quiescence_ms": null,
+      "cancellation_measured": false,
+      "yield_reasons_observed": [
+        "bandwidth",
+        "ready"
+      ],
+      "storage_usage": {
+        "io_budgets": [
+          {
+            "device": "8:0",
+            "kind": "rotational",
+            "limit_bytes_per_sec": 8388608,
+            "current_bytes_per_sec": 8388608,
+            "concurrency": 1,
+            "active": 0,
+            "deferred": 0,
+            "accounted_bytes": 16883712,
+            "observed_bytes_per_sec": 0.0,
+            "queue_depth": 0.0,
+            "request_latency_ms": null,
+            "yield_reason": "ready",
+            "probes_available": true
+          },
+          {
+            "device": "8:16",
+            "kind": "rotational",
+            "limit_bytes_per_sec": 8388608,
+            "current_bytes_per_sec": 8388608,
+            "concurrency": 1,
+            "active": 0,
+            "deferred": 0,
+            "accounted_bytes": 8794112,
+            "observed_bytes_per_sec": 393203.8924657432,
+            "queue_depth": 0.003999876835792472,
+            "request_latency_ms": 0.041666666666666664,
+            "yield_reason": "ready",
+            "probes_available": true
+          }
+        ],
+        "io_stall_pct": 0.85,
+        "cache_inventory_ready": true,
+        "data_dir": "/mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-unchanged",
+        "library_db_bytes": 4096,
+        "server_db_bytes": 0,
+        "thumbnails": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 10737418240,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "previews": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 10737418240,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "peer_previews": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 2147483648,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "asset_count": 0,
+        "source_count": 1
+      },
+      "assertion_failures": []
+    },
+    {
+      "phase": "unchanged_quick_cold",
+      "mode": "quick",
+      "job": {
+        "id": "01a11782-ec71-7271-b5e5-404bc3786840",
+        "kind": "scan",
+        "state": "done",
+        "progress": {
+          "done": 2000,
+          "total": 2000,
+          "current": null
+        },
+        "error": null,
+        "summary": "Discovered 2000 paths; queued 0 revisions for verification; 0 missing",
+        "created_at": 1791395818609,
+        "updated_at": 1791395820651,
+        "sources": [
+          "01a11782-e3a7-79c1-b03b-4302c8737482"
+        ],
+        "collections": []
+      },
+      "cache_state": "cold_metadata_model",
+      "elapsed_ms": 2043.188325,
+      "first_observed_committed_progress_ms": 306.16740599999997,
+      "progress_events": 9,
+      "stream_lagged": false,
+      "source": {
+        "walk_calls": 1,
+        "listed_paths": 4000,
+        "listing_requests": 4122,
+        "metadata_requests": 2000,
+        "eligible_paths": 2000,
+        "fetch_opens": 0,
+        "source_payload_bytes": 0,
+        "scratch_written_bytes": 0,
+        "round_trips": 0
+      },
+      "scratch_read_bytes": null,
+      "sql_read_statements": null,
+      "sql_writer_statements": 8080,
+      "asset_rows_updated": 0,
+      "sql_trigger_statements": 0,
+      "sql_commit_statements": 20,
+      "sql_writer_elapsed_ms": 72.0,
+      "wal_before_bytes": 2480272,
+      "wal_peak_bytes": 2480272,
+      "wal_end_bytes": 2480272,
+      "wal_growth_bytes": 0,
+      "checkpoint": {
+        "elapsed_ms": 152.15947899999998,
+        "busy": 0,
+        "wal_frames": 27,
+        "checkpointed_frames": 27,
+        "page_size": 4096,
+        "logical_checkpoint_bytes": 110592,
+        "physical_checkpoint_bytes": null
+      },
+      "checkpoint_process_io": {
+        "cancelled_write_bytes": 0,
+        "rchar": 75671,
+        "read_bytes": 0,
+        "syscr": 37,
+        "syscw": 4,
+        "wchar": 16384,
+        "write_bytes": 16384
+      },
+      "process_io": {
+        "cancelled_write_bytes": 0,
+        "rchar": 2040293,
+        "read_bytes": 811008,
+        "syscr": 2891,
+        "syscw": 656,
+        "wchar": 725198,
+        "write_bytes": 217088
+      },
+      "host_before": {
+        "rss_bytes": 14155776,
+        "peak_rss_bytes": 14155776,
+        "io": {
+          "cancelled_write_bytes": 368640,
+          "rchar": 3476331,
+          "read_bytes": 806912,
+          "syscr": 3592,
+          "syscw": 2069,
+          "wchar": 3951421,
+          "write_bytes": 3653632
+        },
+        "load": "4.39 5.68 6.97 4/4995 1255043\n",
+        "io_pressure": "some avg10=1.28 avg60=0.48 avg300=1.43 total=14384233919\nfull avg10=0.85 avg60=0.35 avg300=1.26 total=11056457612\n"
+      },
+      "host_after": {
+        "rss_bytes": 14327808,
+        "peak_rss_bytes": 14327808,
+        "io": {
+          "cancelled_write_bytes": 368640,
+          "rchar": 5516624,
+          "read_bytes": 1617920,
+          "syscr": 6483,
+          "syscw": 2725,
+          "wchar": 4676619,
+          "write_bytes": 3870720
+        },
+        "load": "4.36 5.66 6.96 9/4992 1255045\n",
+        "io_pressure": "some avg10=1.41 avg60=0.53 avg300=1.44 total=14384254303\nfull avg10=0.88 avg60=0.37 avg300=1.26 total=11056476659\n"
+      },
+      "peak_rss_bytes": 14327808,
+      "browse": {
+        "samples": 182,
+        "p95_ms": 0.261271,
+        "p99_ms": 0.293463
+      },
+      "co_tenant": {
+        "samples": 198,
+        "p95_ms": 0.074961,
+        "p99_ms": 0.09024
+      },
+      "co_tenant_cache_mode": "evict",
+      "co_tenant_cache_limit": "cached reuses one OS page; evict requests Linux page-cache eviction before each read, without bypassing filesystem/device caches or proving physical I/O",
+      "foreground_writer": {
+        "samples": 0,
+        "p95_ms": null,
+        "p99_ms": null
+      },
+      "cancellation_requested": false,
+      "cancellation_source_quiescence_ms": null,
+      "cancellation_measured": false,
+      "yield_reasons_observed": [
+        "bandwidth",
+        "ready"
+      ],
+      "storage_usage": {
+        "io_budgets": [
+          {
+            "device": "8:0",
+            "kind": "rotational",
+            "limit_bytes_per_sec": 8388608,
+            "current_bytes_per_sec": 8388608,
+            "concurrency": 1,
+            "active": 0,
+            "deferred": 0,
+            "accounted_bytes": 33767424,
+            "observed_bytes_per_sec": 0.0,
+            "queue_depth": 0.0,
+            "request_latency_ms": null,
+            "yield_reason": "ready",
+            "probes_available": true
+          },
+          {
+            "device": "8:16",
+            "kind": "rotational",
+            "limit_bytes_per_sec": 8388608,
+            "current_bytes_per_sec": 7864320,
+            "concurrency": 1,
+            "active": 0,
+            "deferred": 0,
+            "accounted_bytes": 17555456,
+            "observed_bytes_per_sec": 409596.9067241604,
+            "queue_depth": 0.003999969792228129,
+            "request_latency_ms": 0.08,
+            "yield_reason": "ready",
+            "probes_available": true
+          }
+        ],
+        "io_stall_pct": 0.88,
+        "cache_inventory_ready": true,
+        "data_dir": "/mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-unchanged",
+        "library_db_bytes": 729088,
+        "server_db_bytes": 0,
+        "thumbnails": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 10737418240,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "previews": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 10737418240,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "peer_previews": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 2147483648,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "asset_count": 0,
+        "source_count": 1
+      },
+      "assertion_failures": []
+    },
+    {
+      "phase": "unchanged_quick_warm",
+      "mode": "quick",
+      "job": {
+        "id": "01a11782-f509-7e32-a627-d593ed3315ae",
+        "kind": "scan",
+        "state": "done",
+        "progress": {
+          "done": 2000,
+          "total": 2000,
+          "current": null
+        },
+        "error": null,
+        "summary": "Discovered 2000 paths; queued 0 revisions for verification; 0 missing",
+        "created_at": 1791395820809,
+        "updated_at": 1791395822852,
+        "sources": [
+          "01a11782-e3a7-79c1-b03b-4302c8737482"
+        ],
+        "collections": []
+      },
+      "cache_state": "warm_model",
+      "elapsed_ms": 2043.6072850000003,
+      "first_observed_committed_progress_ms": 306.582908,
+      "progress_events": 9,
+      "stream_lagged": false,
+      "source": {
+        "walk_calls": 1,
+        "listed_paths": 4000,
+        "listing_requests": 4122,
+        "metadata_requests": 2000,
+        "eligible_paths": 2000,
+        "fetch_opens": 0,
+        "source_payload_bytes": 0,
+        "scratch_written_bytes": 0,
+        "round_trips": 0
+      },
+      "scratch_read_bytes": null,
+      "sql_read_statements": null,
+      "sql_writer_statements": 8080,
+      "asset_rows_updated": 0,
+      "sql_trigger_statements": 0,
+      "sql_commit_statements": 20,
+      "sql_writer_elapsed_ms": 68.0,
+      "wal_before_bytes": 2480272,
+      "wal_peak_bytes": 2480272,
+      "wal_end_bytes": 2480272,
+      "wal_growth_bytes": 0,
+      "checkpoint": {
+        "elapsed_ms": 154.117745,
+        "busy": 0,
+        "wal_frames": 27,
+        "checkpointed_frames": 27,
+        "page_size": 4096,
+        "logical_checkpoint_bytes": 110592,
+        "physical_checkpoint_bytes": null
+      },
+      "checkpoint_process_io": {
+        "cancelled_write_bytes": 0,
+        "rchar": 75671,
+        "read_bytes": 0,
+        "syscr": 37,
+        "syscw": 4,
+        "wchar": 16384,
+        "write_bytes": 16384
+      },
+      "process_io": {
+        "cancelled_write_bytes": 0,
+        "rchar": 2020251,
+        "read_bytes": 806912,
+        "syscr": 2851,
+        "syscw": 680,
+        "wchar": 790798,
+        "write_bytes": 118784
+      },
+      "host_before": {
+        "rss_bytes": 14376960,
+        "peak_rss_bytes": 14376960,
+        "io": {
+          "cancelled_write_bytes": 368640,
+          "rchar": 5620557,
+          "read_bytes": 1617920,
+          "syscr": 6562,
+          "syscw": 2736,
+          "wchar": 4693044,
+          "write_bytes": 3887104
+        },
+        "load": "4.36 5.66 6.96 7/4993 1255046\n",
+        "io_pressure": "some avg10=1.41 avg60=0.53 avg300=1.44 total=14384275461\nfull avg10=0.88 avg60=0.37 avg300=1.26 total=11056496900\n"
+      },
+      "host_after": {
+        "rss_bytes": 14389248,
+        "peak_rss_bytes": 14389248,
+        "io": {
+          "cancelled_write_bytes": 368640,
+          "rchar": 7640808,
+          "read_bytes": 2424832,
+          "syscr": 9413,
+          "syscw": 3416,
+          "wchar": 5483842,
+          "write_bytes": 4005888
+        },
+        "load": "4.36 5.66 6.96 4/4955 1255150\n",
+        "io_pressure": "some avg10=1.33 avg60=0.54 avg300=1.43 total=14384295467\nfull avg10=0.90 avg60=0.39 avg300=1.26 total=11056516043\n"
+      },
+      "peak_rss_bytes": 14389248,
+      "browse": {
+        "samples": 182,
+        "p95_ms": 0.290878,
+        "p99_ms": 0.338096
+      },
+      "co_tenant": {
+        "samples": 197,
+        "p95_ms": 0.093837,
+        "p99_ms": 0.163318
+      },
+      "co_tenant_cache_mode": "evict",
+      "co_tenant_cache_limit": "cached reuses one OS page; evict requests Linux page-cache eviction before each read, without bypassing filesystem/device caches or proving physical I/O",
+      "foreground_writer": {
+        "samples": 0,
+        "p95_ms": null,
+        "p99_ms": null
+      },
+      "cancellation_requested": false,
+      "cancellation_source_quiescence_ms": null,
+      "cancellation_measured": false,
+      "yield_reasons_observed": [
+        "bandwidth",
+        "ready"
+      ],
+      "storage_usage": {
+        "io_budgets": [
+          {
+            "device": "8:0",
+            "kind": "rotational",
+            "limit_bytes_per_sec": 8388608,
+            "current_bytes_per_sec": 8388608,
+            "concurrency": 1,
+            "active": 0,
+            "deferred": 0,
+            "accounted_bytes": 50651136,
+            "observed_bytes_per_sec": 0.0,
+            "queue_depth": 0.0,
+            "request_latency_ms": null,
+            "yield_reason": "ready",
+            "probes_available": true
+          },
+          {
+            "device": "8:16",
+            "kind": "rotational",
+            "limit_bytes_per_sec": 8388608,
+            "current_bytes_per_sec": 7602176,
+            "concurrency": 1,
+            "active": 0,
+            "deferred": 0,
+            "accounted_bytes": 26316800,
+            "observed_bytes_per_sec": 409597.20327029604,
+            "queue_depth": 0.003999972688186485,
+            "request_latency_ms": 0.04,
+            "yield_reason": "ready",
+            "probes_available": true
+          }
+        ],
+        "io_stall_pct": 0.9,
+        "cache_inventory_ready": true,
+        "data_dir": "/mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-unchanged",
+        "library_db_bytes": 729088,
+        "server_db_bytes": 0,
+        "thumbnails": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 10737418240,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "previews": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 10737418240,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "peer_previews": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 2147483648,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "asset_count": 0,
+        "source_count": 1
+      },
+      "assertion_failures": []
+    },
+    {
+      "phase": "first_full_verification",
+      "mode": "full",
+      "job": {
+        "id": "01a11782-fda9-7761-a994-56a6688ef385",
+        "kind": "scan",
+        "state": "done",
+        "progress": {
+          "done": 2000,
+          "total": 2000,
+          "current": null
+        },
+        "error": null,
+        "summary": "Scanned 2000 item(s)",
+        "created_at": 1791395823017,
+        "updated_at": 1791395828435,
+        "sources": [
+          "01a11782-e3a7-79c1-b03b-4302c8737482"
+        ],
+        "collections": []
+      },
+      "cache_state": "warm_model",
+      "elapsed_ms": 5417.62353,
+      "first_observed_committed_progress_ms": 599.021426,
+      "progress_events": 18,
+      "stream_lagged": false,
+      "source": {
+        "walk_calls": 1,
+        "listed_paths": 4000,
+        "listing_requests": 4122,
+        "metadata_requests": 2000,
+        "eligible_paths": 2000,
+        "fetch_opens": 2000,
+        "source_payload_bytes": 2184000,
+        "scratch_written_bytes": 0,
+        "round_trips": 0
+      },
+      "scratch_read_bytes": null,
+      "sql_read_statements": null,
+      "sql_writer_statements": 24182,
+      "asset_rows_updated": 4041,
+      "sql_trigger_statements": 96081,
+      "sql_commit_statements": 37,
+      "sql_writer_elapsed_ms": 796.0,
+      "wal_before_bytes": 2480272,
+      "wal_peak_bytes": 5599112,
+      "wal_end_bytes": 5599112,
+      "wal_growth_bytes": 3118840,
+      "checkpoint": {
+        "elapsed_ms": 329.820594,
+        "busy": 0,
+        "wal_frames": 726,
+        "checkpointed_frames": 726,
+        "page_size": 4096,
+        "logical_checkpoint_bytes": 2973696,
+        "physical_checkpoint_bytes": null
+      },
+      "checkpoint_process_io": {
+        "cancelled_write_bytes": 0,
+        "rchar": 1111968,
+        "read_bytes": 0,
+        "syscr": 291,
+        "syscw": 257,
+        "wchar": 1052672,
+        "write_bytes": 1052672
+      },
+      "process_io": {
+        "cancelled_write_bytes": 3252224,
+        "rchar": 22495824,
+        "read_bytes": 1761280,
+        "syscr": 60610,
+        "syscw": 143097,
+        "wchar": 293497553,
+        "write_bytes": 14311424
+      },
+      "host_before": {
+        "rss_bytes": 14434304,
+        "peak_rss_bytes": 14434304,
+        "io": {
+          "cancelled_write_bytes": 368640,
+          "rchar": 7744741,
+          "read_bytes": 2424832,
+          "syscr": 9492,
+          "syscw": 3427,
+          "wchar": 5500267,
+          "write_bytes": 4022272
+        },
+        "load": "4.36 5.66 6.96 7/4958 1255193\n",
+        "io_pressure": "some avg10=1.33 avg60=0.54 avg300=1.43 total=14384323756\nfull avg10=0.90 avg60=0.39 avg300=1.26 total=11056542312\n"
+      },
+      "host_after": {
+        "rss_bytes": 18628608,
+        "peak_rss_bytes": 18628608,
+        "io": {
+          "cancelled_write_bytes": 3620864,
+          "rchar": 30240565,
+          "read_bytes": 4186112,
+          "syscr": 70102,
+          "syscw": 146524,
+          "wchar": 298997820,
+          "write_bytes": 18333696
+        },
+        "load": "4.33 5.63 6.94 7/4959 1255446\n",
+        "io_pressure": "some avg10=4.23 avg60=1.14 avg300=1.54 total=14384726406\nfull avg10=3.81 avg60=0.97 avg300=1.36 total=11056926487\n"
+      },
+      "peak_rss_bytes": 18628608,
+      "browse": {
+        "samples": 431,
+        "p95_ms": 0.808783,
+        "p99_ms": 0.974734
+      },
+      "co_tenant": {
+        "samples": 428,
+        "p95_ms": 9.706709,
+        "p99_ms": 54.838561
+      },
+      "co_tenant_cache_mode": "evict",
+      "co_tenant_cache_limit": "cached reuses one OS page; evict requests Linux page-cache eviction before each read, without bypassing filesystem/device caches or proving physical I/O",
+      "foreground_writer": {
+        "samples": 41,
+        "p95_ms": 44.454378000000005,
+        "p99_ms": 63.597507
+      },
+      "cancellation_requested": false,
+      "cancellation_source_quiescence_ms": null,
+      "cancellation_measured": false,
+      "yield_reasons_observed": [
+        "bandwidth",
+        "io_stall",
+        "ready"
+      ],
+      "storage_usage": {
+        "io_budgets": [
+          {
+            "device": "8:0",
+            "kind": "rotational",
+            "limit_bytes_per_sec": 8388608,
+            "current_bytes_per_sec": 8388608,
+            "concurrency": 1,
+            "active": 0,
+            "deferred": 0,
+            "accounted_bytes": 71904848,
+            "observed_bytes_per_sec": 0.0,
+            "queue_depth": 0.0,
+            "request_latency_ms": null,
+            "yield_reason": "ready",
+            "probes_available": true
+          },
+          {
+            "device": "8:16",
+            "kind": "rotational",
+            "limit_bytes_per_sec": 8388608,
+            "current_bytes_per_sec": 4194304,
+            "concurrency": 1,
+            "active": 0,
+            "deferred": 0,
+            "accounted_bytes": 35028736,
+            "observed_bytes_per_sec": 398815.94195221504,
+            "queue_depth": 0.0077893738662542,
+            "request_latency_ms": 0.04,
+            "yield_reason": "ready",
+            "probes_available": true
+          }
+        ],
+        "io_stall_pct": 3.81,
+        "cache_inventory_ready": true,
+        "data_dir": "/mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-unchanged",
+        "library_db_bytes": 2031616,
+        "server_db_bytes": 0,
+        "thumbnails": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 10737418240,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "previews": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 10737418240,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "peer_previews": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 2147483648,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "asset_count": 2000,
+        "source_count": 1
+      },
+      "assertion_failures": []
+    },
+    {
+      "phase": "few_change_quick",
+      "mode": "quick",
+      "job": {
+        "id": "01a11783-1429-7eb1-b633-7e73670bbf0b",
+        "kind": "scan",
+        "state": "done",
+        "progress": {
+          "done": 2000,
+          "total": 2000,
+          "current": null
+        },
+        "error": null,
+        "summary": "Discovered 2000 paths; queued 0 revisions for verification; 0 missing",
+        "created_at": 1791395828777,
+        "updated_at": 1791395831096,
+        "sources": [
+          "01a11782-e3a7-79c1-b03b-4302c8737482"
+        ],
+        "collections": []
+      },
+      "cache_state": "warm_model",
+      "elapsed_ms": 2319.4779529999996,
+      "first_observed_committed_progress_ms": 415.307869,
+      "progress_events": 9,
+      "stream_lagged": false,
+      "source": {
+        "walk_calls": 1,
+        "listed_paths": 4000,
+        "listing_requests": 4122,
+        "metadata_requests": 2000,
+        "eligible_paths": 2000,
+        "fetch_opens": 0,
+        "source_payload_bytes": 0,
+        "scratch_written_bytes": 0,
+        "round_trips": 0
+      },
+      "scratch_read_bytes": null,
+      "sql_read_statements": null,
+      "sql_writer_statements": 10100,
+      "asset_rows_updated": 20,
+      "sql_trigger_statements": 0,
+      "sql_commit_statements": 20,
+      "sql_writer_elapsed_ms": 73.0,
+      "wal_before_bytes": 5599112,
+      "wal_peak_bytes": 5599112,
+      "wal_end_bytes": 5599112,
+      "wal_growth_bytes": 0,
+      "checkpoint": {
+        "elapsed_ms": 153.037912,
+        "busy": 0,
+        "wal_frames": 47,
+        "checkpointed_frames": 47,
+        "page_size": 4096,
+        "logical_checkpoint_bytes": 192512,
+        "physical_checkpoint_bytes": null
+      },
+      "checkpoint_process_io": {
+        "cancelled_write_bytes": 0,
+        "rchar": 305056,
+        "read_bytes": 0,
+        "syscr": 94,
+        "syscw": 7,
+        "wchar": 20496,
+        "write_bytes": 20480
+      },
+      "process_io": {
+        "cancelled_write_bytes": 0,
+        "rchar": 10625683,
+        "read_bytes": 917504,
+        "syscr": 5705,
+        "syscw": 850,
+        "wchar": 1152218,
+        "write_bytes": 258048
+      },
+      "host_before": {
+        "rss_bytes": 18661376,
+        "peak_rss_bytes": 18661376,
+        "io": {
+          "cancelled_write_bytes": 3620864,
+          "rchar": 31380813,
+          "read_bytes": 4186112,
+          "syscr": 70437,
+          "syscw": 146789,
+          "wchar": 300050544,
+          "write_bytes": 19386368
+        },
+        "load": "4.33 5.63 6.94 10/4959 1255446\n",
+        "io_pressure": "some avg10=4.23 avg60=1.14 avg300=1.54 total=14384750471\nfull avg10=3.81 avg60=0.97 avg300=1.36 total=11056948357\n"
+      },
+      "host_after": {
+        "rss_bytes": 18726912,
+        "peak_rss_bytes": 18726912,
+        "io": {
+          "cancelled_write_bytes": 3620864,
+          "rchar": 42006496,
+          "read_bytes": 5103616,
+          "syscr": 76142,
+          "syscw": 147639,
+          "wchar": 301202762,
+          "write_bytes": 19644416
+        },
+        "load": "4.46 5.63 6.94 7/4990 1255481\n",
+        "io_pressure": "some avg10=3.65 avg60=1.14 avg300=1.54 total=14384770743\nfull avg10=3.30 avg60=0.97 avg300=1.36 total=11056966919\n"
+      },
+      "peak_rss_bytes": 18661376,
+      "browse": {
+        "samples": 194,
+        "p95_ms": 0.7264170000000001,
+        "p99_ms": 0.893581
+      },
+      "co_tenant": {
+        "samples": 224,
+        "p95_ms": 0.078127,
+        "p99_ms": 0.090881
+      },
+      "co_tenant_cache_mode": "evict",
+      "co_tenant_cache_limit": "cached reuses one OS page; evict requests Linux page-cache eviction before each read, without bypassing filesystem/device caches or proving physical I/O",
+      "foreground_writer": {
+        "samples": 20,
+        "p95_ms": 57.036298,
+        "p99_ms": 57.036298
+      },
+      "cancellation_requested": false,
+      "cancellation_source_quiescence_ms": null,
+      "cancellation_measured": false,
+      "yield_reasons_observed": [
+        "bandwidth",
+        "ready"
+      ],
+      "storage_usage": {
+        "io_budgets": [
+          {
+            "device": "8:0",
+            "kind": "rotational",
+            "limit_bytes_per_sec": 8388608,
+            "current_bytes_per_sec": 8388608,
+            "concurrency": 1,
+            "active": 0,
+            "deferred": 0,
+            "accounted_bytes": 88788560,
+            "observed_bytes_per_sec": 0.0,
+            "queue_depth": 0.0,
+            "request_latency_ms": null,
+            "yield_reason": "ready",
+            "probes_available": true
+          },
+          {
+            "device": "8:16",
+            "kind": "rotational",
+            "limit_bytes_per_sec": 8388608,
+            "current_bytes_per_sec": 6815744,
+            "concurrency": 1,
+            "active": 0,
+            "deferred": 0,
+            "accounted_bytes": 43790080,
+            "observed_bytes_per_sec": 405686.28919480246,
+            "queue_depth": 0.003961780167917993,
+            "request_latency_ms": 0.04,
+            "yield_reason": "ready",
+            "probes_available": true
+          }
+        ],
+        "io_stall_pct": 3.3,
+        "cache_inventory_ready": true,
+        "data_dir": "/mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-unchanged",
+        "library_db_bytes": 2551808,
+        "server_db_bytes": 0,
+        "thumbnails": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 10737418240,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "previews": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 10737418240,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "peer_previews": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 2147483648,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "asset_count": 2000,
+        "source_count": 1
+      },
+      "assertion_failures": []
+    },
+    {
+      "phase": "verify_changes_full",
+      "mode": "full",
+      "job": {
+        "id": "01a11783-1dd4-72a2-ae3c-0c20ac066daf",
+        "kind": "scan",
+        "state": "done",
+        "progress": {
+          "done": 2000,
+          "total": 2000,
+          "current": null
+        },
+        "error": null,
+        "summary": "Scanned 2000 item(s)",
+        "created_at": 1791395831252,
+        "updated_at": 1791395834598,
+        "sources": [
+          "01a11782-e3a7-79c1-b03b-4302c8737482"
+        ],
+        "collections": []
+      },
+      "cache_state": "warm_model",
+      "elapsed_ms": 3346.781439,
+      "first_observed_committed_progress_ms": 585.567636,
+      "progress_events": 17,
+      "stream_lagged": false,
+      "source": {
+        "walk_calls": 1,
+        "listed_paths": 4000,
+        "listing_requests": 4122,
+        "metadata_requests": 2000,
+        "eligible_paths": 2000,
+        "fetch_opens": 2000,
+        "source_payload_bytes": 2184000,
+        "scratch_written_bytes": 0,
+        "round_trips": 0
+      },
+      "scratch_read_bytes": null,
+      "sql_read_statements": null,
+      "sql_writer_statements": 20161,
+      "asset_rows_updated": 2029,
+      "sql_trigger_statements": 2000,
+      "sql_commit_statements": 35,
+      "sql_writer_elapsed_ms": 87.0,
+      "wal_before_bytes": 5599112,
+      "wal_peak_bytes": 5599112,
+      "wal_end_bytes": 5599112,
+      "wal_growth_bytes": 0,
+      "checkpoint": {
+        "elapsed_ms": 282.91061499999995,
+        "busy": 0,
+        "wal_frames": 420,
+        "checkpointed_frames": 420,
+        "page_size": 4096,
+        "logical_checkpoint_bytes": 1720320,
+        "physical_checkpoint_bytes": null
+      },
+      "checkpoint_process_io": {
+        "cancelled_write_bytes": 0,
+        "rchar": 694176,
+        "read_bytes": 0,
+        "syscr": 189,
+        "syscw": 155,
+        "wchar": 634880,
+        "write_bytes": 634880
+      },
+      "process_io": {
+        "cancelled_write_bytes": 0,
+        "rchar": 16572601,
+        "read_bytes": 1331200,
+        "syscr": 13409,
+        "syscw": 1722,
+        "wchar": 2166725,
+        "write_bytes": 1736704
+      },
+      "host_before": {
+        "rss_bytes": 18952192,
+        "peak_rss_bytes": 18952192,
+        "io": {
+          "cancelled_write_bytes": 3620864,
+          "rchar": 42360312,
+          "read_bytes": 5103616,
+          "syscr": 76285,
+          "syscw": 147653,
+          "wchar": 301223295,
+          "write_bytes": 19664896
+        },
+        "load": "4.46 5.63 6.94 4/4990 1255481\n",
+        "io_pressure": "some avg10=3.65 avg60=1.14 avg300=1.54 total=14384797652\nfull avg10=3.30 avg60=0.97 avg300=1.36 total=11056991791\n"
+      },
+      "host_after": {
+        "rss_bytes": 19501056,
+        "peak_rss_bytes": 19501056,
+        "io": {
+          "cancelled_write_bytes": 3620864,
+          "rchar": 58932913,
+          "read_bytes": 6434816,
+          "syscr": 89694,
+          "syscw": 149375,
+          "wchar": 303390020,
+          "write_bytes": 21401600
+        },
+        "load": "4.43 5.61 6.92 6/4981 1255487\n",
+        "io_pressure": "some avg10=2.74 avg60=1.13 avg300=1.53 total=14384824220\nfull avg10=2.51 avg60=0.97 avg300=1.35 total=11057017415\n"
+      },
+      "peak_rss_bytes": 19501056,
+      "browse": {
+        "samples": 284,
+        "p95_ms": 0.72829,
+        "p99_ms": 0.959385
+      },
+      "co_tenant": {
+        "samples": 325,
+        "p95_ms": 0.089468,
+        "p99_ms": 0.108424
+      },
+      "co_tenant_cache_mode": "evict",
+      "co_tenant_cache_limit": "cached reuses one OS page; evict requests Linux page-cache eviction before each read, without bypassing filesystem/device caches or proving physical I/O",
+      "foreground_writer": {
+        "samples": 29,
+        "p95_ms": 8.072363000000001,
+        "p99_ms": 57.142378
+      },
+      "cancellation_requested": false,
+      "cancellation_source_quiescence_ms": null,
+      "cancellation_measured": false,
+      "yield_reasons_observed": [
+        "bandwidth",
+        "ready"
+      ],
+      "storage_usage": {
+        "io_budgets": [
+          {
+            "device": "8:0",
+            "kind": "rotational",
+            "limit_bytes_per_sec": 8388608,
+            "current_bytes_per_sec": 8388608,
+            "concurrency": 1,
+            "active": 0,
+            "deferred": 0,
+            "accounted_bytes": 110042272,
+            "observed_bytes_per_sec": 0.0,
+            "queue_depth": 0.0,
+            "request_latency_ms": null,
+            "yield_reason": "ready",
+            "probes_available": true
+          },
+          {
+            "device": "8:16",
+            "kind": "rotational",
+            "limit_bytes_per_sec": 8388608,
+            "current_bytes_per_sec": 8388608,
+            "concurrency": 1,
+            "active": 0,
+            "deferred": 0,
+            "accounted_bytes": 52498176,
+            "observed_bytes_per_sec": 406538.47591660917,
+            "queue_depth": 0.005838385740989906,
+            "request_latency_ms": 0.058823529411764705,
+            "yield_reason": "ready",
+            "probes_available": true
+          }
+        ],
+        "io_stall_pct": 2.51,
+        "cache_inventory_ready": true,
+        "data_dir": "/mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-unchanged",
+        "library_db_bytes": 2551808,
+        "server_db_bytes": 0,
+        "thumbnails": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 10737418240,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "previews": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 10737418240,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "peer_previews": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 2147483648,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "asset_count": 2000,
+        "source_count": 1
+      },
+      "assertion_failures": []
+    },
+    {
+      "phase": "unchanged_delta",
+      "mode": "delta",
+      "job": {
+        "id": "01a11783-2c0e-77f3-838c-969e97de929e",
+        "kind": "scan",
+        "state": "done",
+        "progress": {
+          "done": 2000,
+          "total": 2000,
+          "current": null
+        },
+        "error": null,
+        "summary": "Scanned 2000 item(s) (2000 unchanged)",
+        "created_at": 1791395834894,
+        "updated_at": 1791395836935,
+        "sources": [
+          "01a11782-e3a7-79c1-b03b-4302c8737482"
+        ],
+        "collections": []
+      },
+      "cache_state": "warm_model",
+      "elapsed_ms": 2042.0288289999999,
+      "first_observed_committed_progress_ms": 304.852012,
+      "progress_events": 9,
+      "stream_lagged": false,
+      "source": {
+        "walk_calls": 1,
+        "listed_paths": 4000,
+        "listing_requests": 4122,
+        "metadata_requests": 2000,
+        "eligible_paths": 2000,
+        "fetch_opens": 0,
+        "source_payload_bytes": 0,
+        "scratch_written_bytes": 0,
+        "round_trips": 0
+      },
+      "scratch_read_bytes": null,
+      "sql_read_statements": null,
+      "sql_writer_statements": 4118,
+      "asset_rows_updated": 18,
+      "sql_trigger_statements": 0,
+      "sql_commit_statements": 27,
+      "sql_writer_elapsed_ms": 64.0,
+      "wal_before_bytes": 5599112,
+      "wal_peak_bytes": 5599112,
+      "wal_end_bytes": 5599112,
+      "wal_growth_bytes": 0,
+      "checkpoint": {
+        "elapsed_ms": 149.369167,
+        "busy": 0,
+        "wal_frames": 45,
+        "checkpointed_frames": 45,
+        "page_size": 4096,
+        "logical_checkpoint_bytes": 184320,
+        "physical_checkpoint_bytes": null
+      },
+      "checkpoint_process_io": {
+        "cancelled_write_bytes": 0,
+        "rchar": 79776,
+        "read_bytes": 0,
+        "syscr": 39,
+        "syscw": 5,
+        "wchar": 20480,
+        "write_bytes": 20480
+      },
+      "process_io": {
+        "cancelled_write_bytes": 0,
+        "rchar": 9029785,
+        "read_bytes": 811008,
+        "syscr": 4834,
+        "syscw": 666,
+        "wchar": 615185,
+        "write_bytes": 192512
+      },
+      "host_before": {
+        "rss_bytes": 19533824,
+        "peak_rss_bytes": 19533824,
+        "io": {
+          "cancelled_write_bytes": 3620864,
+          "rchar": 59655369,
+          "read_bytes": 6434816,
+          "syscr": 89927,
+          "syscw": 149537,
+          "wchar": 304024940,
+          "write_bytes": 22036480
+        },
+        "load": "4.43 5.61 6.92 5/4980 1255487\n",
+        "io_pressure": "some avg10=2.74 avg60=1.13 avg300=1.53 total=14384856602\nfull avg10=2.51 avg60=0.97 avg300=1.35 total=11057046282\n"
+      },
+      "host_after": {
+        "rss_bytes": 20303872,
+        "peak_rss_bytes": 20303872,
+        "io": {
+          "cancelled_write_bytes": 3620864,
+          "rchar": 68685154,
+          "read_bytes": 7245824,
+          "syscr": 94761,
+          "syscw": 150203,
+          "wchar": 304640125,
+          "write_bytes": 22228992
+        },
+        "load": "4.43 5.61 6.92 4/4951 1255496\n",
+        "io_pressure": "some avg10=2.60 avg60=1.16 avg300=1.53 total=14384873027\nfull avg10=2.42 avg60=1.01 avg300=1.36 total=11057061889\n"
+      },
+      "peak_rss_bytes": 19853312,
+      "browse": {
+        "samples": 171,
+        "p95_ms": 0.660493,
+        "p99_ms": 0.8378669999999999
+      },
+      "co_tenant": {
+        "samples": 198,
+        "p95_ms": 0.070122,
+        "p99_ms": 0.11072800000000001
+      },
+      "co_tenant_cache_mode": "evict",
+      "co_tenant_cache_limit": "cached reuses one OS page; evict requests Linux page-cache eviction before each read, without bypassing filesystem/device caches or proving physical I/O",
+      "foreground_writer": {
+        "samples": 18,
+        "p95_ms": 57.250011,
+        "p99_ms": 57.250011
+      },
+      "cancellation_requested": false,
+      "cancellation_source_quiescence_ms": null,
+      "cancellation_measured": false,
+      "yield_reasons_observed": [
+        "bandwidth",
+        "ready"
+      ],
+      "storage_usage": {
+        "io_budgets": [
+          {
+            "device": "8:0",
+            "kind": "rotational",
+            "limit_bytes_per_sec": 8388608,
+            "current_bytes_per_sec": 8388608,
+            "concurrency": 1,
+            "active": 0,
+            "deferred": 0,
+            "accounted_bytes": 126925984,
+            "observed_bytes_per_sec": 16382.343941615629,
+            "queue_depth": 0.0,
+            "request_latency_ms": 0.0,
+            "yield_reason": "ready",
+            "probes_available": true
+          },
+          {
+            "device": "8:16",
+            "kind": "rotational",
+            "limit_bytes_per_sec": 8388608,
+            "current_bytes_per_sec": 7864320,
+            "concurrency": 1,
+            "active": 0,
+            "deferred": 0,
+            "accounted_bytes": 53047040,
+            "observed_bytes_per_sec": 397937.21781821095,
+            "queue_depth": 0.0038861056427559664,
+            "request_latency_ms": 0.04,
+            "yield_reason": "ready",
+            "probes_available": true
+          }
+        ],
+        "io_stall_pct": 2.42,
+        "cache_inventory_ready": true,
+        "data_dir": "/mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-unchanged",
+        "library_db_bytes": 2551808,
+        "server_db_bytes": 0,
+        "thumbnails": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 10737418240,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "previews": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 10737418240,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "peer_previews": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 2147483648,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "asset_count": 2000,
+        "source_count": 1
+      },
+      "assertion_failures": []
+    },
+    {
+      "phase": "unchanged_full",
+      "mode": "full",
+      "job": {
+        "id": "01a11783-34a6-75f0-ae8c-3e5b92c029a9",
+        "kind": "scan",
+        "state": "done",
+        "progress": {
+          "done": 2000,
+          "total": 2000,
+          "current": null
+        },
+        "error": null,
+        "summary": "Scanned 2000 item(s)",
+        "created_at": 1791395837094,
+        "updated_at": 1791395841711,
+        "sources": [
+          "01a11782-e3a7-79c1-b03b-4302c8737482"
+        ],
+        "collections": []
+      },
+      "cache_state": "warm_model",
+      "elapsed_ms": 4617.39924,
+      "first_observed_committed_progress_ms": 479.52477300000004,
+      "progress_events": 17,
+      "stream_lagged": false,
+      "source": {
+        "walk_calls": 1,
+        "listed_paths": 4000,
+        "listing_requests": 4122,
+        "metadata_requests": 2000,
+        "eligible_paths": 2000,
+        "fetch_opens": 2000,
+        "source_payload_bytes": 2184000,
+        "scratch_written_bytes": 0,
+        "round_trips": 0
+      },
+      "scratch_read_bytes": null,
+      "sql_read_statements": null,
+      "sql_writer_statements": 20172,
+      "asset_rows_updated": 2040,
+      "sql_trigger_statements": 2000,
+      "sql_commit_statements": 35,
+      "sql_writer_elapsed_ms": 93.0,
+      "wal_before_bytes": 5599112,
+      "wal_peak_bytes": 5599112,
+      "wal_end_bytes": 5599112,
+      "wal_growth_bytes": 0,
+      "checkpoint": {
+        "elapsed_ms": 296.363766,
+        "busy": 0,
+        "wal_frames": 434,
+        "checkpointed_frames": 434,
+        "page_size": 4096,
+        "logical_checkpoint_bytes": 1777664,
+        "physical_checkpoint_bytes": null
+      },
+      "checkpoint_process_io": {
+        "cancelled_write_bytes": 0,
+        "rchar": 911265,
+        "read_bytes": 0,
+        "syscr": 242,
+        "syscw": 157,
+        "wchar": 634896,
+        "write_bytes": 634880
+      },
+      "process_io": {
+        "cancelled_write_bytes": 0,
+        "rchar": 19359164,
+        "read_bytes": 1847296,
+        "syscr": 15691,
+        "syscw": 2022,
+        "wchar": 2222488,
+        "write_bytes": 1794048
+      },
+      "host_before": {
+        "rss_bytes": 20336640,
+        "peak_rss_bytes": 20336640,
+        "io": {
+          "cancelled_write_bytes": 3620864,
+          "rchar": 68793210,
+          "read_bytes": 7245824,
+          "syscr": 94844,
+          "syscw": 150215,
+          "wchar": 304660641,
+          "write_bytes": 22249472
+        },
+        "load": "4.43 5.61 6.92 5/4951 1255496\n",
+        "io_pressure": "some avg10=2.60 avg60=1.16 avg300=1.53 total=14384900261\nfull avg10=2.42 avg60=1.01 avg300=1.36 total=11057083717\n"
+      },
+      "host_after": {
+        "rss_bytes": 20303872,
+        "peak_rss_bytes": 20303872,
+        "io": {
+          "cancelled_write_bytes": 3620864,
+          "rchar": 88152374,
+          "read_bytes": 9093120,
+          "syscr": 110535,
+          "syscw": 152237,
+          "wchar": 306883129,
+          "write_bytes": 24043520
+        },
+        "load": "4.55 5.61 6.91 7/4943 1255559\n",
+        "io_pressure": "some avg10=8.29 avg60=2.34 avg300=1.77 total=14385752796\nfull avg10=7.70 avg60=2.11 avg300=1.58 total=11057882239\n"
+      },
+      "peak_rss_bytes": 20529152,
+      "browse": {
+        "samples": 394,
+        "p95_ms": 0.637389,
+        "p99_ms": 0.8106949999999999
+      },
+      "co_tenant": {
+        "samples": 451,
+        "p95_ms": 0.06899,
+        "p99_ms": 0.078408
+      },
+      "co_tenant_cache_mode": "evict",
+      "co_tenant_cache_limit": "cached reuses one OS page; evict requests Linux page-cache eviction before each read, without bypassing filesystem/device caches or proving physical I/O",
+      "foreground_writer": {
+        "samples": 40,
+        "p95_ms": 0.406444,
+        "p99_ms": 57.230293
+      },
+      "cancellation_requested": false,
+      "cancellation_source_quiescence_ms": null,
+      "cancellation_measured": false,
+      "yield_reasons_observed": [
+        "bandwidth",
+        "io_stall",
+        "ready"
+      ],
+      "storage_usage": {
+        "io_budgets": [
+          {
+            "device": "8:0",
+            "kind": "rotational",
+            "limit_bytes_per_sec": 8388608,
+            "current_bytes_per_sec": 8388608,
+            "concurrency": 1,
+            "active": 0,
+            "deferred": 0,
+            "accounted_bytes": 148179696,
+            "observed_bytes_per_sec": 0.0,
+            "queue_depth": 0.0,
+            "request_latency_ms": null,
+            "yield_reason": "ready",
+            "probes_available": true
+          },
+          {
+            "device": "8:16",
+            "kind": "rotational",
+            "limit_bytes_per_sec": 8388608,
+            "current_bytes_per_sec": 8388608,
+            "concurrency": 1,
+            "active": 0,
+            "deferred": 0,
+            "accounted_bytes": 61755136,
+            "observed_bytes_per_sec": 402623.7985306089,
+            "queue_depth": 0.003389545717694377,
+            "request_latency_ms": 0.06896551724137931,
+            "yield_reason": "ready",
+            "probes_available": true
+          }
+        ],
+        "io_stall_pct": 18.32066126008862,
+        "cache_inventory_ready": true,
+        "data_dir": "/mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-unchanged",
+        "library_db_bytes": 2551808,
+        "server_db_bytes": 0,
+        "thumbnails": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 10737418240,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "previews": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 10737418240,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "peer_previews": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 2147483648,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "asset_count": 2000,
+        "source_count": 1
+      },
+      "assertion_failures": []
+    },
+    {
+      "phase": "cancel_full",
+      "mode": "full",
+      "job": {
+        "id": "01a11783-47da-7240-8449-4b6336968415",
+        "kind": "scan",
+        "state": "cancelled",
+        "progress": {
+          "done": 0,
+          "total": 2000,
+          "current": null
+        },
+        "error": null,
+        "created_at": 1791395842010,
+        "updated_at": 1791395842068,
+        "sources": [
+          "01a11782-e3a7-79c1-b03b-4302c8737482"
+        ],
+        "collections": []
+      },
+      "cache_state": "warm_model",
+      "elapsed_ms": 58.416896,
+      "first_observed_committed_progress_ms": null,
+      "progress_events": 1,
+      "stream_lagged": false,
+      "source": {
+        "walk_calls": 0,
+        "listed_paths": 0,
+        "listing_requests": 0,
+        "metadata_requests": 0,
+        "eligible_paths": 0,
+        "fetch_opens": 0,
+        "source_payload_bytes": 0,
+        "scratch_written_bytes": 0,
+        "round_trips": 0
+      },
+      "scratch_read_bytes": null,
+      "sql_read_statements": null,
+      "sql_writer_statements": 5,
+      "asset_rows_updated": 1,
+      "sql_trigger_statements": 0,
+      "sql_commit_statements": 0,
+      "sql_writer_elapsed_ms": 58.0,
+      "wal_before_bytes": 5599112,
+      "wal_peak_bytes": 5599112,
+      "wal_end_bytes": 5599112,
+      "wal_growth_bytes": 0,
+      "checkpoint": {
+        "elapsed_ms": 146.202527,
+        "busy": 0,
+        "wal_frames": 9,
+        "checkpointed_frames": 9,
+        "page_size": 4096,
+        "logical_checkpoint_bytes": 36864,
+        "physical_checkpoint_bytes": null
+      },
+      "checkpoint_process_io": {
+        "cancelled_write_bytes": 0,
+        "rchar": 75681,
+        "read_bytes": 0,
+        "syscr": 38,
+        "syscw": 4,
+        "wchar": 16384,
+        "write_bytes": 16384
+      },
+      "process_io": {
+        "cancelled_write_bytes": 0,
+        "rchar": 228986,
+        "read_bytes": 4096,
+        "syscr": 93,
+        "syscw": 29,
+        "wchar": 37189,
+        "write_bytes": 45056
+      },
+      "host_before": {
+        "rss_bytes": 20422656,
+        "peak_rss_bytes": 20422656,
+        "io": {
+          "cancelled_write_bytes": 3620864,
+          "rchar": 89108305,
+          "read_bytes": 9093120,
+          "syscr": 110825,
+          "syscw": 152401,
+          "wchar": 307518060,
+          "write_bytes": 24678400
+        },
+        "load": "4.55 5.61 6.91 6/4943 1255559\n",
+        "io_pressure": "some avg10=8.29 avg60=2.34 avg300=1.77 total=14385814082\nfull avg10=7.70 avg60=2.11 avg300=1.58 total=11057942153\n"
+      },
+      "host_after": {
+        "rss_bytes": 20430848,
+        "peak_rss_bytes": 20430848,
+        "io": {
+          "cancelled_write_bytes": 3620864,
+          "rchar": 89337291,
+          "read_bytes": 9097216,
+          "syscr": 110918,
+          "syscw": 152430,
+          "wchar": 307555249,
+          "write_bytes": 24723456
+        },
+        "load": "4.55 5.61 6.91 4/4943 1255559\n",
+        "io_pressure": "some avg10=8.29 avg60=2.34 avg300=1.77 total=14385827446\nfull avg10=7.70 avg60=2.11 avg300=1.58 total=11057955290\n"
+      },
+      "peak_rss_bytes": 20430848,
+      "browse": {
+        "samples": 1,
+        "p95_ms": 0.671504,
+        "p99_ms": 0.671504
+      },
+      "co_tenant": {
+        "samples": 1,
+        "p95_ms": 46.869002,
+        "p99_ms": 46.869002
+      },
+      "co_tenant_cache_mode": "evict",
+      "co_tenant_cache_limit": "cached reuses one OS page; evict requests Linux page-cache eviction before each read, without bypassing filesystem/device caches or proving physical I/O",
+      "foreground_writer": {
+        "samples": 1,
+        "p95_ms": 57.45296200000001,
+        "p99_ms": 57.45296200000001
+      },
+      "cancellation_requested": true,
+      "cancellation_source_quiescence_ms": 0.46198,
+      "cancellation_measured": true,
+      "yield_reasons_observed": [],
+      "storage_usage": {
+        "io_budgets": [
+          {
+            "device": "8:0",
+            "kind": "rotational",
+            "limit_bytes_per_sec": 8388608,
+            "current_bytes_per_sec": 8388608,
+            "concurrency": 1,
+            "active": 0,
+            "deferred": 0,
+            "accounted_bytes": 148179696,
+            "observed_bytes_per_sec": 0.0,
+            "queue_depth": 0.0,
+            "request_latency_ms": null,
+            "yield_reason": "ready",
+            "probes_available": true
+          },
+          {
+            "device": "8:16",
+            "kind": "rotational",
+            "limit_bytes_per_sec": 8388608,
+            "current_bytes_per_sec": 8388608,
+            "concurrency": 1,
+            "active": 0,
+            "deferred": 0,
+            "accounted_bytes": 61755136,
+            "observed_bytes_per_sec": 402623.7985306089,
+            "queue_depth": 0.003389545717694377,
+            "request_latency_ms": 0.06896551724137931,
+            "yield_reason": "ready",
+            "probes_available": true
+          }
+        ],
+        "io_stall_pct": 19.739721568762356,
+        "cache_inventory_ready": true,
+        "data_dir": "/mnt/Larry/3dam-scan-sweep-20261007/catalog-separate-unchanged",
+        "library_db_bytes": 2551808,
+        "server_db_bytes": 0,
+        "thumbnails": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 10737418240,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "previews": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 10737418240,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "peer_previews": {
+          "bytes": 0,
+          "files": 0,
+          "budget_bytes": 2147483648,
+          "hits": 0,
+          "misses": 0,
+          "evictions": 0,
+          "stale_deleted": 0
+        },
+        "asset_count": 2000,
+        "source_count": 1
+      },
+      "assertion_failures": []
+    }
+  ]
+}
