@@ -204,6 +204,10 @@ The desktop workspace (DESIGN_GUIDELINES §3.1) maps to plain DOM, not a canvas:
 ```
 
 - **Left / centre / inspector are DOM** — semantic HTML + CSS. The centre grid/table is **virtualised** (windowed rendering) so a 100k+ grid scrolls at 60fps with lazily-fetched thumbnails (DESIGN_GUIDELINES §1.1, §3.1). Grid and table are equal views over the same query, toggle preserves selection+filter.
+- **Combined library.** The browser queries all sources by default, including federated peers.
+  Navigation counts describe that complete library. Source rows expose status and management
+  actions; source and source-relative folder selection live in the search filter panel and
+  appear in the active filter chips. Source URL parameters remain ordinary query filters.
 - **Inspector** prioritises the license badge high (DESIGN_GUIDELINES §3.1), then preview, metadata, features, tags — all DOM, fed by `get_asset` (file 03).
 - **All state comes from the API.** Every list, facet, tag edit, and preview is a file-03 call; live progress arrives on the `/api/ws` socket (§A.3). The DOM gets responsive layout, touch, text input, and accessibility for free (PRODUCT_SPEC §7).
 
@@ -212,7 +216,7 @@ The desktop workspace (DESIGN_GUIDELINES §3.1) maps to plain DOM, not a canvas:
 The exact stack is framed here as an implementable starting point (frozen in [ADR 0008](../adr/0008-web-client-stack.md)):
 
 - **Bundler / dev server: Vite.** Fast HMR (the web-first iteration loop, §A.4 dev proxy), first-class WASM + Web Worker support, and a simple `pnpm build → web/dist/` that the `rust-embed` step consumes. `pnpm` as the package manager (matches the release matrix, §15.5).
-- **Router: a lightweight client-side router** (e.g. React Router, or a minimal file-based router). URL owns view state (current source/collection/filter/selected asset) so views are linkable and back/forward works; the axum SPA fallback (§A.4) serves `index.html` for all such routes.
+- **Router: a lightweight client-side router** (e.g. React Router, or a minimal file-based router). URL owns view state (current collection/search filters/selected asset) so views are linkable and back/forward works; the axum SPA fallback (§A.4) serves `index.html` for all such routes.
 - **Data fetching / server state:** a query/cache layer (e.g. TanStack Query) over a thin typed API client wrapping file-03 endpoints — caching, background refetch, and request dedup for the grid, with the WebSocket (§A.3) invalidating/patching cached queries on live events. **UI state** (selection, view toggle, filter chips) stays minimal and local/URL-driven; a heavy global store is likely unnecessary.
 - **Styling: CSS** (CSS Modules or a small utility layer), dark-first, low-chrome, information-dense per DESIGN_GUIDELINES §4 — one restrained accent for selection/focus/primary. No heavyweight component framework; the design language is dense tables and tight grids, not card-heavy chrome.
 

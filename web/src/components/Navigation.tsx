@@ -190,7 +190,7 @@ function Row({
   );
 }
 
-/** @param onNavigate called after a filter/source tap so the caller can dismiss the drawer on
+/** @param onNavigate called after a filter tap so the caller can dismiss the drawer on
  *  narrow screens (responsive + touch pass). Undefined for the persistent `lg` rail, which never closes. */
 export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
   const { state, patch } = useViewState();
@@ -199,15 +199,10 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
     onNavigate?.();
   };
   const sources = useSources();
-  // Sidebar counts follow the browsed source (phase 6): a scoped local source counts its own
-  // assets; a federated source reports the peer's live numbers (polled — no WS across peers).
-  // Unscoped counts every reachable source, peers included, so they need the same polling
-  // whenever any federated source is registered — a peer's catalog changes silently here too.
-  const isPeer =
-    sources.data?.some((s) =>
-      s.kind === "federated" && (state.source === null || s.id === state.source),
-    ) ?? false;
-  const stats = useStats(state.source, { isPeer });
+  // Library counts always combine all sources. Poll when a live peer contributes assets;
+  // source search filters narrow results, while these counts describe the whole library.
+  const isPeer = sources.data?.some((s) => s.kind === "federated") ?? false;
+  const stats = useStats(null, { isPeer });
   const scan = useScan();
   const analyze = useAnalyze();
   const removeSource = useRemoveSource();
@@ -299,11 +294,25 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
       {/* library / media filters */}
       <SectionLabel>Library</SectionLabel>
       <Row
-        active={!state.media && !state.collection}
-        onClick={() => go({ media: null, collection: null })}
+        active={
+          !state.media && !state.collection && !state.source && !state.path &&
+          !state.license && !state.tag && !state.fav && !state.q && state.adv.length === 0
+        }
+        onClick={() => go({
+          media: null,
+          collection: null,
+          source: null,
+          path: null,
+          subfolders: true,
+          license: null,
+          tag: null,
+          fav: false,
+          q: "",
+          adv: [],
+        })}
         right={<Count n={total} loading={stats.isLoading} />}
       >
-        <Layers size={14} /> All media types
+        <Layers size={14} /> All assets
       </Row>
       {/* Favorites (issue #63): a boolean facet — star an asset from the Inspector — that composes
           with the media/source facets. Toggling it on clears any active collection view. */}
@@ -369,7 +378,7 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
       {/* sources */}
       <div className="flex items-center justify-between px-3 pt-4 pb-1">
         <span className="text-[10px] font-semibold tracking-wider text-fg-dim uppercase">
-          Sources
+          Library sources
         </span>
         <button
           className="flex items-center justify-center text-fg-dim hover:text-accent disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:text-fg-dim coarse:min-h-11 coarse:min-w-11"
@@ -380,6 +389,9 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
           <FolderPlus size={14} />
         </button>
       </div>
+      <p className="px-3 pb-1 text-[10px] text-fg-dim">
+        Combined in one library. Filter by source in search.
+      </p>
       {/* Only when the fetch actually succeeded with zero sources — `data?.length === 0` was falsy
           while `data` is undefined (loading/error), leaving a blank, unexplained section (issue #24). */}
       {sources.isSuccess && sources.data.length === 0 && (
@@ -395,13 +407,7 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
           key={s.id}
           source={s}
           gate={gate}
-          active={state.source === s.id && !state.path && !state.collection}
           removing={removeSource.isPending && removeSource.variables === s.id}
-          onNavigate={onNavigate}
-          onSelect={() =>
-            // Selecting the source row means the whole source — drop any folder scope (issue #66).
-            go({ source: state.source === s.id ? null : s.id, path: null, collection: null })
-          }
           onShare={
             canShare
               ? () =>

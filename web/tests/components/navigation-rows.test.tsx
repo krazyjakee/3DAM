@@ -1,6 +1,6 @@
 // The two units that came out of `Navigation.tsx` (issue #168): the collections section, which owns
-// its own CRUD, and one source row, which owns its disclosure. Both are extracted precisely because
-// they stand alone — so these tests mount them without the rail, the view state, or a workspace.
+// its own CRUD, and one source row, which shows status and management actions. Both stand alone,
+// so these tests mount them without the rail, the view state, or a workspace.
 
 import { HttpResponse, http } from "msw";
 import { screen, waitFor, within } from "@testing-library/react";
@@ -129,34 +129,20 @@ test("an empty, settled collections list offers the create shortcut", async () =
   expect(await screen.findByRole("button", { name: "+ Create a manual collection" })).toBeVisible();
 });
 
-test("a local source row discloses its folder tree without scoping the browser to the source", async () => {
-  const user = userEvent.setup();
-  const onSelect = vi.fn();
-  server.use(
-    http.post("http://localhost/api/v1/folders", () =>
-      HttpResponse.json([{ path: "Drums/", name: "Drums", asset_count: 7, has_children: false }]),
-    ),
-  );
-
+test("a local source row shows status without offering source or folder navigation", () => {
   renderApp(
     <SourceRow
       source={source()}
       gate={allow}
-      active={false}
       removing={false}
-      onSelect={onSelect}
       onRescan={vi.fn()}
       onRemove={vi.fn()}
     />,
   );
   expect(screen.getByText("42")).toBeVisible();
   expect(screen.getByRole("img", { name: /Source status/ })).toBeVisible();
-
-  await user.click(screen.getByRole("button", { name: "Expand Project folders" }));
-  expect(await screen.findByText("Drums")).toBeVisible();
-  expect(onSelect).not.toHaveBeenCalled();
-  await user.click(screen.getByRole("button", { name: "Collapse Project folders" }));
-  await waitFor(() => expect(screen.queryByText("Drums")).toBeNull());
+  expect(screen.getByText("Project")).toBeVisible();
+  expect(screen.queryByRole("button", { name: /Project/ })).not.toBeInTheDocument();
 });
 
 test("a federated peer row offers neither folders nor a rescan", () => {
@@ -164,9 +150,7 @@ test("a federated peer row offers neither folders nor a rescan", () => {
     <SourceRow
       source={source({ id: "p1", kind: "federated", name: "Studio peer" })}
       gate={allow}
-      active
       removing={false}
-      onSelect={vi.fn()}
       onRescan={vi.fn()}
       onRemove={vi.fn()}
       onShare={vi.fn()}
@@ -186,9 +170,7 @@ test("rescan and remove fire from the row's own actions", async () => {
     <SourceRow
       source={source({ state: "scanning" })}
       gate={allow}
-      active={false}
       removing={false}
-      onSelect={vi.fn()}
       onRescan={onRescan}
       onRemove={onRemove}
     />,

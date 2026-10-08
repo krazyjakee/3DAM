@@ -96,7 +96,7 @@ earlier in this document over the one later.
 ## 3. Interaction & UX guidelines
 
 The desktop app draws on three proven layouts (see `docs/existing-product-screenshots/`):
-a **hierarchical source/category sidebar** (Connecter), a **content grid + rich detail
+a **category sidebar** (Connecter), a **content grid + rich detail
 panel** (Connecter / echo3D), and a **sortable attribute table with inline previews and
 similarity search** (Sononym). 3DAM unifies these into one workspace.
 
@@ -124,6 +124,9 @@ similarity search** (Sononym). 3DAM unifies these into one workspace.
 - Previews are generated once, cached, and regenerated only on source change.
 
 ### 3.3 Search and discovery
+- **One combined library.** Browsing and library counts include all registered file and
+  federated sources together. Source rows show status and management actions; choosing a
+  source or a folder is an explicit search filter, never a library switch.
 - **Text search** (names, tags, metadata) is always available and instant.
 - **Similarity search** ("find more like this") is a first-class action on any asset,
   powered by content embeddings — the signature feature carried across all three media

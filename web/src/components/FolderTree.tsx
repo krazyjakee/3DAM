@@ -16,7 +16,7 @@ export interface FolderSelection {
   onSelect: (prefix: string) => void;
 }
 
-/** Lazy folder tree for one source (issue #66). Rendered beneath an expanded source row: each node
+/** Lazy folder tree for one source (issue #66). Used in search filters and upload destinations: each node
  *  fetches only its immediate children, and only once it is opened — so a deep hierarchy costs
  *  nothing until the user actually browses into it. Selecting a folder scopes the Browser to that
  *  subtree (source + path-prefix filter, deep-linked via the `path` URL param) — unless `select` is

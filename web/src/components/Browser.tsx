@@ -352,8 +352,7 @@ export function Browser({
           });
         }}
       />
-      {/* Folder breadcrumb (issue #66) — the current source + path segments, each clickable to jump
-          up the tree. Only shown when browsing a source (not a collection view). */}
+      {/* Folder breadcrumb (issue #66) — shown for an explicit folder search filter. */}
       <Breadcrumb />
       {smartFolderWarning && (
         <div

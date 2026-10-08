@@ -1,0 +1,99 @@
+{
+  "capturedAt": "2026-10-08T10:02:01.435Z",
+  "baseUrl": "http://127.0.0.1:5173",
+  "fixtureApi": true,
+  "scenarios": [
+    {
+      "name": "all-sources",
+      "width": 1440,
+      "height": 900,
+      "path": "/?view=table",
+      "touch": false,
+      "filterBounds": null,
+      "title": "3DAM",
+      "viewportWidth": 1440,
+      "pageScrollWidth": 1440,
+      "browserWidth": 912,
+      "toolbarVisible": true,
+      "statusVisible": true,
+      "searchVisible": true,
+      "tableVisible": true,
+      "cancelVisible": true,
+      "connectionVisible": true,
+      "signInVisible": true,
+      "file": "all-sources.png"
+    },
+    {
+      "name": "source-filter",
+      "width": 1440,
+      "height": 900,
+      "path": "/?view=table&source=fixture-local",
+      "touch": false,
+      "filters": true,
+      "filterBounds": {
+        "left": 515.859375,
+        "right": 835.859375
+      },
+      "title": "3DAM",
+      "viewportWidth": 1440,
+      "pageScrollWidth": 1440,
+      "browserWidth": 912,
+      "toolbarVisible": true,
+      "statusVisible": true,
+      "searchVisible": true,
+      "tableVisible": true,
+      "cancelVisible": true,
+      "connectionVisible": true,
+      "signInVisible": true,
+      "file": "source-filter.png"
+    },
+    {
+      "name": "source-filter-320",
+      "width": 320,
+      "height": 720,
+      "path": "/?view=table&source=fixture-local",
+      "touch": true,
+      "filters": true,
+      "filterBounds": {
+        "left": 12,
+        "right": 316
+      },
+      "title": "3DAM",
+      "viewportWidth": 320,
+      "pageScrollWidth": 320,
+      "browserWidth": 320,
+      "toolbarVisible": true,
+      "statusVisible": true,
+      "searchVisible": true,
+      "tableVisible": true,
+      "cancelVisible": true,
+      "connectionVisible": true,
+      "signInVisible": true,
+      "file": "source-filter-320.png"
+    },
+    {
+      "name": "source-filter-mobile",
+      "width": 360,
+      "height": 760,
+      "path": "/?view=table&source=fixture-local",
+      "touch": true,
+      "filters": true,
+      "filterBounds": {
+        "left": 12,
+        "right": 332
+      },
+      "title": "3DAM",
+      "viewportWidth": 360,
+      "pageScrollWidth": 360,
+      "browserWidth": 360,
+      "toolbarVisible": true,
+      "statusVisible": true,
+      "searchVisible": true,
+      "tableVisible": true,
+      "cancelVisible": true,
+      "connectionVisible": true,
+      "signInVisible": true,
+      "file": "source-filter-mobile.png"
+    }
+  ]
+}

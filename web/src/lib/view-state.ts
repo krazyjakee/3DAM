@@ -18,6 +18,7 @@ export type ViewMode = "grid" | "table";
 export interface ViewState {
   q: string;
   media: MediaType | null;
+  /** Optional search filter. The library combines every source when this is absent. */
   source: string | null;
   license: string | null;
   /** Confirmed-tag facet — composes with media/source/license, mutually exclusive with a collection. */

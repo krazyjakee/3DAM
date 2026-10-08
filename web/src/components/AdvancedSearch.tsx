@@ -1,16 +1,18 @@
 // Advanced Search (structured attribute filters). The tags-vs-attributes split made concrete: the
 // bounded, extracted metadata the analysis pass stores in the per-media attr columns
 // (audio_attr/image_attr/model_attr) is surfaced here as typed dropdown / range / toggle controls,
-// contextual to the selected media type, plus a free tag filter. Everything writes the `adv`
-// `Filter[]` in view-state, so a whole faceted query stays URL-linkable and composes with the
-// sidebar facets and text search. Mirrors the Rust `FacetField` variants one-for-one — keep in sync.
+// contextual to the selected media type, plus tag, source, and folder filters. Filters live in
+// URL view state, so a whole faceted query stays linkable and composes with the sidebar facets
+// and text search. Mirrors the Rust `FacetField` variants one-for-one — keep in sync.
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ShieldCheck, SlidersHorizontal, X } from "lucide-react";
 import type { FacetField, Filter, LicenseStatus, MediaType } from "@/api/types";
+import { useSources } from "@/api/queries";
 import { licenseLabel } from "@/lib/format";
 import { USAGE_RIGHTS, type UsageRightOp } from "@/lib/license";
 import { useViewState } from "@/lib/view-state";
+import { FolderTree } from "./FolderTree";
 
 /** One structured control. `enum`/`bool` emit a single equality filter; `range` emits a
  *  range/gte/lte depending on which bounds are set; `numEnum` is a dropdown of numeric values. */
@@ -499,9 +501,10 @@ function TagFilter({ adv, onChange }: { adv: Filter[]; onChange: (next: Filter[]
 }
 
 /** The "Filters" toolbar button + its popover panel. Contextual to the active media type: pick a
- *  media in the sidebar and its structured controls appear. Tag filters are always available. */
+ *  media in the sidebar and its structured controls appear. Source and tag filters are always available. */
 export function AdvancedSearch() {
   const { state, patch } = useViewState();
+  const sources = useSources();
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
@@ -527,10 +530,13 @@ export function AdvancedSearch() {
   }, [close, open]);
 
   const controls = state.media ? CATALOG[state.media] : null;
-  // The licence status lives in its own URL param, not in `adv`, but it is edited from this panel —
-  // so it counts towards the badge and is cleared by "Clear advanced".
-  const activeCount = adv.length + (state.license ? 1 : 0);
-  const clearAll = () => patch({ adv: [], license: null, collection: null });
+  // Filters edited here all contribute to the badge, including those with their own URL params.
+  const activeCount =
+    adv.length + (state.license ? 1 : 0) + (state.source ? 1 : 0) + (state.path ? 1 : 0);
+  const clearAll = () => patch({
+    adv: [], license: null, source: null, path: null, subfolders: true, collection: null,
+  });
+  const source = sources.data?.find((item) => item.id === state.source);
 
   return (
     <div
@@ -573,7 +579,7 @@ export function AdvancedSearch() {
             event.stopPropagation();
             close(true);
           }}
-          className="absolute right-0 z-50 mt-1 max-h-[70vh] w-80 max-w-[calc(100vw-1rem)] overflow-y-auto rounded-md border border-border bg-surface p-3 shadow-xl"
+          className="absolute left-0 z-50 mt-1 max-h-[70vh] w-80 max-w-[calc(100vw-1rem)] overflow-y-auto rounded-md border border-border bg-surface p-3 shadow-xl sm:right-0 sm:left-auto"
         >
           <div className="mb-2 flex items-center justify-between">
             <h2 id="advanced-search-title" className="text-xs font-semibold text-fg">
@@ -599,6 +605,49 @@ export function AdvancedSearch() {
             </div>
           </div>
 
+          <label className="flex items-center justify-between gap-2 text-[11px] text-fg-muted">
+            Source
+            <select
+              className="field min-w-0 flex-1 text-xs"
+              value={state.source ?? ""}
+              disabled={!sources.isSuccess}
+              onChange={(event) => patch({
+                source: event.target.value || null,
+                path: null,
+                subfolders: true,
+                collection: null,
+              })}
+            >
+              <option value="">All sources</option>
+              {state.source && !source && (
+                <option value={state.source}>Unavailable source</option>
+              )}
+              {sources.data?.map((item) => (
+                <option key={item.id} value={item.id}>{item.name}</option>
+              ))}
+            </select>
+          </label>
+          {sources.isError && (
+            <p className="mt-1 text-[11px] text-danger">Couldn’t load sources.</p>
+          )}
+          {source && source.kind !== "federated" && (
+            <section className="mt-2" aria-label="Folder filter">
+              <div className="flex items-center justify-between text-[11px] text-fg-muted">
+                <span>Folder</span>
+                {state.path && (
+                  <button
+                    className="text-fg-dim hover:text-accent"
+                    onClick={() => patch({ path: null, subfolders: true })}
+                  >
+                    All folders
+                  </button>
+                )}
+              </div>
+              <FolderTree key={source.id} source={source.id} prefix="" depth={0} />
+            </section>
+          )}
+
+          <div className="my-2 border-t border-border" />
           {controls ? (
             <div className="flex flex-col gap-1.5">
               {controls.map((c) => (

@@ -3,15 +3,15 @@ import { ChevronRight, Layers } from "lucide-react";
 import { useSources } from "@/api/queries";
 import { useViewState } from "@/lib/view-state";
 
-/** Folder breadcrumb (issue #66): when the browse is scoped to a source, show the source name
+/** Folder breadcrumb (issue #66): when a folder filter is active, show the source name
  *  followed by each path segment, `/`-separated. Clicking a crumb re-scopes to that level (the
  *  source name clears the folder path entirely); the trailing crumb is the current folder and is
- *  inert. Hidden in collection views and when no source is active. Reads/writes the same `source` +
- *  `path` view state the sidebar tree drives, so the two surfaces stay in lockstep. */
+ *  inert. Hidden in collection views and without a folder filter. Reads/writes the same `source` +
+ *  `path` view state as the search filters. */
 export function Breadcrumb() {
   const { state, patch } = useViewState();
   const sources = useSources();
-  if (!state.source || state.collection) return null;
+  if (!state.source || !state.path || state.collection) return null;
 
   const sourceName = sources.data?.find((s) => s.id === state.source)?.name ?? "Source";
   const segs = (state.path ?? "").split("/").filter(Boolean);
