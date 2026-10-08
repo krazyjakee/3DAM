@@ -22,6 +22,9 @@ export default defineConfig({
         // Settings server state moved behind its own TanStack Query hooks (issue #163). Both the
         // orchestrator and hook module must remain visible to per-file thresholds.
         "src/api/admin-queries.ts",
+        "src/api/updates.ts",
+        "src/components/Updates.tsx",
+        "src/components/UpdateNotice.tsx",
         "src/components/AuthGate.tsx",
         // Standalone forms extracted from AuthGate.tsx (issue #169). This is an allowlist, so each
         // new module must be named or per-file thresholds would silently stop applying to it.

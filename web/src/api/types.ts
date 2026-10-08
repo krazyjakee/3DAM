@@ -986,3 +986,17 @@ export interface ErrorBody {
   message: string;
   detail?: unknown;
 }
+// Desktop-only native IPC contract (dam-api::updates). It describes the installed app, not a server.
+export type UpdatePhase = "idle" | "checking" | "up_to_date" | "available" | "downloading" | "installing" | "ready" | "error";
+export interface DesktopUpdateStatus {
+  current_version: string;
+  supported: boolean;
+  unavailable_reason: string | null;
+  automatic_checks: boolean;
+  phase: UpdatePhase;
+  release: { version: string; notes: string | null; date: string | null } | null;
+  checked_at: number | null;
+  downloaded_bytes: number;
+  total_bytes: number | null;
+  error: string | null;
+}

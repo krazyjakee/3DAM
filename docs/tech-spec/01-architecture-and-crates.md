@@ -59,6 +59,7 @@ dam-cli
 └── dam-server
 
 dam-desktop
+├── dam-api                 (desktop update IPC DTOs)
 ├── dam-frontend
 └── dam-server
 

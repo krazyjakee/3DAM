@@ -14,6 +14,7 @@ pub mod federation;
 pub mod id;
 pub mod page;
 pub mod service;
+pub mod updates;
 
 /// Unix epoch milliseconds — the single time unit used across the schema and job/audit timestamps
 /// (tech-spec 02 §3.1). Shared here so every crate reads the clock the same way.

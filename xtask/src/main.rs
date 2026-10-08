@@ -496,6 +496,7 @@ const ALLOWED_DAM_EDGES: &[(&str, &str, bool)] = &[
     ("dam-core", "dam-render", true),
     ("dam-core", "dam-sources", false),
     ("dam-core", "dam-store", false),
+    ("dam-desktop", "dam-api", false),
     ("dam-desktop", "dam-frontend", false),
     ("dam-desktop", "dam-server", false),
     ("dam-frontend", "dam-api", false),

@@ -3,6 +3,8 @@
 **/target/
 # Frontend component-test coverage output.
 /web/coverage/
+# Python release automation bytecode.
+__pycache__/
 # Local scale-harness reports; CI publishes these as workflow artifacts.
 /perf-results/
 # Generated shell completions + man pages (`cargo xtask packaging`). Deliberately NOT under

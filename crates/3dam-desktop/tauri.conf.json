@@ -3,6 +3,15 @@
   "productName": "3DAM",
   "identifier": "io.github.krazyjakee.threedam",
   "mainBinaryName": "3dam",
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEEyQTM5MzBERDRFRTIyMkEKUldRcUl1N1VEWk9qb2hKZzNLWEJVT2lacks3UmlkS3o2L0ZXTndVcE1kMFY5cjk3TTNCRGxMT2YK",
+      "endpoints": [
+        "https://github.com/krazyjakee/3DAM/releases/latest/download/latest.json"
+      ],
+      "requireSignedVersion": true
+    }
+  },
   "app": {
     "windows": [],
     "withGlobalTauri": true,
@@ -12,7 +21,10 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["deb", "appimage"],
+    "targets": [
+      "deb",
+      "appimage"
+    ],
     "publisher": "Jake Cattrall",
     "category": "GraphicsAndDesign",
     "shortDescription": "Game-asset manager for audio, image, and 3D assets.",

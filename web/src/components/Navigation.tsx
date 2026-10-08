@@ -3,6 +3,7 @@ import { useState } from "react";
 import { Link } from "react-router";
 import {
   AudioLines,
+  ArrowDownToLine,
   Ban,
   Box,
   Clock,
@@ -43,6 +44,7 @@ import { useViewState } from "@/lib/view-state";
 import { useDialogs } from "@/lib/dialogs";
 import { useTheme, type ThemePref } from "@/lib/theme";
 import { ACCOUNT_ROUTES, accountNavigation } from "@/lib/account-surfaces";
+import { hasDesktopUpdater } from "@/api/updates";
 import { AddSourceDialog } from "./AddSourceDialog";
 import { Collections } from "./navigation/Collections";
 import { SourceRow } from "./navigation/SourceRow";
@@ -521,6 +523,11 @@ export function Navigation({ onNavigate }: { onNavigate?: () => void }) {
           className="flex items-center gap-2 border-t border-border px-3 py-2 text-xs text-fg-dim hover:text-accent coarse:min-h-11"
         >
           <SettingsIcon size={14} /> Administration
+        </Link>
+      )}
+      {hasDesktopUpdater() && (
+        <Link to="/updates" onClick={onNavigate} className="flex items-center gap-2 border-t border-border px-3 py-2 text-xs text-fg-dim hover:text-accent coarse:min-h-11">
+          <ArrowDownToLine size={14} /> Updates
         </Link>
       )}
       {showAdd && <AddSourceDialog onClose={() => setShowAdd(false)} />}

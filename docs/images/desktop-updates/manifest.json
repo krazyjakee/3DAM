@@ -1,0 +1,32 @@
+{
+  "capturedAt": "2026-10-08T09:48:21.296Z",
+  "baseUrl": "http://127.0.0.1:5173",
+  "fixtureApi": true,
+  "scenarios": [
+    {
+      "name": "updates-desktop",
+      "width": 1200,
+      "height": 760,
+      "path": "/updates",
+      "touch": false,
+      "title": "3DAM",
+      "viewportWidth": 1200,
+      "pageScrollWidth": 1200,
+      "connectionVisible": true,
+      "file": "updates-desktop.png"
+    },
+    {
+      "name": "updates-narrow",
+      "width": 360,
+      "height": 820,
+      "path": "/updates",
+      "touch": true,
+      "title": "3DAM",
+      "viewportWidth": 360,
+      "pageScrollWidth": 360,
+      "connectionVisible": true,
+      "file": "updates-narrow.png"
+    }
+  ],
+  "fixtureNativeUpdater": true
+}

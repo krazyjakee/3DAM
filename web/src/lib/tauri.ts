@@ -23,7 +23,11 @@ interface TauriOpener {
 declare global {
   interface Window {
     /** Injected by the desktop shell's webview; never present in a plain browser. */
-    __TAURI__?: { dialog?: TauriDialog; opener?: TauriOpener };
+    __TAURI__?: {
+      dialog?: TauriDialog;
+      opener?: TauriOpener;
+      core?: { invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> };
+    };
     /** Immutable launch-mode bit injected before page scripts by the native shell. */
     __3DAM_EMBEDDED_SERVER__?: boolean;
   }

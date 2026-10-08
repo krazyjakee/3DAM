@@ -1,0 +1,14 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "loopback-updates",
+  "description": "Updater commands for the embedded UI. Native state also rejects hosted launches, including --connect to loopback.",
+  "windows": ["main"],
+  "remote": { "urls": ["http://127.0.0.1:*"] },
+  "permissions": [
+    "allow-desktop-update-status",
+    "allow-desktop-update-check",
+    "allow-desktop-update-install",
+    "allow-desktop-update-preferences",
+    "allow-desktop-update-restart"
+  ]
+}

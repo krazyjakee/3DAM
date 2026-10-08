@@ -27,6 +27,8 @@ url = { workspace = true }
 # JSON-encode native fetch-closure inputs without hand-escaping.
 serde_json = { workspace = true }
 anyhow = { workspace = true }
+serde.workspace = true
+tempfile.workspace = true
 
 # The webview shell (ADR 0013). Declared here rather than in the workspace table since this crate is
 # its only consumer (the eframe precedent).
@@ -41,6 +43,8 @@ tauri-plugin-opener = "2"
 # restores runtime-created windows too, so the window built in `.setup()` is covered without an
 # explicit `restore_state` call.
 tauri-plugin-window-state = "2"
+tauri-plugin-updater = "2"
+dam-api.workspace = true
 
 [features]
 ann = ["dam-server/ann"]

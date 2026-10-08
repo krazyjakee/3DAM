@@ -12,6 +12,7 @@ import { AUTH_COPY, isUnauthorized, notifyUnauthorized } from "./lib/auth";
 import { getServer } from "./lib/server";
 import { errorMessage, toast } from "./lib/toast";
 import { ACCOUNT_ROUTES } from "./lib/account-surfaces";
+import { UpdateNotice } from "./components/UpdateNotice";
 
 // Keep route implementations out of the application shell. In particular, the browse workspace
 // pulls in virtualisation and every preview surface, while account/admin and upload bring their own API
@@ -37,6 +38,7 @@ const Upload = lazy(() =>
 const JobHistory = lazy(() =>
   import("./components/JobHistory").then(({ JobHistory }) => ({ default: JobHistory })),
 );
+const Updates = lazy(() => import("./components/Updates").then(({ Updates }) => ({ default: Updates })));
 
 function RouteFallback() {
   return (
@@ -111,9 +113,11 @@ export function App() {
       {/* Front-door auth: in token mode nothing below renders until a credential validates. */}
       <AuthGate>
         <BrowserRouter>
+          <UpdateNotice />
           <JobNotifications />
           <Suspense fallback={<RouteFallback />}>
             <Routes>
+              <Route path="/updates" element={<Updates />} />
               {/* Personal account self-service and server administration are separate surfaces. */}
               <Route path={ACCOUNT_ROUTES.profile} element={<Profile />} />
               <Route path={ACCOUNT_ROUTES.administration} element={<Administration />} />

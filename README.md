@@ -88,6 +88,18 @@ This builds the web client, then the release `3dam` binary, then runs the Tauri 
 against it (config in `crates/3dam-desktop/tauri.conf.json`). Bundles land under
 `target/release/bundle/`. The AppImage target additionally needs `librsvg2-dev` installed.
 
+### Desktop updates
+
+Open **Updates** in the desktop sidebar or **Help → Check for Updates…**. Signed release builds
+check automatically at launch and every six hours, show release notes and download progress, and
+install only when you choose. Automatic checks can be disabled; the setting persists across launches.
+Linux AppImage, macOS app, and Windows MSI/NSIS installations support in-app updates. Linux `.deb`
+and portable/source builds provide a link to download a new release instead. Open the local desktop
+library to update; a browser or hosted `--connect` page cannot install desktop software.
+
+Release maintainers must configure the updater signing keys before publishing; see
+[desktop update configuration](docs/desktop-updates.md).
+
 ## Quick start
 
 ```sh

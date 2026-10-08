@@ -22,6 +22,8 @@ use tauri::menu::{AboutMetadata, Menu, MenuBuilder, MenuItemBuilder, SubmenuBuil
 use tauri::{AppHandle, Manager, Runtime, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_window_state::StateFlags;
 
+mod updates;
+
 /// Webview zoom bounds and step for the View menu — browser conventions (25%–300%, 10% steps).
 /// The factor is shell-side state: `set_zoom` is write-only, so the menu handler tracks it.
 const ZOOM_MIN: f64 = 0.25;
@@ -100,7 +102,20 @@ pub fn run(args: Vec<OsString>) -> u8 {
     // shell is the source of truth for Zoom In/Out stepping.
     let zoom = Mutex::new(1.0_f64);
 
+    let mut updater_plugin = tauri_plugin_updater::Builder::new();
+    if let Some(key) = option_env!("DAM_UPDATER_PUBLIC_KEY").filter(|key| !key.trim().is_empty()) {
+        updater_plugin = updater_plugin.pubkey(key.trim());
+    }
+
     let outcome = tauri::Builder::default()
+        .plugin(updater_plugin.build())
+        .invoke_handler(tauri::generate_handler![
+            updates::desktop_update_status,
+            updates::desktop_update_check,
+            updates::desktop_update_install,
+            updates::desktop_update_preferences,
+            updates::desktop_update_restart,
+        ])
         // Native path dialogs and completed-output opening. The webview loads a remote
         // `http://127.0.0.1:<port>` URL, so IPC is off by default; the capability in
         // `capabilities/loopback-dialog.json` grants only open/save dialogs and path opening to the
@@ -116,11 +131,12 @@ pub fn run(args: Vec<OsString>) -> u8 {
                 .with_state_flags(StateFlags::SIZE | StateFlags::POSITION | StateFlags::MAXIMIZED)
                 .build(),
         )
-        .menu(app_menu)
+        .menu(move |handle| app_menu(handle, !hosted))
         .on_menu_event(move |app, event| {
             handle_menu_event(app, event.id().as_ref(), &zoom, keychain_account.as_deref())
         })
         .setup(move |app| {
+            updates::setup(app.handle(), !hosted, &url)?;
             let mut win = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url))
                 .title("3DAM")
                 // A fresh renderer partition means a service worker from an earlier compromised
@@ -154,7 +170,7 @@ pub fn run(args: Vec<OsString>) -> u8 {
 /// the View items are custom ids handled in [`handle_menu_event`]; About is the predefined item
 /// (native About dialog on every platform, no dialog plugin needed). The layout is the
 /// Windows/Linux convention; a macOS app-menu arrangement can come with the bundle work.
-fn app_menu<R: Runtime>(handle: &AppHandle<R>) -> tauri::Result<Menu<R>> {
+fn app_menu<R: Runtime>(handle: &AppHandle<R>, embedded: bool) -> tauri::Result<Menu<R>> {
     let file = SubmenuBuilder::new(handle, "File")
         .item(
             &MenuItemBuilder::with_id("forget-server-credential", "Forget Server Credential")
@@ -207,6 +223,11 @@ fn app_menu<R: Runtime>(handle: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     );
     let view = view.build()?;
     let help = SubmenuBuilder::new(handle, "Help")
+        .item(
+            &MenuItemBuilder::with_id("updates", "Check for Updates…")
+                .enabled(embedded)
+                .build(handle)?,
+        )
         .about_with_text(
             "About 3DAM",
             Some(AboutMetadata {
@@ -237,6 +258,9 @@ fn handle_menu_event<R: Runtime>(
         return;
     };
     match id {
+        "updates" => {
+            let _ = win.eval("window.location.assign('/updates?check=1')");
+        }
         "forget-server-credential" => {
             let Some(account) = keychain_account else {
                 return;
